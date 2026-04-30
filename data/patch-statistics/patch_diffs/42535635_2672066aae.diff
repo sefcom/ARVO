@@ -1,0 +1,1289 @@
+From 06c2624491a79673149a99d5c597bd0ff388c867 Mon Sep 17 00:00:00 2001
+From: Ram Mohan M <ram.mohan@ittiam.com>
+Date: Sat, 18 May 2024 21:21:12 +0530
+Subject: [PATCH] Updates to jpeg decoder helper util class
+
+jpegdecoderutil class handles subsampling format 420. Decoding images
+with other sub sampling formats return with error. This class is now
+updated to handle various 4:a:b configurations
+
+removed possible oob access in parse xmp metadata
+
+fixed warnings in sample app
+
+Test: ./ultrahdr_unit_test
+Test: ./ultrahdr_dec_fuzzer
+---
+ examples/ultrahdr_app.cpp                |  16 +-
+ lib/include/ultrahdr/jpegdecoderhelper.h | 250 ++++-----
+ lib/include/ultrahdr/jpegrutils.h        |   2 +-
+ lib/src/jpegdecoderhelper.cpp            | 661 ++++++++++-------------
+ lib/src/jpegr.cpp                        |  24 +-
+ lib/src/jpegrutils.cpp                   |   6 +-
+ tests/jpegdecoderhelper_test.cpp         |  11 +-
+ 7 files changed, 442 insertions(+), 528 deletions(-)
+
+diff --git a/examples/ultrahdr_app.cpp b/examples/ultrahdr_app.cpp
+index b4efc1b8..371e599f 100644
+--- a/examples/ultrahdr_app.cpp
++++ b/examples/ultrahdr_app.cpp
+@@ -260,8 +260,8 @@ class UltraHdrAppInput {
+         mSdrIntentCompressedFile(sdrIntentCompressedFile),
+         mGainMapCompressedFile(gainmapCompressedFile),
+         mGainMapMetadataCfgFile(gainmapMetadataCfgFile),
+-        mOutputFile(outputFile),
+         mUhdrFile(nullptr),
++        mOutputFile(outputFile),
+         mWidth(width),
+         mHeight(height),
+         mHdrCf(hdrCf),
+@@ -1384,13 +1384,10 @@ int main(int argc, char* argv[]) {
+       std::cerr << "did not receive raw resources for encoding." << std::endl;
+       return -1;
+     }
+-    if (output_file == nullptr) {
+-      output_file = "out.jpeg";
+-    }
+     UltraHdrAppInput appInput(hdr_intent_raw_file, sdr_intent_raw_file, sdr_intent_compressed_file,
+-                              gainmap_compressed_file, gainmap_metadata_cfg_file, output_file,
+-                              width, height, hdr_cf, sdr_cf, hdr_cg, sdr_cg, hdr_tf, quality,
+-                              out_tf, out_cf);
++                              gainmap_compressed_file, gainmap_metadata_cfg_file,
++                              output_file ? output_file : "out.jpeg", width, height, hdr_cf, sdr_cf,
++                              hdr_cg, sdr_cg, hdr_tf, quality, out_tf, out_cf);
+     if (!appInput.encode()) return -1;
+     if (compute_psnr == 1) {
+       if (!appInput.decode()) return -1;
+@@ -1421,10 +1418,7 @@ int main(int argc, char* argv[]) {
+       std::cerr << "did not receive resources for decoding " << std::endl;
+       return -1;
+     }
+-    if (output_file == nullptr) {
+-      output_file = "outrgb.raw";
+-    }
+-    UltraHdrAppInput appInput(uhdr_file, output_file, out_tf, out_cf);
++    UltraHdrAppInput appInput(uhdr_file, output_file ? output_file : "outrgb.raw", out_tf, out_cf);
+     if (!appInput.decode()) return -1;
+   } else {
+     std::cerr << "unrecognized input mode " << mode << std::endl;
+diff --git a/lib/include/ultrahdr/jpegdecoderhelper.h b/lib/include/ultrahdr/jpegdecoderhelper.h
+index 8a6c3715..dd315902 100644
+--- a/lib/include/ultrahdr/jpegdecoderhelper.h
++++ b/lib/include/ultrahdr/jpegdecoderhelper.h
+@@ -38,139 +38,145 @@ extern "C" {
+ namespace ultrahdr {
+ 
+ // constraint on max width and max height is only due to device alloc constraints
+-// Can tune these values basing on the target device
++// can tune these values basing on the target device
+ static const int kMaxWidth = 8192;
+ static const int kMaxHeight = 8192;
+ 
++/*!\brief List of supported operations */
+ typedef enum {
+-  PARSE_ONLY = 0,          // Dont decode. Parse for dimensions, EXIF, ICC, XMP
+-  DECODE_TO_RGBA = 1,      // Parse and decode to rgba
+-  DECODE_TO_YCBCR = 2,     // Parse and decode to YCBCR or Grayscale
+-                           // if input has 1 channel, decode to Grayscale
+-                           // if input has 3 channels, decode to YCBCR
+-  DECODE_TO_GAIN_MAP = 3,  // parse and decode gain map.
+-                           // if input has 1 channel, decode to Grayscale
+-                           // if input has 3 channels, decode to RGBA
++  PARSE_STREAM = (1 << 0),   /**< Parse jpeg header, APPn markers (Exif, Icc, Xmp, Iso) */
++  DECODE_STREAM = (1 << 16), /**< Single channel images are decoded to Grayscale format and multi
++                                channel images are decoded to RGB format */
++  DECODE_TO_YCBCR_CS = (1 << 17), /**< Decode image to YCbCr Color Space  */
++  DECODE_TO_RGB_CS = (1 << 18),   /**< Decode image to RGB Color Space  */
+ } decode_mode_t;
+ 
+-/*
+- * Encapsulates a converter from JPEG to raw image (YUV420planer or grey-scale) format.
+- * This class is not thread-safe.
+- */
++/*!\brief Encapsulates a converter from JPEG to raw image format. This class is not thread-safe */
+ class JpegDecoderHelper {
+  public:
+-  JpegDecoderHelper();
+-  ~JpegDecoderHelper();
+-  /*
+-   * Decompresses JPEG image to raw image (YUV420planer, grey-scale or RGBA) format. After
+-   * calling this method, call getDecompressedImage() to get the image.
+-   * Returns false if decompressing the image fails.
+-   */
+-  bool decompressImage(const void* image, int length, decode_mode_t decodeTo = DECODE_TO_YCBCR);
+-  /*
+-   * Returns the decompressed raw image buffer pointer. This method must be called only after
+-   * calling decompressImage().
+-   */
+-  void* getDecompressedImagePtr();
+-  /*
+-   * Returns the decompressed raw image buffer size. This method must be called only after
+-   * calling decompressImage().
+-   */
+-  size_t getDecompressedImageSize();
+-  /*
+-   * Returns the image width in pixels. This method must be called only after calling
+-   * decompressImage().
+-   */
+-  size_t getDecompressedImageWidth();
+-  /*
+-   * Returns the image width in pixels. This method must be called only after calling
+-   * decompressImage().
+-   */
+-  size_t getDecompressedImageHeight();
+-  /*
+-   * Returns the XMP data from the image.
+-   */
+-  void* getXMPPtr();
+-  /*
+-   * Returns the decompressed XMP buffer size. This method must be called only after
+-   * calling decompressImage() or getCompressedImageParameters().
+-   */
+-  size_t getXMPSize();
+-  /*
+-   * Extracts EXIF package and updates the EXIF position / length without decoding the image.
+-   */
+-  bool extractEXIF(const void* image, int length);
+-  /*
+-   * Returns the EXIF data from the image.
+-   * This method must be called after extractEXIF() or decompressImage().
+-   */
+-  void* getEXIFPtr();
+-  /*
+-   * Returns the decompressed EXIF buffer size. This method must be called only after
+-   * calling decompressImage(), extractEXIF() or getCompressedImageParameters().
+-   */
+-  size_t getEXIFSize();
+-  /*
+-   * Returns the position offset of EXIF package
+-   * (4 bypes offset to FF sign, the byte after FF E1 XX XX <this byte>),
+-   * or -1  if no EXIF exists.
+-   * This method must be called after extractEXIF() or decompressImage().
+-   */
+-  int getEXIFPos() { return mExifPos; }
+-  /*
+-   * Returns the ICC data from the image.
+-   */
+-  void* getICCPtr();
+-  /*
+-   * Returns the decompressed ICC buffer size. This method must be called only after
+-   * calling decompressImage() or getCompressedImageParameters().
+-   */
+-  size_t getICCSize();
+-  /*
+-   * Returns the iso metadata from the image.
+-   */
+-  void* getIsoMetadataPtr();
+-  /*
+-   * Returns the decompressed iso metadata buffer size. This method must be called only after
+-   * calling decompressImage() or getCompressedImageParameters().
+-   */
+-  size_t getIsoMetadataSize();
+-  /*
+-   * Decompresses metadata of the image. All vectors are owned by the caller.
+-   */
+-  bool getCompressedImageParameters(const void* image, int length);
++  // ===============================================================================================
++  // Enum Definitions
++  // ===============================================================================================
++
++  /*!\brief list of jpg decoder output formats */
++  typedef enum {
++    UNKNOWN,
++    GRAYSCALE,
++    YUV444,
++    YUV440,
++    YUV422,
++    YUV420,
++    YUV411,
++    YUV410,
++    RGB,
++    RGBA,
++  } jpg_out_fmt_t;
++
++  JpegDecoderHelper() = default;
++  ~JpegDecoderHelper() = default;
++
++  /*!\brief This function decodes the bitstream that is passed to it to the desired format and
++   * stores the results internally. The result is accessible via getter functions.
++   *
++   * \param[in]  image    pointer to compressed image
++   * \param[in]  length   length of compressed image
++   * \param[in]  mode     output decode format
++   *
++   * \returns true if operation succeeds, false otherwise.
++   */
++  bool decompressImage(const void* image, int length, decode_mode_t mode = DECODE_TO_YCBCR_CS);
++
++  /*!\brief This function parses the bitstream that is passed to it and makes image information
++   * available to the client via getter() functions. It does not decompress the image. That is done
++   * by decompressImage().
++   *
++   * \param[in]  image    pointer to compressed image
++   * \param[in]  length   length of compressed image
++   *
++   * \returns true if operation succeeds, false otherwise.
++   */
++  bool parseImage(const void* image, int length) {
++    return decompressImage(image, length, PARSE_STREAM);
++  }
++
++  /*! Below public methods are only effective if a call to decompressImage() is made and it returned
++   * true. */
++
++  /*!\brief returns pointer to decompressed image */
++  void* getDecompressedImagePtr() { return mResultBuffer.data(); }
++
++  /*!\brief returns size of decompressed image */
++  size_t getDecompressedImageSize() { return mResultBuffer.size(); }
++
++  /*!\brief returns format of decompressed image */
++  jpg_out_fmt_t getDecompressedImageFormat() { return mOutFormat; }
++
++  /*! Below public methods are only effective if a call to parseImage() or decompressImage() is made
++   * and it returned true. */
++
++  /*!\brief returns image width */
++  size_t getDecompressedImageWidth() { return mPlaneWidth[0]; }
++
++  /*!\brief returns image height */
++  size_t getDecompressedImageHeight() { return mPlaneHeight[0]; }
++
++  /*!\brief returns pointer to xmp block present in input image */
++  void* getXMPPtr() { return mXMPBuffer.data(); }
++
++  /*!\brief returns size of xmp block */
++  size_t getXMPSize() { return mXMPBuffer.size(); }
++
++  /*!\brief returns pointer to exif block present in input image */
++  void* getEXIFPtr() { return mEXIFBuffer.data(); }
++
++  /*!\brief returns size of exif block */
++  size_t getEXIFSize() { return mEXIFBuffer.size(); }
++
++  /*!\brief returns pointer to icc block present in input image */
++  void* getICCPtr() { return mICCBuffer.data(); }
++
++  /*!\brief returns size of icc block */
++  size_t getICCSize() { return mICCBuffer.size(); }
++
++  /*!\brief returns pointer to iso block present in input image */
++  void* getIsoMetadataPtr() { return mIsoMetadataBuffer.data(); }
++
++  /*!\brief returns size of iso block */
++  size_t getIsoMetadataSize() { return mIsoMetadataBuffer.size(); }
++
++  /*!\brief returns the offset of exif data payload with reference to 'image' address that is passed
++   * via parseImage()/decompressImage() call. Note this does not include jpeg marker (0xffe1) and
++   * the next 2 bytes indicating the size of the payload. If exif block is not present in the image
++   * passed, then it returns -1. */
++  int getEXIFPos() { return mExifPayLoadOffset; }
+ 
+  private:
+-  bool decode(const void* image, int length, decode_mode_t decodeTo);
+-  // Returns false if errors occur.
+-  bool decompress(jpeg_decompress_struct* cinfo, const uint8_t* dest, bool isSingleChannel);
+-  bool decompressYUV(jpeg_decompress_struct* cinfo, const uint8_t* dest);
+-  bool decompressRGBA(jpeg_decompress_struct* cinfo, const uint8_t* dest);
+-  bool decompressSingleChannel(jpeg_decompress_struct* cinfo, const uint8_t* dest);
+-  // Process 16 lines of Y and 16 lines of U/V each time.
+-  // We must pass at least 16 scanlines according to libjpeg documentation.
+-  static const int kCompressBatchSize = 16;
+-  // The buffer that holds the decompressed result.
+-  std::vector<JOCTET> mResultBuffer;
+-  // The buffer that holds XMP Data.
+-  std::vector<JOCTET> mXMPBuffer;
+-  // The buffer that holds EXIF Data.
+-  std::vector<JOCTET> mEXIFBuffer;
+-  // The buffer that holds ICC Data.
+-  std::vector<JOCTET> mICCBuffer;
+-  // The buffer that holds iso metadata.
+-  std::vector<JOCTET> mIsoMetadataBuffer;
+-
+-  // Resolution of the decompressed image.
+-  size_t mWidth;
+-  size_t mHeight;
+-
+-  // Position of EXIF package, default value is -1 which means no EXIF package appears.
+-  int mExifPos = -1;
+-
+-  std::unique_ptr<uint8_t[]> mEmpty = nullptr;
+-  std::unique_ptr<uint8_t[]> mBufferIntermediate = nullptr;
++  // max number of components supported
++  static constexpr int kMaxNumComponents = 3;
++
++  bool decode(const void* image, int length, decode_mode_t mode);
++  bool decode(jpeg_decompress_struct* cinfo, uint8_t* dest);
++  bool decodeToCSYCbCr(jpeg_decompress_struct* cinfo, uint8_t* dest);
++  bool decodeToCSRGB(jpeg_decompress_struct* cinfo, uint8_t* dest);
++
++  // temporary storage
++  std::unique_ptr<uint8_t[]> mPlanesMCURow[kMaxNumComponents];
++
++  std::vector<JOCTET> mResultBuffer;       // buffer to store decoded data
++  std::vector<JOCTET> mXMPBuffer;          // buffer to store xmp data
++  std::vector<JOCTET> mEXIFBuffer;         // buffer to store exif data
++  std::vector<JOCTET> mICCBuffer;          // buffer to store icc data
++  std::vector<JOCTET> mIsoMetadataBuffer;  // buffer to store iso data
++
++  // image attributes
++  jpg_out_fmt_t mOutFormat;
++  size_t mPlaneWidth[kMaxNumComponents];
++  size_t mPlaneHeight[kMaxNumComponents];
++
++  int mExifPayLoadOffset;  // Position of EXIF package, default value is -1 which means no EXIF
++                           // package appears.
+ };
++
+ } /* namespace ultrahdr  */
+ 
+ #endif  // ULTRAHDR_JPEGDECODERHELPER_H
+diff --git a/lib/include/ultrahdr/jpegrutils.h b/lib/include/ultrahdr/jpegrutils.h
+index 6744b4f4..ce523c80 100644
+--- a/lib/include/ultrahdr/jpegrutils.h
++++ b/lib/include/ultrahdr/jpegrutils.h
+@@ -76,7 +76,7 @@ status_t Write(jr_compressed_ptr destination, const void* source, int length, in
+  * @param metadata place to store HDR metadata values
+  * @return true if metadata is successfully retrieved, false otherwise
+  */
+-bool getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, ultrahdr_metadata_struct* metadata);
++bool getMetadataFromXMP(uint8_t* xmp_data, int xmp_size, ultrahdr_metadata_struct* metadata);
+ 
+ /*
+  * This method generates XMP metadata for the primary image.
+diff --git a/lib/src/jpegdecoderhelper.cpp b/lib/src/jpegdecoderhelper.cpp
+index 69cc733a..e7c80290 100644
+--- a/lib/src/jpegdecoderhelper.cpp
++++ b/lib/src/jpegdecoderhelper.cpp
+@@ -17,6 +17,7 @@
+ #include <errno.h>
+ #include <setjmp.h>
+ 
++#include <cmath>
+ #include <cstring>
+ 
+ #include "ultrahdr/ultrahdrcommon.h"
+@@ -27,52 +28,55 @@ using namespace std;
+ 
+ namespace ultrahdr {
+ 
+-const uint32_t kAPP0Marker = JPEG_APP0;      // JFIF
+-const uint32_t kAPP1Marker = JPEG_APP0 + 1;  // EXIF, XMP
+-const uint32_t kAPP2Marker = JPEG_APP0 + 2;  // ICC, iso metadata
++static const uint32_t kAPP0Marker = JPEG_APP0;      // JFIF
++static const uint32_t kAPP1Marker = JPEG_APP0 + 1;  // EXIF, XMP
++static const uint32_t kAPP2Marker = JPEG_APP0 + 2;  // ICC, ISO Metadata
+ 
+-constexpr uint8_t kICCSig[] = {
++static constexpr uint8_t kICCSig[] = {
+     'I', 'C', 'C', '_', 'P', 'R', 'O', 'F', 'I', 'L', 'E', '\0',
+ };
+-constexpr uint8_t kXmpNameSpace[] = {
+-    'h', 't', 't', 'p', ':', '/', '/', 'n', 's', '.', 'a', 'd', 'o', 'b',  'e',
++
++static constexpr uint8_t kXmpNameSpace[] = {
++    'h', 't', 't', 'p', ':', '/', '/', 'n', 's', '.', 'a', 'd', 'o', 'b', 'e',
+     '.', 'c', 'o', 'm', '/', 'x', 'a', 'p', '/', '1', '.', '0', '/', '\0',
+ };
+-constexpr uint8_t kExifIdCode[] = {
++
++static constexpr uint8_t kExifIdCode[] = {
+     'E', 'x', 'i', 'f', '\0', '\0',
+ };
+ 
+-constexpr uint8_t kIsoMetadataNameSpace[] = {
++static constexpr uint8_t kIsoMetadataNameSpace[] = {
+     'u', 'r', 'n', ':', 'i', 's', 'o', ':', 's', 't', 'd', ':', 'i', 's',
+     'o', ':', 't', 's', ':', '2', '1', '4', '9', '6', ':', '-', '1', '\0',
+ };
+ 
+-struct jpegr_source_mgr : jpeg_source_mgr {
+-  jpegr_source_mgr(const uint8_t* ptr, int len);
+-  ~jpegr_source_mgr();
++/*!\brief module for managing input */
++struct jpeg_source_mgr_impl : jpeg_source_mgr {
++  jpeg_source_mgr_impl(const uint8_t* ptr, int len);
++  ~jpeg_source_mgr_impl() = default;
+ 
+   const uint8_t* mBufferPtr;
+   size_t mBufferLength;
+ };
+ 
+-struct jpegrerror_mgr {
+-  struct jpeg_error_mgr pub;
++/*!\brief module for managing error */
++struct jpeg_error_mgr_impl : jpeg_error_mgr {
+   jmp_buf setjmp_buffer;
+ };
+ 
+ static void jpegr_init_source(j_decompress_ptr cinfo) {
+-  jpegr_source_mgr* src = static_cast<jpegr_source_mgr*>(cinfo->src);
++  jpeg_source_mgr_impl* src = static_cast<jpeg_source_mgr_impl*>(cinfo->src);
+   src->next_input_byte = static_cast<const JOCTET*>(src->mBufferPtr);
+   src->bytes_in_buffer = src->mBufferLength;
+ }
+ 
+ static boolean jpegr_fill_input_buffer(j_decompress_ptr /* cinfo */) {
+-  ALOGE("%s : should not get here", __func__);
++  ALOGE("%s : should not reach here", __func__);
+   return FALSE;
+ }
+ 
+ static void jpegr_skip_input_data(j_decompress_ptr cinfo, long num_bytes) {
+-  jpegr_source_mgr* src = static_cast<jpegr_source_mgr*>(cinfo->src);
++  jpeg_source_mgr_impl* src = static_cast<jpeg_source_mgr_impl*>(cinfo->src);
+ 
+   if (num_bytes > static_cast<long>(src->bytes_in_buffer)) {
+     ALOGE("jpegr_skip_input_data - num_bytes > (long)src->bytes_in_buffer");
+@@ -84,7 +88,7 @@ static void jpegr_skip_input_data(j_decompress_ptr cinfo, long num_bytes) {
+ 
+ static void jpegr_term_source(j_decompress_ptr /*cinfo*/) {}
+ 
+-jpegr_source_mgr::jpegr_source_mgr(const uint8_t* ptr, int len)
++jpeg_source_mgr_impl::jpeg_source_mgr_impl(const uint8_t* ptr, int len)
+     : mBufferPtr(ptr), mBufferLength(len) {
+   init_source = jpegr_init_source;
+   fill_input_buffer = jpegr_fill_input_buffer;
+@@ -93,292 +97,283 @@ jpegr_source_mgr::jpegr_source_mgr(const uint8_t* ptr, int len)
+   term_source = jpegr_term_source;
+ }
+ 
+-jpegr_source_mgr::~jpegr_source_mgr() {}
+-
+ static void jpegrerror_exit(j_common_ptr cinfo) {
+-  jpegrerror_mgr* err = reinterpret_cast<jpegrerror_mgr*>(cinfo->err);
++  jpeg_error_mgr_impl* err = reinterpret_cast<jpeg_error_mgr_impl*>(cinfo->err);
+   longjmp(err->setjmp_buffer, 1);
+ }
+ 
+ static void output_message(j_common_ptr cinfo) {
+   char buffer[JMSG_LENGTH_MAX];
+ 
+-  /* Create the message */
+   (*cinfo->err->format_message)(cinfo, buffer);
+   ALOGE("%s\n", buffer);
+ }
+ 
+-JpegDecoderHelper::JpegDecoderHelper() {}
+-
+-JpegDecoderHelper::~JpegDecoderHelper() {}
+-
+-bool JpegDecoderHelper::decompressImage(const void* image, int length, decode_mode_t decodeTo) {
+-  if (image == nullptr || length <= 0) {
+-    ALOGE("Image size can not be handled: %d", length);
+-    return false;
++static void jpeg_extract_marker_payload(const j_decompress_ptr cinfo, const uint32_t marker_code,
++                                        const uint8_t* marker_fourcc_code,
++                                        const uint32_t fourcc_length,
++                                        std::vector<JOCTET>& destination,
++                                        int& markerPayloadOffsetRelativeToSourceBuffer) {
++  size_t pos = 2; /* position after reading SOI marker (0xffd8) */
++  markerPayloadOffsetRelativeToSourceBuffer = -1;
++
++  for (jpeg_marker_struct* marker = cinfo->marker_list; marker; marker = marker->next) {
++    pos += 4; /* position after reading next marker and its size (0xFFXX, [SIZE = 2 bytes]) */
++
++    if (marker->marker == marker_code && marker->data_length > fourcc_length &&
++        !memcmp(marker->data, marker_fourcc_code, fourcc_length)) {
++      destination.resize(marker->data_length);
++      memcpy(static_cast<void*>(destination.data()), marker->data, marker->data_length);
++      markerPayloadOffsetRelativeToSourceBuffer = pos;
++      return;
++    }
++    pos += marker->original_length; /* position after marker's payload */
+   }
+-  mResultBuffer.clear();
+-  mXMPBuffer.clear();
+-  return decode(image, length, decodeTo);
+ }
+ 
+-void* JpegDecoderHelper::getDecompressedImagePtr() { return mResultBuffer.data(); }
+-
+-size_t JpegDecoderHelper::getDecompressedImageSize() { return mResultBuffer.size(); }
+-
+-void* JpegDecoderHelper::getXMPPtr() { return mXMPBuffer.data(); }
+-
+-size_t JpegDecoderHelper::getXMPSize() { return mXMPBuffer.size(); }
+-
+-void* JpegDecoderHelper::getEXIFPtr() { return mEXIFBuffer.data(); }
+-
+-size_t JpegDecoderHelper::getEXIFSize() { return mEXIFBuffer.size(); }
+-
+-void* JpegDecoderHelper::getICCPtr() { return mICCBuffer.data(); }
+-
+-size_t JpegDecoderHelper::getICCSize() { return mICCBuffer.size(); }
+-
+-void* JpegDecoderHelper::getIsoMetadataPtr() { return mIsoMetadataBuffer.data(); }
+-
+-size_t JpegDecoderHelper::getIsoMetadataSize() { return mIsoMetadataBuffer.size(); }
+-
+-size_t JpegDecoderHelper::getDecompressedImageWidth() { return mWidth; }
+-
+-size_t JpegDecoderHelper::getDecompressedImageHeight() { return mHeight; }
+-
+-// Here we only handle the first EXIF package, and in theary EXIF (or JFIF) must be the first
+-// in the image file.
+-// We assume that all packages are starting with two bytes marker (eg FF E1 for EXIF package),
+-// two bytes of package length which is stored in marker->original_length, and the real data
+-// which is stored in marker->data.
+-bool JpegDecoderHelper::extractEXIF(const void* image, int length) {
+-  jpeg_decompress_struct cinfo;
+-  jpegr_source_mgr mgr(static_cast<const uint8_t*>(image), length);
+-  jpegrerror_mgr myerr;
+-
+-  cinfo.err = jpeg_std_error(&myerr.pub);
+-  myerr.pub.error_exit = jpegrerror_exit;
+-  myerr.pub.output_message = output_message;
++static JpegDecoderHelper::jpg_out_fmt_t getOutputSamplingFormat(const j_decompress_ptr cinfo) {
++  if (cinfo->num_components == 1)
++    return JpegDecoderHelper::GRAYSCALE;
++  else {
++    int a = cinfo->max_h_samp_factor / cinfo->comp_info[1].h_samp_factor;
++    int b = cinfo->max_v_samp_factor / cinfo->comp_info[1].v_samp_factor;
++    if (a == 1 && b == 1)
++      return JpegDecoderHelper::YUV444;
++    else if (a == 1 && b == 2)
++      return JpegDecoderHelper::YUV440;
++    else if (a == 2 && b == 1)
++      return JpegDecoderHelper::YUV422;
++    else if (a == 2 && b == 2)
++      return JpegDecoderHelper::YUV420;
++    else if (a == 4 && b == 1)
++      return JpegDecoderHelper::YUV411;
++    else if (a == 4 && b == 2)
++      return JpegDecoderHelper::YUV410;
++  }
++  return JpegDecoderHelper::UNKNOWN;
++}
+ 
+-  if (setjmp(myerr.setjmp_buffer)) {
+-    jpeg_destroy_decompress(&cinfo);
++bool JpegDecoderHelper::decompressImage(const void* image, int length, decode_mode_t mode) {
++  if (image == nullptr) {
++    ALOGE("received nullptr for compressed image data");
++    return false;
++  }
++  if (length <= 0) {
++    ALOGE("received bad compressed image size %d", length);
+     return false;
+   }
+-  jpeg_create_decompress(&cinfo);
+-
+-  jpeg_save_markers(&cinfo, kAPP0Marker, 0xFFFF);
+-  jpeg_save_markers(&cinfo, kAPP1Marker, 0xFFFF);
+-
+-  cinfo.src = &mgr;
+-  jpeg_read_header(&cinfo, TRUE);
+-
+-  size_t pos = 2;  // position after SOI
+-  for (jpeg_marker_struct* marker = cinfo.marker_list; marker; marker = marker->next) {
+-    pos += 4;
+-    pos += marker->original_length;
+-
+-    if (marker->marker != kAPP1Marker) {
+-      continue;
+-    }
+-
+-    const unsigned int len = marker->data_length;
+ 
+-    if (len > sizeof(kExifIdCode) && !memcmp(marker->data, kExifIdCode, sizeof(kExifIdCode))) {
+-      mEXIFBuffer.resize(len, 0);
+-      memcpy(static_cast<void*>(mEXIFBuffer.data()), marker->data, len);
+-      mExifPos = pos - marker->original_length;
+-      break;
+-    }
++  // reset context
++  mResultBuffer.clear();
++  mXMPBuffer.clear();
++  mEXIFBuffer.clear();
++  mICCBuffer.clear();
++  mIsoMetadataBuffer.clear();
++  mOutFormat = UNKNOWN;
++  for (int i = 0; i < kMaxNumComponents; i++) {
++    mPlanesMCURow[i].reset();
++    mPlaneWidth[i] = 0;
++    mPlaneHeight[i] = 0;
+   }
++  mExifPayLoadOffset = -1;
+ 
+-  jpeg_destroy_decompress(&cinfo);
+-  return true;
++  return decode(image, length, mode);
+ }
+ 
+-bool JpegDecoderHelper::decode(const void* image, int length, decode_mode_t decodeTo) {
++bool JpegDecoderHelper::decode(const void* image, int length, decode_mode_t mode) {
++  jpeg_source_mgr_impl mgr(static_cast<const uint8_t*>(image), length);
+   jpeg_decompress_struct cinfo;
+-  jpegrerror_mgr myerr;
+-  cinfo.err = jpeg_std_error(&myerr.pub);
+-  myerr.pub.error_exit = jpegrerror_exit;
+-  myerr.pub.output_message = output_message;
+-
+-  if (setjmp(myerr.setjmp_buffer)) {
+-    jpeg_destroy_decompress(&cinfo);
+-    return false;
+-  }
+-
+-  jpeg_create_decompress(&cinfo);
+-
+-  jpeg_save_markers(&cinfo, kAPP0Marker, 0xFFFF);
+-  jpeg_save_markers(&cinfo, kAPP1Marker, 0xFFFF);
+-  jpeg_save_markers(&cinfo, kAPP2Marker, 0xFFFF);
+-
+-  jpegr_source_mgr mgr(static_cast<const uint8_t*>(image), length);
+-  cinfo.src = &mgr;
+-  if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+-    jpeg_destroy_decompress(&cinfo);
+-    return false;
+-  }
++  jpeg_error_mgr_impl myerr;
++
++  cinfo.err = jpeg_std_error(&myerr);
++  myerr.error_exit = jpegrerror_exit;
++  myerr.output_message = output_message;
++
++  if (0 == setjmp(myerr.setjmp_buffer)) {
++    jpeg_create_decompress(&cinfo);
++    cinfo.src = &mgr;
++    jpeg_save_markers(&cinfo, kAPP0Marker, 0xFFFF);
++    jpeg_save_markers(&cinfo, kAPP1Marker, 0xFFFF);
++    jpeg_save_markers(&cinfo, kAPP2Marker, 0xFFFF);
++    int ret_val = jpeg_read_header(&cinfo, TRUE /* require an image to be present */);
++    if (JPEG_HEADER_OK != ret_val) {
++      ALOGE("jpeg_read_header(...) returned %d, expected %d", ret_val, JPEG_HEADER_OK);
++      jpeg_destroy_decompress(&cinfo);
++      return false;
++    }
++    int payloadOffset = -1;
++    jpeg_extract_marker_payload(&cinfo, kAPP1Marker, kXmpNameSpace,
++                                sizeof kXmpNameSpace / sizeof kXmpNameSpace[0], mXMPBuffer,
++                                payloadOffset);
++    jpeg_extract_marker_payload(&cinfo, kAPP1Marker, kExifIdCode,
++                                sizeof kExifIdCode / sizeof kExifIdCode[0], mEXIFBuffer,
++                                mExifPayLoadOffset);
++    jpeg_extract_marker_payload(&cinfo, kAPP2Marker, kICCSig, sizeof kICCSig / sizeof kICCSig[0],
++                                mICCBuffer, payloadOffset);
++    jpeg_extract_marker_payload(&cinfo, kAPP2Marker, kIsoMetadataNameSpace,
++                                sizeof kIsoMetadataNameSpace / sizeof kIsoMetadataNameSpace[0],
++                                mIsoMetadataBuffer, payloadOffset);
++
++    if (cinfo.image_width < 1 || cinfo.image_height < 1) {
++      ALOGE("received bad image width or height, wd = %d, ht = %d. wd and height shall be >= 1",
++            cinfo.image_width, cinfo.image_height);
++      jpeg_destroy_decompress(&cinfo);
++      return false;
++    }
++    if (cinfo.image_width > kMaxWidth || cinfo.image_height > kMaxHeight) {
++      ALOGE(
++          "max width, max supported by library are %d, %d respectively. Current image width and "
++          "height are %d, %d. Recompile library with updated max supported dimensions to proceed",
++          kMaxWidth, kMaxHeight, cinfo.image_width, cinfo.image_height);
++      jpeg_destroy_decompress(&cinfo);
++      return false;
++    }
++    if (cinfo.num_components != 1 && cinfo.num_components != 3) {
++      ALOGE(
++          "ultrahdr primary image and supplimentary images are images encoded with 1 component "
++          "(grayscale) or 3 components (YCbCr / RGB). Unrecognized number of components %d",
++          cinfo.num_components);
++      jpeg_destroy_decompress(&cinfo);
++      return false;
++    }
+ 
+-  // Save XMP data, EXIF data, iso metadata, and ICC data.
+-  // Here we only handle the first XMP / EXIF / iso metadata / ICC package.
+-  // We assume that all packages are starting with two bytes marker (eg FF E1 for EXIF package),
+-  // two bytes of package length which is stored in marker->original_length, and the real data
+-  // which is stored in marker->data.
+-  bool exifAppears = false;
+-  bool xmpAppears = false;
+-  bool iccAppears = false;
+-  bool isoMetadataAppears = false;
+-  size_t pos = 2;  // position after SOI
+-  for (jpeg_marker_struct* marker = cinfo.marker_list;
+-       marker && !(exifAppears && xmpAppears && iccAppears); marker = marker->next) {
+-    pos += 4;
+-    pos += marker->original_length;
+-    if (marker->marker != kAPP1Marker && marker->marker != kAPP2Marker) {
+-      continue;
++    for (int i = 0, product = 0; i < cinfo.num_components; i++) {
++      if (cinfo.comp_info[i].h_samp_factor < 1 || cinfo.comp_info[i].h_samp_factor > 4) {
++        ALOGE(
++            "received bad horizontal sampling factor for component index %d, sample factor h = %d, "
++            "this is expected to be with in range [1-4]",
++            i, cinfo.comp_info[i].h_samp_factor);
++        jpeg_destroy_decompress(&cinfo);
++        return false;
++      }
++      if (cinfo.comp_info[i].v_samp_factor < 1 || cinfo.comp_info[i].v_samp_factor > 4) {
++        ALOGE(
++            "received bad vertical sampling factor for component index %d, sample factor v = %d, "
++            "this is expected to be with in range [1-4]",
++            i, cinfo.comp_info[i].v_samp_factor);
++        jpeg_destroy_decompress(&cinfo);
++        return false;
++      }
++      product += cinfo.comp_info[i].h_samp_factor * cinfo.comp_info[i].v_samp_factor;
++      if (product > 10) {
++        ALOGE(
++            "received bad sampling factors for components, sum of product of h_samp_factor, "
++            "v_samp_factor across all components exceeds 10");
++        jpeg_destroy_decompress(&cinfo);
++        return false;
++      }
+     }
+-    const unsigned int len = marker->data_length;
+-    if (!xmpAppears && len > sizeof(kXmpNameSpace) &&
+-        !memcmp(marker->data, kXmpNameSpace, sizeof(kXmpNameSpace))) {
+-      mXMPBuffer.resize(len + 1, 0);
+-      memcpy(static_cast<void*>(mXMPBuffer.data()), marker->data, len);
+-      xmpAppears = true;
+-    } else if (!exifAppears && len > sizeof(kExifIdCode) &&
+-               !memcmp(marker->data, kExifIdCode, sizeof(kExifIdCode))) {
+-      mEXIFBuffer.resize(len, 0);
+-      memcpy(static_cast<void*>(mEXIFBuffer.data()), marker->data, len);
+-      exifAppears = true;
+-      mExifPos = pos - marker->original_length;
+-    } else if (!iccAppears && len > sizeof(kICCSig) &&
+-               !memcmp(marker->data, kICCSig, sizeof(kICCSig))) {
+-      mICCBuffer.resize(len, 0);
+-      memcpy(static_cast<void*>(mICCBuffer.data()), marker->data, len);
+-      iccAppears = true;
+-    } else if (!isoMetadataAppears && len > sizeof(kIsoMetadataNameSpace) &&
+-               !memcmp(marker->data, kIsoMetadataNameSpace, sizeof(kIsoMetadataNameSpace))) {
+-      mIsoMetadataBuffer.resize(len, 0);
+-      memcpy(static_cast<void*>(mIsoMetadataBuffer.data()), marker->data, len);
+-      isoMetadataAppears = true;
++
++    for (int i = 0; i < cinfo.num_components; i++) {
++      mPlaneWidth[i] = std::ceil(((float)cinfo.image_width * cinfo.comp_info[i].h_samp_factor) /
++                                 cinfo.max_h_samp_factor);
++      mPlaneHeight[i] = std::ceil(((float)cinfo.image_height * cinfo.comp_info[i].v_samp_factor) /
++                                  cinfo.max_v_samp_factor);
+     }
+-  }
+ 
+-  bool status = true;
+-  mWidth = cinfo.image_width;
+-  mHeight = cinfo.image_height;
+-  if (mWidth > kMaxWidth || mHeight > kMaxHeight) {
+-    status = false;
+-    goto CleanUp;
+-  }
++    if (cinfo.num_components == 3 &&
++        (mPlaneWidth[1] != mPlaneWidth[2] || mPlaneHeight[1] != mPlaneHeight[2])) {
++      ALOGE(
++          "cb, cr planes are not sampled identically. cb width %d, cb height %d, cr width %d, cr "
++          "height %d",
++          (int)mPlaneWidth[1], (int)mPlaneWidth[2], (int)mPlaneHeight[1], (int)mPlaneHeight[2]);
++      jpeg_destroy_decompress(&cinfo);
++      return false;
++    }
+ 
+-  if (decodeTo == DECODE_TO_RGBA) {
+-    // The primary image is expected to be yuv420 sampling
+-    if (cinfo.jpeg_color_space != JCS_YCbCr) {
+-      status = false;
+-      ALOGE("%s: decodeToRGBA unexpected jpeg color space ", __func__);
+-      goto CleanUp;
++    if (PARSE_STREAM == mode) {
++      jpeg_destroy_decompress(&cinfo);
++      return true;
+     }
+-    if (cinfo.comp_info[0].h_samp_factor != 2 || cinfo.comp_info[0].v_samp_factor != 2 ||
+-        cinfo.comp_info[1].h_samp_factor != 1 || cinfo.comp_info[1].v_samp_factor != 1 ||
+-        cinfo.comp_info[2].h_samp_factor != 1 || cinfo.comp_info[2].v_samp_factor != 1) {
+-      status = false;
+-      ALOGE("%s: decodeToRGBA unexpected primary image sub-sampling", __func__);
+-      goto CleanUp;
++
++    if (DECODE_STREAM == mode) {
++      mode = cinfo.num_components == 1 ? DECODE_TO_YCBCR_CS : DECODE_TO_RGB_CS;
+     }
+-#ifdef JCS_ALPHA_EXTENSIONS
+-    // 4 bytes per pixel
+-    mResultBuffer.resize(cinfo.image_width * cinfo.image_height * 4);
+-    cinfo.out_color_space = JCS_EXT_RGBA;
+-#else
+-    // 3 bytes per pixel
+-    mResultBuffer.resize(cinfo.image_width * cinfo.image_height * 3);
+-    cinfo.out_color_space = JCS_RGB;
+-#endif
+ 
+-  } else if (decodeTo == DECODE_TO_YCBCR) {
+-    if (cinfo.jpeg_color_space == JCS_YCbCr) {
+-      if (cinfo.comp_info[0].h_samp_factor != 2 || cinfo.comp_info[0].v_samp_factor != 2 ||
+-          cinfo.comp_info[1].h_samp_factor != 1 || cinfo.comp_info[1].v_samp_factor != 1 ||
+-          cinfo.comp_info[2].h_samp_factor != 1 || cinfo.comp_info[2].v_samp_factor != 1) {
+-        status = false;
+-        ALOGE("%s: decoding to YUV only supports 4:2:0 subsampling", __func__);
+-        goto CleanUp;
++    if (DECODE_TO_RGB_CS == mode) {
++      if (cinfo.jpeg_color_space != JCS_YCbCr && cinfo.jpeg_color_space != JCS_RGB) {
++        ALOGE("expected input color space to be JCS_YCbCr or JCS_RGB but got %d",
++              cinfo.jpeg_color_space);
++        jpeg_destroy_decompress(&cinfo);
++        return false;
+       }
+-      mResultBuffer.resize(cinfo.image_width * cinfo.image_height * 3 / 2, 0);
+-    } else if (cinfo.jpeg_color_space == JCS_GRAYSCALE) {
+-      mResultBuffer.resize(cinfo.image_width * cinfo.image_height, 0);
+-    } else {
+-      status = false;
+-      ALOGE("%s: decodeToYUV unexpected jpeg color space", __func__);
+-      goto CleanUp;
+-    }
+-    cinfo.out_color_space = cinfo.jpeg_color_space;
+-    cinfo.raw_data_out = TRUE;
+-  } else if (decodeTo == DECODE_TO_GAIN_MAP) {
+-    if (cinfo.jpeg_color_space == JCS_GRAYSCALE) {
+-      mResultBuffer.resize(cinfo.image_width * cinfo.image_height, 0);
+-      cinfo.out_color_space = cinfo.jpeg_color_space;
+-      cinfo.raw_data_out = TRUE;
+-    } else {
+-      mResultBuffer.resize(cinfo.image_width * cinfo.image_height * 4);
+ #ifdef JCS_ALPHA_EXTENSIONS
++      mResultBuffer.resize(cinfo.image_width * cinfo.image_height * 4);
+       cinfo.out_color_space = JCS_EXT_RGBA;
+ #else
++      mResultBuffer.resize(cinfo.image_width * cinfo.image_height * 3);
+       cinfo.out_color_space = JCS_RGB;
+ #endif
+-      cinfo.dct_method = JDCT_ISLOW;
+-      jpeg_start_decompress(&cinfo);
+-      if (!decompressRGBA(&cinfo, static_cast<const uint8_t*>(mResultBuffer.data()))) {
+-        status = false;
++    } else if (DECODE_TO_YCBCR_CS == mode) {
++      if (cinfo.jpeg_color_space != JCS_YCbCr && cinfo.jpeg_color_space != JCS_GRAYSCALE) {
++        ALOGE("expected input color space to be JCS_YCbCr or JCS_GRAYSCALE but got %d",
++              cinfo.jpeg_color_space);
++        jpeg_destroy_decompress(&cinfo);
++        return false;
++      }
++      if (cinfo.jpeg_color_space == JCS_YCbCr) {
++        if (cinfo.comp_info[0].h_samp_factor != 2 || cinfo.comp_info[0].v_samp_factor != 2 ||
++            cinfo.comp_info[1].h_samp_factor != 1 || cinfo.comp_info[1].v_samp_factor != 1 ||
++            cinfo.comp_info[2].h_samp_factor != 1 || cinfo.comp_info[2].v_samp_factor != 1) {
++          ALOGE("apply gainmap supports only 4:2:0 sub sampling format, stopping image decode");
++          jpeg_destroy_decompress(&cinfo);
++          return false;
++        }
++      }
++      int size = 0;
++      for (int i = 0; i < cinfo.num_components; i++) {
++        size += mPlaneWidth[i] * mPlaneHeight[i];
+       }
+-      goto CleanUp;
++      mResultBuffer.resize(size);
++      cinfo.out_color_space = cinfo.jpeg_color_space;
++      cinfo.raw_data_out = TRUE;
++    }
++    cinfo.dct_method = JDCT_ISLOW;
++    jpeg_start_decompress(&cinfo);
++    if (!decode(&cinfo, static_cast<uint8_t*>(mResultBuffer.data()))) {
++      jpeg_destroy_decompress(&cinfo);
++      return false;
+     }
+   } else {
+-    status = decodeTo == PARSE_ONLY;
++    cinfo.err->output_message((j_common_ptr)&cinfo);
+     jpeg_destroy_decompress(&cinfo);
+-    return status;
+-  }
+-
+-  cinfo.dct_method = JDCT_ISLOW;
+-  jpeg_start_decompress(&cinfo);
+-  if (!decompress(&cinfo, static_cast<const uint8_t*>(mResultBuffer.data()),
+-                  cinfo.jpeg_color_space == JCS_GRAYSCALE)) {
+-    status = false;
+-    goto CleanUp;
++    return false;
+   }
+-
+-CleanUp:
+   jpeg_finish_decompress(&cinfo);
+   jpeg_destroy_decompress(&cinfo);
+-
+-  return status;
++  return true;
+ }
+ 
+-bool JpegDecoderHelper::decompress(jpeg_decompress_struct* cinfo, const uint8_t* dest,
+-                                   bool isSingleChannel) {
+-  if (isSingleChannel) {
+-    return decompressSingleChannel(cinfo, dest);
+-  } else {
++bool JpegDecoderHelper::decode(jpeg_decompress_struct* cinfo, uint8_t* dest) {
++  switch (cinfo->out_color_space) {
++    case JCS_GRAYSCALE:
++      [[fallthrough]];
++    case JCS_YCbCr:
++      mOutFormat = getOutputSamplingFormat(cinfo);
++      return decodeToCSYCbCr(cinfo, dest);
+ #ifdef JCS_ALPHA_EXTENSIONS
+-    if (cinfo->out_color_space == JCS_EXT_RGBA) {
+-#else
+-    if (cinfo->out_color_space == JCS_RGB) {
++    case JCS_EXT_RGBA:
++      mOutFormat = RGBA;
++      return decodeToCSRGB(cinfo, dest);
+ #endif
+-      return decompressRGBA(cinfo, dest);
+-    } else {
+-      return decompressYUV(cinfo, dest);
+-    }
++    case JCS_RGB:
++      mOutFormat = RGB;
++      return decodeToCSRGB(cinfo, dest);
++    default:
++      ALOGE("unrecognized output color space %d", cinfo->out_color_space);
+   }
++  return false;
+ }
+ 
+-bool JpegDecoderHelper::getCompressedImageParameters(const void* image, int length) {
+-  return decode(image, length, PARSE_ONLY);
+-}
+-
+-bool JpegDecoderHelper::decompressRGBA(jpeg_decompress_struct* cinfo, const uint8_t* dest) {
++bool JpegDecoderHelper::decodeToCSRGB(jpeg_decompress_struct* cinfo, uint8_t* dest) {
+   JSAMPLE* out = (JSAMPLE*)dest;
+ 
+   while (cinfo->output_scanline < cinfo->image_height) {
+-    if (1 != jpeg_read_scanlines(cinfo, &out, 1)) return false;
++    JDIMENSION read_lines = jpeg_read_scanlines(cinfo, &out, 1);
++    if (1 != read_lines) {
++      ALOGE("jpeg_read_scanlines returned %d, expected %d", read_lines, 1);
++      return false;
++    }
+ #ifdef JCS_ALPHA_EXTENSIONS
+     out += cinfo->image_width * 4;
+ #else
+@@ -388,140 +383,64 @@ bool JpegDecoderHelper::decompressRGBA(jpeg_decompress_struct* cinfo, const uint
+   return true;
+ }
+ 
+-bool JpegDecoderHelper::decompressYUV(jpeg_decompress_struct* cinfo, const uint8_t* dest) {
+-  size_t luma_plane_size = cinfo->image_width * cinfo->image_height;
+-  size_t chroma_plane_size = luma_plane_size / 4;
+-  uint8_t* y_plane = const_cast<uint8_t*>(dest);
+-  uint8_t* u_plane = const_cast<uint8_t*>(dest + luma_plane_size);
+-  uint8_t* v_plane = const_cast<uint8_t*>(dest + luma_plane_size + chroma_plane_size);
+-
+-  const size_t aligned_width = ALIGNM(cinfo->image_width, kCompressBatchSize);
+-  const bool is_width_aligned = (aligned_width == cinfo->image_width);
+-  uint8_t* y_plane_intrm = nullptr;
+-  uint8_t* u_plane_intrm = nullptr;
+-  uint8_t* v_plane_intrm = nullptr;
+-
+-  JSAMPROW y[kCompressBatchSize];
+-  JSAMPROW cb[kCompressBatchSize / 2];
+-  JSAMPROW cr[kCompressBatchSize / 2];
+-  JSAMPARRAY planes[3]{y, cb, cr};
+-  JSAMPROW y_intrm[kCompressBatchSize];
+-  JSAMPROW cb_intrm[kCompressBatchSize / 2];
+-  JSAMPROW cr_intrm[kCompressBatchSize / 2];
+-  JSAMPARRAY planes_intrm[3]{y_intrm, cb_intrm, cr_intrm};
+-
+-  if (cinfo->image_height % kCompressBatchSize != 0) {
+-    mEmpty = std::make_unique<uint8_t[]>(aligned_width);
+-  }
+-
+-  if (!is_width_aligned) {
+-    size_t mcu_row_size = aligned_width * kCompressBatchSize * 3 / 2;
+-    mBufferIntermediate = std::make_unique<uint8_t[]>(mcu_row_size);
+-    y_plane_intrm = mBufferIntermediate.get();
+-    u_plane_intrm = y_plane_intrm + (aligned_width * kCompressBatchSize);
+-    v_plane_intrm = u_plane_intrm + (aligned_width * kCompressBatchSize) / 4;
+-    for (int i = 0; i < kCompressBatchSize; ++i) {
+-      y_intrm[i] = y_plane_intrm + i * aligned_width;
+-    }
+-    for (int i = 0; i < kCompressBatchSize / 2; ++i) {
+-      int offset_intrm = i * (aligned_width / 2);
+-      cb_intrm[i] = u_plane_intrm + offset_intrm;
+-      cr_intrm[i] = v_plane_intrm + offset_intrm;
+-    }
+-  }
+-
+-  while (cinfo->output_scanline < cinfo->image_height) {
+-    size_t scanline_copy = cinfo->output_scanline;
+-    for (int i = 0; i < kCompressBatchSize; ++i) {
+-      size_t scanline = cinfo->output_scanline + i;
+-      if (scanline < cinfo->image_height) {
+-        y[i] = y_plane + scanline * cinfo->image_width;
+-      } else {
+-        y[i] = mEmpty.get();
+-      }
+-    }
+-    // cb, cr only have half scanlines
+-    for (int i = 0; i < kCompressBatchSize / 2; ++i) {
+-      size_t scanline = cinfo->output_scanline / 2 + i;
+-      if (scanline < cinfo->image_height / 2) {
+-        int offset = scanline * (cinfo->image_width / 2);
+-        cb[i] = u_plane + offset;
+-        cr[i] = v_plane + offset;
+-      } else {
+-        cb[i] = cr[i] = mEmpty.get();
+-      }
+-    }
+-
+-    int processed =
+-        jpeg_read_raw_data(cinfo, is_width_aligned ? planes : planes_intrm, kCompressBatchSize);
+-    if (processed != kCompressBatchSize) {
+-      ALOGE("Number of processed lines does not equal input lines.");
+-      return false;
+-    }
+-    if (!is_width_aligned) {
+-      for (int i = 0; i < kCompressBatchSize; ++i) {
+-        if (scanline_copy + i < cinfo->image_height) {
+-          memcpy(y[i], y_intrm[i], cinfo->image_width);
+-        }
+-      }
+-      for (int i = 0; i < kCompressBatchSize / 2; ++i) {
+-        if (((scanline_copy / 2) + i) < (cinfo->image_height / 2)) {
+-          memcpy(cb[i], cb_intrm[i], cinfo->image_width / 2);
+-          memcpy(cr[i], cr_intrm[i], cinfo->image_width / 2);
+-        }
++bool JpegDecoderHelper::decodeToCSYCbCr(jpeg_decompress_struct* cinfo, uint8_t* dest) {
++  JSAMPROW mcuRows[kMaxNumComponents][4 * DCTSIZE];
++  JSAMPROW mcuRowsTmp[kMaxNumComponents][4 * DCTSIZE];
++  uint8_t* planes[kMaxNumComponents]{};
++  size_t alignedPlaneWidth[kMaxNumComponents]{};
++  JSAMPARRAY subImage[kMaxNumComponents];
++
++  for (int i = 0, plane_offset = 0; i < cinfo->num_components; i++) {
++    planes[i] = dest + plane_offset;
++    plane_offset += mPlaneWidth[i] * mPlaneHeight[i];
++    alignedPlaneWidth[i] = ALIGNM(mPlaneWidth[i], DCTSIZE);
++    if (mPlaneWidth[i] != alignedPlaneWidth[i]) {
++      mPlanesMCURow[i] = std::make_unique<uint8_t[]>(alignedPlaneWidth[i] * DCTSIZE *
++                                                     cinfo->comp_info[i].v_samp_factor);
++      uint8_t* mem = mPlanesMCURow[i].get();
++      for (int j = 0; j < DCTSIZE * cinfo->comp_info[i].v_samp_factor;
++           j++, mem += alignedPlaneWidth[i]) {
++        mcuRowsTmp[i][j] = mem;
+       }
++    } else if (mPlaneHeight[i] % DCTSIZE != 0) {
++      mPlanesMCURow[i] = std::make_unique<uint8_t[]>(alignedPlaneWidth[i]);
+     }
++    subImage[i] = mPlaneWidth[i] == alignedPlaneWidth[i] ? mcuRows[i] : mcuRowsTmp[i];
+   }
+-  return true;
+-}
+-
+-bool JpegDecoderHelper::decompressSingleChannel(jpeg_decompress_struct* cinfo,
+-                                                const uint8_t* dest) {
+-  uint8_t* y_plane = const_cast<uint8_t*>(dest);
+-  uint8_t* y_plane_intrm = nullptr;
+-
+-  const size_t aligned_width = ALIGNM(cinfo->image_width, kCompressBatchSize);
+-  const bool is_width_aligned = (aligned_width == cinfo->image_width);
+ 
+-  JSAMPROW y[kCompressBatchSize];
+-  JSAMPARRAY planes[1]{y};
+-  JSAMPROW y_intrm[kCompressBatchSize];
+-  JSAMPARRAY planes_intrm[1]{y_intrm};
++  while (cinfo->output_scanline < cinfo->image_height) {
++    JDIMENSION mcu_scanline_start[kMaxNumComponents];
+ 
+-  if (cinfo->image_height % kCompressBatchSize != 0) {
+-    mEmpty = std::make_unique<uint8_t[]>(aligned_width);
+-  }
++    for (int i = 0; i < cinfo->num_components; i++) {
++      mcu_scanline_start[i] =
++          std::ceil(((float)cinfo->output_scanline * cinfo->comp_info[i].v_samp_factor) /
++                    cinfo->max_v_samp_factor);
+ 
+-  if (!is_width_aligned) {
+-    size_t mcu_row_size = aligned_width * kCompressBatchSize;
+-    mBufferIntermediate = std::make_unique<uint8_t[]>(mcu_row_size);
+-    y_plane_intrm = mBufferIntermediate.get();
+-    for (int i = 0; i < kCompressBatchSize; ++i) {
+-      y_intrm[i] = y_plane_intrm + i * aligned_width;
+-    }
+-  }
++      for (int j = 0; j < cinfo->comp_info[i].v_samp_factor * DCTSIZE; j++) {
++        JDIMENSION scanline = mcu_scanline_start[i] + j;
+ 
+-  while (cinfo->output_scanline < cinfo->image_height) {
+-    size_t scanline_copy = cinfo->output_scanline;
+-    for (int i = 0; i < kCompressBatchSize; ++i) {
+-      size_t scanline = cinfo->output_scanline + i;
+-      if (scanline < cinfo->image_height) {
+-        y[i] = y_plane + scanline * cinfo->image_width;
+-      } else {
+-        y[i] = mEmpty.get();
++        if (scanline < mPlaneHeight[i]) {
++          mcuRows[i][j] = planes[i] + scanline * mPlaneWidth[i];
++        } else {
++          mcuRows[i][j] = mPlanesMCURow[i].get();
++        }
+       }
+     }
+ 
+-    int processed =
+-        jpeg_read_raw_data(cinfo, is_width_aligned ? planes : planes_intrm, kCompressBatchSize);
+-    if (processed != kCompressBatchSize / 2) {
+-      ALOGE("Number of processed lines does not equal input lines.");
++    int processed = jpeg_read_raw_data(cinfo, subImage, DCTSIZE * cinfo->max_v_samp_factor);
++    if (processed != DCTSIZE * cinfo->max_v_samp_factor) {
++      ALOGE("number of scan lines read %d does not equal requested scan lines %d ", processed,
++            DCTSIZE * cinfo->max_v_samp_factor);
+       return false;
+     }
+-    if (!is_width_aligned) {
+-      for (int i = 0; i < kCompressBatchSize; ++i) {
+-        if (scanline_copy + i < cinfo->image_height) {
+-          memcpy(y[i], y_intrm[i], cinfo->image_width);
++
++    for (int i = 0; i < cinfo->num_components; i++) {
++      if (mPlaneWidth[i] != alignedPlaneWidth[i]) {
++        for (int j = 0; j < cinfo->comp_info[i].v_samp_factor * DCTSIZE; j++) {
++          JDIMENSION scanline = mcu_scanline_start[i] + j;
++          if (scanline < mPlaneHeight[i]) {
++            memcpy(mcuRows[i][j], mcuRowsTmp[i][j], mPlaneWidth[i]);
++          }
+         }
+       }
+     }
+diff --git a/lib/src/jpegr.cpp b/lib/src/jpegr.cpp
+index 800fdef0..ef601137 100644
+--- a/lib/src/jpegr.cpp
++++ b/lib/src/jpegr.cpp
+@@ -579,8 +579,7 @@ status_t JpegR::encodeJPEGR(jr_compressed_ptr yuv420jpg_image_ptr,
+   // We just want to check if ICC is present, so don't do a full decode. Note,
+   // this doesn't verify that the ICC is valid.
+   JpegDecoderHelper decoder;
+-  if (!decoder.getCompressedImageParameters(yuv420jpg_image_ptr->data,
+-                                            yuv420jpg_image_ptr->length)) {
++  if (!decoder.parseImage(yuv420jpg_image_ptr->data, yuv420jpg_image_ptr->length)) {
+     return ERROR_JPEGR_DECODE_ERROR;
+   }
+ 
+@@ -662,7 +661,7 @@ status_t JpegR::decodeJPEGR(jr_compressed_ptr jpegr_image_ptr, jr_uncompressed_p
+   JpegDecoderHelper jpeg_dec_obj_yuv420;
+   if (!jpeg_dec_obj_yuv420.decompressImage(
+           primary_jpeg_image.data, primary_jpeg_image.length,
+-          (output_format == ULTRAHDR_OUTPUT_SDR) ? DECODE_TO_RGBA : DECODE_TO_YCBCR)) {
++          (output_format == ULTRAHDR_OUTPUT_SDR) ? DECODE_TO_RGB_CS : DECODE_TO_YCBCR_CS)) {
+     return ERROR_JPEGR_DECODE_ERROR;
+   }
+ 
+@@ -700,18 +699,15 @@ status_t JpegR::decodeJPEGR(jr_compressed_ptr jpegr_image_ptr, jr_uncompressed_p
+   jpegr_uncompressed_struct gainmap_image;
+   if (gainmap_image_ptr != nullptr || output_format != ULTRAHDR_OUTPUT_SDR) {
+     if (!jpeg_dec_obj_gm.decompressImage(gainmap_jpeg_image.data, gainmap_jpeg_image.length,
+-                                         DECODE_TO_GAIN_MAP)) {
++                                         DECODE_STREAM)) {
+       return ERROR_JPEGR_DECODE_ERROR;
+     }
+-    int gain_map_width = jpeg_dec_obj_gm.getDecompressedImageWidth();
+-    int gain_map_height = jpeg_dec_obj_gm.getDecompressedImageHeight();
+-    int gain_map_size = jpeg_dec_obj_gm.getDecompressedImageSize();
+-    if (gain_map_width * gain_map_height * 4 == gain_map_size) {
+-      gainmap_image.pixelFormat = ULTRAHDR_PIX_FMT_RGBA8888;
+-    } else if (gain_map_width * gain_map_height * 3 == gain_map_size) {
+-      gainmap_image.pixelFormat = ULTRAHDR_PIX_FMT_RGB888;
+-    } else if (gain_map_width * gain_map_height == gain_map_size) {
++    if (jpeg_dec_obj_gm.getDecompressedImageFormat() == JpegDecoderHelper::GRAYSCALE) {
+       gainmap_image.pixelFormat = ULTRAHDR_PIX_FMT_MONOCHROME;
++    } else if (jpeg_dec_obj_gm.getDecompressedImageFormat() == JpegDecoderHelper::RGB) {
++      gainmap_image.pixelFormat = ULTRAHDR_PIX_FMT_RGB888;
++    } else if (jpeg_dec_obj_gm.getDecompressedImageFormat() == JpegDecoderHelper::RGBA) {
++      gainmap_image.pixelFormat = ULTRAHDR_PIX_FMT_RGBA8888;
+     } else {
+       return ERROR_JPEGR_GAIN_MAP_SIZE_ERROR;
+     }
+@@ -1329,7 +1325,7 @@ status_t JpegR::extractPrimaryImageAndGainMap(jr_compressed_ptr jpegr_image_ptr,
+ status_t JpegR::parseJpegInfo(jr_compressed_ptr jpeg_image_ptr, j_info_ptr jpeg_image_info_ptr,
+                               size_t* img_width, size_t* img_height) {
+   JpegDecoderHelper jpeg_dec_obj;
+-  if (!jpeg_dec_obj.getCompressedImageParameters(jpeg_image_ptr->data, jpeg_image_ptr->length)) {
++  if (!jpeg_dec_obj.parseImage(jpeg_image_ptr->data, jpeg_image_ptr->length)) {
+     return ERROR_JPEGR_DECODE_ERROR;
+   }
+   size_t imgWidth, imgHeight;
+@@ -1479,7 +1475,7 @@ status_t JpegR::appendGainMap(jr_compressed_ptr primary_jpg_image_ptr,
+   // Check if EXIF package presents in the JPEG input.
+   // If so, extract and remove the EXIF package.
+   JpegDecoderHelper decoder;
+-  if (!decoder.extractEXIF(primary_jpg_image_ptr->data, primary_jpg_image_ptr->length)) {
++  if (!decoder.parseImage(primary_jpg_image_ptr->data, primary_jpg_image_ptr->length)) {
+     return ERROR_JPEGR_DECODE_ERROR;
+   }
+   jpegr_exif_struct exif_from_jpg;
+diff --git a/lib/src/jpegrutils.cpp b/lib/src/jpegrutils.cpp
+index 38885976..d9647c54 100644
+--- a/lib/src/jpegrutils.cpp
++++ b/lib/src/jpegrutils.cpp
+@@ -433,10 +433,10 @@ const string XMPXmlHandler::hdrCapacityMinAttrName = kMapHDRCapacityMin;
+ const string XMPXmlHandler::hdrCapacityMaxAttrName = kMapHDRCapacityMax;
+ const string XMPXmlHandler::baseRenditionIsHdrAttrName = kMapBaseRenditionIsHDR;
+ 
+-bool getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, ultrahdr_metadata_struct* metadata) {
++bool getMetadataFromXMP(uint8_t* xmp_data, int xmp_size, ultrahdr_metadata_struct* metadata) {
+   string nameSpace = "http://ns.adobe.com/xap/1.0/\0";
+ 
+-  if (xmp_size < nameSpace.size() + 2) {
++  if (xmp_size < (int)nameSpace.size() + 2) {
+     // Data too short
+     return false;
+   }
+@@ -455,7 +455,7 @@ bool getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, ultrahdr_metadata_st
+   // parser. if there is no packet header, do nothing otherwise go to the position of '<' without
+   // '?' after it.
+   int offset = 0;
+-  for (unsigned i = 0; i < xmp_size; ++i) {
++  for (int i = 0; i < xmp_size - 1; ++i) {
+     if (xmp_data[i] == '<') {
+       if (xmp_data[i + 1] != '?') {
+         offset = i;
+diff --git a/tests/jpegdecoderhelper_test.cpp b/tests/jpegdecoderhelper_test.cpp
+index 8363cef2..cde8ff86 100644
+--- a/tests/jpegdecoderhelper_test.cpp
++++ b/tests/jpegdecoderhelper_test.cpp
+@@ -109,7 +109,7 @@ TEST_F(JpegDecoderHelperTest, decodeYuvImage) {
+ 
+ TEST_F(JpegDecoderHelperTest, decodeYuvImageToRgba) {
+   JpegDecoderHelper decoder;
+-  EXPECT_TRUE(decoder.decompressImage(mYuvImage.buffer.get(), mYuvImage.size, DECODE_TO_RGBA));
++  EXPECT_TRUE(decoder.decompressImage(mYuvImage.buffer.get(), mYuvImage.size, DECODE_TO_RGB_CS));
+   ASSERT_GT(decoder.getDecompressedImageSize(), static_cast<uint32_t>(0));
+   EXPECT_EQ(IccHelper::readIccColorGamut(decoder.getICCPtr(), decoder.getICCSize()),
+             ULTRAHDR_COLORGAMUT_UNSPECIFIED);
+@@ -127,14 +127,13 @@ TEST_F(JpegDecoderHelperTest, decodeGreyImage) {
+   JpegDecoderHelper decoder;
+   EXPECT_TRUE(decoder.decompressImage(mGreyImage.buffer.get(), mGreyImage.size));
+   ASSERT_GT(decoder.getDecompressedImageSize(), static_cast<uint32_t>(0));
+-  EXPECT_TRUE(
+-      decoder.decompressImage(mGreyImage.buffer.get(), mGreyImage.size, DECODE_TO_GAIN_MAP));
++  EXPECT_TRUE(decoder.decompressImage(mGreyImage.buffer.get(), mGreyImage.size, DECODE_STREAM));
+   ASSERT_GT(decoder.getDecompressedImageSize(), static_cast<uint32_t>(0));
+ }
+ 
+ TEST_F(JpegDecoderHelperTest, decodeRgbImageToRgba) {
+   JpegDecoderHelper decoder;
+-  EXPECT_TRUE(decoder.decompressImage(mRgbImage.buffer.get(), mRgbImage.size, DECODE_TO_GAIN_MAP));
++  EXPECT_TRUE(decoder.decompressImage(mRgbImage.buffer.get(), mRgbImage.size, DECODE_STREAM));
+   ASSERT_GT(decoder.getDecompressedImageSize(), static_cast<uint32_t>(0));
+   EXPECT_EQ(IccHelper::readIccColorGamut(decoder.getICCPtr(), decoder.getICCSize()),
+             ULTRAHDR_COLORGAMUT_UNSPECIFIED);
+@@ -142,7 +141,7 @@ TEST_F(JpegDecoderHelperTest, decodeRgbImageToRgba) {
+ 
+ TEST_F(JpegDecoderHelperTest, getCompressedImageParameters) {
+   JpegDecoderHelper decoder;
+-  EXPECT_TRUE(decoder.getCompressedImageParameters(mYuvImage.buffer.get(), mYuvImage.size));
++  EXPECT_TRUE(decoder.parseImage(mYuvImage.buffer.get(), mYuvImage.size));
+   EXPECT_EQ(IMAGE_WIDTH, decoder.getDecompressedImageWidth());
+   EXPECT_EQ(IMAGE_HEIGHT, decoder.getDecompressedImageHeight());
+   EXPECT_EQ(decoder.getICCSize(), 0);
+@@ -151,7 +150,7 @@ TEST_F(JpegDecoderHelperTest, getCompressedImageParameters) {
+ 
+ TEST_F(JpegDecoderHelperTest, getCompressedImageParametersIcc) {
+   JpegDecoderHelper decoder;
+-  EXPECT_TRUE(decoder.getCompressedImageParameters(mYuvIccImage.buffer.get(), mYuvIccImage.size));
++  EXPECT_TRUE(decoder.parseImage(mYuvIccImage.buffer.get(), mYuvIccImage.size));
+   EXPECT_EQ(IMAGE_WIDTH, decoder.getDecompressedImageWidth());
+   EXPECT_EQ(IMAGE_HEIGHT, decoder.getDecompressedImageHeight());
+   EXPECT_GT(decoder.getICCSize(), 0);

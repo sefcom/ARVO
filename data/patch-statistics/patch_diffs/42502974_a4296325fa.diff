@@ -1,0 +1,66 @@
+From 20e38cd1ba068cc86de12949dadcf9668f989ef8 Mon Sep 17 00:00:00 2001
+From: "Alan T. DeKok" <aland@freeradius.org>
+Date: Tue, 12 Oct 2021 10:26:36 -0400
+Subject: [PATCH] don't convert octets from hex, and don't unescape strings
+
+---
+ src/protocols/tacacs/decode.c | 43 +++++++++++++++++++++++++++--------
+ 1 file changed, 34 insertions(+), 9 deletions(-)
+
+diff --git a/src/protocols/tacacs/decode.c b/src/protocols/tacacs/decode.c
+index c067a8c0d584..bc115dcbbf6e 100644
+--- a/src/protocols/tacacs/decode.c
++++ b/src/protocols/tacacs/decode.c
+@@ -160,18 +160,43 @@ static int tacacs_decode_args(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr
+ 		}
+ 
+ 		/*
+-		 *	Parse the string, and try to convert it to the
+-		 *	underlying data type.  If it can't be
+-		 *	converted as a data type, just convert it as
+-		 *	Argument-List.
++		 *	If it's OCTETS or STRING type, then just copy
++		 *	the value verbatim.  But if it's zero length,
++		 *	then don't do anything.
+ 		 *
+-		 *	And if that fails, just ignore it completely.
++		 *	Note that we copy things manually here because
++		 *	we don't want the OCTETS type to be parsed as
++		 *	hex.  And, we don't want the string type to be
++		 *	unescaped.
+ 		 */
+-		if (fr_pair_value_from_str(vp, (char const *) value, arg_end - value, 0, true) < 0) {
+-			talloc_free(vp);
+-			if (da != parent) goto raw;
++		if (da->type == FR_TYPE_OCTETS) {
++			if ((arg_end > value) &&
++			    (fr_pair_value_memdup(vp, value, arg_end - value, true) < 0)) {
++				goto fail;
++			}
++
++		} else if (da->type == FR_TYPE_STRING) {
++			if ((arg_end > value) &&
++			    (fr_pair_value_bstrndup(vp, (char const *) value, arg_end - value, true) < 0)) {
++				goto fail;
++			}
+ 
+-			goto next;
++		} else {
++			/*
++			 *	Parse the string, and try to convert it to the
++			 *	underlying data type.  If it can't be
++			 *	converted as a data type, just convert it as
++			 *	Argument-List.
++			 *
++			 *	And if that fails, just ignore it completely.
++			 */
++			if (fr_pair_value_from_str(vp, (char const *) value, arg_end - value, 0, true) < 0) {
++			fail:
++				talloc_free(vp);
++				if (da != parent) goto raw;
++
++				goto next;
++			}
+ 		}
+ 
+ 		fr_pair_append(out, vp);

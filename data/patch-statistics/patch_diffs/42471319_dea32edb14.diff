@@ -1,0 +1,108 @@
+From 520f98b00802054d3945f39000a09f60a226084a Mon Sep 17 00:00:00 2001
+From: Grzegorz Antoniak <ga@anadoxin.org>
+Date: Fri, 18 Jan 2019 06:17:19 +0100
+Subject: [PATCH 1/2] RAR5 reader: Fixed a read from invalid memory block
+
+In multi-file RAR5 archives, if a block spans from one file to another,
+the RAR5 reader merges both blocks into one, and feeds this merged block
+to the decompressor function. The problem is that the block merge
+function allocates the exact number of bytes for this block. This is
+problematic because when trying to read the last byte from this new
+block with bit reader functions, the bit reader functions will reference
+few additional bytes right after the byte the caller is trying to read,
+resulting in an out of bounds read.
+
+The commit increases the allocation size for new merged block. This
+ensures that bit reader functions will never perform any out of bounds
+reads. Additional space is zeroed out to prevent errors from
+instrumentation tools like ASan or Valgrind.
+
+Fixes #1119
+---
+ libarchive/archive_read_support_format_rar5.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index 99d817681..6d824673e 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -2679,13 +2679,21 @@ static int merge_block(struct archive_read* a, ssize_t block_size,
+     if(rar->vol.push_buf)
+         free((void*) rar->vol.push_buf);
+ 
+-    rar->vol.push_buf = malloc(block_size);
++    /* Increasing the allocation block by 8 is due to bit reading functions,
++     * which are using additional 2 or 4 bytes. Allocating the block size
++     * by exact value would make bit reader perform reads from invalid memory
++     * block when reading the last byte from the buffer. */
++    rar->vol.push_buf = malloc(block_size + 8);
+     if(!rar->vol.push_buf) {
+         archive_set_error(&a->archive, ENOMEM, "Can't allocate memory for a "
+                 "merge block buffer.");
+         return ARCHIVE_FATAL;
+     }
+ 
++    /* Valgrind complains if the extension block for bit reader is not
++     * initialized, so initialize it. */
++    memset(&rar->vol.push_buf[block_size], 0, 8);
++
+     /* A single block can span across multiple multivolume archive files,
+      * so we use a loop here. This loop will consume enough multivolume
+      * archive files until the whole block is read. */
+
+From 72f40fab252122a1daa5e3f5484ad2a802dddb70 Mon Sep 17 00:00:00 2001
+From: Grzegorz Antoniak <ga@anadoxin.org>
+Date: Fri, 18 Jan 2019 07:24:17 +0100
+Subject: [PATCH 2/2] RAR5 reader: Removed a memory leak in process_head_file
+
+The process_head_file function was using memset() to clear the
+archive_entry structure. The problem was that this structure could
+contain pointers to allocated blocks of memory, and removing those
+pointers with memset() resulted in a memory leak.
+
+Switching it in favor of archive_entry_clear() effectively clears the
+structure, but also releases any allocated memory blocks. This removes
+the memory leak.
+
+The commit also changes the way a temporary archive_entry instance is
+being created when skipping a base block after block merge; instead of
+directly creating a new instance on the stack, a constructor function
+archive_entry_new() is used to ensure the new archive_entry instance is
+not in an inconsistent state. This is needed because the fix described
+in the first half of this commit message depends on the archive_entry
+instance being in a consistent state due to the call of the
+archive_entry_clear() function.
+---
+ libarchive/archive_read_support_format_rar5.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index 6d824673e..b5f94e0c0 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -1301,7 +1301,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar,
+     char name_utf8_buf[2048 * 4];
+     const uint8_t* p;
+ 
+-    memset(entry, 0, sizeof(struct archive_entry));
++    archive_entry_clear(entry);
+ 
+     /* Do not reset file context if we're switching archives. */
+     if(!rar->cstate.switch_multivolume) {
+@@ -1795,8 +1795,14 @@ static int skip_base_block(struct archive_read* a) {
+     int ret;
+     struct rar5* rar = get_context(a);
+ 
+-    struct archive_entry entry;
+-    ret = process_base_block(a, &entry);
++    /* Create a new local archive_entry structure that will be operated on
++     * by header reader; operations on this archive_entry will be discarded.
++     */
++    struct archive_entry* entry = archive_entry_new();
++    ret = process_base_block(a, entry);
++
++    /* Discard operations on this archive_entry structure. */
++    archive_entry_free(entry);
+ 
+     if(rar->generic.last_header_id == 2 && rar->generic.split_before > 0)
+         return ARCHIVE_OK;

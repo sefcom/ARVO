@@ -1,0 +1,80 @@
+From ae82bcc3e8797af4fdca8adf8ef73acac7718f7b Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 20 Oct 2020 08:54:54 +0100
+Subject: [PATCH] fix out of bounds exif read in heifload
+
+We were subtracting 4 from the length of the exif data block without
+checking that there were 4 or more bytes there.
+---
+ ChangeLog                  |  1 +
+ libvips/foreign/exif.c     | 10 +++++++++-
+ libvips/foreign/heifload.c |  6 ++++--
+ 3 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index 3296e28c60..fe971a3de3 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,6 +1,7 @@
+ 18/10/20 started 8.10.3
+ - relax heic is_a rules [hisham]
+ - fix vips7 webp load [barryspearce]
++- fix out of bounds exif read in heifload
+ 
+ 6/9/20 started 8.10.2
+ - update magicksave/load profile handling [kelilevi]
+diff --git a/libvips/foreign/exif.c b/libvips/foreign/exif.c
+index 3727af04a7..521e142fbb 100644
+--- a/libvips/foreign/exif.c
++++ b/libvips/foreign/exif.c
+@@ -158,10 +158,18 @@ show_values( ExifData *data )
+  * their default value and we won't know about it. 
+  */
+ static ExifData *
+-vips_exif_load_data_without_fix( const void *data, int length )
++vips_exif_load_data_without_fix( const void *data, size_t length )
+ {
+ 	ExifData *ed;
+ 
++	/* exif_data_load_data() only allows uint for length. Limit it to less
++	 * than that: 2**20 should be enough for anyone.
++	 */
++	if( length > 1 << 20 ) {
++		vips_error( "exif", "%s", _( "exif too large" ) ); 
++		return( NULL );
++	}
++
+ 	if( !(ed = exif_data_new()) ) {
+ 		vips_error( "exif", "%s", _( "unable to init exif" ) ); 
+ 		return( NULL );
+diff --git a/libvips/foreign/heifload.c b/libvips/foreign/heifload.c
+index fc98bc0732..77e5f4bc34 100644
+--- a/libvips/foreign/heifload.c
++++ b/libvips/foreign/heifload.c
+@@ -464,7 +464,7 @@ vips_foreign_load_heif_set_header( VipsForeignLoadHeif *heif, VipsImage *out )
+ 		char name[256];
+ 
+ #ifdef DEBUG
+-		printf( "metadata type = %s, length = %zd\n", type, length ); 
++		printf( "metadata type = %s, length = %zu\n", type, length ); 
+ #endif /*DEBUG*/
+ 
+ 		if( !(data = VIPS_ARRAY( out, length, unsigned char )) )
+@@ -479,7 +479,8 @@ vips_foreign_load_heif_set_header( VipsForeignLoadHeif *heif, VipsImage *out )
+ 		/* We need to skip the first four bytes of EXIF, they just
+ 		 * contain the offset.
+ 		 */
+-		if( g_ascii_strcasecmp( type, "exif" ) == 0 ) {
++		if( length > 4 &&
++			g_ascii_strcasecmp( type, "exif" ) == 0 ) {
+ 			data += 4;
+ 			length -= 4;
+ 		}
+@@ -492,6 +493,7 @@ vips_foreign_load_heif_set_header( VipsForeignLoadHeif *heif, VipsImage *out )
+ 		if( g_ascii_strcasecmp( type, "exif" ) == 0 )
+ 			vips_snprintf( name, 256, VIPS_META_EXIF_NAME );
+ 		else if( g_ascii_strcasecmp( type, "mime" ) == 0 &&
++			length > 10 &&
+ 			vips_isprefix( "<x:xmpmeta", (const char *) data ) ) 
+ 			vips_snprintf( name, 256, VIPS_META_XMP_NAME );
+ 		else

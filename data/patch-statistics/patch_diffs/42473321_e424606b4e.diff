@@ -1,0 +1,121 @@
+From 3a81ac60a10b3b0b73eeefd1681152e0771c46de Mon Sep 17 00:00:00 2001
+From: xiaotiansf <xiaotianshimail@gmail.com>
+Date: Wed, 13 Feb 2019 12:16:03 -0800
+Subject: [PATCH] Fix ossz-fuzz reported bug-13001.  the fix has added one
+ error code in codec_app_def.h which handles null ptrs in ref pic lists within
+ refCount.
+
+---
+ codec/api/svc/codec_app_def.h             | 15 ++++++++-------
+ codec/decoder/core/src/decode_slice.cpp   | 12 +++++++++---
+ codec/decoder/core/src/decoder_core.cpp   |  5 ++++-
+ codec/decoder/core/src/manage_dec_ref.cpp |  6 ++++++
+ codec/decoder/plus/src/welsDecoderExt.cpp |  6 ++++++
+ 5 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/codec/api/svc/codec_app_def.h b/codec/api/svc/codec_app_def.h
+index e5ee3cc46b..1e26f9f277 100644
+--- a/codec/api/svc/codec_app_def.h
++++ b/codec/api/svc/codec_app_def.h
+@@ -78,13 +78,14 @@ typedef enum {
+   /**
+   * Errors derived from bitstream parsing
+   */
+-  dsErrorFree           = 0x00,   ///< bit stream error-free
+-  dsFramePending        = 0x01,   ///< need more throughput to generate a frame output,
+-  dsRefLost             = 0x02,   ///< layer lost at reference frame with temporal id 0
+-  dsBitstreamError      = 0x04,   ///< error bitstreams(maybe broken internal frame) the decoder cared
+-  dsDepLayerLost        = 0x08,   ///< dependented layer is ever lost
+-  dsNoParamSets         = 0x10,   ///< no parameter set NALs involved
+-  dsDataErrorConcealed  = 0x20,   ///< current data error concealed specified
++  dsErrorFree = 0x00,   ///< bit stream error-free
++  dsFramePending = 0x01,   ///< need more throughput to generate a frame output,
++  dsRefLost = 0x02,   ///< layer lost at reference frame with temporal id 0
++  dsBitstreamError = 0x04,   ///< error bitstreams(maybe broken internal frame) the decoder cared
++  dsDepLayerLost = 0x08,   ///< dependented layer is ever lost
++  dsNoParamSets = 0x10,   ///< no parameter set NALs involved
++  dsDataErrorConcealed = 0x20,   ///< current data error concealed specified
++  dsRefListNullPtrs = 0x40, ///<ref picure list contains null ptrs within uiRefCount range
+ 
+   /**
+   * Errors derived from logic level
+diff --git a/codec/decoder/core/src/decode_slice.cpp b/codec/decoder/core/src/decode_slice.cpp
+index 00cd86474f..533d20f82d 100644
+--- a/codec/decoder/core/src/decode_slice.cpp
++++ b/codec/decoder/core/src/decode_slice.cpp
+@@ -62,9 +62,15 @@ static bool CheckRefPics (const PWelsDecoderContext& pCtx) {
+     ++listCount;
+   }
+   for (int32_t list = LIST_0; list < listCount; ++list) {
+-    int32_t refCount = pCtx->sRefPic.uiRefCount[list];
+-    for (int32_t refIdx = 0; refIdx < refCount; ++refIdx) {
+-      if (!pCtx->sRefPic.pRefList[list][refIdx]) {
++    int32_t shortRefCount = pCtx->sRefPic.uiShortRefCount[list];
++    for (int32_t refIdx = 0; refIdx < shortRefCount; ++refIdx) {
++      if (!pCtx->sRefPic.pShortRefList[list][refIdx]) {
++        return false;
++      }
++    }
++    int32_t longRefCount = pCtx->sRefPic.uiLongRefCount[list];
++    for (int32_t refIdx = 0; refIdx < longRefCount; ++refIdx) {
++      if (!pCtx->sRefPic.pLongRefList[list][refIdx]) {
+         return false;
+       }
+     }
+diff --git a/codec/decoder/core/src/decoder_core.cpp b/codec/decoder/core/src/decoder_core.cpp
+index 9735882efc..e179074a46 100644
+--- a/codec/decoder/core/src/decoder_core.cpp
++++ b/codec/decoder/core/src/decoder_core.cpp
+@@ -2720,7 +2720,10 @@ bool CheckAndFinishLastPic (PWelsDecoderContext pCtx, uint8_t** ppDst, SBufferIn
+       DecodeFrameConstruction (pCtx, ppDst, pDstInfo);
+       pCtx->pPreviousDecodedPictureInDpb = pCtx->pDec; //save ECed pic for future use
+       if (pCtx->sLastNalHdrExt.sNalUnitHeader.uiNalRefIdc > 0) {
+-        MarkECFrameAsRef (pCtx);
++        if (MarkECFrameAsRef (pCtx) == ERR_INFO_INVALID_PTR) {
++          pCtx->iErrorCode |= dsRefListNullPtrs;
++          return false;
++        }
+       }
+     } else if (pCtx->pParam->bParseOnly) { //clear parse only internal data status
+       pCtx->pParserBsInfo->iNalNum = 0;
+diff --git a/codec/decoder/core/src/manage_dec_ref.cpp b/codec/decoder/core/src/manage_dec_ref.cpp
+index c304afe009..56ee94356a 100644
+--- a/codec/decoder/core/src/manage_dec_ref.cpp
++++ b/codec/decoder/core/src/manage_dec_ref.cpp
+@@ -792,6 +792,9 @@ static int32_t AddShortTermToList (PRefPic pRefPic, PPicture pPic) {
+   if (pRefPic->uiShortRefCount[LIST_0] > 0) {
+     // Check the duplicate frame_num in short ref list
+     for (int32_t iPos = 0; iPos < pRefPic->uiShortRefCount[LIST_0]; iPos++) {
++      if (!pRefPic->pShortRefList[LIST_0][iPos]) {
++        return ERR_INFO_INVALID_PTR;
++      }
+       if (pPic->iFrameNum == pRefPic->pShortRefList[LIST_0][iPos]->iFrameNum) {
+         // Replace the previous ref pic with the new one with the same frame_num
+         pRefPic->pShortRefList[LIST_0][iPos] = pPic;
+@@ -819,6 +822,9 @@ static int32_t AddLongTermToList (PRefPic pRefPic, PPicture pPic, int32_t iLongT
+     pRefPic->pLongRefList[LIST_0][pRefPic->uiLongRefCount[LIST_0]] = pPic;
+   } else {
+     for (i = 0; i < pRefPic->uiLongRefCount[LIST_0]; i++) {
++      if (!pRefPic->pLongRefList[LIST_0][i]) {
++        return ERR_INFO_INVALID_PTR;
++      }
+       if (pRefPic->pLongRefList[LIST_0][i]->iLongTermFrameIdx > pPic->iLongTermFrameIdx) {
+         break;
+       }
+diff --git a/codec/decoder/plus/src/welsDecoderExt.cpp b/codec/decoder/plus/src/welsDecoderExt.cpp
+index c8c6c2ec15..371ff495fa 100644
+--- a/codec/decoder/plus/src/welsDecoderExt.cpp
++++ b/codec/decoder/plus/src/welsDecoderExt.cpp
+@@ -593,6 +593,12 @@ DECODING_STATE CWelsDecoder::DecodeFrame2 (const unsigned char* kpSrc,
+       }
+       return dsErrorFree;
+     }
++    if (m_pDecContext->iErrorCode & dsRefListNullPtrs) {
++      if (ResetDecoder()) {
++        return dsRefListNullPtrs;
++      }
++      return dsErrorFree;
++    }
+     //for AVC bitstream (excluding AVC with temporal scalability, including TP), as long as error occur, SHOULD notify upper layer key frame loss.
+     if ((IS_PARAM_SETS_NALS (eNalType) || NAL_UNIT_CODED_SLICE_IDR == eNalType) ||
+         (VIDEO_BITSTREAM_AVC == m_pDecContext->eVideoType)) {

@@ -1,0 +1,1162 @@
+From beb9792a6b17938913db39a9bee5bebea2923560 Mon Sep 17 00:00:00 2001
+From: Bill Hollings <bill.hollings@brenwill.com>
+Date: Wed, 11 Jun 2025 19:35:39 -0400
+Subject: [PATCH] MSL: Support SPIR-V Fast Math execution modes and
+ decorations.
+
+- Add CompilerMSL::Options::use_fast_math_pragmas to direct whether the MSL
+  should include pragma directives to control floating point compilation options.
+- Add CompilerMSL::get_fp_fast_math_flags() to return a set of FPFastMathModeMask
+  flags that are safe to be applied to all floating-point types, based on
+  FPFastMathDefault and FPFastMathMode decorations on individual operations,
+  or execution modes SignedZeroInfNanPreserve and ContractionOff.
+- Add SPIREntryPoint::fp_fast_math_defaults to track FPFastMathDefault by type ID.
+- Add Decoration::fp_fast_math_mode to support DecorationFPFastMathMode.
+- Use add_pragma_line() for all emitted pragmas, to better control line spacing.
+- Update numerous shader references that were affected by a reordering
+  in emitted pragma lines, due to the consistent use of add_pragma_line().
+---
+ ...p-spec-constant-op-vector-related.asm.comp |  2 +-
+ .../frag/lut-promotion-initializer.asm.frag   |  2 +-
+ .../asm/frag/op-constant-null.asm.frag        |  2 +-
+ .../pull-model-interpolation.asm.msl23.frag   |  2 +-
+ .../frag/single-function-private-lut.asm.frag |  2 +-
+ .../storage-class-output-initializer.asm.frag |  2 +-
+ ...h-shader-dxil-spirv.asm.msl3.spv16.vk.mesh |  2 +-
+ .../asm/tese/unnamed-builtin-array.asm.tese   |  2 +-
+ .../complex-composite-constant-array.comp     |  2 +-
+ .../shaders-msl/comp/complex-type-alias.comp  |  2 +-
+ .../comp/composite-array-initialization.comp  |  2 +-
+ .../shaders-msl/comp/composite-construct.comp |  2 +-
+ .../comp/copy-array-of-arrays.comp            |  2 +-
+ reference/shaders-msl/comp/functions.comp     |  2 +-
+ ...argument-buffer.texture-buffer-native.comp |  2 +-
+ ...gument-buffer.msl2.decoration-binding.comp |  2 +-
+ .../comp/shared-array-of-arrays.comp          |  2 +-
+ .../comp/shared-matrix-array-of-array.comp    |  2 +-
+ .../shared-matrix-nested-struct-array.comp    |  2 +-
+ .../comp/shared-zero-init-simple.comp         |  1 +
+ .../shaders-msl/comp/shared-zero-init.comp    |  2 +-
+ reference/shaders-msl/comp/shared.comp        |  2 +-
+ .../comp/spec-constant-work-group-size.comp   |  2 +-
+ .../storage-buffer-std140-vector-array.comp   |  2 +-
+ .../comp/threadgroup-boolean-workaround.comp  |  2 +-
+ .../tesc/arrayed-output.desktop.sso.tesc      |  2 +-
+ .../frag/array-component-io.invalid.frag      |  2 +-
+ .../frag/array-lut-no-loop-variable.frag      |  2 +-
+ .../shaders-msl/frag/array-of-array-lut.frag  |  2 +-
+ .../frag/clip-distance-varying.frag           |  2 +-
+ .../shaders-msl/frag/constant-array.frag      |  2 +-
+ .../shaders-msl/frag/constant-composites.frag |  2 +-
+ .../frag/cull-distance-varying.frag           |  2 +-
+ ...agment-component-padding.pad-fragment.frag |  2 +-
+ .../frag/gather-compare-const-offsets.frag    |  2 +-
+ .../frag/gather-const-offsets.frag            |  2 +-
+ ...ck_with_multiple_structs_of_same_type.frag |  2 +-
+ reference/shaders-msl/frag/lut-promotion.frag |  2 +-
+ reference/shaders-msl/frag/mrt-array.frag     |  2 +-
+ .../read-cull-clip-distance-in-function.frag  |  2 +-
+ .../frag/vecsize-mismatch.shader-inputs.frag  |  2 +-
+ ...er-basic-lines.msl3.spv14.vk.nocompat.mesh |  2 +-
+ ...basic-triangle.msl3.spv14.vk.nocompat.mesh |  2 +-
+ ...r-flat-varying.msl3.spv14.vk.nocompat.mesh |  2 +-
+ .../tesc/arrayed-block-io.multi-patch.tesc    |  2 +-
+ ...control-point-inout-types.multi-patch.tesc |  2 +-
+ .../complex-control-point-inout-types.tesc    |  2 +-
+ .../tesc/complex-patch-out-types.tesc         |  2 +-
+ ...rol-point-array-of-matrix.multi-patch.tesc |  2 +-
+ .../load-control-point-array-of-matrix.tesc   |  2 +-
+ ...rol-point-array-of-struct.multi-patch.tesc |  2 +-
+ .../load-control-point-array-of-struct.tesc   |  2 +-
+ .../load-control-point-array.multi-patch.tesc |  2 +-
+ .../tesc/load-control-point-array.tesc        |  2 +-
+ .../tese/in-array-of-struct.raw-tess-in.tese  |  2 +-
+ .../tese/load-control-point-array.tese        |  2 +-
+ reference/shaders-msl/tese/quad.domain.tese   |  2 +-
+ reference/shaders-msl/tese/quad.tese          |  2 +-
+ .../read-tess-level-in-func-quad.msl2.tese    |  2 +-
+ ...s-level-in-func-quad.raw-tess-in.msl2.tese |  2 +-
+ .../tese/read-tess-level-in-func.msl2.tese    |  2 +-
+ ...d-tess-level-in-func.raw-tess-in.msl2.tese |  2 +-
+ .../shaders-msl/tese/triangle-tess-level.tese |  2 +-
+ .../array-component-io.for-tess.invalid.vert  |  2 +-
+ .../vert/array-component-io.invalid.vert      |  2 +-
+ .../vert/float-math.invariant-float-math.vert |  2 +-
+ reference/shaders-msl/vert/float-math.vert    |  2 +-
+ .../shaders-msl/vert/in_out_array_mat.vert    |  2 +-
+ .../interface-block-block-composites.frag     |  2 +-
+ .../interface-block-block-composites.vert     |  2 +-
+ .../interface-block-single-element-array.vert |  2 +-
+ .../out-block-with-nested-struct-array.vert   |  2 +-
+ .../vert/out-block-with-struct-array.vert     |  2 +-
+ reference/shaders-msl/vert/return-array.vert  |  2 +-
+ .../signedness-mismatch.shader-inputs.vert    |  2 +-
+ ...asic.multiview.no-layered.nocompat.vk.frag |  2 +-
+ .../frag/basic.multiview.nocompat.vk.frag     |  2 +-
+ spirv_common.hpp                              |  2 +
+ spirv_cross.cpp                               |  4 ++
+ spirv_cross_parsed_ir.cpp                     | 10 ++++
+ spirv_msl.cpp                                 | 56 +++++++++++++++++--
+ spirv_msl.hpp                                 | 12 ++++
+ spirv_parser.cpp                              | 12 +++-
+ 83 files changed, 166 insertions(+), 83 deletions(-)
+
+diff --git a/reference/shaders-msl/asm/comp/op-spec-constant-op-vector-related.asm.comp b/reference/shaders-msl/asm/comp/op-spec-constant-op-vector-related.asm.comp
+index 42c13f7a4..70c0dee3e 100644
+--- a/reference/shaders-msl/asm/comp/op-spec-constant-op-vector-related.asm.comp
++++ b/reference/shaders-msl/asm/comp/op-spec-constant-op-vector-related.asm.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/asm/frag/lut-promotion-initializer.asm.frag b/reference/shaders-msl/asm/frag/lut-promotion-initializer.asm.frag
+index 002ffae4c..3b6b52338 100644
+--- a/reference/shaders-msl/asm/frag/lut-promotion-initializer.asm.frag
++++ b/reference/shaders-msl/asm/frag/lut-promotion-initializer.asm.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/asm/frag/op-constant-null.asm.frag b/reference/shaders-msl/asm/frag/op-constant-null.asm.frag
+index e0037589f..7ff38d300 100644
+--- a/reference/shaders-msl/asm/frag/op-constant-null.asm.frag
++++ b/reference/shaders-msl/asm/frag/op-constant-null.asm.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/asm/frag/pull-model-interpolation.asm.msl23.frag b/reference/shaders-msl/asm/frag/pull-model-interpolation.asm.msl23.frag
+index 02ec4751b..bab30ea55 100644
+--- a/reference/shaders-msl/asm/frag/pull-model-interpolation.asm.msl23.frag
++++ b/reference/shaders-msl/asm/frag/pull-model-interpolation.asm.msl23.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/asm/frag/single-function-private-lut.asm.frag b/reference/shaders-msl/asm/frag/single-function-private-lut.asm.frag
+index 2ea037407..8ab1848ad 100644
+--- a/reference/shaders-msl/asm/frag/single-function-private-lut.asm.frag
++++ b/reference/shaders-msl/asm/frag/single-function-private-lut.asm.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/asm/frag/storage-class-output-initializer.asm.frag b/reference/shaders-msl/asm/frag/storage-class-output-initializer.asm.frag
+index d59013daa..b8fad2a74 100644
+--- a/reference/shaders-msl/asm/frag/storage-class-output-initializer.asm.frag
++++ b/reference/shaders-msl/asm/frag/storage-class-output-initializer.asm.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/asm/mesh/mesh-shader-dxil-spirv.asm.msl3.spv16.vk.mesh b/reference/shaders-msl/asm/mesh/mesh-shader-dxil-spirv.asm.msl3.spv16.vk.mesh
+index ebbe3e153..e41483611 100644
+--- a/reference/shaders-msl/asm/mesh/mesh-shader-dxil-spirv.asm.msl3.spv16.vk.mesh
++++ b/reference/shaders-msl/asm/mesh/mesh-shader-dxil-spirv.asm.msl3.spv16.vk.mesh
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/asm/tese/unnamed-builtin-array.asm.tese b/reference/shaders-msl/asm/tese/unnamed-builtin-array.asm.tese
+index 7fd48b4f7..4d7360f2a 100644
+--- a/reference/shaders-msl/asm/tese/unnamed-builtin-array.asm.tese
++++ b/reference/shaders-msl/asm/tese/unnamed-builtin-array.asm.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/complex-composite-constant-array.comp b/reference/shaders-msl/comp/complex-composite-constant-array.comp
+index d3d15242b..36b2f8967 100644
+--- a/reference/shaders-msl/comp/complex-composite-constant-array.comp
++++ b/reference/shaders-msl/comp/complex-composite-constant-array.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/complex-type-alias.comp b/reference/shaders-msl/comp/complex-type-alias.comp
+index 982ee87ff..9f7a0e878 100644
+--- a/reference/shaders-msl/comp/complex-type-alias.comp
++++ b/reference/shaders-msl/comp/complex-type-alias.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/composite-array-initialization.comp b/reference/shaders-msl/comp/composite-array-initialization.comp
+index 0010718d3..0357e4375 100644
+--- a/reference/shaders-msl/comp/composite-array-initialization.comp
++++ b/reference/shaders-msl/comp/composite-array-initialization.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/composite-construct.comp b/reference/shaders-msl/comp/composite-construct.comp
+index 808ef790e..a02219f9e 100644
+--- a/reference/shaders-msl/comp/composite-construct.comp
++++ b/reference/shaders-msl/comp/composite-construct.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/copy-array-of-arrays.comp b/reference/shaders-msl/comp/copy-array-of-arrays.comp
+index 904f96abb..db4595a3e 100644
+--- a/reference/shaders-msl/comp/copy-array-of-arrays.comp
++++ b/reference/shaders-msl/comp/copy-array-of-arrays.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/functions.comp b/reference/shaders-msl/comp/functions.comp
+index f6d4e23f6..e04af6de0 100644
+--- a/reference/shaders-msl/comp/functions.comp
++++ b/reference/shaders-msl/comp/functions.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/overlapping-bindings.msl31.argument.argument-tier-1.decoration-binding.device-argument-buffer.texture-buffer-native.comp b/reference/shaders-msl/comp/overlapping-bindings.msl31.argument.argument-tier-1.decoration-binding.device-argument-buffer.texture-buffer-native.comp
+index 938eea96a..16416c28d 100644
+--- a/reference/shaders-msl/comp/overlapping-bindings.msl31.argument.argument-tier-1.decoration-binding.device-argument-buffer.texture-buffer-native.comp
++++ b/reference/shaders-msl/comp/overlapping-bindings.msl31.argument.argument-tier-1.decoration-binding.device-argument-buffer.texture-buffer-native.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wincompatible-pointer-types-discards-qualifiers"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/raw-buffer-descriptor-aliasing.argument.discrete.device-argument-buffer.msl2.decoration-binding.comp b/reference/shaders-msl/comp/raw-buffer-descriptor-aliasing.argument.discrete.device-argument-buffer.msl2.decoration-binding.comp
+index a68974671..ff369f441 100644
+--- a/reference/shaders-msl/comp/raw-buffer-descriptor-aliasing.argument.discrete.device-argument-buffer.msl2.decoration-binding.comp
++++ b/reference/shaders-msl/comp/raw-buffer-descriptor-aliasing.argument.discrete.device-argument-buffer.msl2.decoration-binding.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wincompatible-pointer-types-discards-qualifiers"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/shared-array-of-arrays.comp b/reference/shaders-msl/comp/shared-array-of-arrays.comp
+index d8b7b2f42..33b9709e6 100644
+--- a/reference/shaders-msl/comp/shared-array-of-arrays.comp
++++ b/reference/shaders-msl/comp/shared-array-of-arrays.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/shared-matrix-array-of-array.comp b/reference/shaders-msl/comp/shared-matrix-array-of-array.comp
+index 173b31cde..dbcd8b55f 100644
+--- a/reference/shaders-msl/comp/shared-matrix-array-of-array.comp
++++ b/reference/shaders-msl/comp/shared-matrix-array-of-array.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/shared-matrix-nested-struct-array.comp b/reference/shaders-msl/comp/shared-matrix-nested-struct-array.comp
+index db5ed440f..aa811adc9 100644
+--- a/reference/shaders-msl/comp/shared-matrix-nested-struct-array.comp
++++ b/reference/shaders-msl/comp/shared-matrix-nested-struct-array.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/shared-zero-init-simple.comp b/reference/shaders-msl/comp/shared-zero-init-simple.comp
+index f8e21f350..ec6029f9b 100644
+--- a/reference/shaders-msl/comp/shared-zero-init-simple.comp
++++ b/reference/shaders-msl/comp/shared-zero-init-simple.comp
+@@ -1,4 +1,5 @@
+ #pragma clang diagnostic ignored "-Wsometimes-uninitialized"
++
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+ 
+diff --git a/reference/shaders-msl/comp/shared-zero-init.comp b/reference/shaders-msl/comp/shared-zero-init.comp
+index 2d0e55b96..5b3f56537 100644
+--- a/reference/shaders-msl/comp/shared-zero-init.comp
++++ b/reference/shaders-msl/comp/shared-zero-init.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/shared.comp b/reference/shaders-msl/comp/shared.comp
+index ee8154f07..ee88e57f4 100644
+--- a/reference/shaders-msl/comp/shared.comp
++++ b/reference/shaders-msl/comp/shared.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/spec-constant-work-group-size.comp b/reference/shaders-msl/comp/spec-constant-work-group-size.comp
+index de30edec1..8b04d6662 100644
+--- a/reference/shaders-msl/comp/spec-constant-work-group-size.comp
++++ b/reference/shaders-msl/comp/spec-constant-work-group-size.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/storage-buffer-std140-vector-array.comp b/reference/shaders-msl/comp/storage-buffer-std140-vector-array.comp
+index 5593629c0..8d9acd572 100644
+--- a/reference/shaders-msl/comp/storage-buffer-std140-vector-array.comp
++++ b/reference/shaders-msl/comp/storage-buffer-std140-vector-array.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/comp/threadgroup-boolean-workaround.comp b/reference/shaders-msl/comp/threadgroup-boolean-workaround.comp
+index 2db794a60..1468b20f1 100644
+--- a/reference/shaders-msl/comp/threadgroup-boolean-workaround.comp
++++ b/reference/shaders-msl/comp/threadgroup-boolean-workaround.comp
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/desktop-only/tesc/arrayed-output.desktop.sso.tesc b/reference/shaders-msl/desktop-only/tesc/arrayed-output.desktop.sso.tesc
+index 01fceeb6c..8e5dbc5f4 100644
+--- a/reference/shaders-msl/desktop-only/tesc/arrayed-output.desktop.sso.tesc
++++ b/reference/shaders-msl/desktop-only/tesc/arrayed-output.desktop.sso.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/array-component-io.invalid.frag b/reference/shaders-msl/frag/array-component-io.invalid.frag
+index 9b4c5b520..fa06b4ed4 100644
+--- a/reference/shaders-msl/frag/array-component-io.invalid.frag
++++ b/reference/shaders-msl/frag/array-component-io.invalid.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/array-lut-no-loop-variable.frag b/reference/shaders-msl/frag/array-lut-no-loop-variable.frag
+index cdedd73a7..fc9dcc667 100644
+--- a/reference/shaders-msl/frag/array-lut-no-loop-variable.frag
++++ b/reference/shaders-msl/frag/array-lut-no-loop-variable.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/array-of-array-lut.frag b/reference/shaders-msl/frag/array-of-array-lut.frag
+index ba553824e..7b3f648e8 100644
+--- a/reference/shaders-msl/frag/array-of-array-lut.frag
++++ b/reference/shaders-msl/frag/array-of-array-lut.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/clip-distance-varying.frag b/reference/shaders-msl/frag/clip-distance-varying.frag
+index 9a72d5ba3..21bf19aa1 100644
+--- a/reference/shaders-msl/frag/clip-distance-varying.frag
++++ b/reference/shaders-msl/frag/clip-distance-varying.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/constant-array.frag b/reference/shaders-msl/frag/constant-array.frag
+index 990860762..3b56fb22f 100644
+--- a/reference/shaders-msl/frag/constant-array.frag
++++ b/reference/shaders-msl/frag/constant-array.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/constant-composites.frag b/reference/shaders-msl/frag/constant-composites.frag
+index e0fa980fb..4652b920b 100644
+--- a/reference/shaders-msl/frag/constant-composites.frag
++++ b/reference/shaders-msl/frag/constant-composites.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/cull-distance-varying.frag b/reference/shaders-msl/frag/cull-distance-varying.frag
+index 708a29571..3076e7ebd 100644
+--- a/reference/shaders-msl/frag/cull-distance-varying.frag
++++ b/reference/shaders-msl/frag/cull-distance-varying.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/fragment-component-padding.pad-fragment.frag b/reference/shaders-msl/frag/fragment-component-padding.pad-fragment.frag
+index 6420bb9f4..6d21caaa7 100644
+--- a/reference/shaders-msl/frag/fragment-component-padding.pad-fragment.frag
++++ b/reference/shaders-msl/frag/fragment-component-padding.pad-fragment.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/gather-compare-const-offsets.frag b/reference/shaders-msl/frag/gather-compare-const-offsets.frag
+index 600fb1747..9ba427170 100644
+--- a/reference/shaders-msl/frag/gather-compare-const-offsets.frag
++++ b/reference/shaders-msl/frag/gather-compare-const-offsets.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/gather-const-offsets.frag b/reference/shaders-msl/frag/gather-const-offsets.frag
+index e17f41c2b..7a078d3f2 100644
+--- a/reference/shaders-msl/frag/gather-const-offsets.frag
++++ b/reference/shaders-msl/frag/gather-const-offsets.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/in_block_with_multiple_structs_of_same_type.frag b/reference/shaders-msl/frag/in_block_with_multiple_structs_of_same_type.frag
+index 7b011ffb5..06d6fc97b 100644
+--- a/reference/shaders-msl/frag/in_block_with_multiple_structs_of_same_type.frag
++++ b/reference/shaders-msl/frag/in_block_with_multiple_structs_of_same_type.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/lut-promotion.frag b/reference/shaders-msl/frag/lut-promotion.frag
+index b1e0e7311..5bd2dd8fa 100644
+--- a/reference/shaders-msl/frag/lut-promotion.frag
++++ b/reference/shaders-msl/frag/lut-promotion.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/mrt-array.frag b/reference/shaders-msl/frag/mrt-array.frag
+index bc2682844..dbe7eea71 100644
+--- a/reference/shaders-msl/frag/mrt-array.frag
++++ b/reference/shaders-msl/frag/mrt-array.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/read-cull-clip-distance-in-function.frag b/reference/shaders-msl/frag/read-cull-clip-distance-in-function.frag
+index 02d57d9be..d9d475939 100644
+--- a/reference/shaders-msl/frag/read-cull-clip-distance-in-function.frag
++++ b/reference/shaders-msl/frag/read-cull-clip-distance-in-function.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/frag/vecsize-mismatch.shader-inputs.frag b/reference/shaders-msl/frag/vecsize-mismatch.shader-inputs.frag
+index 1cb7aa703..d43973a47 100644
+--- a/reference/shaders-msl/frag/vecsize-mismatch.shader-inputs.frag
++++ b/reference/shaders-msl/frag/vecsize-mismatch.shader-inputs.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/mesh/mesh-shader-basic-lines.msl3.spv14.vk.nocompat.mesh b/reference/shaders-msl/mesh/mesh-shader-basic-lines.msl3.spv14.vk.nocompat.mesh
+index 62b96ec39..23989f744 100644
+--- a/reference/shaders-msl/mesh/mesh-shader-basic-lines.msl3.spv14.vk.nocompat.mesh
++++ b/reference/shaders-msl/mesh/mesh-shader-basic-lines.msl3.spv14.vk.nocompat.mesh
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/mesh/mesh-shader-basic-triangle.msl3.spv14.vk.nocompat.mesh b/reference/shaders-msl/mesh/mesh-shader-basic-triangle.msl3.spv14.vk.nocompat.mesh
+index 8c02206a8..16a28769d 100644
+--- a/reference/shaders-msl/mesh/mesh-shader-basic-triangle.msl3.spv14.vk.nocompat.mesh
++++ b/reference/shaders-msl/mesh/mesh-shader-basic-triangle.msl3.spv14.vk.nocompat.mesh
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/mesh/mesh-shader-flat-varying.msl3.spv14.vk.nocompat.mesh b/reference/shaders-msl/mesh/mesh-shader-flat-varying.msl3.spv14.vk.nocompat.mesh
+index b1e06402a..bd168801b 100644
+--- a/reference/shaders-msl/mesh/mesh-shader-flat-varying.msl3.spv14.vk.nocompat.mesh
++++ b/reference/shaders-msl/mesh/mesh-shader-flat-varying.msl3.spv14.vk.nocompat.mesh
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/arrayed-block-io.multi-patch.tesc b/reference/shaders-msl/tesc/arrayed-block-io.multi-patch.tesc
+index bc0208d2b..259f2a6d8 100644
+--- a/reference/shaders-msl/tesc/arrayed-block-io.multi-patch.tesc
++++ b/reference/shaders-msl/tesc/arrayed-block-io.multi-patch.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/complex-control-point-inout-types.multi-patch.tesc b/reference/shaders-msl/tesc/complex-control-point-inout-types.multi-patch.tesc
+index d266d2512..9ee2cf47b 100644
+--- a/reference/shaders-msl/tesc/complex-control-point-inout-types.multi-patch.tesc
++++ b/reference/shaders-msl/tesc/complex-control-point-inout-types.multi-patch.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/complex-control-point-inout-types.tesc b/reference/shaders-msl/tesc/complex-control-point-inout-types.tesc
+index 48f10baec..a879c40e5 100644
+--- a/reference/shaders-msl/tesc/complex-control-point-inout-types.tesc
++++ b/reference/shaders-msl/tesc/complex-control-point-inout-types.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/complex-patch-out-types.tesc b/reference/shaders-msl/tesc/complex-patch-out-types.tesc
+index bd24f5802..422e057bd 100644
+--- a/reference/shaders-msl/tesc/complex-patch-out-types.tesc
++++ b/reference/shaders-msl/tesc/complex-patch-out-types.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/load-control-point-array-of-matrix.multi-patch.tesc b/reference/shaders-msl/tesc/load-control-point-array-of-matrix.multi-patch.tesc
+index cd452b742..123510905 100644
+--- a/reference/shaders-msl/tesc/load-control-point-array-of-matrix.multi-patch.tesc
++++ b/reference/shaders-msl/tesc/load-control-point-array-of-matrix.multi-patch.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/load-control-point-array-of-matrix.tesc b/reference/shaders-msl/tesc/load-control-point-array-of-matrix.tesc
+index 67b97a511..0f3a8e14a 100644
+--- a/reference/shaders-msl/tesc/load-control-point-array-of-matrix.tesc
++++ b/reference/shaders-msl/tesc/load-control-point-array-of-matrix.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/load-control-point-array-of-struct.multi-patch.tesc b/reference/shaders-msl/tesc/load-control-point-array-of-struct.multi-patch.tesc
+index 621721f82..3a9804c44 100644
+--- a/reference/shaders-msl/tesc/load-control-point-array-of-struct.multi-patch.tesc
++++ b/reference/shaders-msl/tesc/load-control-point-array-of-struct.multi-patch.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/load-control-point-array-of-struct.tesc b/reference/shaders-msl/tesc/load-control-point-array-of-struct.tesc
+index 8438f49f5..f6d87b0b4 100644
+--- a/reference/shaders-msl/tesc/load-control-point-array-of-struct.tesc
++++ b/reference/shaders-msl/tesc/load-control-point-array-of-struct.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/load-control-point-array.multi-patch.tesc b/reference/shaders-msl/tesc/load-control-point-array.multi-patch.tesc
+index 91fbe308e..a5fe0a5fd 100644
+--- a/reference/shaders-msl/tesc/load-control-point-array.multi-patch.tesc
++++ b/reference/shaders-msl/tesc/load-control-point-array.multi-patch.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tesc/load-control-point-array.tesc b/reference/shaders-msl/tesc/load-control-point-array.tesc
+index 5c1885729..17ae78499 100644
+--- a/reference/shaders-msl/tesc/load-control-point-array.tesc
++++ b/reference/shaders-msl/tesc/load-control-point-array.tesc
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/in-array-of-struct.raw-tess-in.tese b/reference/shaders-msl/tese/in-array-of-struct.raw-tess-in.tese
+index 44e495fb3..815aff0c3 100644
+--- a/reference/shaders-msl/tese/in-array-of-struct.raw-tess-in.tese
++++ b/reference/shaders-msl/tese/in-array-of-struct.raw-tess-in.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/load-control-point-array.tese b/reference/shaders-msl/tese/load-control-point-array.tese
+index 5b008c63f..11c582308 100644
+--- a/reference/shaders-msl/tese/load-control-point-array.tese
++++ b/reference/shaders-msl/tese/load-control-point-array.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/quad.domain.tese b/reference/shaders-msl/tese/quad.domain.tese
+index 10cdf5f10..c33e59810 100644
+--- a/reference/shaders-msl/tese/quad.domain.tese
++++ b/reference/shaders-msl/tese/quad.domain.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/quad.tese b/reference/shaders-msl/tese/quad.tese
+index e0c794439..596e4de4e 100644
+--- a/reference/shaders-msl/tese/quad.tese
++++ b/reference/shaders-msl/tese/quad.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/read-tess-level-in-func-quad.msl2.tese b/reference/shaders-msl/tese/read-tess-level-in-func-quad.msl2.tese
+index 7048546ce..88a25d486 100644
+--- a/reference/shaders-msl/tese/read-tess-level-in-func-quad.msl2.tese
++++ b/reference/shaders-msl/tese/read-tess-level-in-func-quad.msl2.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/read-tess-level-in-func-quad.raw-tess-in.msl2.tese b/reference/shaders-msl/tese/read-tess-level-in-func-quad.raw-tess-in.msl2.tese
+index f8f81b757..d2cead1eb 100644
+--- a/reference/shaders-msl/tese/read-tess-level-in-func-quad.raw-tess-in.msl2.tese
++++ b/reference/shaders-msl/tese/read-tess-level-in-func-quad.raw-tess-in.msl2.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/read-tess-level-in-func.msl2.tese b/reference/shaders-msl/tese/read-tess-level-in-func.msl2.tese
+index 432ad7cc2..2571339c0 100644
+--- a/reference/shaders-msl/tese/read-tess-level-in-func.msl2.tese
++++ b/reference/shaders-msl/tese/read-tess-level-in-func.msl2.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/read-tess-level-in-func.raw-tess-in.msl2.tese b/reference/shaders-msl/tese/read-tess-level-in-func.raw-tess-in.msl2.tese
+index 5be7c4017..9c0056960 100644
+--- a/reference/shaders-msl/tese/read-tess-level-in-func.raw-tess-in.msl2.tese
++++ b/reference/shaders-msl/tese/read-tess-level-in-func.raw-tess-in.msl2.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/tese/triangle-tess-level.tese b/reference/shaders-msl/tese/triangle-tess-level.tese
+index 86ccc4f02..37423716d 100644
+--- a/reference/shaders-msl/tese/triangle-tess-level.tese
++++ b/reference/shaders-msl/tese/triangle-tess-level.tese
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/array-component-io.for-tess.invalid.vert b/reference/shaders-msl/vert/array-component-io.for-tess.invalid.vert
+index 24958eb50..960799aa7 100644
+--- a/reference/shaders-msl/vert/array-component-io.for-tess.invalid.vert
++++ b/reference/shaders-msl/vert/array-component-io.for-tess.invalid.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/array-component-io.invalid.vert b/reference/shaders-msl/vert/array-component-io.invalid.vert
+index 352c9d2ef..1aca4cc7a 100644
+--- a/reference/shaders-msl/vert/array-component-io.invalid.vert
++++ b/reference/shaders-msl/vert/array-component-io.invalid.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/float-math.invariant-float-math.vert b/reference/shaders-msl/vert/float-math.invariant-float-math.vert
+index 4b25e91b4..868d79143 100644
+--- a/reference/shaders-msl/vert/float-math.invariant-float-math.vert
++++ b/reference/shaders-msl/vert/float-math.invariant-float-math.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/float-math.vert b/reference/shaders-msl/vert/float-math.vert
+index e96fdaedc..4931650bf 100644
+--- a/reference/shaders-msl/vert/float-math.vert
++++ b/reference/shaders-msl/vert/float-math.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/in_out_array_mat.vert b/reference/shaders-msl/vert/in_out_array_mat.vert
+index d44d52146..26f4372f3 100644
+--- a/reference/shaders-msl/vert/in_out_array_mat.vert
++++ b/reference/shaders-msl/vert/in_out_array_mat.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/interface-block-block-composites.frag b/reference/shaders-msl/vert/interface-block-block-composites.frag
+index cc2727682..953d71403 100644
+--- a/reference/shaders-msl/vert/interface-block-block-composites.frag
++++ b/reference/shaders-msl/vert/interface-block-block-composites.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/interface-block-block-composites.vert b/reference/shaders-msl/vert/interface-block-block-composites.vert
+index a05c93315..d4960da71 100644
+--- a/reference/shaders-msl/vert/interface-block-block-composites.vert
++++ b/reference/shaders-msl/vert/interface-block-block-composites.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/interface-block-single-element-array.vert b/reference/shaders-msl/vert/interface-block-single-element-array.vert
+index 6858db730..678b5d766 100644
+--- a/reference/shaders-msl/vert/interface-block-single-element-array.vert
++++ b/reference/shaders-msl/vert/interface-block-single-element-array.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/out-block-with-nested-struct-array.vert b/reference/shaders-msl/vert/out-block-with-nested-struct-array.vert
+index cabcfcb52..3a71d6c02 100644
+--- a/reference/shaders-msl/vert/out-block-with-nested-struct-array.vert
++++ b/reference/shaders-msl/vert/out-block-with-nested-struct-array.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/out-block-with-struct-array.vert b/reference/shaders-msl/vert/out-block-with-struct-array.vert
+index 61c7c18b5..b2926982d 100644
+--- a/reference/shaders-msl/vert/out-block-with-struct-array.vert
++++ b/reference/shaders-msl/vert/out-block-with-struct-array.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/return-array.vert b/reference/shaders-msl/vert/return-array.vert
+index dacb0ba30..6330da0c2 100644
+--- a/reference/shaders-msl/vert/return-array.vert
++++ b/reference/shaders-msl/vert/return-array.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vert/signedness-mismatch.shader-inputs.vert b/reference/shaders-msl/vert/signedness-mismatch.shader-inputs.vert
+index 56e00199c..a9a105a0a 100644
+--- a/reference/shaders-msl/vert/signedness-mismatch.shader-inputs.vert
++++ b/reference/shaders-msl/vert/signedness-mismatch.shader-inputs.vert
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vulkan/frag/basic.multiview.no-layered.nocompat.vk.frag b/reference/shaders-msl/vulkan/frag/basic.multiview.no-layered.nocompat.vk.frag
+index f0935f6dc..8c17cabd9 100644
+--- a/reference/shaders-msl/vulkan/frag/basic.multiview.no-layered.nocompat.vk.frag
++++ b/reference/shaders-msl/vulkan/frag/basic.multiview.no-layered.nocompat.vk.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/reference/shaders-msl/vulkan/frag/basic.multiview.nocompat.vk.frag b/reference/shaders-msl/vulkan/frag/basic.multiview.nocompat.vk.frag
+index 67895e3e9..276ce9383 100644
+--- a/reference/shaders-msl/vulkan/frag/basic.multiview.nocompat.vk.frag
++++ b/reference/shaders-msl/vulkan/frag/basic.multiview.nocompat.vk.frag
+@@ -1,5 +1,5 @@
+-#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ #pragma clang diagnostic ignored "-Wmissing-braces"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
+ 
+ #include <metal_stdlib>
+ #include <simd/simd.h>
+diff --git a/spirv_common.hpp b/spirv_common.hpp
+index a4778c29b..3d5247712 100644
+--- a/spirv_common.hpp
++++ b/spirv_common.hpp
+@@ -695,6 +695,7 @@ struct SPIREntryPoint
+ 	FunctionID self = 0;
+ 	std::string name;
+ 	std::string orig_name;
++	std::unordered_map<uint32_t, uint32_t> fp_fast_math_defaults;
+ 	SmallVector<VariableID> interface_variables;
+ 
+ 	Bitset flags;
+@@ -1732,6 +1733,7 @@ struct Meta
+ 		uint32_t spec_id = 0;
+ 		uint32_t index = 0;
+ 		spv::FPRoundingMode fp_rounding_mode = spv::FPRoundingModeMax;
++		spv::FPFastMathModeMask fp_fast_math_mode = spv::FPFastMathModeMaskNone;
+ 		bool builtin = false;
+ 		bool qualified_alias_explicit_override = false;
+ 
+diff --git a/spirv_cross.cpp b/spirv_cross.cpp
+index 8aa4e5e70..350eff342 100644
+--- a/spirv_cross.cpp
++++ b/spirv_cross.cpp
+@@ -2370,6 +2370,10 @@ void Compiler::set_execution_mode(ExecutionMode mode, uint32_t arg0, uint32_t ar
+ 		execution.output_primitives = arg0;
+ 		break;
+ 
++	case ExecutionModeFPFastMathDefault:
++		execution.fp_fast_math_defaults[arg0] = arg1;
++		break;
++
+ 	default:
+ 		break;
+ 	}
+diff --git a/spirv_cross_parsed_ir.cpp b/spirv_cross_parsed_ir.cpp
+index 397e40f4d..760b8037d 100644
+--- a/spirv_cross_parsed_ir.cpp
++++ b/spirv_cross_parsed_ir.cpp
+@@ -452,6 +452,10 @@ void ParsedIR::set_decoration(ID id, Decoration decoration, uint32_t argument)
+ 		dec.fp_rounding_mode = static_cast<FPRoundingMode>(argument);
+ 		break;
+ 
++	case DecorationFPFastMathMode:
++		dec.fp_fast_math_mode = static_cast<FPFastMathModeMask>(argument);
++		break;
++
+ 	default:
+ 		break;
+ 	}
+@@ -643,6 +647,8 @@ uint32_t ParsedIR::get_decoration(ID id, Decoration decoration) const
+ 		return dec.index;
+ 	case DecorationFPRoundingMode:
+ 		return dec.fp_rounding_mode;
++	case DecorationFPFastMathMode:
++		return dec.fp_fast_math_mode;
+ 	default:
+ 		return 1;
+ 	}
+@@ -730,6 +736,10 @@ void ParsedIR::unset_decoration(ID id, Decoration decoration)
+ 		dec.fp_rounding_mode = FPRoundingModeMax;
+ 		break;
+ 
++	case DecorationFPFastMathMode:
++		dec.fp_fast_math_mode = FPFastMathModeMaskNone;
++		break;
++
+ 	case DecorationHlslCounterBufferGOOGLE:
+ 	{
+ 		auto &counter = meta[id].hlsl_magic_counter_buffer;
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index eba8396bf..fd9ebe56a 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -5750,22 +5750,44 @@ void CompilerMSL::emit_header()
+ {
+ 	// This particular line can be overridden during compilation, so make it a flag and not a pragma line.
+ 	if (suppress_missing_prototypes)
+-		statement("#pragma clang diagnostic ignored \"-Wmissing-prototypes\"");
++		add_pragma_line("#pragma clang diagnostic ignored \"-Wmissing-prototypes\"");
+ 	if (suppress_incompatible_pointer_types_discard_qualifiers)
+-		statement("#pragma clang diagnostic ignored \"-Wincompatible-pointer-types-discards-qualifiers\"");
++		add_pragma_line("#pragma clang diagnostic ignored \"-Wincompatible-pointer-types-discards-qualifiers\"");
+ 
+ 	// Disable warning about "sometimes unitialized" when zero-initializing simple threadgroup variables
+ 	if (suppress_sometimes_unitialized)
+-		statement("#pragma clang diagnostic ignored \"-Wsometimes-uninitialized\"");
++		add_pragma_line("#pragma clang diagnostic ignored \"-Wsometimes-uninitialized\"");
+ 
+ 	// Disable warning about missing braces for array<T> template to make arrays a value type
+ 	if (spv_function_implementations.count(SPVFuncImplUnsafeArray) != 0)
+-		statement("#pragma clang diagnostic ignored \"-Wmissing-braces\"");
++		add_pragma_line("#pragma clang diagnostic ignored \"-Wmissing-braces\"");
++
++	// Floating point fast math compile declarations
++	if (msl_options.use_fast_math_pragmas && msl_options.supports_msl_version(3, 2))
++	{
++		uint32_t contract_mask = FPFastMathModeAllowContractMask;
++		uint32_t relax_mask = (FPFastMathModeNSZMask | FPFastMathModeAllowRecipMask | FPFastMathModeAllowReassocMask);
++		uint32_t fast_mask = (relax_mask | FPFastMathModeNotNaNMask | FPFastMathModeNotInfMask);
++
++		// FP math mode
++		uint32_t fp_flags = get_fp_fast_math_flags(true);
++		const char *math_mode = "safe";
++		if ((fp_flags & fast_mask) == fast_mask)		// Must have all flags
++			math_mode = "fast";
++		else if ((fp_flags & relax_mask) == relax_mask)	// Must have all flags
++			math_mode = "relaxed";
++
++		add_pragma_line(join("#pragma metal fp math_mode(", math_mode, ")"));
++
++		// FP contraction
++		const char *contract_mode = ((fp_flags & contract_mask) == contract_mask) ?  "fast" : "off";
++		add_pragma_line(join("#pragma metal fp contract(", contract_mode, ")"));
++	}
+ 
+ 	for (auto &pragma : pragma_lines)
+ 		statement(pragma);
+ 
+-	if (!pragma_lines.empty() || suppress_missing_prototypes)
++	if (!pragma_lines.empty())
+ 		statement("");
+ 
+ 	statement("#include <metal_stdlib>");
+@@ -19861,6 +19883,30 @@ bool CompilerMSL::specialization_constant_is_macro(uint32_t const_id) const
+ 	return constant_macro_ids.find(const_id) != constant_macro_ids.end();
+ }
+ 
++// Start with all fast math flags enabled, and selectively disable based execution modes and float controls
++uint32_t CompilerMSL::get_fp_fast_math_flags(bool incl_ops)
++{
++	uint32_t fp_flags = ~0;
++	auto &ep = get_entry_point();
++
++	if (ep.flags.get(ExecutionModeSignedZeroInfNanPreserve))
++		fp_flags &= ~(FPFastMathModeNSZMask | FPFastMathModeNotInfMask | FPFastMathModeNotNaNMask);
++
++	if (ep.flags.get(ExecutionModeContractionOff))
++		fp_flags &= ~(FPFastMathModeAllowContractMask);
++
++	for (auto &fp_pair : ep.fp_fast_math_defaults)
++		if (fp_pair.second)
++			fp_flags &= get<SPIRConstant>(fp_pair.second).scalar();
++
++	if (incl_ops)
++		for (auto &p_m : ir.meta)
++			if(p_m.second.decoration.decoration_flags.get(DecorationFPFastMathMode))
++				fp_flags &= p_m.second.decoration.fp_fast_math_mode;
++
++	return fp_flags;
++}
++
+ void CompilerMSL::emit_block_hints(const SPIRBlock &)
+ {
+ }
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index a3d08bfcc..6b7866183 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -542,6 +542,10 @@ class CompilerMSL : public CompilerGLSL
+ 		// The result can be queried with get_is_rasterization_disabled.
+ 		bool auto_disable_rasterization = false;
+ 
++		// Use Fast Math pragmas in MSL code, based on SPIR-V float controls and FP ExecutionModes.
++		// Requires MSL 3.2 or above, and has no effect with earlier MSL versions.
++		bool use_fast_math_pragmas = false;
++
+ 		bool is_ios() const
+ 		{
+ 			return platform == iOS;
+@@ -767,6 +771,14 @@ class CompilerMSL : public CompilerGLSL
+ 	// These must only be called after a successful call to CompilerMSL::compile().
+ 	bool specialization_constant_is_macro(uint32_t constant_id) const;
+ 
++	// Returns a mask of SPIR-V FP Fast Math Mode flags, that represents the set of flags that can be applied
++	// across all floating-point types. Each FPFastMathDefault execution mode operation identifies the flags
++	// for one floating-point type, and the value returned here is a bitwise-AND combination across all types.
++	// If incl_ops is enabled, the FPFastMathMode of any SPIR-V operations are also included in the bitwise-AND
++	// to determine the minimal fast-math that applies to all default execution modes and all operations.
++	// The returned value is also affected by execution modes SignedZeroInfNanPreserve and ContractionOff.
++	uint32_t get_fp_fast_math_flags(bool incl_ops);
++
+ protected:
+ 	// An enum of SPIR-V functions that are implemented in additional
+ 	// source code that is added to the shader if necessary.
+diff --git a/spirv_parser.cpp b/spirv_parser.cpp
+index 745ab6e81..91e14b09b 100644
+--- a/spirv_parser.cpp
++++ b/spirv_parser.cpp
+@@ -381,13 +381,21 @@ void Parser::parse(const Instruction &instruction)
+ 		auto mode = static_cast<ExecutionMode>(ops[1]);
+ 		execution.flags.set(mode);
+ 
+-		if (mode == ExecutionModeLocalSizeId)
++		switch (mode)
+ 		{
++		case ExecutionModeLocalSizeId:
+ 			execution.workgroup_size.id_x = ops[2];
+ 			execution.workgroup_size.id_y = ops[3];
+ 			execution.workgroup_size.id_z = ops[4];
+-		}
++			break;
++
++		case ExecutionModeFPFastMathDefault:
++			execution.fp_fast_math_defaults[ops[2]] = ops[3];
++			break;
+ 
++		default:
++			break;
++		}
+ 		break;
+ 	}
+ 

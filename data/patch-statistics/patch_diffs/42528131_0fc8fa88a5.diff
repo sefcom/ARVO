@@ -1,0 +1,53 @@
+From 386e9a10db28af620658ca0c635e1d98915f6306 Mon Sep 17 00:00:00 2001
+From: Frank Tang <ftang@chromium.org>
+Date: Thu, 14 Sep 2023 13:41:31 -0700
+Subject: [PATCH] ICU-22504 Fix buffer overflow write error
+
+---
+ icu4c/source/common/uloc_tag.cpp       | 13 +++++++++++--
+ icu4c/source/test/intltest/loctest.cpp |  2 ++
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/icu4c/source/common/uloc_tag.cpp b/icu4c/source/common/uloc_tag.cpp
+index 7a2b86735860..d261e46b3e28 100644
+--- a/icu4c/source/common/uloc_tag.cpp
++++ b/icu4c/source/common/uloc_tag.cpp
+@@ -1326,14 +1326,23 @@ _appendKeywordsToLanguageTag(const char* localeID, icu::ByteSink& sink, UBool st
+                         attrBufLength = 0;
+                         for (; i < len; i++) {
+                             if (buf[i] != '-') {
+-                                attrBuf[attrBufLength++] = buf[i];
++                                if (static_cast<size_t>(attrBufLength) < sizeof(attrBuf)) {
++                                    attrBuf[attrBufLength++] = buf[i];
++                                } else {
++                                    *status = U_ILLEGAL_ARGUMENT_ERROR;
++                                    return;
++                                }
+                             } else {
+                                 i++;
+                                 break;
+                             }
+                         }
+                         if (attrBufLength > 0) {
+-                            attrBuf[attrBufLength] = 0;
++                            if (static_cast<size_t>(attrBufLength) < sizeof(attrBuf)) {
++                                attrBuf[attrBufLength] = 0;
++                            } else {
++                                *status = U_STRING_NOT_TERMINATED_WARNING;
++                            }
+ 
+                         } else if (i >= len){
+                             break;
+diff --git a/icu4c/source/test/intltest/loctest.cpp b/icu4c/source/test/intltest/loctest.cpp
+index 1c88f77fe638..d72d7acfd32a 100644
+--- a/icu4c/source/test/intltest/loctest.cpp
++++ b/icu4c/source/test/intltest/loctest.cpp
+@@ -5982,6 +5982,8 @@ void LocaleTest::TestToLanguageTag() {
+       {"und-1994-biske-rozaj-x-private", "und-1994-biske-rozaj-x-private"},
+       // ICU-22497
+       {"-ins0-ins17Rz-yqyq-UWLF-uRyq-UWLF-uRRyq-UWLF-uR-UWLF-uRns0-ins17Rz-yq-UWLF-uRyq-UWLF-uRRyq-LF-uRyq-UWLF-uRRyq-UWLF-uRq-UWLF-uRyq-UWLF-uRRyq-UWLF-uR", ""},
++      // ICU-22504
++      {"@attribute=zzo9zzzzzzzs0zzzzzzzzzz55555555555555555555500000000000000000000fffffffffffffffffffffffffzzzzz2mfPAK", ""},
+     };
+     int32_t i;
+     for (i=0; i < UPRV_LENGTHOF(testCases); i++) {

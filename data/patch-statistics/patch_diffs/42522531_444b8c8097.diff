@@ -1,0 +1,2758 @@
+From ce53bc020d37e10a06a59501c45f1ab82539f0c5 Mon Sep 17 00:00:00 2001
+From: jhendersonHDF <jhenderson@hdfgroup.org>
+Date: Sun, 31 Mar 2024 22:44:18 -0500
+Subject: [PATCH] Fixes for file format security issues (#4283)
+
+---
+ src/H5Dchunk.c            |   3 -
+ src/H5Dcompact.c          |  63 +++++++++++-
+ src/H5Dcontig.c           |  91 ++++++++++++++----
+ src/H5Defl.c              |  63 +++++++++++-
+ src/H5Dint.c              |  66 +++++++------
+ src/H5Dpkg.h              |   2 +
+ src/H5Gent.c              | 160 ++++++++++--------------------
+ src/H5Glink.c             | 198 ++++++++++++++++++++++++++------------
+ src/H5Gloc.c              |  17 ++--
+ src/H5Gnode.c             | 121 +++++++++++++----------
+ src/H5Gobj.c              |  15 ++-
+ src/H5Gpkg.h              |  28 +++---
+ src/H5Gprivate.h          |   4 +-
+ src/H5Gstab.c             |  68 +++++++------
+ src/H5Gtest.c             |   8 +-
+ src/H5HG.c                |  20 ++++
+ src/H5HL.c                |  50 +++++++---
+ src/H5HLcache.c           |   2 +-
+ src/H5HLprivate.h         |   1 +
+ src/H5Lint.c              |   4 +-
+ src/H5Ocache.c            |   4 +
+ src/H5Ocopy.c             |   6 ++
+ src/H5Odtype.c            |  22 +++++
+ src/H5Oefl.c              |  42 ++++----
+ src/H5Olayout.c           |  29 +++---
+ src/H5Opkg.h              |   4 +-
+ src/H5Oprivate.h          |   2 +-
+ src/H5Osdspace.c          |  20 ++--
+ src/H5Oshared.c           |  26 ++++-
+ src/H5Oshared.h           |   2 +-
+ src/H5Ostab.c             |  19 +++-
+ src/H5S.c                 |  27 +++++-
+ src/H5Spoint.c            |  16 ++-
+ src/H5Sprivate.h          |  19 ++--
+ src/H5T.c                 | 143 +++++++++++++++++++--------
+ src/H5Tprivate.h          |   1 +
+ src/H5VLnative_blob.c     |  13 ++-
+ src/H5Znbit.c             |  15 ++-
+ tools/lib/h5tools_utils.c |   4 +-
+ 39 files changed, 906 insertions(+), 492 deletions(-)
+
+diff --git a/src/H5Dchunk.c b/src/H5Dchunk.c
+index 310f774e8da..4727cc5d125 100644
+--- a/src/H5Dchunk.c
++++ b/src/H5Dchunk.c
+@@ -7028,9 +7028,6 @@ H5D__chunk_copy(H5F_t *f_src, H5O_storage_chunk_t *storage_src, H5O_layout_chunk
+     bkg = udata.bkg;
+ 
+ done:
+-    /* Caller expects that source datatype will be freed */
+-    if (dt_src && (H5T_close(dt_src) < 0))
+-        HDONE_ERROR(H5E_DATASET, H5E_CANTCLOSEOBJ, FAIL, "can't close temporary datatype");
+     if (dt_dst && (H5T_close(dt_dst) < 0))
+         HDONE_ERROR(H5E_DATASET, H5E_CANTCLOSEOBJ, FAIL, "can't close temporary datatype");
+     if (dt_mem && (H5T_close(dt_mem) < 0))
+diff --git a/src/H5Dcompact.c b/src/H5Dcompact.c
+index 864d4963a6e..de84034f638 100644
+--- a/src/H5Dcompact.c
++++ b/src/H5Dcompact.c
+@@ -58,6 +58,7 @@ typedef struct H5D_compact_iovv_memmanage_ud_t {
+ 
+ /* Layout operation callbacks */
+ static herr_t  H5D__compact_construct(H5F_t *f, H5D_t *dset);
++static herr_t  H5D__compact_init(H5F_t *f, const H5D_t *dset, hid_t dapl_id);
+ static bool    H5D__compact_is_space_alloc(const H5O_storage_t *storage);
+ static herr_t  H5D__compact_io_init(H5D_io_info_t *io_info, H5D_dset_io_info_t *dinfo);
+ static herr_t  H5D__compact_iovv_memmanage_cb(hsize_t dst_off, hsize_t src_off, size_t len, void *_udata);
+@@ -79,7 +80,7 @@ static herr_t  H5D__compact_dest(H5D_t *dset);
+ /* Compact storage layout I/O ops */
+ const H5D_layout_ops_t H5D_LOPS_COMPACT[1] = {{
+     H5D__compact_construct,      /* construct */
+-    NULL,                        /* init */
++    H5D__compact_init,           /* init */
+     H5D__compact_is_space_alloc, /* is_space_alloc */
+     NULL,                        /* is_data_cached */
+     H5D__compact_io_init,        /* io_init */
+@@ -198,6 +199,63 @@ H5D__compact_construct(H5F_t *f, H5D_t *dset)
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* end H5D__compact_construct() */
+ 
++/*-------------------------------------------------------------------------
++ * Function:	H5D__compact_init
++ *
++ * Purpose:	Initialize the info for a compact dataset.  This is
++ *		called when the dataset is initialized.
++ *
++ * Return:	Non-negative on success/Negative on failure
++ *
++ *-------------------------------------------------------------------------
++ */
++static herr_t
++H5D__compact_init(H5F_t H5_ATTR_UNUSED *f, const H5D_t *dset, hid_t H5_ATTR_UNUSED dapl_id)
++{
++    hssize_t snelmts;             /* Temporary holder for number of elements in dataspace */
++    hsize_t  nelmts;              /* Number of elements in dataspace */
++    size_t   dt_size;             /* Size of datatype */
++    hsize_t  data_size;           /* Dataset size, in bytes */
++    herr_t   ret_value = SUCCEED; /* Return value */
++
++    FUNC_ENTER_PACKAGE
++
++    /* Sanity check */
++    assert(dset);
++    assert(H5D_COMPACT == dset->shared->layout.storage.type);
++
++    /*
++     * Now that we've read the dataset's datatype, dataspace and
++     * layout information, perform a quick check for compact datasets
++     * to ensure that the size of the internal buffer that was
++     * allocated for the dataset's raw data matches the size of
++     * the data. A corrupted file can cause a mismatch between the
++     * two, which might result in buffer overflows during future
++     * I/O to the dataset.
++     */
++    if (0 == (dt_size = H5T_GET_SIZE(dset->shared->type)))
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get datatype size");
++    if ((snelmts = H5S_GET_EXTENT_NPOINTS(dset->shared->space)) < 0)
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get number of elements in dataset's dataspace");
++    nelmts = (hsize_t)snelmts;
++
++    /* Compute the size of the dataset's contiguous storage */
++    data_size = nelmts * dt_size;
++
++    /* Check for overflow during multiplication */
++    if (nelmts != (data_size / dt_size))
++        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "size of dataset's storage overflowed");
++
++    /* Check for mismatch */
++    if (dset->shared->layout.storage.u.compact.size != data_size)
++        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
++                    "bad value from dataset header - size of compact dataset's data buffer doesn't match "
++                    "size of dataset data");
++
++done:
++    FUNC_LEAVE_NOAPI(ret_value)
++} /* end H5D__compact_init() */
++
+ /*-------------------------------------------------------------------------
+  * Function:	H5D__compact_is_space_alloc
+  *
+@@ -606,9 +664,6 @@ H5D__compact_copy(H5F_t *f_src, H5O_storage_compact_t *_storage_src, H5F_t *f_ds
+     storage_dst->dirty = true;
+ 
+ done:
+-    /* Caller expects that source datatype will be freed */
+-    if (dt_src && (H5T_close(dt_src) < 0))
+-        HDONE_ERROR(H5E_DATASET, H5E_CANTCLOSEOBJ, FAIL, "can't close temporary datatype");
+     if (dt_dst && (H5T_close(dt_dst) < 0))
+         HDONE_ERROR(H5E_DATASET, H5E_CANTCLOSEOBJ, FAIL, "can't close temporary datatype");
+     if (dt_mem && (H5T_close(dt_mem) < 0))
+diff --git a/src/H5Dcontig.c b/src/H5Dcontig.c
+index d9137b9479a..11b0a8e4ef8 100644
+--- a/src/H5Dcontig.c
++++ b/src/H5Dcontig.c
+@@ -356,6 +356,65 @@ H5D__contig_delete(H5F_t *f, const H5O_storage_t *storage)
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* end H5D__contig_delete */
+ 
++/*-------------------------------------------------------------------------
++ * Function:	H5D__contig_check
++ *
++ * Purpose:	Sanity check the contiguous info for a dataset.
++ *
++ * Return:	Non-negative on success/Negative on failure
++ *
++ *-------------------------------------------------------------------------
++ */
++herr_t
++H5D__contig_check(const H5F_t *f, const H5O_layout_t *layout, const H5S_extent_t *extent, const H5T_t *dt)
++{
++    hsize_t nelmts;              /* Number of elements in dataspace */
++    size_t  dt_size;             /* Size of datatype */
++    hsize_t data_size;           /* Raw data size */
++    herr_t  ret_value = SUCCEED; /* Return value */
++
++    FUNC_ENTER_PACKAGE
++
++    /* Sanity check */
++    assert(f);
++    assert(layout);
++    assert(extent);
++    assert(dt);
++
++    /* Retrieve the number of elements in the dataspace */
++    nelmts = H5S_extent_nelem(extent);
++
++    /* Get the datatype's size */
++    if (0 == (dt_size = H5T_GET_SIZE(dt)))
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to retrieve size of datatype");
++
++    /* Compute the size of the dataset's contiguous storage */
++    data_size = nelmts * dt_size;
++
++    /* Check for overflow during multiplication */
++    if (nelmts != (data_size / dt_size))
++        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "size of dataset's storage overflowed");
++
++    /* Check for invalid (corrupted in the file, probably) dimensions */
++    if (H5_addr_defined(layout->storage.u.contig.addr)) {
++        haddr_t rel_eoa; /* Relative end of file address	*/
++
++        if (HADDR_UNDEF == (rel_eoa = H5F_get_eoa(f, H5FD_MEM_DRAW)))
++            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to determine file size");
++
++        /* Check for invalid dataset size (from bad dimensions) putting the
++         * dataset elements off the end of the file
++         */
++        if (H5_addr_le((layout->storage.u.contig.addr + data_size), layout->storage.u.contig.addr))
++            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "invalid dataset size, likely file corruption");
++        if (H5_addr_gt((layout->storage.u.contig.addr + data_size), rel_eoa))
++            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "invalid dataset size, likely file corruption");
++    }
++
++done:
++    FUNC_LEAVE_NOAPI(ret_value)
++} /* end H5D__contig_check() */
++
+ /*-------------------------------------------------------------------------
+  * Function:	H5D__contig_construct
+  *
+@@ -438,11 +497,10 @@ H5D__contig_construct(H5F_t *f, H5D_t *dset)
+  *-------------------------------------------------------------------------
+  */
+ static herr_t
+-H5D__contig_init(H5F_t H5_ATTR_UNUSED *f, const H5D_t *dset, hid_t H5_ATTR_UNUSED dapl_id)
++H5D__contig_init(H5F_t *f, const H5D_t *dset, hid_t H5_ATTR_UNUSED dapl_id)
+ {
+-    hsize_t tmp_size;            /* Temporary holder for raw data size */
+-    size_t  tmp_sieve_buf_size;  /* Temporary holder for sieve buffer size */
+-    herr_t  ret_value = SUCCEED; /* Return value */
++    size_t tmp_sieve_buf_size;  /* Temporary holder for sieve buffer size */
++    herr_t ret_value = SUCCEED; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+ 
+@@ -450,6 +508,11 @@ H5D__contig_init(H5F_t H5_ATTR_UNUSED *f, const H5D_t *dset, hid_t H5_ATTR_UNUSE
+     assert(f);
+     assert(dset);
+ 
++    /* Sanity check the dataset's info */
++    if (H5D__contig_check(f, &dset->shared->layout, H5S_GET_EXTENT(dset->shared->space), dset->shared->type) <
++        0)
++        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "invalid dataset info");
++
+     /* Compute the size of the contiguous storage for versions of the
+      * layout message less than version 3 because versions 1 & 2 would
+      * truncate the dimension sizes to 32-bits of information. - QAK 5/26/04
+@@ -469,25 +532,16 @@ H5D__contig_init(H5F_t H5_ATTR_UNUSED *f, const H5D_t *dset, hid_t H5_ATTR_UNUSE
+             HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to retrieve size of datatype");
+ 
+         /* Compute the size of the dataset's contiguous storage */
+-        tmp_size = nelmts * dt_size;
+-
+-        /* Check for overflow during multiplication */
+-        if (nelmts != (tmp_size / dt_size))
+-            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "size of dataset's storage overflowed");
+-
+-        /* Assign the dataset's contiguous storage size */
+-        dset->shared->layout.storage.u.contig.size = tmp_size;
+-    } /* end if */
+-    else
+-        tmp_size = dset->shared->layout.storage.u.contig.size;
++        dset->shared->layout.storage.u.contig.size = nelmts * dt_size;
++    }
+ 
+     /* Get the sieve buffer size for the file */
+     tmp_sieve_buf_size = H5F_SIEVE_BUF_SIZE(dset->oloc.file);
+ 
+     /* Adjust the sieve buffer size to the smaller one between the dataset size and the buffer size
+      * from the file access property.  (SLU - 2012/3/30) */
+-    if (tmp_size < tmp_sieve_buf_size)
+-        dset->shared->cache.contig.sieve_buf_size = tmp_size;
++    if (dset->shared->layout.storage.u.contig.size < tmp_sieve_buf_size)
++        dset->shared->cache.contig.sieve_buf_size = dset->shared->layout.storage.u.contig.size;
+     else
+         dset->shared->cache.contig.sieve_buf_size = tmp_sieve_buf_size;
+ 
+@@ -1810,9 +1864,6 @@ H5D__contig_copy(H5F_t *f_src, const H5O_storage_contig_t *storage_src, H5F_t *f
+     } /* end while */
+ 
+ done:
+-    /* Caller expects that source datatype will be freed */
+-    if (dt_src && (H5T_close(dt_src) < 0))
+-        HDONE_ERROR(H5E_DATASET, H5E_CANTCLOSEOBJ, FAIL, "can't close temporary datatype");
+     if (dt_dst && (H5T_close(dt_dst) < 0))
+         HDONE_ERROR(H5E_DATASET, H5E_CANTCLOSEOBJ, FAIL, "can't close temporary datatype");
+     if (dt_mem && (H5T_close(dt_mem) < 0))
+diff --git a/src/H5Defl.c b/src/H5Defl.c
+index 05ca107faec..22348e33fcc 100644
+--- a/src/H5Defl.c
++++ b/src/H5Defl.c
+@@ -55,6 +55,7 @@ typedef struct H5D_efl_writevv_ud_t {
+ 
+ /* Layout operation callbacks */
+ static herr_t  H5D__efl_construct(H5F_t *f, H5D_t *dset);
++static herr_t  H5D__efl_init(H5F_t *f, const H5D_t *dset, hid_t dapl_id);
+ static herr_t  H5D__efl_io_init(H5D_io_info_t *io_info, H5D_dset_io_info_t *dinfo);
+ static ssize_t H5D__efl_readvv(const H5D_io_info_t *io_info, const H5D_dset_io_info_t *dset_info,
+                                size_t dset_max_nseq, size_t *dset_curr_seq, size_t dset_len_arr[],
+@@ -77,7 +78,7 @@ static herr_t H5D__efl_write(const H5O_efl_t *efl, const H5D_t *dset, haddr_t ad
+ /* External File List (EFL) storage layout I/O ops */
+ const H5D_layout_ops_t H5D_LOPS_EFL[1] = {{
+     H5D__efl_construct,      /* construct */
+-    NULL,                    /* init */
++    H5D__efl_init,           /* init */
+     H5D__efl_is_space_alloc, /* is_space_alloc */
+     NULL,                    /* is_data_cached */
+     H5D__efl_io_init,        /* io_init */
+@@ -137,8 +138,9 @@ H5D__efl_construct(H5F_t *f, H5D_t *dset)
+         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to determine datatype size");
+ 
+     /* Check for storage overflows */
+-    max_points  = H5S_get_npoints_max(dset->shared->space);
+-    max_storage = H5O_efl_total_size(&dset->shared->dcpl_cache.efl);
++    max_points = H5S_get_npoints_max(dset->shared->space);
++    if (H5O_efl_total_size(&dset->shared->dcpl_cache.efl, &max_storage) < 0)
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to retrieve size of external file");
+     if (H5S_UNLIMITED == max_points) {
+         if (H5O_EFL_UNLIMITED != max_storage)
+             HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unlimited dataspace but finite storage");
+@@ -149,8 +151,8 @@ H5D__efl_construct(H5F_t *f, H5D_t *dset)
+         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "dataspace size exceeds external storage size");
+ 
+     /* Compute the total size of dataset */
+-    stmp_size = H5S_GET_EXTENT_NPOINTS(dset->shared->space);
+-    assert(stmp_size >= 0);
++    if ((stmp_size = H5S_GET_EXTENT_NPOINTS(dset->shared->space)) < 0)
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to retrieve number of elements in dataspace");
+     tmp_size = (hsize_t)stmp_size * dt_size;
+     H5_CHECKED_ASSIGN(dset->shared->layout.storage.u.contig.size, hsize_t, tmp_size, hssize_t);
+ 
+@@ -161,6 +163,57 @@ H5D__efl_construct(H5F_t *f, H5D_t *dset)
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* end H5D__efl_construct() */
+ 
++/*-------------------------------------------------------------------------
++ * Function:	H5D__efl_init
++ *
++ * Purpose:	Initialize the info for a EFL dataset.  This is
++ *		called when the dataset is initialized.
++ *
++ * Return:	Non-negative on success/Negative on failure
++ *
++ *-------------------------------------------------------------------------
++ */
++static herr_t
++H5D__efl_init(H5F_t H5_ATTR_UNUSED *f, const H5D_t *dset, hid_t H5_ATTR_UNUSED dapl_id)
++{
++    size_t   dt_size;             /* Size of datatype */
++    hssize_t snelmts;             /* Temporary holder for number of elements in dataspace */
++    hsize_t  nelmts;              /* Number of elements in dataspace */
++    hsize_t  data_size;           /* Raw data size */
++    hsize_t  max_storage;         /* Maximum storage size */
++    herr_t   ret_value = SUCCEED; /* Return value */
++
++    FUNC_ENTER_PACKAGE
++
++    /* Sanity check */
++    assert(dset);
++
++    /* Retrieve the size of the dataset's datatype */
++    if (0 == (dt_size = H5T_get_size(dset->shared->type)))
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to determine datatype size");
++
++    /* Retrieve the number of elements in the dataspace */
++    if ((snelmts = H5S_GET_EXTENT_NPOINTS(dset->shared->space)) < 0)
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to retrieve number of elements in dataspace");
++    nelmts = (hsize_t)snelmts;
++
++    /* Compute the size of the dataset's contiguous storage */
++    data_size = nelmts * dt_size;
++
++    /* Check for overflow during multiplication */
++    if (nelmts != (data_size / dt_size))
++        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "size of dataset's storage overflowed");
++
++    /* Check for storage overflows */
++    if (H5O_efl_total_size(&dset->shared->dcpl_cache.efl, &max_storage) < 0)
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to retrieve size of external file");
++    if (H5O_EFL_UNLIMITED != max_storage && data_size > max_storage)
++        HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "dataspace size exceeds external storage size");
++
++done:
++    FUNC_LEAVE_NOAPI(ret_value)
++} /* end H5D__efl_init() */
++
+ /*-------------------------------------------------------------------------
+  * Function:	H5D__efl_is_space_alloc
+  *
+diff --git a/src/H5Dint.c b/src/H5Dint.c
+index 3b9d000f523..71ddda387c7 100644
+--- a/src/H5Dint.c
++++ b/src/H5Dint.c
+@@ -1673,11 +1673,12 @@ static herr_t
+ H5D__open_oid(H5D_t *dataset, hid_t dapl_id)
+ {
+     H5P_genplist_t *plist;                     /* Property list */
+-    H5O_fill_t     *fill_prop;                 /* Pointer to dataset's fill value info */
++    H5O_fill_t     *fill_prop = NULL;          /* Pointer to dataset's fill value info */
+     unsigned        alloc_time_state;          /* Allocation time state */
+     htri_t          msg_exists;                /* Whether a particular type of message exists */
+     bool            layout_init       = false; /* Flag to indicate that chunk information was initialized */
+     bool            must_init_storage = false;
++    bool            fill_init         = false;   /* Flag to indicate that fill information was initialized */
+     herr_t          ret_value         = SUCCEED; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE_TAG(dataset->oloc.addr)
+@@ -1722,34 +1723,6 @@ H5D__open_oid(H5D_t *dataset, hid_t dapl_id)
+     /* Indicate that the layout information was initialized */
+     layout_init = true;
+ 
+-    /*
+-     * Now that we've read the dataset's datatype, dataspace and
+-     * layout information, perform a quick check for compact datasets
+-     * to ensure that the size of the internal buffer that was
+-     * allocated for the dataset's raw data matches the size of
+-     * the data. A corrupted file can cause a mismatch between the
+-     * two, which might result in buffer overflows during future
+-     * I/O to the dataset.
+-     */
+-    if (H5D_COMPACT == dataset->shared->layout.type) {
+-        hssize_t dset_nelemts   = 0;
+-        size_t   dset_type_size = H5T_GET_SIZE(dataset->shared->type);
+-        size_t   dset_data_size = 0;
+-
+-        assert(H5D_COMPACT == dataset->shared->layout.storage.type);
+-
+-        if ((dset_nelemts = H5S_GET_EXTENT_NPOINTS(dataset->shared->space)) < 0)
+-            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL,
+-                        "can't get number of elements in dataset's dataspace");
+-
+-        dset_data_size = (size_t)dset_nelemts * dset_type_size;
+-
+-        if (dataset->shared->layout.storage.u.compact.size != dset_data_size)
+-            HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+-                        "bad value from dataset header - size of compact dataset's data buffer doesn't match "
+-                        "size of dataset data");
+-    }
+-
+     /* Set up flush append property */
+     if (H5D__append_flush_setup(dataset, dapl_id))
+         HGOTO_ERROR(H5E_DATASET, H5E_CANTSET, FAIL, "unable to set up flush append property");
+@@ -1763,6 +1736,9 @@ H5D__open_oid(H5D_t *dataset, hid_t dapl_id)
+     if (msg_exists) {
+         if (NULL == H5O_msg_read(&(dataset->oloc), H5O_FILL_NEW_ID, fill_prop))
+             HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't retrieve message");
++
++        /* Indicate that the fill information was initialized */
++        fill_init = true;
+     } /* end if */
+     else {
+         /* For backward compatibility, try to retrieve the old fill value message */
+@@ -1771,6 +1747,9 @@ H5D__open_oid(H5D_t *dataset, hid_t dapl_id)
+         if (msg_exists) {
+             if (NULL == H5O_msg_read(&(dataset->oloc), H5O_FILL_ID, fill_prop))
+                 HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't retrieve message");
++
++            /* Indicate that the fill information was initialized */
++            fill_init = true;
+         } /* end if */
+         else {
+             /* Set the space allocation time appropriately, based on the type of dataset storage */
+@@ -1809,6 +1788,33 @@ H5D__open_oid(H5D_t *dataset, hid_t dapl_id)
+         (dataset->shared->layout.type == H5D_VIRTUAL && fill_prop->alloc_time == H5D_ALLOC_TIME_INCR))
+         alloc_time_state = 1;
+ 
++    /* Check if there is a fill value, but no type yet */
++    if (fill_prop->buf != NULL && fill_prop->type == NULL) {
++        H5T_t *tmp_type; /* Temporary pointer to dataset's datatype */
++
++        /* Copy the dataset type into the fill value message */
++        if (NULL == (tmp_type = H5T_copy(dataset->shared->type, H5T_COPY_TRANSIENT)))
++            HGOTO_ERROR(H5E_DATASET, H5E_CANTCOPY, FAIL, "unable to copy dataset datatype for fill value");
++
++        /* Check if conversion is necessary on fill buffer, and if fill-value
++         * buffer is too small to hold the result.
++         */
++        if (!H5T_noop_conv(dataset->shared->type, tmp_type)) {
++            size_t bkg_size = MAX(H5T_GET_SIZE(tmp_type), H5T_GET_SIZE(dataset->shared->type));
++
++            assert(fill_prop->size >= 0);
++            if ((size_t)fill_prop->size < bkg_size) {
++                if (H5T_close_real(tmp_type) < 0)
++                    HDONE_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "Can't free temporary datatype");
++                HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
++                            "fill value size doesn't match dataset's datatype size");
++            }
++        }
++
++        if (H5T_close_real(tmp_type) < 0)
++            HGOTO_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "Can't free temporary datatype");
++    }
++
+     /* Set revised fill value properties, if they are different from the defaults */
+     if (H5P_fill_value_cmp(&H5D_def_dset.dcpl_cache.fill, fill_prop, sizeof(H5O_fill_t))) {
+         if (H5P_set(plist, H5D_CRT_FILL_VALUE_NAME, fill_prop) < 0)
+@@ -1845,6 +1851,8 @@ H5D__open_oid(H5D_t *dataset, hid_t dapl_id)
+         if (H5_addr_defined(dataset->oloc.addr) && H5O_close(&(dataset->oloc), NULL) < 0)
+             HDONE_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "unable to release object header");
+         if (dataset->shared) {
++            if (fill_init)
++                H5O_msg_reset(H5O_FILL_ID, fill_prop);
+             if (layout_init)
+                 if (dataset->shared->layout.ops->dest && (dataset->shared->layout.ops->dest)(dataset) < 0)
+                     HDONE_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "unable to destroy layout info");
+diff --git a/src/H5Dpkg.h b/src/H5Dpkg.h
+index 5a0b586594f..4214341b434 100644
+--- a/src/H5Dpkg.h
++++ b/src/H5Dpkg.h
+@@ -712,6 +712,8 @@ H5_DLL herr_t H5D__contig_write(H5D_io_info_t *io_info, H5D_dset_io_info_t *dinf
+ H5_DLL herr_t H5D__contig_copy(H5F_t *f_src, const H5O_storage_contig_t *storage_src, H5F_t *f_dst,
+                                H5O_storage_contig_t *storage_dst, H5T_t *src_dtype, H5O_copy_t *cpy_info);
+ H5_DLL herr_t H5D__contig_delete(H5F_t *f, const H5O_storage_t *store);
++H5_DLL herr_t H5D__contig_check(const H5F_t *f, const H5O_layout_t *layout, const H5S_extent_t *extent,
++                                const H5T_t *dt);
+ 
+ /* Functions that operate on chunked dataset storage */
+ H5_DLL htri_t H5D__chunk_cacheable(const H5D_io_info_t *io_info, H5D_dset_io_info_t *dset_info, haddr_t caddr,
+diff --git a/src/H5Gent.c b/src/H5Gent.c
+index 5b7c064ecfa..40872a041cc 100644
+--- a/src/H5Gent.c
++++ b/src/H5Gent.c
+@@ -342,139 +342,77 @@ H5G__ent_reset(H5G_entry_t *ent)
+ } /* end H5G__ent_reset() */
+ 
+ /*-------------------------------------------------------------------------
+- * Function:    H5G__ent_convert
++ * Function:	H5G__ent_to_link
+  *
+- * Purpose:     Convert a link to a symbol table entry
++ * Purpose:     Convert a symbol table entry to a link
+  *
+- * Return:	Success:	Non-negative
+- *		Failure:	Negative
++ * Return:	Non-negative on success/Negative on failure
+  *
+  *-------------------------------------------------------------------------
+  */
+ herr_t
+-H5G__ent_convert(H5F_t *f, H5HL_t *heap, const char *name, const H5O_link_t *lnk, H5O_type_t obj_type,
+-                 const void *crt_info, H5G_entry_t *ent)
++H5G__ent_to_link(const H5G_entry_t *ent, const H5HL_t *heap, H5O_link_t *lnk)
+ {
+-    size_t name_offset;         /* Offset of name in heap */
+-    herr_t ret_value = SUCCEED; /* Return value */
++    const char *name;                /* Pointer to link name in heap */
++    size_t      block_size;          /* Size of the heap block */
++    bool        dup_soft  = false;   /* xstrdup the symbolic link name or not */
++    herr_t      ret_value = SUCCEED; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+ 
+     /* check arguments */
+-    assert(f);
++    assert(ent);
+     assert(heap);
+-    assert(name);
+     assert(lnk);
+ 
+-    /* Reset the new entry */
+-    H5G__ent_reset(ent);
+-
+-    /* Add the new name to the heap */
+-    if (H5HL_insert(f, heap, strlen(name) + 1, name, &name_offset) < 0)
+-        HGOTO_ERROR(H5E_SYM, H5E_CANTINSERT, FAIL, "unable to insert symbol name into heap");
+-    ent->name_off = name_offset;
+-
+-    /* Build correct information for symbol table entry based on link type */
+-    switch (lnk->type) {
+-        case H5L_TYPE_HARD:
+-            if (obj_type == H5O_TYPE_GROUP) {
+-                const H5G_obj_create_t *gcrt_info = (const H5G_obj_create_t *)crt_info;
+-
+-                ent->type = gcrt_info->cache_type;
+-                if (ent->type != H5G_NOTHING_CACHED)
+-                    ent->cache = gcrt_info->cache;
+-#ifndef NDEBUG
+-                else {
+-                    /* Make sure there is no stab message in the target object
+-                     */
+-                    H5O_loc_t targ_oloc;   /* Location of link target */
+-                    htri_t    stab_exists; /* Whether the target symbol table exists */
+-
+-                    /* Build target object location */
+-                    if (H5O_loc_reset(&targ_oloc) < 0)
+-                        HGOTO_ERROR(H5E_SYM, H5E_CANTRESET, FAIL, "unable to initialize target location");
+-                    targ_oloc.file = f;
+-                    targ_oloc.addr = lnk->u.hard.addr;
+-
+-                    /* Check if a symbol table message exists */
+-                    if ((stab_exists = H5O_msg_exists(&targ_oloc, H5O_STAB_ID)) < 0)
+-                        HGOTO_ERROR(H5E_SYM, H5E_NOTFOUND, FAIL, "unable to check for STAB message");
+-
+-                    assert(!stab_exists);
+-                } /* end else */
+-#endif            /* NDEBUG */
+-            }     /* end if */
+-            else if (obj_type == H5O_TYPE_UNKNOWN) {
+-                /* Try to retrieve symbol table information for caching */
+-                H5O_loc_t  targ_oloc;   /* Location of link target */
+-                H5O_t     *oh;          /* Link target object header */
+-                H5O_stab_t stab;        /* Link target symbol table */
+-                htri_t     stab_exists; /* Whether the target symbol table exists */
+-
+-                /* Build target object location */
+-                if (H5O_loc_reset(&targ_oloc) < 0)
+-                    HGOTO_ERROR(H5E_SYM, H5E_CANTRESET, FAIL, "unable to initialize target location");
+-                targ_oloc.file = f;
+-                targ_oloc.addr = lnk->u.hard.addr;
+-
+-                /* Get the object header */
+-                if (NULL == (oh = H5O_protect(&targ_oloc, H5AC__READ_ONLY_FLAG, false)))
+-                    HGOTO_ERROR(H5E_SYM, H5E_CANTPROTECT, FAIL, "unable to protect target object header");
+-
+-                /* Check if a symbol table message exists */
+-                if ((stab_exists = H5O_msg_exists_oh(oh, H5O_STAB_ID)) < 0) {
+-                    if (H5O_unprotect(&targ_oloc, oh, H5AC__NO_FLAGS_SET) < 0)
+-                        HERROR(H5E_SYM, H5E_CANTUNPROTECT, "unable to release object header");
+-                    HGOTO_ERROR(H5E_SYM, H5E_NOTFOUND, FAIL, "unable to check for STAB message");
+-                } /* end if */
+-
+-                if (stab_exists) {
+-                    /* Read symbol table message */
+-                    if (NULL == H5O_msg_read_oh(f, oh, H5O_STAB_ID, &stab)) {
+-                        if (H5O_unprotect(&targ_oloc, oh, H5AC__NO_FLAGS_SET) < 0)
+-                            HERROR(H5E_SYM, H5E_CANTUNPROTECT, "unable to release object header");
+-                        HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to read STAB message");
+-                    } /* end if */
+-
+-                    /* Cache symbol table message */
+-                    ent->type                  = H5G_CACHED_STAB;
+-                    ent->cache.stab.btree_addr = stab.btree_addr;
+-                    ent->cache.stab.heap_addr  = stab.heap_addr;
+-                } /* end if */
+-                else
+-                    /* No symbol table message, don't cache anything */
+-                    ent->type = H5G_NOTHING_CACHED;
+-
+-                if (H5O_unprotect(&targ_oloc, oh, H5AC__NO_FLAGS_SET) < 0)
+-                    HGOTO_ERROR(H5E_SYM, H5E_CANTUNPROTECT, FAIL, "unable to release object header");
+-            } /* end else */
+-            else
+-                ent->type = H5G_NOTHING_CACHED;
++    /* Get the size of the heap block */
++    block_size = H5HL_heap_get_size(heap);
+ 
+-            ent->header = lnk->u.hard.addr;
+-            break;
++    /* Get pointer to link's name in the heap */
++    if (NULL == (name = (const char *)H5HL_offset_into(heap, ent->name_off)))
++        HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get symbol table link name");
+ 
+-        case H5L_TYPE_SOFT: {
+-            size_t lnk_offset; /* Offset to sym-link value	*/
++    /* Set (default) common info for link */
++    lnk->cset         = H5F_DEFAULT_CSET;
++    lnk->corder       = 0;
++    lnk->corder_valid = false; /* Creation order not valid for this link */
++    if (NULL == (lnk->name = H5MM_strndup(name, (block_size - ent->name_off))))
++        HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to duplicate link name");
+ 
+-            /* Insert link value into local heap */
+-            if (H5HL_insert(f, heap, strlen(lnk->u.soft.name) + 1, lnk->u.soft.name, &lnk_offset) < 0)
+-                HGOTO_ERROR(H5E_SYM, H5E_CANTINIT, FAIL, "unable to write link value to local heap");
++    /* Object is a symbolic or hard link */
++    if (ent->type == H5G_CACHED_SLINK) {
++        const char *s; /* Pointer to link value */
+ 
+-            ent->type                    = H5G_CACHED_SLINK;
+-            ent->cache.slink.lval_offset = lnk_offset;
+-        } break;
++        if (NULL == (s = (const char *)H5HL_offset_into(heap, ent->cache.slink.lval_offset)))
++            HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get symbolic link name");
+ 
+-        case H5L_TYPE_ERROR:
+-        case H5L_TYPE_EXTERNAL:
+-        case H5L_TYPE_MAX:
+-        default:
+-            HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "unrecognized link type");
+-    } /* end switch */
++        /* Copy the link value */
++        if (NULL == (lnk->u.soft.name = H5MM_strndup(s, (block_size - ent->cache.slink.lval_offset))))
++            HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to duplicate symbolic link name");
++
++        dup_soft = true;
++
++        /* Set link type */
++        lnk->type = H5L_TYPE_SOFT;
++    } /* end if */
++    else {
++        /* Set address of object */
++        lnk->u.hard.addr = ent->header;
++
++        /* Set link type */
++        lnk->type = H5L_TYPE_HARD;
++    } /* end else */
+ 
+ done:
++    if (ret_value < 0) {
++        if (lnk->name)
++            H5MM_xfree(lnk->name);
++        if (ent->type == H5G_CACHED_SLINK && dup_soft)
++            H5MM_xfree(lnk->u.soft.name);
++    }
++
+     FUNC_LEAVE_NOAPI(ret_value)
+-} /* end H5G__ent_convert() */
++} /* end H5G__ent_to_link() */
+ 
+ /*-------------------------------------------------------------------------
+  * Function:    H5G__ent_debug
+diff --git a/src/H5Glink.c b/src/H5Glink.c
+index b862947f195..1982f54984c 100644
+--- a/src/H5Glink.c
++++ b/src/H5Glink.c
+@@ -175,70 +175,6 @@ H5G__link_cmp_corder_dec(const void *lnk1, const void *lnk2)
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* end H5G__link_cmp_corder_dec() */
+ 
+-/*-------------------------------------------------------------------------
+- * Function:	H5G__ent_to_link
+- *
+- * Purpose:     Convert a symbol table entry to a link
+- *
+- * Return:	Non-negative on success/Negative on failure
+- *
+- *-------------------------------------------------------------------------
+- */
+-herr_t
+-H5G__ent_to_link(H5O_link_t *lnk, const H5HL_t *heap, const H5G_entry_t *ent, const char *name)
+-{
+-    bool   dup_soft  = false;   /* xstrdup the symbolic link name or not */
+-    herr_t ret_value = SUCCEED; /* Return value */
+-
+-    FUNC_ENTER_PACKAGE
+-
+-    /* check arguments */
+-    assert(lnk);
+-    assert(heap);
+-    assert(ent);
+-    assert(name);
+-
+-    /* Set (default) common info for link */
+-    lnk->cset         = H5F_DEFAULT_CSET;
+-    lnk->corder       = 0;
+-    lnk->corder_valid = false; /* Creation order not valid for this link */
+-    if ((lnk->name = H5MM_xstrdup(name)) == NULL)
+-        HGOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "unable to duplicate link name");
+-
+-    /* Object is a symbolic or hard link */
+-    if (ent->type == H5G_CACHED_SLINK) {
+-        const char *s; /* Pointer to link value */
+-
+-        if ((s = (const char *)H5HL_offset_into(heap, ent->cache.slink.lval_offset)) == NULL)
+-            HGOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "unable to get symbolic link name");
+-
+-        /* Copy the link value */
+-        if ((lnk->u.soft.name = H5MM_xstrdup(s)) == NULL)
+-            HGOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "unable to duplicate symbolic link name");
+-
+-        dup_soft = true;
+-
+-        /* Set link type */
+-        lnk->type = H5L_TYPE_SOFT;
+-    } /* end if */
+-    else {
+-        /* Set address of object */
+-        lnk->u.hard.addr = ent->header;
+-
+-        /* Set link type */
+-        lnk->type = H5L_TYPE_HARD;
+-    } /* end else */
+-
+-done:
+-    if (ret_value < 0) {
+-        if (lnk->name)
+-            H5MM_xfree(lnk->name);
+-        if (ent->type == H5G_CACHED_SLINK && dup_soft)
+-            H5MM_xfree(lnk->u.soft.name);
+-    }
+-    FUNC_LEAVE_NOAPI(ret_value)
+-} /* end H5G__ent_to_link() */
+-
+ /*-------------------------------------------------------------------------
+  * Function:	H5G_link_to_info
+  *
+@@ -317,6 +253,140 @@ H5G_link_to_info(const H5O_loc_t *link_loc, const H5O_link_t *lnk, H5L_info2_t *
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* end H5G_link_to_info() */
+ 
++/*-------------------------------------------------------------------------
++ * Function:    H5G__link_to_ent
++ *
++ * Purpose:     Convert a link to a symbol table entry
++ *
++ * Return:	Success:	Non-negative
++ *		Failure:	Negative
++ *
++ *-------------------------------------------------------------------------
++ */
++herr_t
++H5G__link_to_ent(H5F_t *f, H5HL_t *heap, const H5O_link_t *lnk, H5O_type_t obj_type, const void *crt_info,
++                 H5G_entry_t *ent)
++{
++    size_t name_offset;         /* Offset of name in heap */
++    herr_t ret_value = SUCCEED; /* Return value */
++
++    FUNC_ENTER_PACKAGE
++
++    /* check arguments */
++    assert(f);
++    assert(heap);
++    assert(lnk && lnk->name);
++
++    /* Reset the new entry */
++    H5G__ent_reset(ent);
++
++    /* Add the new name to the heap */
++    if (H5HL_insert(f, heap, strlen(lnk->name) + 1, lnk->name, &name_offset) < 0)
++        HGOTO_ERROR(H5E_SYM, H5E_CANTINSERT, FAIL, "unable to insert symbol name into heap");
++    ent->name_off = name_offset;
++
++    /* Build correct information for symbol table entry based on link type */
++    switch (lnk->type) {
++        case H5L_TYPE_HARD:
++            if (obj_type == H5O_TYPE_GROUP) {
++                const H5G_obj_create_t *gcrt_info = (const H5G_obj_create_t *)crt_info;
++
++                ent->type = gcrt_info->cache_type;
++                if (ent->type != H5G_NOTHING_CACHED)
++                    ent->cache = gcrt_info->cache;
++#ifndef NDEBUG
++                else {
++                    /* Make sure there is no stab message in the target object
++                     */
++                    H5O_loc_t targ_oloc;   /* Location of link target */
++                    htri_t    stab_exists; /* Whether the target symbol table exists */
++
++                    /* Build target object location */
++                    if (H5O_loc_reset(&targ_oloc) < 0)
++                        HGOTO_ERROR(H5E_SYM, H5E_CANTRESET, FAIL, "unable to initialize target location");
++                    targ_oloc.file = f;
++                    targ_oloc.addr = lnk->u.hard.addr;
++
++                    /* Check if a symbol table message exists */
++                    if ((stab_exists = H5O_msg_exists(&targ_oloc, H5O_STAB_ID)) < 0)
++                        HGOTO_ERROR(H5E_SYM, H5E_NOTFOUND, FAIL, "unable to check for STAB message");
++
++                    assert(!stab_exists);
++                } /* end else */
++#endif            /* NDEBUG */
++            }     /* end if */
++            else if (obj_type == H5O_TYPE_UNKNOWN) {
++                /* Try to retrieve symbol table information for caching */
++                H5O_loc_t  targ_oloc;   /* Location of link target */
++                H5O_t     *oh;          /* Link target object header */
++                H5O_stab_t stab;        /* Link target symbol table */
++                htri_t     stab_exists; /* Whether the target symbol table exists */
++
++                /* Build target object location */
++                if (H5O_loc_reset(&targ_oloc) < 0)
++                    HGOTO_ERROR(H5E_SYM, H5E_CANTRESET, FAIL, "unable to initialize target location");
++                targ_oloc.file = f;
++                targ_oloc.addr = lnk->u.hard.addr;
++
++                /* Get the object header */
++                if (NULL == (oh = H5O_protect(&targ_oloc, H5AC__READ_ONLY_FLAG, false)))
++                    HGOTO_ERROR(H5E_SYM, H5E_CANTPROTECT, FAIL, "unable to protect target object header");
++
++                /* Check if a symbol table message exists */
++                if ((stab_exists = H5O_msg_exists_oh(oh, H5O_STAB_ID)) < 0) {
++                    if (H5O_unprotect(&targ_oloc, oh, H5AC__NO_FLAGS_SET) < 0)
++                        HERROR(H5E_SYM, H5E_CANTUNPROTECT, "unable to release object header");
++                    HGOTO_ERROR(H5E_SYM, H5E_NOTFOUND, FAIL, "unable to check for STAB message");
++                } /* end if */
++
++                if (stab_exists) {
++                    /* Read symbol table message */
++                    if (NULL == H5O_msg_read_oh(f, oh, H5O_STAB_ID, &stab)) {
++                        if (H5O_unprotect(&targ_oloc, oh, H5AC__NO_FLAGS_SET) < 0)
++                            HERROR(H5E_SYM, H5E_CANTUNPROTECT, "unable to release object header");
++                        HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to read STAB message");
++                    } /* end if */
++
++                    /* Cache symbol table message */
++                    ent->type                  = H5G_CACHED_STAB;
++                    ent->cache.stab.btree_addr = stab.btree_addr;
++                    ent->cache.stab.heap_addr  = stab.heap_addr;
++                } /* end if */
++                else
++                    /* No symbol table message, don't cache anything */
++                    ent->type = H5G_NOTHING_CACHED;
++
++                if (H5O_unprotect(&targ_oloc, oh, H5AC__NO_FLAGS_SET) < 0)
++                    HGOTO_ERROR(H5E_SYM, H5E_CANTUNPROTECT, FAIL, "unable to release object header");
++            } /* end else */
++            else
++                ent->type = H5G_NOTHING_CACHED;
++
++            ent->header = lnk->u.hard.addr;
++            break;
++
++        case H5L_TYPE_SOFT: {
++            size_t lnk_offset; /* Offset to sym-link value	*/
++
++            /* Insert link value into local heap */
++            if (H5HL_insert(f, heap, strlen(lnk->u.soft.name) + 1, lnk->u.soft.name, &lnk_offset) < 0)
++                HGOTO_ERROR(H5E_SYM, H5E_CANTINIT, FAIL, "unable to write link value to local heap");
++
++            ent->type                    = H5G_CACHED_SLINK;
++            ent->cache.slink.lval_offset = lnk_offset;
++        } break;
++
++        case H5L_TYPE_ERROR:
++        case H5L_TYPE_EXTERNAL:
++        case H5L_TYPE_MAX:
++        default:
++            HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "unrecognized link type");
++    } /* end switch */
++
++done:
++    FUNC_LEAVE_NOAPI(ret_value)
++} /* end H5G__link_to_ent() */
++
+ /*-------------------------------------------------------------------------
+  * Function:	H5G__link_to_loc
+  *
+diff --git a/src/H5Gloc.c b/src/H5Gloc.c
+index 1ba45dee223..d04c582d009 100644
+--- a/src/H5Gloc.c
++++ b/src/H5Gloc.c
+@@ -553,7 +553,7 @@ H5G__loc_insert(H5G_loc_t *grp_loc, char *name, H5G_loc_t *obj_loc, H5O_type_t o
+     lnk.u.hard.addr  = obj_loc->oloc->addr;
+ 
+     /* Insert new group into current group's symbol table */
+-    if (H5G_obj_insert(grp_loc->oloc, name, &lnk, true, obj_type, crt_info) < 0)
++    if (H5G_obj_insert(grp_loc->oloc, &lnk, true, obj_type, crt_info) < 0)
+         HGOTO_ERROR(H5E_SYM, H5E_CANTINSERT, FAIL, "unable to insert object");
+ 
+     /* Set the name of the object location */
+@@ -644,24 +644,21 @@ H5G__loc_addr_cb(H5G_loc_t H5_ATTR_UNUSED *grp_loc /*in*/, const char H5_ATTR_UN
+                  const H5O_link_t H5_ATTR_UNUSED *lnk, H5G_loc_t *obj_loc, void *_udata /*in,out*/,
+                  H5G_own_loc_t *own_loc /*out*/)
+ {
+-    haddr_t *udata     = (haddr_t *)_udata; /* User data passed in */
+-    herr_t   ret_value = SUCCEED;           /* Return value */
++    haddr_t *udata = (haddr_t *)_udata; /* User data passed in */
+ 
+-    FUNC_ENTER_PACKAGE
++    FUNC_ENTER_PACKAGE_NOERR
+ 
+     /* Check if the name in this group resolved to a valid link */
+     if (obj_loc == NULL)
+-        HGOTO_ERROR(H5E_SYM, H5E_NOTFOUND, FAIL, "name doesn't exist");
+-
+-    /* Set address of object */
+-    *udata = obj_loc->oloc->addr;
++        *udata = HADDR_UNDEF; /* No object found */
++    else
++        *udata = obj_loc->oloc->addr; /* Set address of object */
+ 
+-done:
+     /* Indicate that this callback didn't take ownership of the group *
+      * location for the object */
+     *own_loc = H5G_OWN_NONE;
+ 
+-    FUNC_LEAVE_NOAPI(ret_value)
++    FUNC_LEAVE_NOAPI(SUCCEED)
+ } /* end H5G__loc_addr_cb() */
+ 
+ /*-------------------------------------------------------------------------
+diff --git a/src/H5Gnode.c b/src/H5Gnode.c
+index b4bd1214bf8..f211e74e041 100644
+--- a/src/H5Gnode.c
++++ b/src/H5Gnode.c
+@@ -344,6 +344,7 @@ H5G__node_cmp2(void *_lt_key, void *_udata, void *_rt_key)
+     H5G_node_key_t  *lt_key = (H5G_node_key_t *)_lt_key;
+     H5G_node_key_t  *rt_key = (H5G_node_key_t *)_rt_key;
+     const char      *s1, *s2;
++    size_t           max_len;
+     int              ret_value = SUCCEED; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+@@ -359,8 +360,14 @@ H5G__node_cmp2(void *_lt_key, void *_udata, void *_rt_key)
+     if ((s2 = (const char *)H5HL_offset_into(udata->heap, rt_key->offset)) == NULL)
+         HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get key name");
+ 
++    /* Compute maximum length of string to compare */
++    if (rt_key->offset > lt_key->offset)
++        max_len = udata->block_size - rt_key->offset;
++    else
++        max_len = udata->block_size - lt_key->offset;
++
+     /* Set return value */
+-    ret_value = strcmp(s1, s2);
++    ret_value = strncmp(s1, s2, max_len);
+ 
+ done:
+     FUNC_LEAVE_NOAPI(ret_value)
+@@ -406,13 +413,13 @@ H5G__node_cmp3(void *_lt_key, void *_udata, void *_rt_key)
+     /* left side */
+     if ((s = (const char *)H5HL_offset_into(udata->heap, lt_key->offset)) == NULL)
+         HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get key name");
+-    if (strcmp(udata->name, s) <= 0)
++    if (strncmp(udata->name, s, (udata->block_size - lt_key->offset)) <= 0)
+         ret_value = (-1);
+     else {
+         /* right side */
+         if ((s = (const char *)H5HL_offset_into(udata->heap, rt_key->offset)) == NULL)
+             HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get key name");
+-        if (strcmp(udata->name, s) > 0)
++        if (strncmp(udata->name, s, (udata->block_size - rt_key->offset)) > 0)
+             ret_value = 1;
+     } /* end else */
+ 
+@@ -476,7 +483,7 @@ H5G__node_found(H5F_t *f, haddr_t addr, const void H5_ATTR_UNUSED *_lt_key, bool
+ 
+         if ((s = (const char *)H5HL_offset_into(udata->common.heap, sn->entry[idx].name_off)) == NULL)
+             HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get symbol table name");
+-        cmp = strcmp(udata->common.name, s);
++        cmp = strncmp(udata->common.name, s, (udata->common.block_size - sn->entry[idx].name_off));
+ 
+         if (cmp < 0)
+             rt = idx;
+@@ -574,7 +581,7 @@ H5G__node_insert(H5F_t *f, haddr_t addr, void H5_ATTR_UNUSED *_lt_key, bool H5_A
+             HGOTO_ERROR(H5E_SYM, H5E_CANTGET, H5B_INS_ERROR, "unable to get symbol table name");
+ 
+         /* Check if symbol is already present */
+-        if (0 == (cmp = strcmp(udata->common.name, s)))
++        if (0 == (cmp = strncmp(udata->common.name, s, (udata->common.block_size - sn->entry[idx].name_off))))
+             HGOTO_ERROR(H5E_SYM, H5E_CANTINSERT, H5B_INS_ERROR, "symbol is already present in symbol table");
+ 
+         if (cmp < 0)
+@@ -585,8 +592,7 @@ H5G__node_insert(H5F_t *f, haddr_t addr, void H5_ATTR_UNUSED *_lt_key, bool H5_A
+     idx += cmp > 0 ? 1 : 0;
+ 
+     /* Convert link information & name to symbol table entry */
+-    if (H5G__ent_convert(f, udata->common.heap, udata->common.name, udata->lnk, udata->obj_type,
+-                         udata->crt_info, &ent) < 0)
++    if (H5G__link_to_ent(f, udata->common.heap, udata->lnk, udata->obj_type, udata->crt_info, &ent) < 0)
+         HGOTO_ERROR(H5E_SYM, H5E_CANTCONVERT, H5B_INS_ERROR, "unable to convert link");
+ 
+     /* Determine where to place entry in node */
+@@ -727,7 +733,7 @@ H5G__node_remove(H5F_t *f, haddr_t addr, void H5_ATTR_NDEBUG_UNUSED *_lt_key /*i
+             idx = (lt + rt) / 2;
+             if ((s = (const char *)H5HL_offset_into(udata->common.heap, sn->entry[idx].name_off)) == NULL)
+                 HGOTO_ERROR(H5E_SYM, H5E_CANTGET, H5B_INS_ERROR, "unable to get symbol table name");
+-            cmp = strcmp(udata->common.name, s);
++            cmp = strncmp(udata->common.name, s, (udata->common.block_size - sn->entry[idx].name_off));
+             if (cmp < 0)
+                 rt = idx;
+             else
+@@ -740,7 +746,11 @@ H5G__node_remove(H5F_t *f, haddr_t addr, void H5_ATTR_NDEBUG_UNUSED *_lt_key /*i
+         /* Get a pointer to the name of the link */
+         if (NULL == (lnk.name = (char *)H5HL_offset_into(udata->common.heap, sn->entry[idx].name_off)))
+             HGOTO_ERROR(H5E_SYM, H5E_CANTGET, H5B_INS_ERROR, "unable to get link name");
+-        link_name_len = strlen(lnk.name) + 1;
++
++        /* Compute the size of the link name in the heap, being defensive about corrupted data */
++        link_name_len = strnlen(lnk.name, (udata->common.block_size - sn->entry[idx].name_off)) + 1;
++        if (link_name_len > (udata->common.block_size - sn->entry[idx].name_off))
++            link_name_len = (udata->common.block_size - sn->entry[idx].name_off);
+ 
+         /* Set up rest of link structure */
+         lnk.corder_valid = false;
+@@ -778,7 +788,13 @@ H5G__node_remove(H5F_t *f, haddr_t addr, void H5_ATTR_NDEBUG_UNUSED *_lt_key /*i
+             if (lnk.u.soft.name) {
+                 size_t soft_link_len; /* Length of string in local heap */
+ 
+-                soft_link_len = strlen(lnk.u.soft.name) + 1;
++                /* Compute the size of the soft link name in the heap, being defensive about corrupted data */
++                soft_link_len = strnlen(lnk.u.soft.name,
++                                        (udata->common.block_size - sn->entry[idx].cache.slink.lval_offset)) +
++                                1;
++                if (soft_link_len > (udata->common.block_size - sn->entry[idx].cache.slink.lval_offset))
++                    soft_link_len = (udata->common.block_size - sn->entry[idx].cache.slink.lval_offset);
++
+                 if (H5HL_remove(f, udata->common.heap, sn->entry[idx].cache.slink.lval_offset,
+                                 soft_link_len) < 0)
+                     HGOTO_ERROR(H5E_SYM, H5E_CANTDELETE, H5B_INS_ERROR,
+@@ -912,15 +928,10 @@ H5G__node_iterate(H5F_t *f, const void H5_ATTR_UNUSED *_lt_key, haddr_t addr,
+         if (udata->skip > 0)
+             --udata->skip;
+         else {
+-            H5O_link_t  lnk;  /* Link for entry */
+-            const char *name; /* Pointer to link name in heap */
+-
+-            /* Get the pointer to the name of the link in the heap */
+-            if ((name = (const char *)H5HL_offset_into(udata->heap, ents[u].name_off)) == NULL)
+-                HGOTO_ERROR(H5E_SYM, H5E_CANTGET, H5_ITER_ERROR, "unable to get symbol table node name");
++            H5O_link_t lnk; /* Link for entry */
+ 
+             /* Convert the entry to a link */
+-            if (H5G__ent_to_link(&lnk, udata->heap, &ents[u], name) < 0)
++            if (H5G__ent_to_link(&ents[u], udata->heap, &lnk) < 0)
+                 HGOTO_ERROR(H5E_SYM, H5E_CANTCONVERT, H5_ITER_ERROR,
+                             "unable to convert symbol table entry to link");
+ 
+@@ -1130,7 +1141,6 @@ H5G__node_copy(H5F_t *f, const void H5_ATTR_UNUSED *_lt_key, haddr_t addr, const
+     H5G_bt_it_cpy_t *udata    = (H5G_bt_it_cpy_t *)_udata;
+     const H5O_loc_t *src_oloc = udata->src_oloc;
+     H5O_copy_t      *cpy_info = udata->cpy_info;
+-    H5HL_t          *heap     = NULL;
+     H5G_node_t      *sn       = NULL;
+     unsigned int     i; /* Local index variable */
+     int              ret_value = H5_ITER_CONT;
+@@ -1141,32 +1151,30 @@ H5G__node_copy(H5F_t *f, const void H5_ATTR_UNUSED *_lt_key, haddr_t addr, const
+     assert(f);
+     assert(H5_addr_defined(addr));
+     assert(udata);
++    assert(udata->src_heap);
+ 
+     /* load the symbol table into memory from the source file */
+     if (NULL == (sn = (H5G_node_t *)H5AC_protect(f, H5AC_SNODE, addr, f, H5AC__READ_ONLY_FLAG)))
+         HGOTO_ERROR(H5E_SYM, H5E_CANTLOAD, H5_ITER_ERROR, "unable to load symbol table node");
+ 
+-    /* get the base address of the heap */
+-    if (NULL == (heap = H5HL_protect(f, udata->src_heap_addr, H5AC__READ_ONLY_FLAG)))
+-        HGOTO_ERROR(H5E_SYM, H5E_NOTFOUND, H5_ITER_ERROR, "unable to protect symbol name");
+-
+     /* copy object in this node one by one */
+     for (i = 0; i < sn->nsyms; i++) {
+         H5G_entry_t *src_ent =
+             &(sn->entry[i]);             /* Convenience variable to refer to current source group entry */
+         H5O_link_t          lnk;         /* Link to insert */
+-        const char         *name;        /* Name of source object */
++        char               *name;        /* Name of source object */
+         H5G_entry_t         tmp_src_ent; /* Temporary copy. Change will not affect the cache */
+         H5O_type_t          obj_type = H5O_TYPE_UNKNOWN; /* Target object type */
+         H5G_copy_file_ud_t *cpy_udata;                   /* Copy file udata */
+         H5G_obj_create_t    gcrt_info;                   /* Group creation info */
++        size_t              max_link_len;                /* Max. length of string in local heap */
+ 
+         /* expand soft link */
+         if (H5G_CACHED_SLINK == src_ent->type && cpy_info->expand_soft_link) {
+-            haddr_t    obj_addr;  /* Address of object pointed to by soft link */
+-            H5G_loc_t  grp_loc;   /* Group location holding soft link */
+-            H5G_name_t grp_path;  /* Path for group holding soft link */
+-            char      *link_name; /* Pointer to value of soft link */
++            haddr_t    obj_addr = HADDR_UNDEF; /* Address of object pointed to by soft link */
++            H5G_loc_t  grp_loc;                /* Group location holding soft link */
++            H5G_name_t grp_path;               /* Path for group holding soft link */
++            char      *link_name;              /* Pointer to value of soft link */
+ 
+             /* Make a temporary copy, so that it will not change the info in the cache */
+             H5MM_memcpy(&tmp_src_ent, src_ent, sizeof(H5G_entry_t));
+@@ -1179,17 +1187,24 @@ H5G__node_copy(H5F_t *f, const void H5_ATTR_UNUSED *_lt_key, haddr_t addr, const
+             H5_GCC_CLANG_DIAG_ON("cast-qual")
+ 
+             /* Get pointer to link value in local heap */
+-            if ((link_name = (char *)H5HL_offset_into(heap, tmp_src_ent.cache.slink.lval_offset)) == NULL)
+-                HGOTO_ERROR(H5E_OHDR, H5E_CANTGET, H5_ITER_ERROR, "unable to get link name");
++            if ((link_name =
++                     (char *)H5HL_offset_into(udata->src_heap, tmp_src_ent.cache.slink.lval_offset)) == NULL)
++                HGOTO_ERROR(H5E_SYM, H5E_CANTGET, H5_ITER_ERROR, "unable to get link name");
++
++            /* Sanity check soft link name, to detect running off the end of the heap block */
++            max_link_len = udata->src_block_size - tmp_src_ent.cache.slink.lval_offset;
++            if (strnlen(link_name, max_link_len) == max_link_len)
++                HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, H5_ITER_ERROR, "invalid link name offset");
+ 
+             /* Check if the object pointed by the soft link exists in the source file */
+-            if (H5G__loc_addr(&grp_loc, link_name, &obj_addr) >= 0) {
++            if (H5G__loc_addr(&grp_loc, link_name, &obj_addr) < 0)
++                HGOTO_ERROR(H5E_SYM, H5E_CANTFIND, H5_ITER_ERROR,
++                            "unable to check if soft link resolves to an object");
++            if (H5_addr_defined(obj_addr)) {
+                 tmp_src_ent.header = obj_addr;
+                 src_ent            = &tmp_src_ent;
+             } /* end if */
+-            else
+-                H5E_clear_stack(NULL); /* discard any errors from a dangling soft link */
+-        }                              /* if ((H5G_CACHED_SLINK == src_ent->type)... */
++        }     /* if ((H5G_CACHED_SLINK == src_ent->type)... */
+ 
+         /* Check if object in source group is a hard link */
+         if (H5_addr_defined(src_ent->header)) {
+@@ -1230,28 +1245,39 @@ H5G__node_copy(H5F_t *f, const void H5_ATTR_UNUSED *_lt_key, haddr_t addr, const
+ 
+             /* Construct link information for eventual insertion */
+             lnk.type = H5L_TYPE_SOFT;
+-            if ((lnk.u.soft.name = (char *)H5HL_offset_into(heap, src_ent->cache.slink.lval_offset)) == NULL)
++            if ((lnk.u.soft.name =
++                     (char *)H5HL_offset_into(udata->src_heap, src_ent->cache.slink.lval_offset)) == NULL)
+                 HGOTO_ERROR(H5E_OHDR, H5E_CANTGET, H5_ITER_ERROR, "unable to get link name");
++
++            /* Sanity check soft link name, to detect running off the end of the heap block */
++            max_link_len = udata->src_block_size - src_ent->cache.slink.lval_offset;
++            if (strnlen(lnk.u.soft.name, max_link_len) == max_link_len)
++                HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, H5_ITER_ERROR, "invalid link name offset");
+         } /* else if */
+         else
+             assert(0 && "Unknown entry type");
+ 
++        /* Determine name of source object */
++        if ((name = (char *)H5HL_offset_into(udata->src_heap, src_ent->name_off)) == NULL)
++            HGOTO_ERROR(H5E_SYM, H5E_CANTGET, H5_ITER_ERROR, "unable to get source object name");
++
++        /* Sanity check soft link name, to detect running off the end of the heap block */
++        max_link_len = udata->src_block_size - src_ent->name_off;
++        if (strnlen(name, max_link_len) == max_link_len)
++            HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, H5_ITER_ERROR, "invalid link name offset");
++
+         /* Set up common link data */
+         lnk.cset         = H5F_DEFAULT_CSET; /* XXX: Allow user to set this */
+         lnk.corder       = 0;                /* Creation order is not tracked for old-style links */
+         lnk.corder_valid = false;            /* Creation order is not valid */
+-        /* lnk.name = name; */               /* This will be set in callback */
+-
+-        /* Determine name of source object */
+-        if ((name = (const char *)H5HL_offset_into(heap, src_ent->name_off)) == NULL)
+-            HGOTO_ERROR(H5E_OHDR, H5E_CANTGET, H5_ITER_ERROR, "unable to get source object name");
++        lnk.name         = name;             /* Name of link */
+ 
+         /* Set copied metadata tag */
+         H5_BEGIN_TAG(H5AC__COPIED_TAG)
+ 
+         /* Insert the new object in the destination file's group */
+         /* (Don't increment the link count - that's already done above for hard links) */
+-        if (H5G__stab_insert_real(udata->dst_file, udata->dst_stab, name, &lnk, obj_type,
++        if (H5G__stab_insert_real(udata->dst_file, udata->dst_stab, &lnk, obj_type,
+                                   (obj_type == H5O_TYPE_GROUP ? &gcrt_info : NULL)) < 0)
+             HGOTO_ERROR_TAG(H5E_DATATYPE, H5E_CANTINIT, H5_ITER_ERROR, "unable to insert the name");
+ 
+@@ -1261,9 +1287,6 @@ H5G__node_copy(H5F_t *f, const void H5_ATTR_UNUSED *_lt_key, haddr_t addr, const
+     } /* end of for (i=0; i<sn->nsyms; i++) */
+ 
+ done:
+-    if (heap && H5HL_unprotect(heap) < 0)
+-        HDONE_ERROR(H5E_SYM, H5E_PROTECT, H5_ITER_ERROR, "unable to unprotect symbol name");
+-
+     if (sn && H5AC_unprotect(f, H5AC_SNODE, addr, sn, H5AC__NO_FLAGS_SET) < 0)
+         HDONE_ERROR(H5E_SYM, H5E_PROTECT, H5_ITER_ERROR, "unable to release object header");
+ 
+@@ -1318,18 +1341,13 @@ H5G__node_build_table(H5F_t *f, const void H5_ATTR_UNUSED *_lt_key, haddr_t addr
+ 
+     /* Iterate over the symbol table node entries, adding to link table */
+     for (u = 0; u < sn->nsyms; u++) {
+-        const char *name;   /* Pointer to link name in heap */
+-        size_t      linkno; /* Link allocated */
+-
+-        /* Get pointer to link's name in the heap */
+-        if ((name = (const char *)H5HL_offset_into(udata->heap, sn->entry[u].name_off)) == NULL)
+-            HGOTO_ERROR(H5E_SYM, H5E_CANTGET, H5_ITER_ERROR, "unable to get symbol table link name");
++        size_t linkno; /* Link allocated */
+ 
+         /* Determine the link to operate on in the table */
+         linkno = udata->ltable->nlinks++;
+ 
+         /* Convert the entry to a link */
+-        if (H5G__ent_to_link(&udata->ltable->lnks[linkno], udata->heap, &sn->entry[u], name) < 0)
++        if (H5G__ent_to_link(&sn->entry[u], udata->heap, &udata->ltable->lnks[linkno]) < 0)
+             HGOTO_ERROR(H5E_SYM, H5E_CANTCONVERT, H5_ITER_ERROR,
+                         "unable to convert symbol table entry to link");
+     } /* end for */
+@@ -1411,7 +1429,8 @@ H5G_node_debug(H5F_t *f, haddr_t addr, FILE *stream, int indent, int fwidth, had
+         H5G_bt_common_t udata; /*data to pass through B-tree	*/
+ 
+         H5E_clear_stack(NULL); /* discard that error */
+-        udata.heap = heap;
++        udata.heap       = heap;
++        udata.block_size = H5HL_heap_get_size(heap);
+         if (H5B_debug(f, addr, stream, indent, fwidth, H5B_SNODE, &udata) < 0)
+             HGOTO_ERROR(H5E_SYM, H5E_CANTLOAD, FAIL, "unable to debug B-tree node");
+     } /* end if */
+diff --git a/src/H5Gobj.c b/src/H5Gobj.c
+index 2b73c2b5cd9..51feeaad56d 100644
+--- a/src/H5Gobj.c
++++ b/src/H5Gobj.c
+@@ -397,7 +397,7 @@ H5G__obj_stab_to_new_cb(const H5O_link_t *lnk, void *_udata)
+ 
+     /* Insert link into group */
+     H5_GCC_CLANG_DIAG_OFF("cast-qual")
+-    if (H5G_obj_insert(udata->grp_oloc, lnk->name, (H5O_link_t *)lnk, false, H5O_TYPE_UNKNOWN, NULL) < 0)
++    if (H5G_obj_insert(udata->grp_oloc, (H5O_link_t *)lnk, false, H5O_TYPE_UNKNOWN, NULL) < 0)
+         HGOTO_ERROR(H5E_SYM, H5E_CANTINSERT, H5_ITER_ERROR, "can't insert link into group");
+     H5_GCC_CLANG_DIAG_ON("cast-qual")
+ 
+@@ -409,8 +409,8 @@ H5G__obj_stab_to_new_cb(const H5O_link_t *lnk, void *_udata)
+  * Function:	H5G_obj_insert
+  *
+  * Purpose:	Insert a new symbol into the group described by GRP_OLOC.
+- *		file F.	 The name of the new symbol is NAME and its symbol
+- *		table entry is OBJ_LNK.  Increment the reference
++ *		file F.	 The name of the new symbol is OBJ_LNK->NAME and its
++ *		symbol table entry is OBJ_LNK.  Increment the reference
+  *              count for the object the link points if OBJ_LNK is a hard link
+  *              and ADJ_LINK is true.
+  *
+@@ -419,8 +419,8 @@ H5G__obj_stab_to_new_cb(const H5O_link_t *lnk, void *_udata)
+  *-------------------------------------------------------------------------
+  */
+ herr_t
+-H5G_obj_insert(const H5O_loc_t *grp_oloc, const char *name, H5O_link_t *obj_lnk, bool adj_link,
+-               H5O_type_t obj_type, const void *crt_info)
++H5G_obj_insert(const H5O_loc_t *grp_oloc, H5O_link_t *obj_lnk, bool adj_link, H5O_type_t obj_type,
++               const void *crt_info)
+ {
+     H5O_pline_t  tmp_pline;             /* Pipeline message */
+     H5O_pline_t *pline = NULL;          /* Pointer to pipeline message */
+@@ -434,7 +434,6 @@ H5G_obj_insert(const H5O_loc_t *grp_oloc, const char *name, H5O_link_t *obj_lnk,
+ 
+     /* check arguments */
+     assert(grp_oloc && grp_oloc->file);
+-    assert(name && *name);
+     assert(obj_lnk);
+ 
+     /* Check if we have information about the number of objects in this group */
+@@ -544,7 +543,7 @@ H5G_obj_insert(const H5O_loc_t *grp_oloc, const char *name, H5O_link_t *obj_lnk,
+              *  group is in the "new format" now and the link info should be
+              *  set up, etc.
+              */
+-            if (H5G_obj_insert(grp_oloc, name, obj_lnk, adj_link, obj_type, crt_info) < 0)
++            if (H5G_obj_insert(grp_oloc, obj_lnk, adj_link, obj_type, crt_info) < 0)
+                 HGOTO_ERROR(H5E_SYM, H5E_CANTINSERT, FAIL, "unable to insert link into group");
+ 
+             /* Done with insertion now */
+@@ -557,7 +556,7 @@ H5G_obj_insert(const H5O_loc_t *grp_oloc, const char *name, H5O_link_t *obj_lnk,
+     /* Insert into symbol table or "dense" storage */
+     if (use_old_format) {
+         /* Insert into symbol table */
+-        if (H5G__stab_insert(grp_oloc, name, obj_lnk, obj_type, crt_info) < 0)
++        if (H5G__stab_insert(grp_oloc, obj_lnk, obj_type, crt_info) < 0)
+             HGOTO_ERROR(H5E_SYM, H5E_CANTINSERT, FAIL, "unable to insert entry into symbol table");
+     } /* end if */
+     else {
+diff --git a/src/H5Gpkg.h b/src/H5Gpkg.h
+index a90ada92ba9..f4f1749dc88 100644
+--- a/src/H5Gpkg.h
++++ b/src/H5Gpkg.h
+@@ -151,8 +151,9 @@ typedef struct {
+  */
+ typedef struct H5G_bt_common_t {
+     /* downward */
+-    const char *name; /*points to temporary memory         */
+-    H5HL_t     *heap; /*symbol table heap             */
++    const char *name;       /* Points to temporary memory */
++    H5HL_t     *heap;       /* Symbol table heap */
++    size_t      block_size; /* Size of the heap block */
+ } H5G_bt_common_t;
+ 
+ /*
+@@ -210,11 +211,12 @@ typedef struct H5G_bt_it_it_t {
+ 
+ /* Data passed through B-tree iteration for copying copy symbol table content */
+ typedef struct H5G_bt_it_cpy_t {
+-    const H5O_loc_t  *src_oloc;      /* Source object location */
+-    haddr_t           src_heap_addr; /* Heap address of the source symbol table  */
+-    H5F_t            *dst_file;      /* File of destination group */
+-    const H5O_stab_t *dst_stab;      /* Symbol table message for destination group */
+-    H5O_copy_t       *cpy_info;      /* Information for copy operation */
++    const H5O_loc_t  *src_oloc;       /* Source object location */
++    H5HL_t           *src_heap;       /* Heap for the source symbol table  */
++    size_t            src_block_size; /* Size of the heap block */
++    H5F_t            *dst_file;       /* File of destination group */
++    const H5O_stab_t *dst_stab;       /* Symbol table message for destination group */
++    H5O_copy_t       *cpy_info;       /* Information for copy operation */
+ } H5G_bt_it_cpy_t;
+ 
+ /* Common information for "by index" lookups in symbol tables */
+@@ -345,9 +347,9 @@ H5_DLL const char *H5G__component(const char *name, size_t *size_p);
+  */
+ H5_DLL herr_t H5G__stab_create(H5O_loc_t *grp_oloc, const H5O_ginfo_t *ginfo, H5O_stab_t *stab);
+ H5_DLL herr_t H5G__stab_create_components(H5F_t *f, H5O_stab_t *stab, size_t size_hint);
+-H5_DLL herr_t H5G__stab_insert(const H5O_loc_t *grp_oloc, const char *name, H5O_link_t *obj_lnk,
+-                               H5O_type_t obj_type, const void *crt_info);
+-H5_DLL herr_t H5G__stab_insert_real(H5F_t *f, const H5O_stab_t *stab, const char *name, H5O_link_t *obj_lnk,
++H5_DLL herr_t H5G__stab_insert(const H5O_loc_t *grp_oloc, H5O_link_t *obj_lnk, H5O_type_t obj_type,
++                               const void *crt_info);
++H5_DLL herr_t H5G__stab_insert_real(H5F_t *f, const H5O_stab_t *stab, H5O_link_t *obj_lnk,
+                                     H5O_type_t obj_type, const void *crt_info);
+ H5_DLL herr_t H5G__stab_delete(H5F_t *f, const H5O_stab_t *stab);
+ H5_DLL herr_t H5G__stab_iterate(const H5O_loc_t *oloc, H5_iter_order_t order, hsize_t skip, hsize_t *last_lnk,
+@@ -374,8 +376,7 @@ H5_DLL void   H5G__ent_reset(H5G_entry_t *ent);
+ H5_DLL herr_t H5G__ent_decode_vec(const H5F_t *f, const uint8_t **pp, const uint8_t *p_end, H5G_entry_t *ent,
+                                   unsigned n);
+ H5_DLL herr_t H5G__ent_encode_vec(const H5F_t *f, uint8_t **pp, const H5G_entry_t *ent, unsigned n);
+-H5_DLL herr_t H5G__ent_convert(H5F_t *f, H5HL_t *heap, const char *name, const H5O_link_t *lnk,
+-                               H5O_type_t obj_type, const void *crt_info, H5G_entry_t *ent);
++H5_DLL herr_t H5G__ent_to_link(const H5G_entry_t *ent, const H5HL_t *heap, H5O_link_t *lnk);
+ H5_DLL herr_t H5G__ent_debug(const H5G_entry_t *ent, FILE *stream, int indent, int fwidth,
+                              const H5HL_t *heap);
+ 
+@@ -392,7 +393,8 @@ H5_DLL herr_t H5G__node_iterate_size(H5F_t *f, const void *_lt_key, haddr_t addr
+ H5_DLL herr_t H5G__node_free(H5G_node_t *sym);
+ 
+ /* Functions that understand links in groups */
+-H5_DLL herr_t H5G__ent_to_link(H5O_link_t *lnk, const H5HL_t *heap, const H5G_entry_t *ent, const char *name);
++H5_DLL herr_t H5G__link_to_ent(H5F_t *f, H5HL_t *heap, const H5O_link_t *lnk, H5O_type_t obj_type,
++                               const void *crt_info, H5G_entry_t *ent);
+ H5_DLL herr_t H5G__link_to_loc(const H5G_loc_t *grp_loc, const H5O_link_t *lnk, H5G_loc_t *obj_loc);
+ H5_DLL herr_t H5G__link_sort_table(H5G_link_table_t *ltable, H5_index_t idx_type, H5_iter_order_t order);
+ H5_DLL herr_t H5G__link_iterate_table(const H5G_link_table_t *ltable, hsize_t skip, hsize_t *last_lnk,
+diff --git a/src/H5Gprivate.h b/src/H5Gprivate.h
+index bb172eb2af7..a756a1c324f 100644
+--- a/src/H5Gprivate.h
++++ b/src/H5Gprivate.h
+@@ -228,8 +228,8 @@ H5_DLL herr_t H5G_link_to_info(const struct H5O_loc_t *link_loc, const struct H5
+ /*
+  * Functions that understand group objects
+  */
+-H5_DLL herr_t H5G_obj_insert(const struct H5O_loc_t *grp_oloc, const char *name, struct H5O_link_t *obj_lnk,
+-                             bool adj_link, H5O_type_t obj_type, const void *crt_info);
++H5_DLL herr_t H5G_obj_insert(const struct H5O_loc_t *grp_oloc, struct H5O_link_t *obj_lnk, bool adj_link,
++                             H5O_type_t obj_type, const void *crt_info);
+ H5_DLL herr_t H5G_obj_get_name_by_idx(const struct H5O_loc_t *oloc, H5_index_t idx_type,
+                                       H5_iter_order_t order, hsize_t n, char *name, size_t name_size,
+                                       size_t *name_len);
+diff --git a/src/H5Gstab.c b/src/H5Gstab.c
+index ef9773d7451..1ebd13681b1 100644
+--- a/src/H5Gstab.c
++++ b/src/H5Gstab.c
+@@ -227,8 +227,8 @@ H5G__stab_create(H5O_loc_t *grp_oloc, const H5O_ginfo_t *ginfo, H5O_stab_t *stab
+  *-------------------------------------------------------------------------
+  */
+ herr_t
+-H5G__stab_insert_real(H5F_t *f, const H5O_stab_t *stab, const char *name, H5O_link_t *obj_lnk,
+-                      H5O_type_t obj_type, const void *crt_info)
++H5G__stab_insert_real(H5F_t *f, const H5O_stab_t *stab, H5O_link_t *obj_lnk, H5O_type_t obj_type,
++                      const void *crt_info)
+ {
+     H5HL_t      *heap = NULL;         /* Pointer to local heap */
+     H5G_bt_ins_t udata;               /* Data to pass through B-tree	*/
+@@ -239,7 +239,6 @@ H5G__stab_insert_real(H5F_t *f, const H5O_stab_t *stab, const char *name, H5O_li
+     /* check arguments */
+     assert(f);
+     assert(stab);
+-    assert(name && *name);
+     assert(obj_lnk);
+ 
+     /* Pin the heap down in memory */
+@@ -247,11 +246,12 @@ H5G__stab_insert_real(H5F_t *f, const H5O_stab_t *stab, const char *name, H5O_li
+         HGOTO_ERROR(H5E_SYM, H5E_PROTECT, FAIL, "unable to protect symbol table heap");
+ 
+     /* Initialize data to pass through B-tree */
+-    udata.common.name = name;
+-    udata.common.heap = heap;
+-    udata.lnk         = obj_lnk;
+-    udata.obj_type    = obj_type;
+-    udata.crt_info    = crt_info;
++    udata.common.name       = obj_lnk->name;
++    udata.common.heap       = heap;
++    udata.common.block_size = H5HL_heap_get_size(heap);
++    udata.lnk               = obj_lnk;
++    udata.obj_type          = obj_type;
++    udata.crt_info          = crt_info;
+ 
+     /* Insert into symbol table */
+     if (H5B_insert(f, H5B_SNODE, stab->btree_addr, &udata) < 0)
+@@ -268,17 +268,14 @@ H5G__stab_insert_real(H5F_t *f, const H5O_stab_t *stab, const char *name, H5O_li
+ /*-------------------------------------------------------------------------
+  * Function:	H5G__stab_insert
+  *
+- * Purpose:	Insert a new symbol into the table described by GRP_ENT in
+- *		file F.	 The name of the new symbol is NAME and its symbol
+- *		table entry is OBJ_ENT.
++ * Purpose:	Insert a new link, OBJ_LNK, into the group, GRP_OLOC.
+  *
+  * Return:	Non-negative on success/Negative on failure
+  *
+  *-------------------------------------------------------------------------
+  */
+ herr_t
+-H5G__stab_insert(const H5O_loc_t *grp_oloc, const char *name, H5O_link_t *obj_lnk, H5O_type_t obj_type,
+-                 const void *crt_info)
++H5G__stab_insert(const H5O_loc_t *grp_oloc, H5O_link_t *obj_lnk, H5O_type_t obj_type, const void *crt_info)
+ {
+     H5O_stab_t stab;                /* Symbol table message		*/
+     herr_t     ret_value = SUCCEED; /* Return value */
+@@ -287,15 +284,14 @@ H5G__stab_insert(const H5O_loc_t *grp_oloc, const char *name, H5O_link_t *obj_ln
+ 
+     /* check arguments */
+     assert(grp_oloc && grp_oloc->file);
+-    assert(name && *name);
+     assert(obj_lnk);
+ 
+     /* Retrieve symbol table message */
+     if (NULL == H5O_msg_read(grp_oloc, H5O_STAB_ID, &stab))
+         HGOTO_ERROR(H5E_SYM, H5E_BADMESG, FAIL, "not a symbol table");
+ 
+-    if (H5G__stab_insert_real(grp_oloc->file, &stab, name, obj_lnk, obj_type, crt_info) < 0)
+-        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, H5_ITER_ERROR, "unable to insert the name");
++    if (H5G__stab_insert_real(grp_oloc->file, &stab, obj_lnk, obj_type, crt_info) < 0)
++        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, H5_ITER_ERROR, "unable to insert the link");
+ 
+ done:
+     FUNC_LEAVE_NOAPI(ret_value)
+@@ -332,9 +328,10 @@ H5G__stab_remove(const H5O_loc_t *loc, H5RS_str_t *grp_full_path_r, const char *
+         HGOTO_ERROR(H5E_SYM, H5E_PROTECT, FAIL, "unable to protect symbol table heap");
+ 
+     /* Initialize data to pass through B-tree */
+-    udata.common.name     = name;
+-    udata.common.heap     = heap;
+-    udata.grp_full_path_r = grp_full_path_r;
++    udata.common.name       = name;
++    udata.common.heap       = heap;
++    udata.common.block_size = H5HL_heap_get_size(heap);
++    udata.grp_full_path_r   = grp_full_path_r;
+ 
+     /* Remove from symbol table */
+     if (H5B_remove(loc->file, H5B_SNODE, stab.btree_addr, &udata) < 0)
+@@ -386,9 +383,10 @@ H5G__stab_remove_by_idx(const H5O_loc_t *grp_oloc, H5RS_str_t *grp_full_path_r,
+         HGOTO_ERROR(H5E_SYM, H5E_PROTECT, FAIL, "unable to protect symbol table heap");
+ 
+     /* Initialize data to pass through B-tree */
+-    udata.common.name     = obj_lnk.name;
+-    udata.common.heap     = heap;
+-    udata.grp_full_path_r = grp_full_path_r;
++    udata.common.name       = obj_lnk.name;
++    udata.common.heap       = heap;
++    udata.common.block_size = H5HL_heap_get_size(heap);
++    udata.grp_full_path_r   = grp_full_path_r;
+ 
+     /* Remove link from symbol table */
+     if (H5B_remove(grp_oloc->file, H5B_SNODE, stab.btree_addr, &udata) < 0)
+@@ -640,6 +638,7 @@ H5G__stab_get_name_by_idx_cb(const H5G_entry_t *ent, void *_udata)
+     H5G_bt_it_gnbi_t *udata = (H5G_bt_it_gnbi_t *)_udata;
+     size_t            name_off;            /* Offset of name in heap */
+     const char       *name;                /* Pointer to name string in heap */
++    size_t            block_size;          /* Size of the heap block */
+     herr_t            ret_value = SUCCEED; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+@@ -648,13 +647,16 @@ H5G__stab_get_name_by_idx_cb(const H5G_entry_t *ent, void *_udata)
+     assert(ent);
+     assert(udata && udata->heap);
+ 
++    /* Get the size of the heap block */
++    block_size = H5HL_heap_get_size(udata->heap);
++
+     /* Get name offset in heap */
+     name_off = ent->name_off;
+ 
+     if ((name = (const char *)H5HL_offset_into(udata->heap, name_off)) == NULL)
+         HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get symbol table link name");
+ 
+-    if ((udata->name = H5MM_strdup(name)) == NULL)
++    if (NULL == (udata->name = H5MM_strndup(name, (block_size - name_off))))
+         HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to duplicate symbol table link name");
+ 
+ done:
+@@ -768,7 +770,7 @@ H5G__stab_lookup_cb(const H5G_entry_t *ent, void *_udata)
+     /* Check for setting link info */
+     if (udata->lnk)
+         /* Convert the entry to a link */
+-        if (H5G__ent_to_link(udata->lnk, udata->heap, ent, udata->name) < 0)
++        if (H5G__ent_to_link(ent, udata->heap, udata->lnk) < 0)
+             HGOTO_ERROR(H5E_SYM, H5E_CANTCONVERT, FAIL, "unable to convert symbol table entry to link");
+ 
+ done:
+@@ -815,10 +817,11 @@ H5G__stab_lookup(const H5O_loc_t *grp_oloc, const char *name, bool *found, H5O_l
+     udata.heap = heap;
+ 
+     /* Set up the user data for actual B-tree find operation */
+-    bt_udata.common.name = name;
+-    bt_udata.common.heap = heap;
+-    bt_udata.op          = H5G__stab_lookup_cb;
+-    bt_udata.op_data     = &udata;
++    bt_udata.common.name       = name;
++    bt_udata.common.heap       = heap;
++    bt_udata.common.block_size = H5HL_heap_get_size(heap);
++    bt_udata.op                = H5G__stab_lookup_cb;
++    bt_udata.op_data           = &udata;
+ 
+     /* Search the B-tree */
+     if (H5B_find(grp_oloc->file, H5B_SNODE, stab.btree_addr, found, &bt_udata) < 0)
+@@ -846,8 +849,7 @@ H5G__stab_lookup(const H5O_loc_t *grp_oloc, const char *name, bool *found, H5O_l
+ static herr_t
+ H5G__stab_lookup_by_idx_cb(const H5G_entry_t *ent, void *_udata)
+ {
+-    H5G_bt_it_lbi_t *udata = (H5G_bt_it_lbi_t *)_udata;
+-    const char      *name;                /* Pointer to name string in heap */
++    H5G_bt_it_lbi_t *udata     = (H5G_bt_it_lbi_t *)_udata;
+     herr_t           ret_value = SUCCEED; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+@@ -856,12 +858,8 @@ H5G__stab_lookup_by_idx_cb(const H5G_entry_t *ent, void *_udata)
+     assert(ent);
+     assert(udata && udata->heap);
+ 
+-    /* Get a pointer to the link name */
+-    if ((name = (const char *)H5HL_offset_into(udata->heap, ent->name_off)) == NULL)
+-        HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get symbol table link name");
+-
+     /* Convert the entry to a link */
+-    if (H5G__ent_to_link(udata->lnk, udata->heap, ent, name) < 0)
++    if (H5G__ent_to_link(ent, udata->heap, udata->lnk) < 0)
+         HGOTO_ERROR(H5E_SYM, H5E_CANTCONVERT, FAIL, "unable to convert symbol table entry to link");
+     udata->found = true;
+ 
+diff --git a/src/H5Gtest.c b/src/H5Gtest.c
+index a6a64067979..0b0708119e1 100644
+--- a/src/H5Gtest.c
++++ b/src/H5Gtest.c
+@@ -796,10 +796,10 @@ H5G__verify_cached_stabs_test(hid_t gid)
+ {
+     H5G_t          *grp = NULL; /* Group */
+     htri_t          stab_exists;
+-    H5O_stab_t      stab;                     /* Symbol table message */
+-    H5G_bt_common_t udata     = {NULL, NULL}; /* Dummy udata so H5B_iterate doesn't freak out */
+-    haddr_t         prev_tag  = HADDR_UNDEF;  /* Previous metadata tag */
+-    herr_t          ret_value = SUCCEED;      /* Return value */
++    H5O_stab_t      stab;                        /* Symbol table message */
++    H5G_bt_common_t udata     = {NULL, NULL, 0}; /* Dummy udata so H5B_iterate doesn't freak out */
++    haddr_t         prev_tag  = HADDR_UNDEF;     /* Previous metadata tag */
++    herr_t          ret_value = SUCCEED;         /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+ 
+diff --git a/src/H5HG.c b/src/H5HG.c
+index 3709c705566..a859b40f100 100644
+--- a/src/H5HG.c
++++ b/src/H5HG.c
+@@ -556,6 +556,11 @@ H5HG_read(H5F_t *f, H5HG_t *hobj, void *object /*out*/, size_t *buf_size)
+     assert(f);
+     assert(hobj);
+ 
++    /* Heap object idx 0 is the free space in the heap and should never be given out */
++    if (0 == hobj->idx)
++        HGOTO_ERROR(H5E_HEAP, H5E_BADVALUE, NULL, "bad heap index, heap object = {%" PRIxHADDR ", %zu}",
++                    hobj->addr, hobj->idx);
++
+     /* Load the heap */
+     if (NULL == (heap = H5HG__protect(f, hobj->addr, H5AC__READ_ONLY_FLAG)))
+         HGOTO_ERROR(H5E_HEAP, H5E_CANTPROTECT, NULL, "unable to protect global heap");
+@@ -630,6 +635,11 @@ H5HG_link(H5F_t *f, const H5HG_t *hobj, int adjust)
+     if (0 == (H5F_INTENT(f) & H5F_ACC_RDWR))
+         HGOTO_ERROR(H5E_HEAP, H5E_WRITEERROR, FAIL, "no write intent on file");
+ 
++    /* Heap object idx 0 is the free space in the heap and should never be given out */
++    if (0 == hobj->idx)
++        HGOTO_ERROR(H5E_HEAP, H5E_BADVALUE, FAIL, "bad heap index, heap object = {%" PRIxHADDR ", %zu}",
++                    hobj->addr, hobj->idx);
++
+     /* Load the heap */
+     if (NULL == (heap = H5HG__protect(f, hobj->addr, H5AC__NO_FLAGS_SET)))
+         HGOTO_ERROR(H5E_HEAP, H5E_CANTPROTECT, FAIL, "unable to protect global heap");
+@@ -682,6 +692,11 @@ H5HG_get_obj_size(H5F_t *f, H5HG_t *hobj, size_t *obj_size)
+     assert(hobj);
+     assert(obj_size);
+ 
++    /* Heap object idx 0 is the free space in the heap and should never be given out */
++    if (0 == hobj->idx)
++        HGOTO_ERROR(H5E_HEAP, H5E_BADVALUE, FAIL, "bad heap index, heap object = {%" PRIxHADDR ", %zu}",
++                    hobj->addr, hobj->idx);
++
+     /* Load the heap */
+     if (NULL == (heap = H5HG__protect(f, hobj->addr, H5AC__READ_ONLY_FLAG)))
+         HGOTO_ERROR(H5E_HEAP, H5E_CANTPROTECT, FAIL, "unable to protect global heap");
+@@ -731,6 +746,11 @@ H5HG_remove(H5F_t *f, H5HG_t *hobj)
+     if (0 == (H5F_INTENT(f) & H5F_ACC_RDWR))
+         HGOTO_ERROR(H5E_HEAP, H5E_WRITEERROR, FAIL, "no write intent on file");
+ 
++    /* Heap object idx 0 is the free space in the heap and should never be given out */
++    if (0 == hobj->idx)
++        HGOTO_ERROR(H5E_HEAP, H5E_BADVALUE, FAIL, "bad heap index, heap object = {%" PRIxHADDR ", %zu}",
++                    hobj->addr, hobj->idx);
++
+     /* Load the heap */
+     if (NULL == (heap = H5HG__protect(f, hobj->addr, H5AC__NO_FLAGS_SET)))
+         HGOTO_ERROR(H5E_HEAP, H5E_CANTPROTECT, FAIL, "unable to protect global heap");
+diff --git a/src/H5HL.c b/src/H5HL.c
+index 680ef0a15db..f6e589b016d 100644
+--- a/src/H5HL.c
++++ b/src/H5HL.c
+@@ -295,13 +295,11 @@ H5HL__minimize_heap_space(H5F_t *f, H5HL_t *heap)
+ H5HL_t *
+ H5HL_protect(H5F_t *f, haddr_t addr, unsigned flags)
+ {
+-    H5HL_cache_prfx_ud_t prfx_udata;                /* User data for protecting local heap prefix       */
+-    H5HL_prfx_t         *prfx = NULL;               /* Local heap prefix                                */
+-    H5HL_dblk_t         *dblk = NULL;               /* Local heap data block                            */
+-    H5HL_t              *heap = NULL;               /* Heap data structure                              */
+-    unsigned prfx_cache_flags = H5AC__NO_FLAGS_SET; /* Cache flags for unprotecting prefix entry        */
+-    unsigned dblk_cache_flags = H5AC__NO_FLAGS_SET; /* Cache flags for unprotecting data block entry    */
+-    H5HL_t  *ret_value        = NULL;
++    H5HL_cache_prfx_ud_t prfx_udata;       /* User data for protecting local heap prefix       */
++    H5HL_prfx_t         *prfx      = NULL; /* Local heap prefix                                */
++    H5HL_dblk_t         *dblk      = NULL; /* Local heap data block                            */
++    H5HL_t              *heap      = NULL; /* Heap data structure                              */
++    H5HL_t              *ret_value = NULL;
+ 
+     FUNC_ENTER_NOAPI(NULL)
+ 
+@@ -328,19 +326,25 @@ H5HL_protect(H5F_t *f, haddr_t addr, unsigned flags)
+     /* Check if the heap is already pinned in memory */
+     /* (for re-entrant situation) */
+     if (heap->prots == 0) {
++        void *pin_obj; /* Pointer to local heap object to pin */
++
+         /* Check if heap has separate data block */
+         if (heap->single_cache_obj)
+-            /* Set the flag for pinning the prefix when unprotecting it */
+-            prfx_cache_flags |= H5AC__PIN_ENTRY_FLAG;
++            /* Pin prefix */
++            pin_obj = prfx;
+         else {
+             /* Protect the local heap data block */
+             if (NULL ==
+                 (dblk = (H5HL_dblk_t *)H5AC_protect(f, H5AC_LHEAP_DBLK, heap->dblk_addr, heap, flags)))
+                 HGOTO_ERROR(H5E_HEAP, H5E_CANTPROTECT, NULL, "unable to load heap data block");
+ 
+-            /* Set the flag for pinning the data block when unprotecting it */
+-            dblk_cache_flags |= H5AC__PIN_ENTRY_FLAG;
++            /* Pin data block */
++            pin_obj = dblk;
+         }
++
++        /* Pin local heap object */
++        if (H5AC_pin_protected_entry(pin_obj) < 0)
++            HGOTO_ERROR(H5E_HEAP, H5E_CANTPIN, NULL, "unable to pin local heap object");
+     }
+ 
+     /* Increment # of times heap is protected */
+@@ -351,11 +355,11 @@ H5HL_protect(H5F_t *f, haddr_t addr, unsigned flags)
+ 
+ done:
+     /* Release the prefix from the cache, now pinned */
+-    if (prfx && heap && H5AC_unprotect(f, H5AC_LHEAP_PRFX, heap->prfx_addr, prfx, prfx_cache_flags) < 0)
++    if (prfx && heap && H5AC_unprotect(f, H5AC_LHEAP_PRFX, heap->prfx_addr, prfx, H5AC__NO_FLAGS_SET) < 0)
+         HDONE_ERROR(H5E_HEAP, H5E_CANTUNPROTECT, NULL, "unable to release local heap prefix");
+ 
+     /* Release the data block from the cache, now pinned */
+-    if (dblk && heap && H5AC_unprotect(f, H5AC_LHEAP_DBLK, heap->dblk_addr, dblk, dblk_cache_flags) < 0)
++    if (dblk && heap && H5AC_unprotect(f, H5AC_LHEAP_DBLK, heap->dblk_addr, dblk, H5AC__NO_FLAGS_SET) < 0)
+         HDONE_ERROR(H5E_HEAP, H5E_CANTUNPROTECT, NULL, "unable to release local heap data block");
+ 
+     FUNC_LEAVE_NOAPI(ret_value)
+@@ -888,6 +892,26 @@ H5HL_delete(H5F_t *f, haddr_t addr)
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* end H5HL_delete() */
+ 
++/*-------------------------------------------------------------------------
++ * Function:    H5HL_heap_get_size
++ *
++ * Purpose:     Retrieves the current size of a heap's block
++ *
++ * Return:      SUCCEED/FAIL
++ *
++ *-------------------------------------------------------------------------
++ */
++size_t
++H5HL_heap_get_size(const H5HL_t *heap)
++{
++    FUNC_ENTER_NOAPI_NOINIT_NOERR
++
++    /* Check arguments */
++    assert(heap);
++
++    FUNC_LEAVE_NOAPI(heap->dblk_size)
++} /* end H5HL_heap_get_size() */
++
+ /*-------------------------------------------------------------------------
+  * Function:    H5HL_get_size
+  *
+diff --git a/src/H5HLcache.c b/src/H5HLcache.c
+index b38ff7c2848..d0836fed4f7 100644
+--- a/src/H5HLcache.c
++++ b/src/H5HLcache.c
+@@ -232,7 +232,7 @@ H5HL__fl_deserialize(H5HL_t *heap)
+         const uint8_t *image; /* Pointer into image buffer */
+ 
+         /* Sanity check */
+-        if (free_block >= heap->dblk_size)
++        if ((free_block + (2 * heap->sizeof_size)) > heap->dblk_size)
+             HGOTO_ERROR(H5E_HEAP, H5E_BADRANGE, FAIL, "bad heap free list");
+ 
+         /* Allocate & initialize free list node */
+diff --git a/src/H5HLprivate.h b/src/H5HLprivate.h
+index 243d7653a86..045c5d7ac1e 100644
+--- a/src/H5HLprivate.h
++++ b/src/H5HLprivate.h
+@@ -44,6 +44,7 @@ typedef struct H5HL_t H5HL_t;
+  */
+ H5_DLL herr_t  H5HL_create(H5F_t *f, size_t size_hint, haddr_t *addr /*out*/);
+ H5_DLL herr_t  H5HL_delete(H5F_t *f, haddr_t addr);
++H5_DLL size_t  H5HL_heap_get_size(const H5HL_t *heap);
+ H5_DLL herr_t  H5HL_get_size(H5F_t *f, haddr_t addr, size_t *size);
+ H5_DLL herr_t  H5HL_heapsize(H5F_t *f, haddr_t addr, hsize_t *heap_size);
+ H5_DLL herr_t  H5HL_insert(H5F_t *f, H5HL_t *heap, size_t size, const void *buf, size_t *offset);
+diff --git a/src/H5Lint.c b/src/H5Lint.c
+index d02e8c48a48..10b935ab09d 100644
+--- a/src/H5Lint.c
++++ b/src/H5Lint.c
+@@ -572,7 +572,7 @@ H5L__link_cb(H5G_loc_t *grp_loc /*in*/, const char *name, const H5O_link_t H5_AT
+     H5_GCC_CLANG_DIAG_ON("cast-qual")
+ 
+     /* Insert link into group */
+-    if (H5G_obj_insert(grp_loc->oloc, name, udata->lnk, true,
++    if (H5G_obj_insert(grp_loc->oloc, udata->lnk, true,
+                        udata->ocrt_info ? udata->ocrt_info->obj_type : H5O_TYPE_UNKNOWN,
+                        udata->ocrt_info ? udata->ocrt_info->crt_info : NULL) < 0)
+         HGOTO_ERROR(H5E_LINK, H5E_CANTINIT, FAIL, "unable to create new link for object");
+@@ -1315,7 +1315,7 @@ H5L__move_dest_cb(H5G_loc_t *grp_loc /*in*/, const char *name, const H5O_link_t
+     H5_GCC_CLANG_DIAG_ON("cast-qual")
+ 
+     /* Insert the link into the group */
+-    if (H5G_obj_insert(grp_loc->oloc, name, udata->lnk, true, H5O_TYPE_UNKNOWN, NULL) < 0)
++    if (H5G_obj_insert(grp_loc->oloc, udata->lnk, true, H5O_TYPE_UNKNOWN, NULL) < 0)
+         HGOTO_ERROR(H5E_LINK, H5E_CANTINIT, FAIL, "unable to create new link to object");
+ 
+     /* If the link was a user-defined link, call its move callback if it has one */
+diff --git a/src/H5Ocache.c b/src/H5Ocache.c
+index 53a7d0a7cfe..6916a9044c7 100644
+--- a/src/H5Ocache.c
++++ b/src/H5Ocache.c
+@@ -309,6 +309,10 @@ H5O__cache_deserialize(const void *image, size_t len, void *_udata, bool *dirty)
+                                &(udata->common), dirty) < 0)
+         HGOTO_ERROR(H5E_OHDR, H5E_CANTINIT, NULL, "can't deserialize first object header chunk");
+ 
++    /* Check for corruption in object header # of messages */
++    if (oh->version == H5O_VERSION_1 && udata->v1_pfx_nmesgs < oh->nmesgs)
++        HGOTO_ERROR(H5E_OHDR, H5E_BADVALUE, NULL, "bad object header message count");
++
+     /* Note that we've loaded the object header from the file */
+     udata->made_attempt = true;
+ 
+diff --git a/src/H5Ocopy.c b/src/H5Ocopy.c
+index f2f307e82db..d6002046269 100644
+--- a/src/H5Ocopy.c
++++ b/src/H5Ocopy.c
+@@ -359,6 +359,12 @@ H5O__copy_header_real(const H5O_loc_t *oloc_src, H5O_loc_t *oloc_dst /*out*/, H5
+         /* Get message class to operate on */
+         copy_type = mesg_src->type;
+ 
++        /* Sanity check message for possible corruption */
++        if (H5O_UNKNOWN_ID != mesg_src->type->id && H5O_NULL_ID != mesg_src->type->id)
++            if (0 == mesg_src->raw_size)
++                HGOTO_ERROR(H5E_OHDR, H5E_BADVALUE, FAIL, "message of type '%s' has zero size",
++                            mesg_src->type->name);
++
+         /* Check for continuation message; these are converted to NULL
+          * messages because the destination OH will have only one chunk
+          */
+diff --git a/src/H5Odtype.c b/src/H5Odtype.c
+index 674d8d4ea1c..24671b02107 100644
+--- a/src/H5Odtype.c
++++ b/src/H5Odtype.c
+@@ -366,6 +366,7 @@ H5O__dtype_decode_helper(unsigned *ioflags /*in,out*/, const uint8_t **pp, H5T_t
+                 hsize_t  dim[H5O_LAYOUT_NDIMS];  /* Dimensions of the array */
+                 H5T_t   *array_dt;               /* Temporary pointer to the array datatype */
+                 H5T_t   *temp_type;              /* Temporary pointer to the field's datatype */
++                unsigned memb_idx;               /* Local index counter */
+ 
+                 /* Get the length of the field name */
+                 if (!skip) {
+@@ -388,6 +389,13 @@ H5O__dtype_decode_helper(unsigned *ioflags /*in,out*/, const uint8_t **pp, H5T_t
+                 if (H5_IS_KNOWN_BUFFER_OVERFLOW(skip, *pp, actual_name_length, p_end))
+                     HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, FAIL, "ran off end of input buffer while decoding");
+ 
++                /* Check for duplicated field name */
++                for (memb_idx = 0; memb_idx < dt->shared->u.compnd.nmembs; memb_idx++)
++                    if (0 == strcmp((const char *)*pp, dt->shared->u.compnd.memb[memb_idx].name))
++                        HGOTO_ERROR(H5E_OHDR, H5E_BADVALUE, FAIL,
++                                    "duplicated compound field name '%s', for fields %u and %u",
++                                    (const char *)*pp, memb_idx, dt->shared->u.compnd.nmembs);
++
+                 /* Decode the field name */
+                 if (NULL == (dt->shared->u.compnd.memb[dt->shared->u.compnd.nmembs].name =
+                                  H5MM_xstrdup((const char *)*pp)))
+@@ -509,6 +517,18 @@ H5O__dtype_decode_helper(unsigned *ioflags /*in,out*/, const uint8_t **pp, H5T_t
+                 if (version == H5O_DTYPE_VERSION_1) {
+                     /* Check if this member is an array field */
+                     if (ndims > 0) {
++                        /* Validate decoded dims */
++                        for (unsigned u = 0; u < ndims; u++)
++                            if (!(dim[u] > 0)) {
++                                dt->shared->u.compnd.memb[dt->shared->u.compnd.nmembs].name =
++                                    H5MM_xfree(dt->shared->u.compnd.memb[dt->shared->u.compnd.nmembs].name);
++                                if (H5T_close_real(temp_type) < 0)
++                                    HDONE_ERROR(H5E_DATATYPE, H5E_CANTRELEASE, FAIL,
++                                                "can't release datatype info");
++                                HGOTO_ERROR(H5E_DATATYPE, H5E_BADVALUE, FAIL,
++                                            "zero-sized dimension specified");
++                            }
++
+                         /* Create the array datatype for the field */
+                         if ((array_dt = H5T__array_create(temp_type, ndims, dim)) == NULL) {
+                             dt->shared->u.compnd.memb[dt->shared->u.compnd.nmembs].name =
+@@ -690,6 +710,8 @@ H5O__dtype_decode_helper(unsigned *ioflags /*in,out*/, const uint8_t **pp, H5T_t
+                      */
+                     actual_name_length = strlen((const char *)*pp);
+                 }
++                if (0 == actual_name_length)
++                    HGOTO_ERROR(H5E_OHDR, H5E_BADSIZE, FAIL, "0 length enum name");
+ 
+                 if (H5_IS_KNOWN_BUFFER_OVERFLOW(skip, *pp, actual_name_length, p_end))
+                     HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, FAIL, "ran off end of input buffer while decoding");
+diff --git a/src/H5Oefl.c b/src/H5Oefl.c
+index 57e5e6991df..351dbd30211 100644
+--- a/src/H5Oefl.c
++++ b/src/H5Oefl.c
+@@ -76,9 +76,10 @@ H5O__efl_decode(H5F_t *f, H5O_t H5_ATTR_UNUSED *open_oh, unsigned H5_ATTR_UNUSED
+ {
+     H5O_efl_t     *mesg = NULL;
+     int            version;
+-    const uint8_t *p_end     = p + p_size - 1; /* pointer to last byte in p */
+-    const char    *s         = NULL;
+-    H5HL_t        *heap      = NULL;
++    const uint8_t *p_end = p + p_size - 1; /* pointer to last byte in p */
++    const char    *s     = NULL;
++    H5HL_t        *heap  = NULL;
++    size_t         block_size;       /* Size of the heap block */
+     void          *ret_value = NULL; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+@@ -139,6 +140,9 @@ H5O__efl_decode(H5F_t *f, H5O_t H5_ATTR_UNUSED *open_oh, unsigned H5_ATTR_UNUSED
+         HGOTO_ERROR(H5E_OHDR, H5E_CANTGET, NULL, "entry at offset 0 in local heap not an empty string");
+ #endif
+ 
++    /* Get the size of the heap block */
++    block_size = H5HL_heap_get_size(heap);
++
+     for (size_t u = 0; u < mesg->nused; u++) {
+ 
+         hsize_t offset = 0;
+@@ -152,7 +156,7 @@ H5O__efl_decode(H5F_t *f, H5O_t H5_ATTR_UNUSED *open_oh, unsigned H5_ATTR_UNUSED
+             HGOTO_ERROR(H5E_OHDR, H5E_CANTGET, NULL, "unable to get external file name");
+         if (*s == '\0')
+             HGOTO_ERROR(H5E_OHDR, H5E_CANTGET, NULL, "invalid external file name");
+-        mesg->slot[u].name = H5MM_xstrdup(s);
++        mesg->slot[u].name = H5MM_strndup(s, (block_size - mesg->slot[u].name_offset));
+         if (mesg->slot[u].name == NULL)
+             HGOTO_ERROR(H5E_OHDR, H5E_NOSPACE, NULL, "string duplication failed");
+ 
+@@ -386,33 +390,35 @@ H5O__efl_reset(void *_mesg)
+ /*-------------------------------------------------------------------------
+  * Function:	H5O_efl_total_size
+  *
+- * Purpose:	Return the total size of the external file list by summing
++ * Purpose:	Query the total size of the external file list by summing
+  *		the sizes of all of the files.
+  *
+- * Return:	Success:	Total reserved size for external data.
+- *
+- *		Failure:	0
++ * Return:	Non-negative on success/Negative on failure
+  *
+  *-------------------------------------------------------------------------
+  */
+-hsize_t
+-H5O_efl_total_size(H5O_efl_t *efl)
++herr_t
++H5O_efl_total_size(const H5O_efl_t *efl, hsize_t *size)
+ {
+-    hsize_t ret_value = 0, tmp;
++    hsize_t total_size = 0, tmp;
++    herr_t  ret_value  = SUCCEED; /* Return value */
+ 
+-    FUNC_ENTER_NOAPI(0)
++    FUNC_ENTER_NOAPI(FAIL)
+ 
+     if (efl->nused > 0 && H5O_EFL_UNLIMITED == efl->slot[efl->nused - 1].size)
+-        ret_value = H5O_EFL_UNLIMITED;
++        *size = H5O_EFL_UNLIMITED;
+     else {
+         size_t u; /* Local index variable */
+ 
+-        for (u = 0; u < efl->nused; u++, ret_value = tmp) {
+-            tmp = ret_value + efl->slot[u].size;
+-            if (tmp <= ret_value)
+-                HGOTO_ERROR(H5E_EFL, H5E_OVERFLOW, 0, "total external storage size overflowed");
++        for (u = 0; u < efl->nused; u++, total_size = tmp) {
++            tmp = total_size + efl->slot[u].size;
++            if (tmp < total_size)
++                HGOTO_ERROR(H5E_EFL, H5E_OVERFLOW, FAIL, "total external storage size overflowed");
+         } /* end for */
+-    }     /* end else */
++
++        /* Set the size to return */
++        *size = total_size;
++    } /* end else */
+ 
+ done:
+     FUNC_LEAVE_NOAPI(ret_value)
+diff --git a/src/H5Olayout.c b/src/H5Olayout.c
+index d14e0009953..e5ffc382476 100644
+--- a/src/H5Olayout.c
++++ b/src/H5Olayout.c
+@@ -1226,8 +1226,7 @@ H5O__layout_copy_file(H5F_t *file_src, void *mesg_src, H5F_t *file_dst, bool H5_
+     H5D_copy_file_ud_t *udata      = (H5D_copy_file_ud_t *)_udata; /* Dataset copying user data */
+     H5O_layout_t       *layout_src = (H5O_layout_t *)mesg_src;
+     H5O_layout_t       *layout_dst = NULL;
+-    bool                copied     = false; /* Whether the data was copied */
+-    void               *ret_value  = NULL;  /* Return value */
++    void               *ret_value  = NULL; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+ 
+@@ -1248,18 +1247,28 @@ H5O__layout_copy_file(H5F_t *file_src, void *mesg_src, H5F_t *file_dst, bool H5_
+                 if (H5D__compact_copy(file_src, &layout_src->storage.u.compact, file_dst,
+                                       &layout_dst->storage.u.compact, udata->src_dtype, cpy_info) < 0)
+                     HGOTO_ERROR(H5E_OHDR, H5E_CANTCOPY, NULL, "unable to copy chunked storage");
+-                copied = true;
+             } /* end if */
+             break;
+ 
+-        case H5D_CONTIGUOUS:
++        case H5D_CONTIGUOUS: {
++            hsize_t nelmts;  /* Number of elements in dataset's extent */
++            size_t  dt_size; /* Size of dataset's datatype in bytes */
++            /* Sanity check the dataset's info */
++            if (H5D__contig_check(file_src, layout_src, udata->src_space_extent, udata->src_dtype) < 0)
++                HGOTO_ERROR(H5E_OHDR, H5E_BADVALUE, NULL, "invalid layout / dataspace / datatype info");
++
+             /* Compute the size of the contiguous storage for versions of the
+              * layout message less than version 3 because versions 1 & 2 would
+              * truncate the dimension sizes to 32-bits of information. - QAK 5/26/04
+              */
++            nelmts  = H5S_extent_nelem(udata->src_space_extent);
++            dt_size = H5T_get_size(udata->src_dtype);
+             if (layout_src->version < H5O_LAYOUT_VERSION_3)
+-                layout_dst->storage.u.contig.size =
+-                    H5S_extent_nelem(udata->src_space_extent) * H5T_get_size(udata->src_dtype);
++                layout_dst->storage.u.contig.size = nelmts * dt_size;
++            else
++                /* Sanity check layout storage size */
++                if (layout_dst->storage.u.contig.size != (nelmts * dt_size))
++                    HGOTO_ERROR(H5E_OHDR, H5E_BADVALUE, NULL, "invalid layout storage size ");
+ 
+             if (H5D__contig_is_space_alloc(&layout_src->storage) ||
+                 (cpy_info->shared_fo &&
+@@ -1268,9 +1277,8 @@ H5O__layout_copy_file(H5F_t *file_src, void *mesg_src, H5F_t *file_dst, bool H5_
+                 if (H5D__contig_copy(file_src, &layout_src->storage.u.contig, file_dst,
+                                      &layout_dst->storage.u.contig, udata->src_dtype, cpy_info) < 0)
+                     HGOTO_ERROR(H5E_OHDR, H5E_CANTCOPY, NULL, "unable to copy contiguous storage");
+-                copied = true;
+             } /* end if */
+-            break;
++        } break;
+ 
+         case H5D_CHUNKED:
+             if (H5D__chunk_is_space_alloc(&layout_src->storage) ||
+@@ -1281,7 +1289,6 @@ H5O__layout_copy_file(H5F_t *file_src, void *mesg_src, H5F_t *file_dst, bool H5_
+                                     &layout_dst->storage.u.chunk, udata->src_space_extent, udata->src_dtype,
+                                     udata->common.src_pline, cpy_info) < 0)
+                     HGOTO_ERROR(H5E_OHDR, H5E_CANTCOPY, NULL, "unable to copy chunked storage");
+-                copied = true;
+             } /* end if */
+             break;
+ 
+@@ -1298,10 +1305,6 @@ H5O__layout_copy_file(H5F_t *file_src, void *mesg_src, H5F_t *file_dst, bool H5_
+             HGOTO_ERROR(H5E_OHDR, H5E_CANTLOAD, NULL, "Invalid layout class");
+     } /* end switch */
+ 
+-    /* Check if copy routine was invoked (which frees the source datatype) */
+-    if (copied)
+-        udata->src_dtype = NULL;
+-
+     /* Set return value */
+     ret_value = layout_dst;
+ 
+diff --git a/src/H5Opkg.h b/src/H5Opkg.h
+index 8e32f3ae13a..1803ae0daa7 100644
+--- a/src/H5Opkg.h
++++ b/src/H5Opkg.h
+@@ -600,8 +600,8 @@ H5_DLL herr_t H5O__condense_header(H5F_t *f, H5O_t *oh);
+ H5_DLL herr_t H5O__release_mesg(H5F_t *f, H5O_t *oh, H5O_mesg_t *mesg, bool adj_link);
+ 
+ /* Shared object operators */
+-H5_DLL void  *H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, const uint8_t *buf,
+-                                 const H5O_msg_class_t *type);
++H5_DLL void  *H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, size_t buf_size,
++                                 const uint8_t *buf, const H5O_msg_class_t *type);
+ H5_DLL herr_t H5O__shared_encode(const H5F_t *f, uint8_t *buf /*out*/, const H5O_shared_t *sh_mesg);
+ H5_DLL size_t H5O__shared_size(const H5F_t *f, const H5O_shared_t *sh_mesg);
+ H5_DLL herr_t H5O__shared_delete(H5F_t *f, H5O_t *open_oh, const H5O_msg_class_t *mesg_type,
+diff --git a/src/H5Oprivate.h b/src/H5Oprivate.h
+index 968a23caada..3f0ff07cd13 100644
+--- a/src/H5Oprivate.h
++++ b/src/H5Oprivate.h
+@@ -1004,7 +1004,7 @@ H5_DLL herr_t     H5O_loc_free(H5O_loc_t *loc);
+ H5_DLL H5O_loc_t *H5O_get_loc(hid_t id);
+ 
+ /* EFL operators */
+-H5_DLL hsize_t H5O_efl_total_size(H5O_efl_t *efl);
++H5_DLL herr_t H5O_efl_total_size(const H5O_efl_t *efl, hsize_t *size);
+ 
+ /* File space info routines */
+ H5_DLL herr_t H5O_fsinfo_set_version(H5F_libver_t low, H5F_libver_t high, H5O_fsinfo_t *fsinfo);
+diff --git a/src/H5Osdspace.c b/src/H5Osdspace.c
+index 1658fa719f9..365e3511243 100644
+--- a/src/H5Osdspace.c
++++ b/src/H5Osdspace.c
+@@ -175,29 +175,31 @@ H5O__sdspace_decode(H5F_t *f, H5O_t H5_ATTR_UNUSED *open_oh, unsigned H5_ATTR_UN
+ 
+     /* Decode dimension sizes */
+     if (sdim->rank > 0) {
+-
+-        /* Sizes */
+-
+         /* Check that we have space to decode sdim->rank values */
+         if (H5_IS_BUFFER_OVERFLOW(p, (H5F_sizeof_size(f) * sdim->rank), p_end))
+             HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+ 
++        /* Sizes */
+         if (NULL == (sdim->size = (hsize_t *)H5FL_ARR_MALLOC(hsize_t, (size_t)sdim->rank)))
+             HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, NULL, "memory allocation failed");
+         for (i = 0; i < sdim->rank; i++)
+             H5F_DECODE_LENGTH(f, p, sdim->size[i]);
+ 
+-        /* Max sizes */
+-
+         if (flags & H5S_VALID_MAX) {
+-            if (NULL == (sdim->max = (hsize_t *)H5FL_ARR_MALLOC(hsize_t, (size_t)sdim->rank)))
+-                HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, NULL, "memory allocation failed");
+-
+             /* Check that we have space to decode sdim->rank values */
+             if (H5_IS_BUFFER_OVERFLOW(p, (H5F_sizeof_size(f) * sdim->rank), p_end))
+                 HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+-            for (i = 0; i < sdim->rank; i++)
++
++            /* Max sizes */
++            if (NULL == (sdim->max = (hsize_t *)H5FL_ARR_MALLOC(hsize_t, (size_t)sdim->rank)))
++                HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, NULL, "memory allocation failed");
++            for (i = 0; i < sdim->rank; i++) {
+                 H5F_DECODE_LENGTH(f, p, sdim->max[i]);
++                if (sdim->size[i] > sdim->max[i])
++                    HGOTO_ERROR(H5E_OHDR, H5E_BADVALUE, NULL,
++                                "dataspace dim %u size of %llu is greater than maxdim size of %llu", i,
++                                (unsigned long long)sdim->size[i], (unsigned long long)sdim->max[i]);
++            }
+         }
+ 
+         /* NOTE: The version 1 permutation indexes were never implemented so
+diff --git a/src/H5Oshared.c b/src/H5Oshared.c
+index 9c32caf426b..d562d1764a8 100644
+--- a/src/H5Oshared.c
++++ b/src/H5Oshared.c
+@@ -286,12 +286,13 @@ H5O__shared_link_adj(H5F_t *f, H5O_t *open_oh, const H5O_msg_class_t *type, H5O_
+  *-------------------------------------------------------------------------
+  */
+ void *
+-H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, const uint8_t *buf,
++H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, size_t buf_size, const uint8_t *buf,
+                    const H5O_msg_class_t *type)
+ {
+-    H5O_shared_t sh_mesg;          /* Shared message info */
+-    unsigned     version;          /* Shared message version */
+-    void        *ret_value = NULL; /* Return value */
++    const uint8_t *buf_end = buf + buf_size - 1; /* End of the buffer */
++    H5O_shared_t   sh_mesg;                      /* Shared message info */
++    unsigned       version;                      /* Shared message version */
++    void          *ret_value = NULL;             /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+ 
+@@ -301,6 +302,8 @@ H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, const uint8_t *b
+     assert(type);
+ 
+     /* Version */
++    if (H5_IS_BUFFER_OVERFLOW(buf, 1, buf_end))
++        HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+     version = *buf++;
+     if (version < H5O_SHARED_VERSION_1 || version > H5O_SHARED_VERSION_LATEST)
+         HGOTO_ERROR(H5E_OHDR, H5E_CANTLOAD, NULL, "bad version number for shared object message");
+@@ -308,6 +311,8 @@ H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, const uint8_t *b
+     /* Get the shared information type
+      * Flags are unused before version 3.
+      */
++    if (H5_IS_BUFFER_OVERFLOW(buf, 1, buf_end))
++        HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+     if (version >= H5O_SHARED_VERSION_2)
+         sh_mesg.type = *buf++;
+     else {
+@@ -316,8 +321,11 @@ H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, const uint8_t *b
+     } /* end else */
+ 
+     /* Skip reserved bytes (for version 1) */
+-    if (version == H5O_SHARED_VERSION_1)
++    if (version == H5O_SHARED_VERSION_1) {
++        if (H5_IS_BUFFER_OVERFLOW(buf, 6, buf_end))
++            HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+         buf += 6;
++    }
+ 
+     /* Body */
+     if (version == H5O_SHARED_VERSION_1) {
+@@ -325,7 +333,11 @@ H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, const uint8_t *b
+         sh_mesg.u.loc.index = 0;
+ 
+         /* Decode stored "symbol table entry" into message location */
++        if (H5_IS_BUFFER_OVERFLOW(buf, H5F_SIZEOF_SIZE(f), buf_end))
++            HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+         buf += H5F_SIZEOF_SIZE(f); /* Skip over local heap address */
++        if (H5_IS_BUFFER_OVERFLOW(buf, H5F_sizeof_addr(f), buf_end))
++            HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+         H5F_addr_decode(f, &buf, &(sh_mesg.u.loc.oh_addr));
+     } /* end if */
+     else if (version >= H5O_SHARED_VERSION_2) {
+@@ -334,6 +346,8 @@ H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, const uint8_t *b
+          */
+         if (sh_mesg.type == H5O_SHARE_TYPE_SOHM) {
+             assert(version >= H5O_SHARED_VERSION_3);
++            if (H5_IS_BUFFER_OVERFLOW(buf, sizeof(sh_mesg.u.heap_id), buf_end))
++                HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+             H5MM_memcpy(&sh_mesg.u.heap_id, buf, sizeof(sh_mesg.u.heap_id));
+         } /* end if */
+         else {
+@@ -344,6 +358,8 @@ H5O__shared_decode(H5F_t *f, H5O_t *open_oh, unsigned *ioflags, const uint8_t *b
+                 sh_mesg.type = H5O_SHARE_TYPE_COMMITTED;
+ 
+             sh_mesg.u.loc.index = 0;
++            if (H5_IS_BUFFER_OVERFLOW(buf, H5F_sizeof_addr(f), buf_end))
++                HGOTO_ERROR(H5E_OHDR, H5E_OVERFLOW, NULL, "ran off end of input buffer while decoding");
+             H5F_addr_decode(f, &buf, &sh_mesg.u.loc.oh_addr);
+         } /* end else */
+     }     /* end else if */
+diff --git a/src/H5Oshared.h b/src/H5Oshared.h
+index 2813badd339..d22e2e1b14c 100644
+--- a/src/H5Oshared.h
++++ b/src/H5Oshared.h
+@@ -57,7 +57,7 @@ H5O_SHARED_DECODE(H5F_t *f, H5O_t *open_oh, unsigned mesg_flags, unsigned *iofla
+     /* Check for shared message */
+     if (mesg_flags & H5O_MSG_FLAG_SHARED) {
+         /* Retrieve native message info indirectly through shared message */
+-        if (NULL == (ret_value = H5O__shared_decode(f, open_oh, ioflags, p, H5O_SHARED_TYPE)))
++        if (NULL == (ret_value = H5O__shared_decode(f, open_oh, ioflags, p_size, p, H5O_SHARED_TYPE)))
+             HGOTO_ERROR(H5E_OHDR, H5E_CANTDECODE, NULL, "unable to decode shared message");
+ 
+             /* We currently do not support automatically fixing shared messages */
+diff --git a/src/H5Ostab.c b/src/H5Ostab.c
+index 5000ca84d7d..c87034dc13f 100644
+--- a/src/H5Ostab.c
++++ b/src/H5Ostab.c
+@@ -331,6 +331,7 @@ H5O__stab_post_copy_file(const H5O_loc_t *src_oloc, const void *mesg_src, H5O_lo
+     const H5O_stab_t *stab_src = (const H5O_stab_t *)mesg_src;
+     H5O_stab_t       *stab_dst = (H5O_stab_t *)mesg_dst;
+     H5G_bt_it_cpy_t   udata;               /* B-tree user data */
++    H5HL_t           *heap      = NULL;    /* Pointer to source group's heap */
+     herr_t            ret_value = SUCCEED; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+@@ -346,18 +347,26 @@ H5O__stab_post_copy_file(const H5O_loc_t *src_oloc, const void *mesg_src, H5O_lo
+     if (cpy_info->max_depth >= 0 && cpy_info->curr_depth >= cpy_info->max_depth)
+         HGOTO_DONE(SUCCEED);
+ 
++    /* Get the heap for the copy*/
++    if (NULL == (heap = H5HL_protect(src_oloc->file, stab_src->heap_addr, H5AC__READ_ONLY_FLAG)))
++        HGOTO_ERROR(H5E_SYM, H5E_PROTECT, FAIL, "unable to protect local heap");
++
+     /* Set up B-tree iteration user data */
+-    udata.src_oloc      = src_oloc;
+-    udata.src_heap_addr = stab_src->heap_addr;
+-    udata.dst_file      = dst_oloc->file;
+-    udata.dst_stab      = stab_dst;
+-    udata.cpy_info      = cpy_info;
++    udata.src_oloc       = src_oloc;
++    udata.src_heap       = heap;
++    udata.src_block_size = H5HL_heap_get_size(heap);
++    udata.dst_file       = dst_oloc->file;
++    udata.dst_stab       = stab_dst;
++    udata.cpy_info       = cpy_info;
+ 
+     /* Iterate over objects in group, copying them */
+     if ((H5B_iterate(src_oloc->file, H5B_SNODE, stab_src->btree_addr, H5G__node_copy, &udata)) < 0)
+         HGOTO_ERROR(H5E_SYM, H5E_CANTINIT, FAIL, "iteration operator failed");
+ 
+ done:
++    if (heap && H5HL_unprotect(heap) < 0)
++        HDONE_ERROR(H5E_SYM, H5E_CANTUNPROTECT, FAIL, "unable to unprotect local heap");
++
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* H5O__stab_post_copy_file() */
+ 
+diff --git a/src/H5S.c b/src/H5S.c
+index 722eac8b563..65d7c49b6ad 100644
+--- a/src/H5S.c
++++ b/src/H5S.c
+@@ -1223,7 +1223,8 @@ H5S_set_extent_simple(H5S_t *space, unsigned rank, const hsize_t *dims, const hs
+     FUNC_ENTER_NOAPI(FAIL)
+ 
+     /* Check args */
+-    assert(rank <= H5S_MAX_RANK);
++    if (rank > H5S_MAX_RANK)
++        HGOTO_ERROR(H5E_DATASPACE, H5E_BADRANGE, FAIL, "dataspace rank too large: %u", rank);
+ 
+     /* shift out of the previous state to a "simple" dataspace.  */
+     if (H5S__extent_release(&space->extent) < 0)
+@@ -1595,6 +1596,30 @@ H5S_decode(const unsigned char **p)
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* end H5S_decode() */
+ 
++/*-------------------------------------------------------------------------
++ * Function:    H5S_get_simple_extent
++ *
++ * Purpose:     Internal function for retrieving the extent for a dataspace object
++ *
++ * Return:      Success:    Pointer to the extent for a dataspace (not copied)
++ *              Failure:    NULL
++ *
++ * Note:        This routine participates in the "Inlining C function pointers"
++ *              pattern, don't call it directly, use the appropriate macro
++ *              defined in H5Sprivate.h.
++ *
++ *-------------------------------------------------------------------------
++ */
++const H5S_extent_t *
++H5S_get_simple_extent(const H5S_t *space)
++{
++    FUNC_ENTER_NOAPI_NOINIT_NOERR
++
++    assert(space);
++
++    FUNC_LEAVE_NOAPI(&space->extent)
++} /* end H5S_get_simple_extent() */
++
+ /*-------------------------------------------------------------------------
+  * Function:    H5S_get_simple_extent_type
+  *
+diff --git a/src/H5Spoint.c b/src/H5Spoint.c
+index 7e66a03a5f6..690cb6592ac 100644
+--- a/src/H5Spoint.c
++++ b/src/H5Spoint.c
+@@ -1415,6 +1415,9 @@ H5S__point_deserialize(H5S_t **space, const uint8_t **p, const size_t p_size, bo
+     if (H5_IS_KNOWN_BUFFER_OVERFLOW(skip, pp, sizeof(uint32_t), p_end))
+         HGOTO_ERROR(H5E_DATASPACE, H5E_OVERFLOW, FAIL, "buffer overflow while decoding selection rank");
+     UINT32DECODE(pp, rank);
++    if (0 == rank || rank > H5S_MAX_RANK)
++        HGOTO_ERROR(H5E_DATASPACE, H5E_BADVALUE, FAIL, "invalid rank (%u) for serialized point selection",
++                    rank);
+ 
+     if (!*space) {
+         /* Patch the rank of the allocated dataspace */
+@@ -1456,10 +1459,6 @@ H5S__point_deserialize(H5S_t **space, const uint8_t **p, const size_t p_size, bo
+             break;
+     } /* end switch */
+ 
+-    /* Allocate space for the coordinates */
+-    if (NULL == (coord = (hsize_t *)H5MM_malloc(num_elem * rank * sizeof(hsize_t))))
+-        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "can't allocate coordinate information");
+-
+     /* Determine necessary size of buffer for coordinates */
+     enc_type_size = 0;
+ 
+@@ -1480,10 +1479,19 @@ H5S__point_deserialize(H5S_t **space, const uint8_t **p, const size_t p_size, bo
+ 
+     coordinate_buffer_requirement = num_elem * rank * enc_type_size;
+ 
++    /* Check for overflow during multiplication */
++    if (num_elem != (coordinate_buffer_requirement / (rank * enc_type_size)))
++        HGOTO_ERROR(H5E_DATASPACE, H5E_OVERFLOW, FAIL, "size of point selection buffer overflowed");
++
++    /* Check for possible buffer overrun */
+     if (H5_IS_KNOWN_BUFFER_OVERFLOW(skip, pp, coordinate_buffer_requirement, p_end))
+         HGOTO_ERROR(H5E_DATASPACE, H5E_OVERFLOW, FAIL,
+                     "buffer overflow while decoding selection coordinates");
+ 
++    /* Allocate space for the coordinates */
++    if (NULL == (coord = (hsize_t *)H5MM_malloc(num_elem * rank * sizeof(hsize_t))))
++        HGOTO_ERROR(H5E_DATASPACE, H5E_CANTALLOC, FAIL, "can't allocate coordinate information");
++
+     /* Retrieve the coordinates from the buffer */
+     for (tcoord = coord, i = 0; i < num_elem; i++)
+         for (j = 0; j < (unsigned)rank; j++, tcoord++)
+diff --git a/src/H5Sprivate.h b/src/H5Sprivate.h
+index 8fd73f54740..24a83353f70 100644
+--- a/src/H5Sprivate.h
++++ b/src/H5Sprivate.h
+@@ -130,6 +130,7 @@ typedef struct H5S_sel_iter_op_t {
+ 
+ /* If the module using this macro is allowed access to the private variables, access them directly */
+ #ifdef H5S_MODULE
++#define H5S_GET_EXTENT(S)                       (&(S)->extent)
+ #define H5S_GET_EXTENT_TYPE(S)                  ((S)->extent.type)
+ #define H5S_GET_EXTENT_NDIMS(S)                 ((S)->extent.rank)
+ #define H5S_GET_EXTENT_NPOINTS(S)               ((S)->extent.nelem)
+@@ -157,6 +158,7 @@ typedef struct H5S_sel_iter_op_t {
+     ((*(ITER)->type->iter_get_seq_list)(ITER, MAXSEQ, MAXBYTES, NSEQ, NBYTES, OFF, LEN))
+ #define H5S_SELECT_ITER_RELEASE(ITER) ((*(ITER)->type->iter_release)(ITER))
+ #else /* H5S_MODULE */
++#define H5S_GET_EXTENT(S)                       (H5S_get_simple_extent(S))
+ #define H5S_GET_EXTENT_TYPE(S)                  (H5S_get_simple_extent_type(S))
+ #define H5S_GET_EXTENT_NDIMS(S)                 (H5S_get_simple_extent_ndims(S))
+ #define H5S_GET_EXTENT_NPOINTS(S)               (H5S_get_simple_extent_npoints(S))
+@@ -200,14 +202,15 @@ struct H5O_loc_t;
+ typedef struct H5S_t H5S_t;
+ 
+ /* Operations on dataspaces */
+-H5_DLL herr_t      H5S_init(void);
+-H5_DLL H5S_t      *H5S_copy(const H5S_t *src, bool share_selection, bool copy_max);
+-H5_DLL herr_t      H5S_close(H5S_t *ds);
+-H5_DLL H5S_class_t H5S_get_simple_extent_type(const H5S_t *ds);
+-H5_DLL hssize_t    H5S_get_simple_extent_npoints(const H5S_t *ds);
+-H5_DLL hsize_t     H5S_get_npoints_max(const H5S_t *ds);
+-H5_DLL bool        H5S_has_extent(const H5S_t *ds);
+-H5_DLL int         H5S_get_simple_extent_ndims(const H5S_t *ds);
++H5_DLL herr_t              H5S_init(void);
++H5_DLL H5S_t              *H5S_copy(const H5S_t *src, bool share_selection, bool copy_max);
++H5_DLL herr_t              H5S_close(H5S_t *ds);
++H5_DLL const H5S_extent_t *H5S_get_simple_extent(const H5S_t *ds);
++H5_DLL H5S_class_t         H5S_get_simple_extent_type(const H5S_t *ds);
++H5_DLL hssize_t            H5S_get_simple_extent_npoints(const H5S_t *ds);
++H5_DLL hsize_t             H5S_get_npoints_max(const H5S_t *ds);
++H5_DLL bool                H5S_has_extent(const H5S_t *ds);
++H5_DLL int                 H5S_get_simple_extent_ndims(const H5S_t *ds);
+ H5_DLL int    H5S_get_simple_extent_dims(const H5S_t *ds, hsize_t dims[] /*out*/, hsize_t max_dims[] /*out*/);
+ H5_DLL herr_t H5S_write(H5F_t *f, struct H5O_t *oh, unsigned update_flags, H5S_t *ds);
+ H5_DLL herr_t H5S_append(H5F_t *f, struct H5O_t *oh, H5S_t *ds);
+diff --git a/src/H5T.c b/src/H5T.c
+index ba93eefd1e4..e3cf451d30a 100644
+--- a/src/H5T.c
++++ b/src/H5T.c
+@@ -377,9 +377,10 @@ static herr_t H5T__register(H5T_pers_t pers, const char *name, H5T_t *src, H5T_t
+ static htri_t H5T__compiler_conv(H5T_t *src, H5T_t *dst);
+ static herr_t H5T__set_size(H5T_t *dt, size_t size);
+ static herr_t H5T__close_cb(H5T_t *dt, void **request);
++static herr_t H5T__init_path_table(void);
++static bool   H5T__path_table_search(const H5T_t *src, const H5T_t *dst, int *idx, int *last_cmp);
+ static H5T_path_t *H5T__path_find_real(const H5T_t *src, const H5T_t *dst, const char *name,
+                                        H5T_conv_func_t *conv);
+-static herr_t      H5T__path_find_init_path_table(void);
+ static herr_t      H5T__path_find_init_new_path(H5T_path_t *path, const H5T_t *src, const H5T_t *dst,
+                                                 H5T_conv_func_t *conv, H5T_conv_ctx_t *conv_ctx);
+ static herr_t      H5T__path_free(H5T_path_t *path, H5T_conv_ctx_t *conv_ctx);
+@@ -4982,33 +4983,47 @@ H5T_cmp(const H5T_t *dt1, const H5T_t *dt2, bool superset)
+ } /* end H5T_cmp() */
+ 
+ /*-------------------------------------------------------------------------
+- * Function:    H5T__bsearch_path_table
+- *
+- * Purpose:    Performs a binary search on the type conversion path table.
+- *             If `last_cmp` is non-NULL, the value of the last comparison
+- *             is returned through it. If `idx` is non-NULL, the idx into
+- *             the path table where the matching path was found is returned
+- *             through it. If no matching path is found, the value for
+- *             `idx` will be the index into the path table where a path
+- *             entry with source and destination datatypes matching src and
+- *             dst should be inserted. In this case, the caller should be
+- *             sure to increment the index value by 1 if the value of the
+- *             last comparison is > 0.
+- *
+- * Return:    Success:    Pointer to the path in the path table
+- *            Failure:    NULL if no matching path is found in the table
++ * Function:    H5T__path_table_search
++ *
++ * Purpose:     Searches the global datatype conversion path table for a
++ *              conversion path between two datatypes.
++ *
++ *              Sets `idx` to be the index of the last table entry compared
++ *              (which will be the index of the matching conversion path on
++ *              success). If no matching path is found, the value for `idx`
++ *              will be the index into the path table where a new path
++ *              entry with source and destination datatypes matching src
++ *              and dst should be inserted. In this case, the caller should
++ *              be sure to increment the index value by 1 if the value of
++ *              the last comparison is > 0.
++ *
++ *              If `last_cmp` is non-NULL, the value of the last comparison
++ *              (-1, 0, or 1) is returned through it.
++ *
++ * Return:    Success:    true (conversion path found, index in *idx)
++ *            Failure:    false (no conversion path between types)
+  *
+  *-------------------------------------------------------------------------
+  */
+-static void *
+-H5T__bsearch_path_table(const H5T_t *src, const H5T_t *dst, int *last_cmp, int *idx)
++static bool
++H5T__path_table_search(const H5T_t *src, const H5T_t *dst, int *idx, int *last_cmp)
+ {
+-    int   cmp;
+-    int   lt, rt, md;
+-    void *ret_value = NULL;
++    int  lt, rt, md;        /* Left, middle, and right edges */
++    int  cmp;               /* Comparison result  */
++    bool ret_value = false; /* Return value */
+ 
+     FUNC_ENTER_PACKAGE_NOERR
+ 
++    /* Sanity check */
++    assert(0 != H5T_g.npaths);
++    assert(src);
++    assert(src->shared);
++    assert(dst);
++    assert(dst->shared);
++    assert(idx);
++
++    /* Find the conversion path in the table, using a binary search */
++    /* NOTE: Doesn't match against entry 0, which is the no-op path */
+     lt = md = 1;
+     rt      = H5T_g.npaths;
+     cmp     = -1;
+@@ -5024,16 +5039,17 @@ H5T__bsearch_path_table(const H5T_t *src, const H5T_t *dst, int *last_cmp, int *
+         else if (cmp > 0)
+             lt = md + 1;
+         else
+-            ret_value = H5T_g.path[md];
++            /* Match found */
++            ret_value = true;
+     }
+ 
++    /* Set middle index & comparison values */
++    *idx = md;
+     if (last_cmp)
+         *last_cmp = cmp;
+-    if (idx)
+-        *idx = md;
+ 
+     FUNC_LEAVE_NOAPI(ret_value)
+-} /* end H5T__bsearch_path_table() */
++} /* end H5T__path_table_search() */
+ 
+ /*-------------------------------------------------------------------------
+  * Function:    H5T_path_find
+@@ -5138,7 +5154,7 @@ H5T__path_find_real(const H5T_t *src, const H5T_t *dst, const char *name, H5T_co
+         HGOTO_ERROR(H5E_DATATYPE, H5E_CANTGET, NULL, "unable to get conversion exception callback");
+ 
+     /* Make sure the path table is initialized */
+-    if ((0 == H5T_g.npaths) && (H5T__path_find_init_path_table() < 0))
++    if ((0 == H5T_g.npaths) && (H5T__init_path_table() < 0))
+         HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, NULL, "unable to initialize type conversion path table");
+ 
+     /* Find the conversion path. If no "force conversion" flags are
+@@ -5150,8 +5166,11 @@ H5T__path_find_real(const H5T_t *src, const H5T_t *dst, const char *name, H5T_co
+         src->shared->force_conv == false && dst->shared->force_conv == false && 0 == H5T_cmp(src, dst, true);
+     if (noop_conv)
+         matched_path = H5T_g.path[0];
+-    else
+-        matched_path = H5T__bsearch_path_table(src, dst, &last_cmp, &path_idx);
++    else {
++        /* Search the table of conversion paths */
++        if (H5T__path_table_search(src, dst, &path_idx, &last_cmp))
++            matched_path = H5T_g.path[path_idx];
++    }
+ 
+     /* Keep a record of the number of paths in the table, in case one of the
+      * initialization calls below (hard or soft) causes more entries to be
+@@ -5199,7 +5218,8 @@ H5T__path_find_real(const H5T_t *src, const H5T_t *dst, const char *name, H5T_co
+      * and re-compute the correct location for this path if so. - QAK, 1/26/02
+      */
+     if (old_npaths != H5T_g.npaths)
+-        matched_path = H5T__bsearch_path_table(src, dst, &last_cmp, &path_idx);
++        if (H5T__path_table_search(src, dst, &path_idx, &last_cmp))
++            matched_path = H5T_g.path[path_idx];
+ 
+     /* Replace an existing table entry or add a new entry */
+     if (matched_path && new_path) {
+@@ -5254,7 +5274,7 @@ H5T__path_find_real(const H5T_t *src, const H5T_t *dst, const char *name, H5T_co
+ } /* end H5T__path_find_real() */
+ 
+ /*-------------------------------------------------------------------------
+- * Function:  H5T__path_find_init_path_table
++ * Function:  H5T__init_path_table
+  *
+  * Purpose:   Helper function to allocate and initialize the table holding
+  *            pointers to datatype conversion paths. Sets the no-op
+@@ -5265,26 +5285,28 @@ H5T__path_find_real(const H5T_t *src, const H5T_t *dst, const char *name, H5T_co
+  *-------------------------------------------------------------------------
+  */
+ static herr_t
+-H5T__path_find_init_path_table(void)
++H5T__init_path_table(void)
+ {
+     herr_t ret_value = SUCCEED;
+ 
+     FUNC_ENTER_PACKAGE
+ 
+-    assert(0 == H5T_g.npaths);
++    /* Sanity check */
++    if (0 != H5T_g.npaths)
++        HGOTO_ERROR(H5E_DATATYPE, H5E_ALREADYINIT, FAIL,
++                    "datatype conversion path table is already initialized");
+ 
+-    if (NULL == (H5T_g.path = H5MM_malloc(H5T_DEF_CONV_TABLE_SLOTS * sizeof(H5T_path_t *))))
+-        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL,
++    if (NULL == (H5T_g.path = H5MM_calloc(H5T_DEF_CONV_TABLE_SLOTS * sizeof(H5T_path_t *))))
++        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTALLOC, FAIL,
+                     "memory allocation failed for type conversion path table");
+-    H5T_g.apaths  = H5T_DEF_CONV_TABLE_SLOTS;
+-    H5T_g.path[0] = NULL;
++    H5T_g.apaths = H5T_DEF_CONV_TABLE_SLOTS;
+ 
+     /*
+      * Allocate a path for the no-op conversion function
+      * and set it as the first entry in the table
+      */
+     if (NULL == (H5T_g.path[0] = H5FL_CALLOC(H5T_path_t)))
+-        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed for no-op conversion path");
++        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTALLOC, FAIL, "memory allocation failed for no-op conversion path");
+ 
+     /* Initialize the no-op path */
+     snprintf(H5T_g.path[0]->name, sizeof(H5T_g.path[0]->name), "no-op");
+@@ -5303,7 +5325,9 @@ H5T__path_find_init_path_table(void)
+     } /* end if */
+ 
+     H5T_g.path[0]->is_noop = true;
+-    H5T_g.npaths           = 1;
++
++    /* Set # of initial paths in the table */
++    H5T_g.npaths = 1;
+ 
+ done:
+     if (ret_value < 0) {
+@@ -5313,7 +5337,7 @@ H5T__path_find_init_path_table(void)
+     }
+ 
+     FUNC_LEAVE_NOAPI(ret_value)
+-}
++} /* end H5T__init_path_table() */
+ 
+ /*-------------------------------------------------------------------------
+  * Function:  H5T__path_find_init_new_path
+@@ -5674,6 +5698,47 @@ H5T_path_noop(const H5T_path_t *p)
+     FUNC_LEAVE_NOAPI(p->is_noop || (p->is_hard && 0 == H5T_cmp(p->src, p->dst, false)))
+ } /* end H5T_path_noop() */
+ 
++/*-------------------------------------------------------------------------
++ * Function:    H5T_noop_conv
++ *
++ * Purpose:     Check if a conversion between two dataypes will be a no-op
++ *
++ * Return:      true / false (can't fail)
++ *
++ *-------------------------------------------------------------------------
++ */
++bool
++H5T_noop_conv(const H5T_t *src, const H5T_t *dst)
++{
++    bool ret_value = false; /* Return value */
++
++    FUNC_ENTER_NOAPI_NOINIT_NOERR
++
++    /* Sanity check */
++    assert(src);
++    assert(src->shared);
++    assert(dst);
++    assert(dst->shared);
++
++    /* Check the conversion path.  If source and destination types are equal
++     * then its a no-op conversion, as long as neither type has a "force conversion"
++     * flag.  Otherwise search over the conversion table entries.
++     */
++    if (src->shared->force_conv == false && dst->shared->force_conv == false &&
++        0 == H5T_cmp(src, dst, true)) {
++        ret_value = true;
++    } /* end if */
++    else {
++        int idx = 0; /* Matching entry */
++
++        /* Search the table of conversion paths */
++        if (H5T__path_table_search(src, dst, &idx, NULL))
++            ret_value = H5T_path_noop(H5T_g.path[idx]);
++    } /* end else */
++
++    FUNC_LEAVE_NOAPI(ret_value)
++} /* end H5T_noop_conv() */
++
+ /*-------------------------------------------------------------------------
+  * Function:  H5T_path_compound_subset
+  *
+diff --git a/src/H5Tprivate.h b/src/H5Tprivate.h
+index 46b2c92fa83..99ea256b27d 100644
+--- a/src/H5Tprivate.h
++++ b/src/H5Tprivate.h
+@@ -131,6 +131,7 @@ H5_DLL herr_t             H5T_convert_committed_datatype(H5T_t *dt, H5F_t *f);
+ H5_DLL htri_t             H5T_is_relocatable(const H5T_t *dt);
+ H5_DLL H5T_path_t        *H5T_path_find(const H5T_t *src, const H5T_t *dst);
+ H5_DLL bool               H5T_path_noop(const H5T_path_t *p);
++H5_DLL bool               H5T_noop_conv(const H5T_t *src, const H5T_t *dst);
+ H5_DLL H5T_bkg_t          H5T_path_bkg(const H5T_path_t *p);
+ H5_DLL H5T_subset_info_t *H5T_path_compound_subset(const H5T_path_t *p);
+ H5_DLL herr_t             H5T_unregister(H5T_pers_t pers, const char *name, H5T_t *src, H5T_t *dst,
+diff --git a/src/H5VLnative_blob.c b/src/H5VLnative_blob.c
+index 718d5487561..890e82dc1b5 100644
+--- a/src/H5VLnative_blob.c
++++ b/src/H5VLnative_blob.c
+@@ -113,14 +113,17 @@ H5VL__native_blob_get(void *obj, const void *blob_id, void *buf, size_t size, vo
+     UINT32DECODE(id, hobjid.idx);
+ 
+     /* Check if this sequence actually has any data */
+-    if (hobjid.addr > 0)
++    if (hobjid.addr > 0) {
++        /* Verify the size is correct */
++        if (H5HG_get_obj_size(f, &hobjid, &hobj_size) < 0)
++            HGOTO_ERROR(H5E_VOL, H5E_CANTGETSIZE, FAIL, "can't get object size");
++        if (hobj_size != size)
++            HGOTO_ERROR(H5E_VOL, H5E_BADSIZE, FAIL, "Expected global heap object size does not match");
++
+         /* Read the VL information from disk */
+         if (NULL == H5HG_read(f, &hobjid, buf, &hobj_size))
+             HGOTO_ERROR(H5E_VOL, H5E_READERROR, FAIL, "unable to read VL information");
+-
+-    /* Verify the size is correct */
+-    if (hobj_size != size)
+-        HGOTO_ERROR(H5E_VOL, H5E_CANTDECODE, FAIL, "Expected global heap object size does not match");
++    }
+ 
+ done:
+     FUNC_LEAVE_NOAPI(ret_value)
+diff --git a/src/H5Znbit.c b/src/H5Znbit.c
+index fb5c5c51f8d..429394d56c8 100644
+--- a/src/H5Znbit.c
++++ b/src/H5Znbit.c
+@@ -947,8 +947,10 @@ H5Z__filter_nbit(unsigned flags, size_t cd_nelmts, const unsigned cd_values[], s
+             HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, 0, "memory allocation failed for nbit decompression");
+ 
+         /* decompress the buffer */
+-        if (H5Z__nbit_decompress(outbuf, d_nelmts, (unsigned char *)*buf, cd_values) < 0)
++        if (H5Z__nbit_decompress(outbuf, d_nelmts, (unsigned char *)*buf, cd_values) < 0) {
++            H5MM_xfree(outbuf);
+             HGOTO_ERROR(H5E_PLINE, H5E_CANTFILTER, 0, "can't decompress buffer");
++        }
+     } /* end if */
+     /* output; compress */
+     else {
+@@ -1180,7 +1182,7 @@ static herr_t
+ H5Z__nbit_decompress_one_compound(unsigned char *data, size_t data_offset, unsigned char *buffer, size_t *j,
+                                   size_t *buf_len, const unsigned parms[], unsigned *parms_index)
+ {
+-    unsigned     i, nmembers, member_offset, member_class, member_size, used_size = 0, size;
++    unsigned     i, nmembers, member_offset, member_class, member_size, used_size = 0, prev_used_size, size;
+     parms_atomic p;
+     herr_t       ret_value = SUCCEED; /* Return value */
+ 
+@@ -1194,10 +1196,15 @@ H5Z__nbit_decompress_one_compound(unsigned char *data, size_t data_offset, unsig
+         member_class  = parms[(*parms_index)++];
+ 
+         /* Check for overflow */
+-        member_size = parms[*parms_index];
++        member_size    = parms[*parms_index];
++        prev_used_size = used_size;
+         used_size += member_size;
+         if (used_size > size)
+-            HGOTO_ERROR(H5E_PLINE, H5E_BADTYPE, FAIL, "compound member offset overflowed compound size");
++            HGOTO_ERROR(H5E_PLINE, H5E_BADVALUE, FAIL, "compound member size overflowed compound size");
++        if (used_size <= prev_used_size)
++            HGOTO_ERROR(H5E_PLINE, H5E_BADVALUE, FAIL, "compound member size overflowed compound size");
++        if ((member_offset + member_size) > size)
++            HGOTO_ERROR(H5E_PLINE, H5E_BADRANGE, FAIL, "compound member offset overflowed compound size");
+         switch (member_class) {
+             case H5Z_NBIT_ATOMIC:
+                 p.size = member_size;
+diff --git a/tools/lib/h5tools_utils.c b/tools/lib/h5tools_utils.c
+index dfffac67385..d7e7ff574a9 100644
+--- a/tools/lib/h5tools_utils.c
++++ b/tools/lib/h5tools_utils.c
+@@ -589,12 +589,12 @@ dump_table(hid_t fid, char *tablename, table_t *table)
+ 
+     PRINTSTREAM(rawoutstream, "%s: # of entries = %d\n", tablename, table->nobjs);
+     for (u = 0; u < table->nobjs; u++) {
+-        H5VLconnector_token_to_str(fid, table->objs[u].obj_token, &obj_tok_str);
++        H5Otoken_to_str(fid, &table->objs[u].obj_token, &obj_tok_str);
+ 
+         PRINTSTREAM(rawoutstream, "%s %s %d %d\n", obj_tok_str, table->objs[u].objname,
+                     table->objs[u].displayed, table->objs[u].recorded);
+ 
+-        H5VLfree_token_str(fid, obj_tok_str);
++        H5free_memory(obj_tok_str);
+     }
+ }
+ 

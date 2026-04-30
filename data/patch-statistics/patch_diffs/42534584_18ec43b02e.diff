@@ -1,0 +1,57 @@
+From a9e823951efa2aca929f09b0f842f902ce28249d Mon Sep 17 00:00:00 2001
+From: aled-ua <bugbuster.cc@gmail.com>
+Date: Sun, 2 Feb 2025 18:48:15 -0600
+Subject: [PATCH] Fix Heap-buffer-overflow in __parse_options (#1678)
+
+* Fix vuln crash-7d18f37e1f05e0ff4aa4dfa2f67dd738340ad9cf
+
+* Move the heap overflow check before the allocation
+
+* Terminating immediately when overflow is found
+
+* Fix typo err
+
+---------
+
+Co-authored-by: dataisland <dataisland@outlook.com>
+---
+ .../LightPcapNg/src/light_pcapng.c            | 21 +++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/3rdParty/LightPcapNg/LightPcapNg/src/light_pcapng.c b/3rdParty/LightPcapNg/LightPcapNg/src/light_pcapng.c
+index 1db448de7f..26423426f6 100644
+--- a/3rdParty/LightPcapNg/LightPcapNg/src/light_pcapng.c
++++ b/3rdParty/LightPcapNg/LightPcapNg/src/light_pcapng.c
+@@ -49,15 +49,28 @@ static struct _light_option *__parse_options(uint32_t **memory, const int32_t ma
+       opt->custom_option_code = *local_memory++;
+       opt->option_length = *local_memory++;
+ 
++      // PCPP patch
++      // Validate option_length
++      if (opt->option_length > max_len - 2 * sizeof(*local_memory)) {
++          free(opt);
++          return NULL;
++      }
++      // PCPP patch end
++
+       actual_length = (opt->option_length % alignment) == 0 ?
+             opt->option_length :
+             (opt->option_length / alignment + 1) * alignment;
+ 
+-      if (actual_length > 0) {
+-         opt->data = calloc(1, actual_length);
+-         memcpy(opt->data, local_memory, actual_length);
+-         local_memory += (sizeof(**memory) / sizeof(*local_memory)) * (actual_length / alignment);
++      // PCPP patch
++      // Validate actual_length
++      if (actual_length <= 0 || actual_length > max_len - 2 * sizeof(*local_memory)) {
++          free(opt);
++          return NULL;
+       }
++      opt->data = calloc(1, actual_length);
++      memcpy(opt->data, local_memory, actual_length);
++      local_memory += (sizeof(**memory) / sizeof(*local_memory)) * (actual_length / alignment);
++      // PCPP patch end
+ 
+       *memory = (uint32_t*)local_memory;
+       remaining_size = max_len - actual_length - 2 * sizeof(*local_memory);

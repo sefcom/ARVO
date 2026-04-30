@@ -1,0 +1,51 @@
+From 83d53c738a14b78a2b55ae3367ebb2a5a54e454d Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@spatialys.com>
+Date: Thu, 10 May 2018 12:21:13 +0200
+Subject: [PATCH] XLSX: avoid stack buffer overflow is creating too many
+ fields. Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=8198.
+ Credit to OSS Fuzz
+
+---
+ gdal/ogr/ogrsf_frmts/xlsx/ogr_xlsx.h            |  3 +--
+ gdal/ogr/ogrsf_frmts/xlsx/ogrxlsxdatasource.cpp | 14 ++++++++++++++
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/gdal/ogr/ogrsf_frmts/xlsx/ogr_xlsx.h b/gdal/ogr/ogrsf_frmts/xlsx/ogr_xlsx.h
+index d8f955d8acf1..8972804c4e5c 100644
+--- a/gdal/ogr/ogrsf_frmts/xlsx/ogr_xlsx.h
++++ b/gdal/ogr/ogrsf_frmts/xlsx/ogr_xlsx.h
+@@ -95,8 +95,7 @@ class OGRXLSXLayer final: public OGRMemLayer
+     { Init(); return OGRMemLayer::GetFeatureCount(bForce); }
+ 
+     virtual OGRErr      CreateField( OGRFieldDefn *poField,
+-                                     int bApproxOK = TRUE ) override
+-    { Init(); SetUpdated(); return OGRMemLayer::CreateField(poField, bApproxOK); }
++                                     int bApproxOK = TRUE ) override;
+ 
+     virtual OGRErr      DeleteField( int iField ) override
+     { Init(); SetUpdated(); return OGRMemLayer::DeleteField(iField); }
+diff --git a/gdal/ogr/ogrsf_frmts/xlsx/ogrxlsxdatasource.cpp b/gdal/ogr/ogrsf_frmts/xlsx/ogrxlsxdatasource.cpp
+index 8b65c360d758..cf16255eaf0b 100644
+--- a/gdal/ogr/ogrsf_frmts/xlsx/ogrxlsxdatasource.cpp
++++ b/gdal/ogr/ogrsf_frmts/xlsx/ogrxlsxdatasource.cpp
+@@ -112,6 +112,20 @@ OGRFeature* OGRXLSXLayer::GetNextFeature()
+     return poFeature;
+ }
+ 
++OGRErr OGRXLSXLayer::CreateField( OGRFieldDefn *poField, int bApproxOK )
++{
++    Init();
++    // BuildColString() takes a 4 character string + nul byte
++    if( GetLayerDefn()->GetFieldCount() >= 2000 )
++    {
++        CPLError(CE_Failure, CPLE_AppDefined,
++                 "Maximum number of fields supported is 2000");
++        return OGRERR_FAILURE;
++    }
++    SetUpdated();
++    return OGRMemLayer::CreateField(poField, bApproxOK);
++}
++
+ /************************************************************************/
+ /*                           GetFeature()                               */
+ /************************************************************************/

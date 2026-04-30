@@ -1,0 +1,56 @@
+From d4ae8a5f164167ef4fcf5b76b743e92b9e76d9dd Mon Sep 17 00:00:00 2001
+From: emanuele-f <faranda@ntop.org>
+Date: Thu, 13 Feb 2020 10:46:30 +0100
+Subject: [PATCH] Fix memory invalid access in SMTP and leaks in TLS
+
+---
+ src/lib/protocols/mail_smtp.c | 9 ++++++---
+ src/lib/protocols/tls.c       | 8 ++++++--
+ 2 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/lib/protocols/mail_smtp.c b/src/lib/protocols/mail_smtp.c
+index 045601f7839..0b4c47be81f 100644
+--- a/src/lib/protocols/mail_smtp.c
++++ b/src/lib/protocols/mail_smtp.c
+@@ -143,7 +143,7 @@ void ndpi_search_mail_smtp_tcp(struct ndpi_detection_module_struct *ndpi_struct,
+ 		u_char *out;
+ 		size_t out_len;
+ 
+-		ndpi_user_pwd_payload_copy(buf, sizeof(buf)-1, 0,
++		ndpi_user_pwd_payload_copy(buf, sizeof(buf), 0,
+ 					   packet->line[a].ptr, packet->line[a].len);
+ 
+ #ifdef SMTP_DEBUG
+@@ -176,8 +176,11 @@ void ndpi_search_mail_smtp_tcp(struct ndpi_detection_module_struct *ndpi_struct,
+ 		out = ndpi_base64_decode((const u_char*)buf, (size_t)strlen((const char*)buf), &out_len);
+ 
+ 		if(out) {
+-		  snprintf(flow->protos.ftp_imap_pop_smtp.password,
+-			   sizeof(flow->protos.ftp_imap_pop_smtp.password), "%s", out);
++		  size_t len = ndpi_min(out_len, sizeof(flow->protos.ftp_imap_pop_smtp.password) - 1);
++
++		  memcpy(flow->protos.ftp_imap_pop_smtp.password, out, len);
++		  flow->protos.ftp_imap_pop_smtp.password[len] = '\0';
++
+ 		  ndpi_free(out);
+ 		}
+ 	      } else {
+diff --git a/src/lib/protocols/tls.c b/src/lib/protocols/tls.c
+index 1b120dc7bdd..aa273f53584 100644
+--- a/src/lib/protocols/tls.c
++++ b/src/lib/protocols/tls.c
+@@ -483,8 +483,12 @@ static int processTLSBlock(struct ndpi_detection_module_struct *ndpi_struct,
+     break;
+ 
+   case 0x0b: /* Certificate */
+-    processCertificate(ndpi_struct, flow);
+-    flow->l4.tcp.tls.certificate_processed = 1;
++    /* Important: populate the tls union fields only after
++     * ndpi_int_tls_add_connection has been called */
++    if(flow->l4.tcp.tls.hello_processed) {
++      processCertificate(ndpi_struct, flow);
++      flow->l4.tcp.tls.certificate_processed = 1;
++    }
+     break;
+ 
+   default:

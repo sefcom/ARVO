@@ -1,0 +1,75 @@
+From c3e0ad3c549f06fb0dcf99f4e39b7858ff07aff5 Mon Sep 17 00:00:00 2001
+From: "Adi (Suissa) Peleg" <adip@google.com>
+Date: Wed, 13 May 2020 15:30:01 -0400
+Subject: [PATCH] Fixing order of variables definition in codec_impl fuzz test
+ (#11168)
+
+This happens when Envoy::Http::Http1::StreamEncoderImpl::~StreamEncoderImpl() is called, and readDisable() is called on connection_ which is already destroyed.
+(The connection is passed as a reference to StreamEncoderImpl.)
+
+Signed-off-by: Adi Suissa-Peleg <adip@google.com>
+---
+ .../http/codec_impl_corpus/read_disable       | 25 +++++++++++++++++++
+ test/common/http/codec_impl_fuzz_test.cc      |  5 ++--
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+ create mode 100644 test/common/http/codec_impl_corpus/read_disable
+
+diff --git a/test/common/http/codec_impl_corpus/read_disable b/test/common/http/codec_impl_corpus/read_disable
+new file mode 100644
+index 0000000000000..d0525e6285ad3
+--- /dev/null
++++ b/test/common/http/codec_impl_corpus/read_disable
+@@ -0,0 +1,25 @@
++actions {
++  new_stream {
++    request_headers {
++      headers {
++        key: ":method"
++        value: "GET"
++      }
++      headers {
++        key: ":path"
++        value: "/"
++      }
++    }
++  }
++}
++actions {
++  client_drain {
++  }
++}
++actions {
++  stream_action {
++    response {
++      read_disable: true
++    }
++  }
++}
+diff --git a/test/common/http/codec_impl_fuzz_test.cc b/test/common/http/codec_impl_fuzz_test.cc
+index 2beb87908c6a0..7163b53c0dd80 100644
+--- a/test/common/http/codec_impl_fuzz_test.cc
++++ b/test/common/http/codec_impl_fuzz_test.cc
+@@ -418,11 +418,14 @@ void codecFuzz(const test::common::http::CodecImplFuzzTestCase& input, HttpVersi
+       fromHttp2Settings(input.h2_settings().client())};
+   const Http1Settings client_http1settings;
+   NiceMock<MockConnectionCallbacks> client_callbacks;
++  NiceMock<Network::MockConnection> server_connection;
++  NiceMock<MockServerConnectionCallbacks> server_callbacks;
+   uint32_t max_request_headers_kb = Http::DEFAULT_MAX_REQUEST_HEADERS_KB;
+   uint32_t max_request_headers_count = Http::DEFAULT_MAX_HEADERS_COUNT;
+   uint32_t max_response_headers_count = Http::DEFAULT_MAX_HEADERS_COUNT;
+   const envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
+       headers_with_underscores_action = envoy::config::core::v3::HttpProtocolOptions::ALLOW;
++
+   ClientConnectionPtr client;
+   ServerConnectionPtr server;
+   const bool http2 = http_version == HttpVersion::Http2;
+@@ -438,8 +441,6 @@ void codecFuzz(const test::common::http::CodecImplFuzzTestCase& input, HttpVersi
+                                                            max_response_headers_count);
+   }
+ 
+-  NiceMock<Network::MockConnection> server_connection;
+-  NiceMock<MockServerConnectionCallbacks> server_callbacks;
+   if (http2) {
+     const envoy::config::core::v3::Http2ProtocolOptions server_http2_options{
+         fromHttp2Settings(input.h2_settings().server())};

@@ -1,0 +1,59 @@
+From 1c43db6db6ec3c8f84d6d751f904ab8558561430 Mon Sep 17 00:00:00 2001
+From: Nickolay Olshevsky <o.nickolay@gmail.com>
+Date: Mon, 7 Sep 2020 12:11:31 +0300
+Subject: [PATCH] Fix oss-fuzz issue 25388: possible heap buffer overflow
+ during parsing of kbx blob.
+
+---
+ src/librekey/key_store_kbx.cpp                    |   5 +++--
+ ...crash-b894a2f79f7d38a16ae0ee8d74972336aa3f5798 | Bin 0 -> 150 bytes
+ src/tests/fuzz_keyring_kbx.cpp                    |   4 ++++
+ 3 files changed, 7 insertions(+), 2 deletions(-)
+ create mode 100644 src/tests/data/test_fuzz_keyring_kbx/crash-b894a2f79f7d38a16ae0ee8d74972336aa3f5798
+
+diff --git a/src/librekey/key_store_kbx.cpp b/src/librekey/key_store_kbx.cpp
+index 7870a85b7..e7b33b242 100644
+--- a/src/librekey/key_store_kbx.cpp
++++ b/src/librekey/key_store_kbx.cpp
+@@ -136,7 +136,8 @@ rnp_key_store_kbx_parse_pgp_blob(kbx_pgp_blob_t *pgp_blob)
+     pgp_blob->keyblock_length = ru32(image);
+     image += 4;
+ 
+-    if (pgp_blob->keyblock_offset > pgp_blob->blob.length ||
++    if ((pgp_blob->keyblock_offset > pgp_blob->blob.length) ||
++        (pgp_blob->keyblock_offset > (UINT32_MAX - pgp_blob->keyblock_length)) ||
+         pgp_blob->blob.length < (pgp_blob->keyblock_offset + pgp_blob->keyblock_length)) {
+         RNP_LOG("Wrong keyblock offset/length, blob size: %" PRIu32
+                 ", keyblock offset: %" PRIu32 ", length: %" PRIu32,
+@@ -454,7 +455,7 @@ rnp_key_store_kbx_from_src(rnp_key_store_t *         key_store,
+             // parse keyblock if it existed
+             pgp_blob = (kbx_pgp_blob_t *) *blob;
+ 
+-            if (pgp_blob->keyblock_length == 0) {
++            if (!pgp_blob->keyblock_length) {
+                 RNP_LOG("PGP blob have zero size");
+                 goto finish;
+             }
+diff --git a/src/tests/data/test_fuzz_keyring_kbx/crash-b894a2f79f7d38a16ae0ee8d74972336aa3f5798 b/src/tests/data/test_fuzz_keyring_kbx/crash-b894a2f79f7d38a16ae0ee8d74972336aa3f5798
+new file mode 100644
+index 0000000000000000000000000000000000000000..95885af483b43dfdacadadd276680b0f79d778a2
+GIT binary patch
+literal 150
+scmZQzV3@|lsGz{Wz@YFS2pAX{3>8QPK+OywBS_NsAE+9HQ2<l`0O;ZuMF0Q*
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/tests/fuzz_keyring_kbx.cpp b/src/tests/fuzz_keyring_kbx.cpp
+index 8540dea38..d0cb33fc7 100644
+--- a/src/tests/fuzz_keyring_kbx.cpp
++++ b/src/tests/fuzz_keyring_kbx.cpp
+@@ -41,4 +41,8 @@ TEST_F(rnp_tests, test_fuzz_keyring_kbx)
+      * rnp_key_store_kbx_from_src */
+     data = file_to_vec(DATA_PATH "crash-5526a2e13255018c857ce493c28ce7108b8b2987");
+     assert_int_equal(keyring_kbx_LLVMFuzzerTestOneInput(data.data(), data.size()), 0);
++
++    /* Issue 25388 in oss-fuzz: rnp:fuzz_keyring_kbx: Heap-buffer-overflow in mem_src_read */
++    data = file_to_vec(DATA_PATH "crash-b894a2f79f7d38a16ae0ee8d74972336aa3f5798");
++    assert_int_equal(keyring_kbx_LLVMFuzzerTestOneInput(data.data(), data.size()), 0);
+ }

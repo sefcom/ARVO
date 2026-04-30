@@ -1,0 +1,550 @@
+From d80f11f4f55100d007ae80a162bf257ec291612c Mon Sep 17 00:00:00 2001
+From: peterhillman <peterh@wetafx.co.nz>
+Date: Fri, 11 Sep 2020 11:02:20 +1200
+Subject: [PATCH] More efficient handling of filled channels reading tiles with
+ scanline API (#830)
+
+* refactor channel filling in InputFile API with tiled source
+
+Signed-off-by: Peter Hillman <peterh@wetafx.co.nz>
+
+* handle edge-case of empty framebuffer
+
+Signed-off-by: Peter Hillman <peterh@wetafx.co.nz>
+---
+ OpenEXR/IlmImf/ImfInputFile.cpp        | 271 ++++++++++++++++---------
+ OpenEXR/IlmImfTest/testScanLineApi.cpp | 134 +++++++++++-
+ 2 files changed, 310 insertions(+), 95 deletions(-)
+
+diff --git a/OpenEXR/IlmImf/ImfInputFile.cpp b/OpenEXR/IlmImf/ImfInputFile.cpp
+index 6bcb451ec4..2ca45a738a 100644
+--- a/OpenEXR/IlmImf/ImfInputFile.cpp
++++ b/OpenEXR/IlmImf/ImfInputFile.cpp
+@@ -278,9 +278,14 @@ bufferedReadPixels (InputFile::Data* ifd, int scanLine1, int scanLine2)
+             //
+             // We don't have any valid buffered info, so we need to read in
+             // from the file.
++            // if no channels are being read that are present in file, cachedBuffer will be empty
+             //
+ 
+-            ifd->tFile->readTiles (0, ifd->tFile->numXTiles (0) - 1, j, j);
++            if (ifd->cachedBuffer->begin() != ifd->cachedBuffer->end())
++            {
++                ifd->tFile->readTiles (0, ifd->tFile->numXTiles (0) - 1, j, j);
++            }
++
+             ifd->cachedTileY = j;
+         }
+ 
+@@ -289,58 +294,135 @@ bufferedReadPixels (InputFile::Data* ifd, int scanLine1, int scanLine2)
+         // framebuffer.
+         //
+ 
+-        for (FrameBuffer::ConstIterator k = ifd->cachedBuffer->begin();
+-             k != ifd->cachedBuffer->end();
++        for (FrameBuffer::ConstIterator k = ifd->tFileBuffer.begin();
++             k != ifd->tFileBuffer.end();
+              ++k)
+         {
+-            Slice fromSlice = k.slice();		// slice to write from
+-            Slice toSlice = ifd->tFileBuffer[k.name()];	// slice to write to
+ 
+-            char *fromPtr, *toPtr;
+-            int size = pixelTypeSize (toSlice.type);
+ 
+-	    int xStart = levelRange.min.x;
+-	    int yStart = minYThisRow;
++            Slice toSlice = k.slice();		// slice to read from
++            char* toPtr;
+ 
+-	    while (modp (xStart, toSlice.xSampling) != 0)
+-		++xStart;
++            int xStart = levelRange.min.x;
++            int yStart = minYThisRow;
+ 
+-	    while (modp (yStart, toSlice.ySampling) != 0)
+-		++yStart;
++            while (modp (xStart, toSlice.xSampling) != 0)
++                ++xStart;
+ 
++            while (modp (yStart, toSlice.ySampling) != 0)
++                ++yStart;
+ 
+-            intptr_t fromBase = reinterpret_cast<intptr_t>(fromSlice.base);
++            FrameBuffer::ConstIterator c = ifd->cachedBuffer->find(k.name());
+             intptr_t toBase = reinterpret_cast<intptr_t>(toSlice.base);
+ 
+-            for (int y = yStart;
+-		 y <= maxYThisRow;
+-		 y += toSlice.ySampling)
++
++            if( c!=ifd->cachedBuffer->end())
++            {
++                //
++                // output channel was read from source image: copy to output slice
++                //
++                Slice fromSlice = c.slice();	// slice to write to
++                intptr_t fromBase = reinterpret_cast<intptr_t>(fromSlice.base);
++
++                int size = pixelTypeSize (toSlice.type);
++                char* fromPtr;
++
++                for (int y = yStart;
++                    y <= maxYThisRow;
++                    y += toSlice.ySampling)
++                {
++                    //
++                    // Set the pointers to the start of the y scanline in
++                    // this row of tiles
++                    //
++
++                    fromPtr = reinterpret_cast<char*> (fromBase  +
++                            (y - tileRange.min.y) * fromSlice.yStride +
++                            xStart * fromSlice.xStride);
++
++                    toPtr = reinterpret_cast<char*> (toBase +
++                            divp (y, toSlice.ySampling) * toSlice.yStride +
++                            divp (xStart, toSlice.xSampling) * toSlice.xStride);
++
++                    //
++                    // Copy all pixels for the scanline in this row of tiles
++                    //
++
++                    for (int x = xStart;
++                        x <= levelRange.max.x;
++                        x += toSlice.xSampling)
++                    {
++                        for (int i = 0; i < size; ++i)
++                            toPtr[i] = fromPtr[i];
++
++                        fromPtr += fromSlice.xStride * toSlice.xSampling;
++                        toPtr += toSlice.xStride;
++                    }
++                }
++            }
++            else
+             {
+-		//
+-                // Set the pointers to the start of the y scanline in
+-                // this row of tiles
+-		//
+-                fromPtr = reinterpret_cast<char*> (fromBase +
+-                          (y - tileRange.min.y) * fromSlice.yStride +
+-                          xStart * fromSlice.xStride);
+-
+-                toPtr = reinterpret_cast<char*> (toBase +
+-                        divp (y, toSlice.ySampling) * toSlice.yStride +
+-                        divp (xStart, toSlice.xSampling) * toSlice.xStride);
+-
+-		//
+-                // Copy all pixels for the scanline in this row of tiles
+-		//
+-
+-                for (int x = xStart;
+-		     x <= levelRange.max.x;
+-		     x += toSlice.xSampling)
++
++                //
++                // channel wasn't present in source file: fill output slice
++                //
++                for (int y = yStart;
++                    y <= maxYThisRow;
++                    y += toSlice.ySampling)
+                 {
+-		    for (int i = 0; i < size; ++i)
+-			toPtr[i] = fromPtr[i];
+ 
+-		    fromPtr += fromSlice.xStride * toSlice.xSampling;
+-		    toPtr += toSlice.xStride;
++                    toPtr = reinterpret_cast<char*> (toBase+
++                            divp (y, toSlice.ySampling) * toSlice.yStride +
++                            divp (xStart, toSlice.xSampling) * toSlice.xStride);
++
++                    //
++                    // Copy all pixels for the scanline in this row of tiles
++                    //
++
++                    switch ( toSlice.type)
++                    {
++                        case UINT:
++                        {
++                            unsigned int fill = toSlice.fillValue;
++                            for (int x = xStart;
++                                x <= levelRange.max.x;
++                                x += toSlice.xSampling)
++                            {
++                                * reinterpret_cast<unsigned int*>(toPtr) = fill;
++                                toPtr += toSlice.xStride;
++                            }
++                            break;
++                        }
++                        case HALF :
++                        {
++                            half fill = toSlice.fillValue;
++                            for (int x = xStart;
++                                x <= levelRange.max.x;
++                                x += toSlice.xSampling)
++                            {
++                                * reinterpret_cast<half*>(toPtr) = fill;
++                                toPtr += toSlice.xStride;
++                            }
++                            break;
++                        }
++                        case FLOAT :
++                        {
++                            float fill = toSlice.fillValue;
++                            for (int x = xStart;
++                                x <= levelRange.max.x;
++                                x += toSlice.xSampling)
++                            {
++                                * reinterpret_cast<float*>(toPtr) = fill;
++                                toPtr += toSlice.xStride;
++                            }
++                            break;
++                        }
++                        case NUM_PIXELTYPES :
++                        {
++                            break;
++                        }
++
++                    }
+                 }
+             }
+         }
+@@ -706,60 +788,67 @@ InputFile::setFrameBuffer (const FrameBuffer &frameBuffer)
+ 	    {
+ 		Slice s = k.slice();
+ 
+-		switch (s.type)
+-		{
+-		  case OPENEXR_IMF_INTERNAL_NAMESPACE::UINT:
+-
+-		    _data->cachedBuffer->insert
+-			(k.name(),
+-			 Slice (UINT,
+-				(char *)(new unsigned int[tileRowSize] - 
+-					_data->offset),
+-				sizeof (unsigned int),
+-				sizeof (unsigned int) *
+-				    _data->tFile->levelWidth(0),
+-				1, 1,
+-				s.fillValue,
+-				false, true));
+-		    break;
+-
+-		  case OPENEXR_IMF_INTERNAL_NAMESPACE::HALF:
+-
+-		    _data->cachedBuffer->insert
+-			(k.name(),
+-			 Slice (HALF,
+-				(char *)(new half[tileRowSize] - 
+-					_data->offset),
+-				sizeof (half),
+-				sizeof (half) *
+-				    _data->tFile->levelWidth(0),
+-				1, 1,
+-				s.fillValue,
+-				false, true));
+-		    break;
+-
+-		  case OPENEXR_IMF_INTERNAL_NAMESPACE::FLOAT:
+-
+-		    _data->cachedBuffer->insert
+-			(k.name(),
+-			 Slice (OPENEXR_IMF_INTERNAL_NAMESPACE::FLOAT,
+-				(char *)(new float[tileRowSize] - 
+-					_data->offset),
+-				sizeof(float),
+-				sizeof(float) *
+-				    _data->tFile->levelWidth(0),
+-				1, 1,
+-				s.fillValue,
+-				false, true));
+-		    break;
+-
+-		  default:
+-
+-		    throw IEX_NAMESPACE::ArgExc ("Unknown pixel data type.");
+-		}
++                //
++                // omit adding channels that are not listed - 'fill' channels are added later
++                //
++                if ( _data->header.channels().find(k.name()) != _data->header.channels().end() )
++                {
++                    switch (s.type)
++                    {
++                    case OPENEXR_IMF_INTERNAL_NAMESPACE::UINT:
++
++                        _data->cachedBuffer->insert
++                            (k.name(),
++                            Slice (UINT,
++                                    (char *)(new unsigned int[tileRowSize] -
++                                            _data->offset),
++                                    sizeof (unsigned int),
++                                    sizeof (unsigned int) *
++                                        _data->tFile->levelWidth(0),
++                                    1, 1,
++                                    s.fillValue,
++                                    false, true));
++                        break;
++
++                    case OPENEXR_IMF_INTERNAL_NAMESPACE::HALF:
++
++                        _data->cachedBuffer->insert
++                            (k.name(),
++                            Slice (HALF,
++                                    (char *)(new half[tileRowSize] -
++                                            _data->offset),
++                                    sizeof (half),
++                                    sizeof (half) *
++                                        _data->tFile->levelWidth(0),
++                                    1, 1,
++                                    s.fillValue,
++                                    false, true));
++                        break;
++
++                    case OPENEXR_IMF_INTERNAL_NAMESPACE::FLOAT:
++
++                        _data->cachedBuffer->insert
++                            (k.name(),
++                            Slice (OPENEXR_IMF_INTERNAL_NAMESPACE::FLOAT,
++                                    (char *)(new float[tileRowSize] -
++                                            _data->offset),
++                                    sizeof(float),
++                                    sizeof(float) *
++                                        _data->tFile->levelWidth(0),
++                                    1, 1,
++                                    s.fillValue,
++                                    false, true));
++                        break;
++
++                    default:
++
++                        throw IEX_NAMESPACE::ArgExc ("Unknown pixel data type.");
++                    }
++                }
+ 	    }
+ 
+ 	    _data->tFile->setFrameBuffer (*_data->cachedBuffer);
++
+         }
+ 
+ 	_data->tFileBuffer = frameBuffer;
+diff --git a/OpenEXR/IlmImfTest/testScanLineApi.cpp b/OpenEXR/IlmImfTest/testScanLineApi.cpp
+index 354d2dccf1..720351ea5d 100644
+--- a/OpenEXR/IlmImfTest/testScanLineApi.cpp
++++ b/OpenEXR/IlmImfTest/testScanLineApi.cpp
+@@ -93,7 +93,9 @@ writeRead (const Array2D<unsigned int> &pi1,
+            int yOffset,
+            Compression comp,
+            LevelMode mode,
+-	   LevelRoundingMode rmode)
++	   LevelRoundingMode rmode,
++           bool fillChannel
++          )
+ {
+     //
+     // Write the pixel data in pi1, ph1 and ph2 to a tiled
+@@ -263,6 +265,16 @@ writeRead (const Array2D<unsigned int> &pi1,
+         Array2D<half>         ph2 (h, w);
+         Array2D<float>        pf2 (h, w);
+ 
++        Array2D<unsigned int> fi2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++        Array2D<half>         fh2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++        Array2D<float>        ff2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++
++
++        const unsigned int fillInt = 12;
++        const half fillHalf = 4.5;
++        const float fillFloat = M_PI;
++
++
+         FrameBuffer fb;
+ 
+         fb.insert ("I",                             // name
+@@ -286,6 +298,30 @@ writeRead (const Array2D<unsigned int> &pi1,
+                           sizeof (pf2[0][0]) * w)   // yStride
+                   );
+ 
++        if(fillChannel)
++        {
++            fb.insert ("FI",                             // name
++                   Slice (IMF::UINT,                // type
++                          (char *) &fi2[-dwy][-dwx],// base
++                          sizeof (fi2[0][0]),       // xStride
++                          sizeof (fi2[0][0]) * w,1,1,fillInt)  // yStride
++                  );
++
++            fb.insert ("FH",                             // name
++                    Slice (IMF::HALF,                // type
++                            (char *) &fh2[-dwy][-dwx],// base
++                            sizeof (fh2[0][0]),       // xStride
++                            sizeof (fh2[0][0]) * w,1,1,fillHalf)   // yStride
++                    );
++
++            fb.insert ("FF",                             // name
++                    Slice (IMF::FLOAT,               // type
++                            (char *) &ff2[-dwy][-dwx],// base
++                            sizeof (ff2[0][0]),       // xStride
++                            sizeof (ff2[0][0]) * w,1,1,fillFloat)   // yStride
++                    );
++        }
++
+         in.setFrameBuffer (fb);
+         for (int y = dw.min.y; y <= dw.max.y; ++y)
+             in.readPixels (y);
+@@ -323,6 +359,13 @@ writeRead (const Array2D<unsigned int> &pi1,
+                 assert (pi1[y][x] == pi2[y][x]);
+                 assert (ph1[y][x] == ph2[y][x]);
+                 assert (pf1[y][x] == pf2[y][x]);
++
++                if (fillChannel)
++                {
++                    assert(fi2[y][x] == fillInt);
++                    assert(fh2[y][x] == fillHalf);
++                    assert(ff2[y][x] == fillFloat);
++                }
+             }
+         }    
+     }
+@@ -342,6 +385,10 @@ writeRead (const Array2D<unsigned int> &pi1,
+         Array2D<half>         ph2 (h, w);
+         Array2D<float>        pf2 (h, w);
+ 
++        Array2D<unsigned int> fi2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++        Array2D<half>         fh2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++        Array2D<float>        ff2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++
+         FrameBuffer fb;
+ 
+         fb.insert ("I",                             // name
+@@ -364,6 +411,34 @@ writeRead (const Array2D<unsigned int> &pi1,
+                           sizeof (pf2[0][0]),       // xStride
+                           sizeof (pf2[0][0]) * w)   // yStride
+                   );
++        const unsigned int fillInt = 21;
++        const half fillHalf = 42;
++        const float fillFloat = 2.8;
++
++        if (fillChannel)
++        {
++            fb.insert ("FI",                             // name
++                   Slice (IMF::UINT,                // type
++                          (char *) &fi2[-dwy][-dwx],// base
++                          sizeof (fi2[0][0]),       // xStride
++                          sizeof (fi2[0][0]) * w,1,1,fillInt)   // yStride
++                  );
++
++            fb.insert ("FH",                             // name
++                    Slice (IMF::HALF,                // type
++                            (char *) &fh2[-dwy][-dwx],// base
++                            sizeof (fh2[0][0]),       // xStride
++                            sizeof (fh2[0][0]) * w,1,1,fillHalf)   // yStride
++                    );
++
++            fb.insert ("FF",                             // name
++                    Slice (IMF::FLOAT,               // type
++                            (char *) &ff2[-dwy][-dwx],// base
++                            sizeof (ff2[0][0]),       // xStride
++                            sizeof (ff2[0][0]) * w,1,1,fillFloat)   // yStride
++                    );
++
++        }
+ 
+         in.setFrameBuffer (fb);
+         for (int y = dw.max.y; y >= dw.min.y; --y)
+@@ -402,6 +477,12 @@ writeRead (const Array2D<unsigned int> &pi1,
+                 assert (pi1[y][x] == pi2[y][x]);
+                 assert (ph1[y][x] == ph2[y][x]);
+                 assert (pf1[y][x] == pf2[y][x]);
++                if (fillChannel)
++                {
++                    assert(fi2[y][x] == fillInt);
++                    assert(fh2[y][x] == fillHalf);
++                    assert(ff2[y][x] == fillFloat);
++                }
+             }
+         }
+     }
+@@ -422,6 +503,17 @@ writeRead (const Array2D<unsigned int> &pi1,
+         Array2D<half>         ph2 (h, w);
+         Array2D<float>        pf2 (h, w);
+ 
++
++        Array2D<unsigned int> fi2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++        Array2D<half>         fh2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++        Array2D<float>        ff2 (fillChannel ? h : 1 , fillChannel ? w : 1);
++
++
++        const unsigned int fillInt = 81;
++        const half fillHalf = 0.5;
++        const float fillFloat = 7.8;
++
++
+         for (int y = dw.min.y; y <= dw.max.y; ++y)
+ 	{
+ 	    FrameBuffer fb;
+@@ -447,6 +539,31 @@ writeRead (const Array2D<unsigned int> &pi1,
+ 			      0)				// yStride
+ 		      );
+ 
++            if (fillChannel)
++            {
++                fb.insert ("FI",					// name
++                        Slice (IMF::UINT,			// type
++                                (char *) &fi2[y - dwy][-dwx],	// base
++                                sizeof (fi2[0][0]),		// xStride
++                                0,1,1,fillInt)				// yStride
++                        );
++
++                fb.insert ("FH",					// name
++                        Slice (IMF::HALF,			// type
++                                (char *) &fh2[y - dwy][-dwx],	// base
++                                sizeof (fh2[0][0]),		// xStride
++                                0,1,1,fillHalf)				// yStride
++                        );
++
++                fb.insert ("FF",                     	        // name
++                        Slice (IMF::FLOAT,			// type
++                                (char *) &ff2[y - dwy][-dwx],	// base
++                                sizeof (ff2[0][0]),		// xStride
++                                0,1,1,fillFloat)				// yStride
++                        );
++
++            }
++
+ 	    in.setFrameBuffer (fb);
+             in.readPixels (y);
+ 	}
+@@ -484,7 +601,14 @@ writeRead (const Array2D<unsigned int> &pi1,
+                 assert (pi1[y][x] == pi2[y][x]);
+                 assert (ph1[y][x] == ph2[y][x]);
+                 assert (pf1[y][x] == pf2[y][x]);
++                if (fillChannel)
++                {
++                    assert (fi2[y][x] == fillInt);
++                    assert (fh2[y][x] == fillHalf);
++                    assert (ff2[y][x] == fillFloat);
++                }
+             }
++
+         }    
+     }
+ 
+@@ -509,11 +633,13 @@ writeRead (const std::string &tempDir,
+     std::string filename = tempDir + "imf_test_scanline_api.exr";
+ 
+     writeRead (pi, ph, pf, filename.c_str(), lorder, W, H,
+-               xSize, ySize, dx, dy, comp, ONE_LEVEL, rmode);
++               xSize, ySize, dx, dy, comp, ONE_LEVEL, rmode , false);
++    writeRead (pi, ph, pf, filename.c_str(), lorder, W, H,
++               xSize, ySize, dx, dy, comp, MIPMAP_LEVELS, rmode , false );
+     writeRead (pi, ph, pf, filename.c_str(), lorder, W, H,
+-               xSize, ySize, dx, dy, comp, MIPMAP_LEVELS, rmode);
++               xSize, ySize, dx, dy, comp, RIPMAP_LEVELS, rmode , false);
+     writeRead (pi, ph, pf, filename.c_str(), lorder, W, H,
+-               xSize, ySize, dx, dy, comp, RIPMAP_LEVELS, rmode);
++               xSize, ySize, dx, dy, comp, ONE_LEVEL, rmode , true);
+ }
+ 
+ } // namespace

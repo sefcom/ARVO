@@ -1,0 +1,134 @@
+From 2422afa72801603247b6a748ea32ca2ce9443ecd Mon Sep 17 00:00:00 2001
+From: Ken Sharp <Ken.Sharp@artifex.com>
+Date: Mon, 20 May 2024 13:07:47 +0100
+Subject: Coverity ID #69096 Heap-buffer overflow in text_to_stream
+
+I'd made an error with the use of the viewer stat stack which could lead
+to us trying to use a state past the end of the stack, in extreme cases.
+
+On reflection there's really no need for this to be tracked like a
+grpahics state parameter, so I've moved it into the general pdfwrite
+device structure, which simplifies the code and solves the problem.
+---
+ devices/vector/gdevpdfb.h | 1 +
+ devices/vector/gdevpdfg.c | 4 ----
+ devices/vector/gdevpdfi.c | 8 ++++----
+ devices/vector/gdevpdfu.c | 4 ++--
+ devices/vector/gdevpdfx.h | 5 ++++-
+ 5 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/devices/vector/gdevpdfb.h b/devices/vector/gdevpdfb.h
+index ac689180d..971e9e283 100644
+--- a/devices/vector/gdevpdfb.h
++++ b/devices/vector/gdevpdfb.h
+@@ -161,6 +161,7 @@ const gx_device_pdf PDF_DEVICE_IDENT =
+  0,				/* font_cache */
+  {0, 0},			/* char_width */
+  0,				/* clip_path */
++ 0,             /* clipped_text_pending */
+  0,                             /* PageLabels */
+  -1,                            /* PageLabels_current_page */
+  0,                             /* PageLabels_current_label */
+diff --git a/devices/vector/gdevpdfg.c b/devices/vector/gdevpdfg.c
+index a9552a031..fdde2ac81 100644
+--- a/devices/vector/gdevpdfg.c
++++ b/devices/vector/gdevpdfg.c
+@@ -98,10 +98,6 @@ pdf_save_viewer_state(gx_device_pdf *pdev, stream *s)
+     pdev->vgstack[i].line_params = pdev->state.line_params;
+     pdev->vgstack[i].line_params.dash.pattern = 0; /* Use pdev->dash_pattern instead. */
+     pdev->vgstack[i].soft_mask_id = pdev->state.soft_mask_id; /* Use pdev->dash_pattern instead. */
+-    if (i > 0)
+-        pdev->vgstack[i].clipped_text_pending = pdev->vgstack[i - 1].clipped_text_pending;
+-    else
+-        pdev->vgstack[i].clipped_text_pending = 0;
+     if (pdev->dash_pattern) {
+         if (pdev->vgstack[i].dash_pattern)
+             gs_free_object(pdev->memory->non_gc_memory, pdev->vgstack[i].dash_pattern, "free gstate copy dash");
+diff --git a/devices/vector/gdevpdfi.c b/devices/vector/gdevpdfi.c
+index adbf434af..0a09390f7 100644
+--- a/devices/vector/gdevpdfi.c
++++ b/devices/vector/gdevpdfi.c
+@@ -3016,7 +3016,7 @@ gdev_pdf_dev_spec_op(gx_device *pdev1, int dev_spec_op, void *data, int size)
+                  *  a time when the clip wasn't active.
+                  * First, check if we have a clip (this should always be true).
+                  */
+-                if (pdev->vgstack[pdev->vgstack_depth].clipped_text_pending) {
++                if (pdev->clipped_text_pending) {
+                     /* Get back to the content stream. This will (amongst other things) flush
+                      * any pending text.
+                      */
+@@ -3024,7 +3024,7 @@ gdev_pdf_dev_spec_op(gx_device *pdev1, int dev_spec_op, void *data, int size)
+                     if (code < 0)
+                         return code;
+                     /* Reset the pending state */
+-                    pdev->vgstack[pdev->vgstack_depth].clipped_text_pending = 0;
++                    pdev->clipped_text_pending = 0;
+                     /* Restore to our saved state */
+                     code = pdf_restore_viewer_state(pdev, pdev->strm);
+                     if (code < 0)
+@@ -3035,7 +3035,7 @@ gdev_pdf_dev_spec_op(gx_device *pdev1, int dev_spec_op, void *data, int size)
+                 /* We are starting text in a clip mode
+                  * First make sure we aren't already in a clip mode (this shuld never be true)
+                  */
+-                if (!pdev->vgstack[pdev->vgstack_depth].clipped_text_pending) {
++                if (!pdev->clipped_text_pending) {
+                     /* Return to the content stream, this will (amongst other things) flush
+                      * any pending text.
+                      */
+@@ -3048,7 +3048,7 @@ gdev_pdf_dev_spec_op(gx_device *pdev1, int dev_spec_op, void *data, int size)
+                     code = pdf_save_viewer_state(pdev, pdev->strm);
+                     if (code < 0)
+                         return code;
+-                    pdev->vgstack[pdev->vgstack_depth].clipped_text_pending = 1;
++                    pdev->clipped_text_pending = 1;
+                 }
+             }
+             break;
+diff --git a/devices/vector/gdevpdfu.c b/devices/vector/gdevpdfu.c
+index 04747ff50..a52beab4a 100644
+--- a/devices/vector/gdevpdfu.c
++++ b/devices/vector/gdevpdfu.c
+@@ -1167,7 +1167,7 @@ stream_to_text(gx_device_pdf * pdev)
+      * *NOT* want to save the viewer state as that will write a q/Q round the text
+      * which will discard the clip.
+      */
+-    if (!pdev->vgstack[pdev->vgstack_depth].clipped_text_pending) {
++    if (!pdev->clipped_text_pending) {
+         code = pdf_save_viewer_state(pdev, pdev->strm);
+         if (code < 0)
+             return 0;
+@@ -1207,7 +1207,7 @@ text_to_stream(gx_device_pdf * pdev)
+      * which will discard the clip. However, we *do* have to undo the 'cm'
+      * operation which is done for Acrobat (see stream_to_text above).
+      */
+-    if (pdev->vgstack[pdev->vgstack_depth].clipped_text_pending)
++    if (pdev->clipped_text_pending)
+         pprintg2(pdev->strm, "%g 0 0 %g 0 0 cm\n",
+              72.0 / pdev->HWResolution[0], 72.0 / pdev->HWResolution[1]);
+     else {
+diff --git a/devices/vector/gdevpdfx.h b/devices/vector/gdevpdfx.h
+index 6c854290e..038278924 100644
+--- a/devices/vector/gdevpdfx.h
++++ b/devices/vector/gdevpdfx.h
+@@ -515,7 +515,6 @@ typedef struct pdf_viewer_state_s {
+     float *dash_pattern;
+     uint dash_pattern_size;
+     gs_id soft_mask_id;
+-    bool clipped_text_pending;
+ } pdf_viewer_state;
+ 
+ /*
+@@ -793,6 +792,10 @@ struct gx_device_pdf_s {
+      * redundant clipping paths when PS document generates such ones.
+      */
+     gx_path *clip_path;
++
++    /* Used for preserving text rendering modes with clip. */
++    bool clipped_text_pending;
++
+     /*
+      * Page labels.
+      */
+-- 
+cgit v1.2.3
+

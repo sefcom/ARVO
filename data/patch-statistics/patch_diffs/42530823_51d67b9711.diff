@@ -1,0 +1,80 @@
+From c9a51565214eece8f1053089739aea73145bfd6b Mon Sep 17 00:00:00 2001
+From: Emanuele Torre <torreemanuele6@gmail.com>
+Date: Wed, 13 Dec 2023 20:17:17 +0100
+Subject: [PATCH] Merge pull request from GHSA-7hmr-442f-qc8j
+
+The unit allocated for decNumberCompare was accidentally removed by
+commit 680baeffeb7983e7570b5e68db07fe47f94db8c7 (PR #2804)
+
+This caused a stack overflow when comparing a nan with a payload of 1000
+or more.
+
+This bug was found by OSS-fuzz.
+Ref: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=64771
+Fixes GHSA-7hmr-442f-qc8j
+
+It also fixes 1e999999999 > 1e-1147483646   triggering UBSAN errors
+Fixes #2968
+---
+ NEWS.md      |  2 +-
+ src/jv.c     | 12 ++++++++----
+ tests/shtest |  5 +++++
+ 3 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/NEWS.md b/NEWS.md
+index fffdbd97f2..913be89879 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -3,7 +3,7 @@
+ ## Security
+ 
+ - CVE-2023-50246: ....
+-- CVE-2023-50268: ....
++- CVE-2023-50268: fix stack-buffer-overflow if comparing nan with payload
+ 
+ ## CLI changes
+ 
+diff --git a/src/jv.c b/src/jv.c
+index 4031dc62f4..6ca1e1d0fd 100644
+--- a/src/jv.c
++++ b/src/jv.c
+@@ -740,15 +740,19 @@ int jvp_number_cmp(jv a, jv b) {
+ 
+ #ifdef USE_DECNUM
+   if (JVP_HAS_FLAGS(a, JVP_FLAGS_NUMBER_LITERAL) && JVP_HAS_FLAGS(b, JVP_FLAGS_NUMBER_LITERAL)) {
+-    decNumber res;
+-    decNumberCompare(&res,
++    struct {
++      decNumber number;
++      decNumberUnit units[1];
++    } res;
++
++    decNumberCompare(&res.number,
+                      jvp_dec_number_ptr(a),
+                      jvp_dec_number_ptr(b),
+                      DEC_CONTEXT()
+                      );
+-    if (decNumberIsZero(&res)) {
++    if (decNumberIsZero(&res.number)) {
+       return 0;
+-    } else if (decNumberIsNegative(&res)) {
++    } else if (decNumberIsNegative(&res.number)) {
+       return -1;
+     } else {
+       return 1;
+diff --git a/tests/shtest b/tests/shtest
+index 469ea1d256..a426c79f3b 100755
+--- a/tests/shtest
++++ b/tests/shtest
+@@ -594,6 +594,11 @@ if ! x=$($JQ -n "1 # foo$cr + 2") || [ "$x" != 1 ]; then
+   exit 1
+ fi
+ 
++# CVE-2023-50268: No stack overflow comparing a nan with a large payload
++$VALGRIND $Q $JQ '1 != .' <<\EOF >/dev/null
++Nan4000
++EOF
++
+ # Allow passing the inline jq script before -- #2919
+ if ! r=$($JQ --args -rn -- '$ARGS.positional[0]' bar) || [ "$r" != bar ]; then
+     echo "passing the inline script after -- didn't work"

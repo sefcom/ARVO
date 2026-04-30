@@ -1,0 +1,639 @@
+From d4b1a4b71273a766973b1ff84886396364ac8e18 Mon Sep 17 00:00:00 2001
+From: Cristy <mikayla-grace@urban-warrior.org>
+Date: Wed, 25 Nov 2020 09:17:22 -0500
+Subject: [PATCH] introducing bilateral filtering
+
+---
+ MagickCore/effect.c              | 227 +++++++++++++++++++++++++++++++
+ MagickCore/effect.h              |   2 +
+ MagickWand/convert.c             |  13 ++
+ MagickWand/magick-image.c        |  49 ++++++-
+ MagickWand/magick-image.h        |   1 +
+ MagickWand/mogrify.c             |  26 ++++
+ MagickWand/operation.c           |  11 ++
+ PerlMagick/Magick.xs             |  27 ++++
+ PerlMagick/quantum/quantum.xs.in |  27 ++++
+ utilities/convert.1              |   2 +
+ utilities/convert.1.in           |   2 +
+ utilities/magick.1               |   2 +
+ utilities/magick.1.in            |   2 +
+ utilities/mogrify.1              |   2 +
+ utilities/mogrify.1.in           |   2 +
+ 15 files changed, 394 insertions(+), 1 deletion(-)
+
+diff --git a/MagickCore/effect.c b/MagickCore/effect.c
+index 60df30faae5..25ac58c6a77 100644
+--- a/MagickCore/effect.c
++++ b/MagickCore/effect.c
+@@ -805,6 +805,233 @@ MagickExport Image *BlurImage(const Image *image,const double radius,
+ %                                                                             %
+ %                                                                             %
+ %                                                                             %
++%     B i l a t e r a l F i l t e r I m a g e                                 %
++%                                                                             %
++%                                                                             %
++%                                                                             %
++%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++%
++%  BilateralFilterImage() smooths and reducees noise in an image while
++%  preserving edges.
++%
++%  The format of the AdaptiveBlurImage method is:
++%
++%      Image *BilateralFilterImage(const Image *image,const double radius,
++%        const double sigma,ExceptionInfo *exception)
++%
++%  A description of each parameter follows:
++%
++%    o image: the image.
++%
++%    o radius: the radius of the Gaussian, in pixels, not counting the center
++%      pixel.
++%
++%    o sigma: the standard deviation of the Laplacian, in pixels.
++%
++%    o exception: return any errors or warnings in this structure.
++%
++*/
++MagickExport Image *BilateralFilterImage(const Image *image,const double radius,
++  const double sigma,ExceptionInfo *exception)
++{
++#define BilateralFilterImageTag  "Convolve/Image"
++#define MagickSigma  (fabs(sigma) < MagickEpsilon ? MagickEpsilon : sigma)
++
++  CacheView
++    *bilateral_view,
++    *image_view;
++
++  Image
++    *bilateral_image;
++
++  MagickBooleanType
++    status;
++
++  MagickOffsetType
++    progress;
++
++  size_t
++    width;
++
++  ssize_t
++    y;
++
++  assert(image != (const Image *) NULL);
++  assert(image->signature == MagickCoreSignature);
++  if (image->debug != MagickFalse)
++    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",image->filename);
++  assert(exception != (ExceptionInfo *) NULL);
++  assert(exception->signature == MagickCoreSignature);
++  bilateral_image=CloneImage(image,0,0,MagickTrue,exception);
++  if (bilateral_image == (Image *) NULL)
++    return((Image *) NULL);
++  if (SetImageStorageClass(bilateral_image,DirectClass,exception) == MagickFalse)
++    {
++      bilateral_image=DestroyImage(bilateral_image);
++      return((Image *) NULL);
++    }
++  /*
++    Create a kernel.
++  */
++  /*
++    Adaptively blur image.
++  */
++  status=MagickTrue;
++  progress=0;
++  width=GetOptimalKernelWidth2D(radius,sigma);
++  image_view=AcquireVirtualCacheView(image,exception);
++  bilateral_view=AcquireAuthenticCacheView(bilateral_image,exception);
++#if defined(MAGICKCORE_OPENMP_SUPPORT)
++  #pragma omp parallel for schedule(static) shared(progress,status) \
++    magick_number_threads(image,bilateral_image,bilateral_image->rows,1)
++#endif
++  for (y=0; y < (ssize_t) bilateral_image->rows; y++)
++  {
++    register const Quantum
++      *magick_restrict r;
++
++    register Quantum
++      *magick_restrict q;
++
++    register ssize_t
++      x;
++
++    if (status == MagickFalse)
++      continue;
++    r=GetCacheViewVirtualPixels(image_view,0,y,image->columns,1,exception);
++    q=QueueCacheViewAuthenticPixels(bilateral_view,0,y,
++      bilateral_image->columns,1,exception);
++    if ((r == (const Quantum *) NULL) || (q == (Quantum *) NULL))
++      {
++        status=MagickFalse;
++        continue;
++      }
++    for (x=0; x < (ssize_t) bilateral_image->columns; x++)
++    {
++      register const Quantum
++        *magick_restrict p;
++
++      register ssize_t
++        i;
++
++      ssize_t
++        center;
++
++      p=GetCacheViewVirtualPixels(image_view,x-((ssize_t) width/2L),y-
++        (ssize_t) (width/2L),width,width,exception);
++      if (p == (const Quantum *) NULL)
++        break;
++      center=(ssize_t) GetPixelChannels(image)*width*(width/2L)+
++        GetPixelChannels(image)*(width/2);
++      for (i=0; i < (ssize_t) GetPixelChannels(bilateral_image); i++)
++      {
++        double
++          alpha,
++          gamma,
++          pixel;
++
++        PixelChannel
++          channel;
++
++        PixelTrait
++          bilateral_traits,
++          traits;
++
++        register const double
++          *magick_restrict k;
++
++        register const Quantum
++          *magick_restrict pixels;
++
++        register ssize_t
++          u;
++
++        ssize_t
++          v;
++
++        channel=GetPixelChannelChannel(image,i);
++        traits=GetPixelChannelTraits(image,channel);
++        bilateral_traits=GetPixelChannelTraits(bilateral_image,channel);
++        if ((traits == UndefinedPixelTrait) ||
++            (bilateral_traits == UndefinedPixelTrait))
++          continue;
++        if ((bilateral_traits & CopyPixelTrait) != 0)
++          {
++            SetPixelChannel(bilateral_image,channel,p[center+i],q);
++            continue;
++          }
++        pixels=p;
++        pixel=0.0;
++        gamma=0.0;
++        if ((bilateral_traits & BlendPixelTrait) == 0)
++          {
++            /*
++              No alpha blending.
++            */
++            for (v=0; v < (ssize_t) width; v++)
++            {
++              for (u=0; u < (ssize_t) width; u++)
++              {
++                pixel+=1.0*pixels[i];
++                gamma+=1.0;
++                k++;
++                pixels+=GetPixelChannels(image);
++              }
++            }
++            gamma=PerceptibleReciprocal(gamma);
++            SetPixelChannel(bilateral_image,channel,ClampToQuantum(gamma*pixel),q);
++            continue;
++          }
++        /*
++          Alpha blending.
++        */
++        for (v=0; v < (ssize_t) width; v++)
++        {
++          for (u=0; u < (ssize_t) width; u++)
++          {
++            alpha=(double) (QuantumScale*GetPixelAlpha(image,pixels));
++            pixel+=1.0*alpha*pixels[i];
++            gamma+=1.0*alpha;
++            k++;
++            pixels+=GetPixelChannels(image);
++          }
++        }
++        gamma=PerceptibleReciprocal(gamma);
++        SetPixelChannel(bilateral_image,channel,ClampToQuantum(gamma*pixel),q);
++      }
++      q+=GetPixelChannels(bilateral_image);
++      r+=GetPixelChannels(image);
++    }
++    if (SyncCacheViewAuthenticPixels(bilateral_view,exception) == MagickFalse)
++      status=MagickFalse;
++    if (image->progress_monitor != (MagickProgressMonitor) NULL)
++      {
++        MagickBooleanType
++          proceed;
++
++#if defined(MAGICKCORE_OPENMP_SUPPORT)
++        #pragma omp atomic
++#endif
++        progress++;
++        proceed=SetImageProgress(image,BilateralFilterImageTag,progress,
++          image->rows);
++        if (proceed == MagickFalse)
++          status=MagickFalse;
++      }
++  }
++  bilateral_image->type=image->type;
++  bilateral_view=DestroyCacheView(bilateral_view);
++  image_view=DestroyCacheView(image_view);
++  if (status == MagickFalse)
++    bilateral_image=DestroyImage(bilateral_image);
++  return(bilateral_image);
++}
++
++/*
++%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++%                                                                             %
++%                                                                             %
++%                                                                             %
+ %     C o n v o l v e I m a g e                                               %
+ %                                                                             %
+ %                                                                             %
+diff --git a/MagickCore/effect.h b/MagickCore/effect.h
+index 7beb464e224..05bf9f6460e 100644
+--- a/MagickCore/effect.h
++++ b/MagickCore/effect.h
+@@ -62,6 +62,8 @@ extern MagickExport Image
+   *AdaptiveBlurImage(const Image *,const double,const double,ExceptionInfo *),
+   *AdaptiveSharpenImage(const Image *,const double,const double,
+      ExceptionInfo *),
++  *BilateralFilterImage(const Image *,const double,const double,
++    ExceptionInfo *),
+   *BlurImage(const Image *,const double,const double,ExceptionInfo *),
+   *ConvolveImage(const Image *,const KernelInfo *,ExceptionInfo *),
+   *DespeckleImage(const Image *,ExceptionInfo *),
+diff --git a/MagickWand/convert.c b/MagickWand/convert.c
+index cad41795433..672f2d9f7b5 100644
+--- a/MagickWand/convert.c
++++ b/MagickWand/convert.c
+@@ -160,6 +160,8 @@ static MagickBooleanType ConvertUsage(void)
+       "  -auto-threshold method\n"
+       "                       automatically perform image thresholding\n"
+       "  -bench iterations    measure performance\n"
++      "  -bilateral-filter geometry\n"
++      "                       smooth and reduce noise while preserving edges\n"
+       "  -black-threshold value\n"
+       "                       force all pixels below the threshold into black\n"
+       "  -blue-shift factor   simulate a scene at nighttime in the moonlight\n"
+@@ -772,6 +774,17 @@ WandExport MagickBooleanType ConvertImageCommand(ImageInfo *image_info,
+               ThrowConvertInvalidArgumentException(option,argv[i]);
+             break;
+           }
++        if (LocaleCompare("bilateral-filter",option+1) == 0)
++          {
++            if (*option == '+')
++              break;
++            i++;
++            if (i == (ssize_t) argc)
++              ThrowConvertException(OptionError,"MissingArgument",option);
++            if (IsGeometry(argv[i]) == MagickFalse)
++              ThrowConvertInvalidArgumentException(option,argv[i]);
++            break;
++          }
+         if (LocaleCompare("black-point-compensation",option+1) == 0)
+           break;
+         if (LocaleCompare("black-threshold",option+1) == 0)
+diff --git a/MagickWand/magick-image.c b/MagickWand/magick-image.c
+index 81a8c1c671e..4c9f1976599 100644
+--- a/MagickWand/magick-image.c
++++ b/MagickWand/magick-image.c
+@@ -877,6 +877,53 @@ WandExport MagickBooleanType MagickAutoThresholdImage(MagickWand *wand,
+ %                                                                             %
+ %                                                                             %
+ %                                                                             %
++%   M a g i c k B i l a t e r a l F i l t e r I m a g e                       %
++%                                                                             %
++%                                                                             %
++%                                                                             %
++%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++%
++%  MagickBilateralFilterImage() smooth and reduce noise while preserving edges.
++%
++%  The format of the MagickBilateralFilterImage method is:
++%
++%      MagickBooleanType MagickBilateralFilterImage(MagickWand *wand,
++%        const double radius,const double sigma)
++%
++%  A description of each parameter follows:
++%
++%    o wand: the magick wand.
++%
++%    o radius: the radius of the Gaussian, in pixels, not counting the center
++%      pixel.
++%
++%    o sigma: the standard deviation of the , in pixels.
++%
++*/
++WandExport MagickBooleanType MagickBilateralFilterImage(MagickWand *wand,
++  const double radius,const double sigma)
++{
++  Image
++    *blur_image;
++
++  assert(wand != (MagickWand *) NULL);
++  assert(wand->signature == MagickWandSignature);
++  if (wand->debug != MagickFalse)
++    (void) LogMagickEvent(WandEvent,GetMagickModule(),"%s",wand->name);
++  if (wand->images == (Image *) NULL)
++    ThrowWandException(WandError,"ContainsNoImages",wand->name);
++  blur_image=BilateralFilterImage(wand->images,radius,sigma,wand->exception);
++  if (blur_image == (Image *) NULL)
++    return(MagickFalse);
++  ReplaceImageInList(&wand->images,blur_image);
++  return(MagickTrue);
++}
++
++/*
++%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++%                                                                             %
++%                                                                             %
++%                                                                             %
+ %   M a g i c k B l a c k T h r e s h o l d I m a g e                         %
+ %                                                                             %
+ %                                                                             %
+@@ -988,7 +1035,7 @@ WandExport MagickBooleanType MagickBlueShiftImage(MagickWand *wand,
+ %
+ %    o wand: the magick wand.
+ %
+-%    o radius: the radius of the , in pixels, not counting the center
++%    o radius: the radius of the Gaussian, in pixels, not counting the center
+ %      pixel.
+ %
+ %    o sigma: the standard deviation of the , in pixels.
+diff --git a/MagickWand/magick-image.h b/MagickWand/magick-image.h
+index 10d39c5bfa7..76410b3ec35 100644
+--- a/MagickWand/magick-image.h
++++ b/MagickWand/magick-image.h
+@@ -93,6 +93,7 @@ extern WandExport MagickBooleanType
+   MagickAutoLevelImage(MagickWand *),
+   MagickAutoOrientImage(MagickWand *),
+   MagickAutoThresholdImage(MagickWand *,const AutoThresholdMethod),
++  MagickBilateralImage(MagickWand *,const double,const double),
+   MagickBlackThresholdImage(MagickWand *,const PixelWand *),
+   MagickBlueShiftImage(MagickWand *,const double),
+   MagickBlurImage(MagickWand *,const double,const double),
+diff --git a/MagickWand/mogrify.c b/MagickWand/mogrify.c
+index 0d649425eaa..28781eba59c 100644
+--- a/MagickWand/mogrify.c
++++ b/MagickWand/mogrify.c
+@@ -946,6 +946,19 @@ WandExport MagickBooleanType MogrifyImage(ImageInfo *image_info,const int argc,
+       }
+       case 'b':
+       {
++        if (LocaleCompare("bilateral-filter",option+1) == 0)
++          {
++            /*
++              Bilateral filter image.
++            */
++            (void) SyncImageSettings(mogrify_info,*image,exception);
++            flags=ParseGeometry(argv[i+1],&geometry_info);
++            if ((flags & SigmaValue) == 0)
++              geometry_info.sigma=geometry_info.rho;
++            mogrify_image=BilateralFilterImage(*image,(size_t)
++              geometry_info.rho,(size_t) geometry_info.sigma,exception);
++            break;
++          }
+         if (LocaleCompare("black-threshold",option+1) == 0)
+           {
+             /*
+@@ -3541,6 +3554,8 @@ static MagickBooleanType MogrifyUsage(void)
+       "  -auto-threshold method\n"
+       "                       automatically perform image thresholding\n"
+       "  -bench iterations    measure performance\n"
++      "  -bilateral-filter geometry\n"
++      "                       smooth and reduce noise while preserving edges\n"
+       "  -black-threshold value\n"
+       "                       force all pixels below the threshold into black\n"
+       "  -blue-shift          simulate a scene at nighttime in the moonlight\n"
+@@ -4233,6 +4248,17 @@ WandExport MagickBooleanType MogrifyImageCommand(ImageInfo *image_info,
+               ThrowMogrifyInvalidArgumentException(option,argv[i]);
+             break;
+           }
++        if (LocaleCompare("bilateral-filter",option+1) == 0)
++          {
++            if (*option == '+')
++              break;
++            i++;
++            if (i == (ssize_t) argc)
++              ThrowMogrifyException(OptionError,"MissingArgument",option);
++            if (IsGeometry(argv[i]) == MagickFalse)
++              ThrowMogrifyInvalidArgumentException(option,argv[i]);
++            break;
++          }
+         if (LocaleCompare("black-point-compensation",option+1) == 0)
+           break;
+         if (LocaleCompare("black-threshold",option+1) == 0)
+diff --git a/MagickWand/operation.c b/MagickWand/operation.c
+index 28650612d08..4b17d8f4287 100644
+--- a/MagickWand/operation.c
++++ b/MagickWand/operation.c
+@@ -1840,6 +1840,17 @@ static MagickBooleanType CLISimpleOperatorImage(MagickCLI *cli_wand,
+     }
+     case 'b':
+     {
++      if (LocaleCompare("bilateral-filter",option+1) == 0)
++        {
++          flags=ParseGeometry(arg1,&geometry_info);
++          if ((flags & (RhoValue|SigmaValue)) == 0)
++            CLIWandExceptArgBreak(OptionError,"InvalidArgument",option,arg1);
++          if ((flags & SigmaValue) == 0)
++            geometry_info.sigma=1.0;
++          new_image=BilateralFilterImage(_image,(size_t) geometry_info.rho,
++            (size_t) geometry_info.sigma,_exception);
++          break;
++        }
+       if (LocaleCompare("black-threshold",option+1) == 0)
+         {
+           if (IsGeometry(arg1) == MagickFalse)
+diff --git a/PerlMagick/Magick.xs b/PerlMagick/Magick.xs
+index 6b3b0cb3e6b..fb2a15c68a0 100644
+--- a/PerlMagick/Magick.xs
++++ b/PerlMagick/Magick.xs
+@@ -580,6 +580,9 @@ static struct
+     { "ColorThreshold", { {"start-color", StringReference},
+       {"stop-color", StringReference}, {"channel", MagickChannelOptions} } },
+     { "WhiteBalance", { { (const char *) NULL, NullReference } } },
++    { "BilateralFilter", { {"geometry", StringReference},
++      {"radius", RealReference}, {"sigma", RealReference},
++      {"channel", MagickChannelOptions} } },
+   };
+ 
+ static SplayTreeInfo
+@@ -7669,6 +7672,8 @@ Mogrify(ref,...)
+     ColorThresholdImage= 302
+     WhiteBalance       = 303
+     WhiteBalanceImage  = 304
++    BilateralFilter    = 305
++    BilateralFilterImage = 306
+     MogrifyRegion      = 666
+   PPCODE:
+   {
+@@ -11570,6 +11575,28 @@ Mogrify(ref,...)
+           (void) WhiteBalanceImage(image,exception);
+           break;
+         }
++        case 153:  /* BilateralFilter */
++        {
++          if (attribute_flag[0] != 0)
++            {
++              flags=ParseGeometry(argument_list[0].string_reference,
++                &geometry_info);
++              if ((flags & SigmaValue) == 0)
++                geometry_info.sigma=1.0;
++            }
++          if (attribute_flag[1] != 0)
++            geometry_info.rho=argument_list[1].real_reference;
++          if (attribute_flag[2] != 0)
++            geometry_info.sigma=argument_list[2].real_reference;
++          if (attribute_flag[3] != 0)
++            channel=(ChannelType) argument_list[3].integer_reference;
++          channel_mask=SetImageChannelMask(image,channel);
++          image=BilateralFilterImage(image,geometry_info.rho,
++            geometry_info.sigma,exception);
++          if (image != (Image *) NULL)
++            (void) SetImageChannelMask(image,channel_mask);
++          break;
++        }
+       }
+       if (next != (Image *) NULL)
+         (void) CatchImageException(next);
+diff --git a/PerlMagick/quantum/quantum.xs.in b/PerlMagick/quantum/quantum.xs.in
+index 3e603c9ff46..dd3a16e3de8 100644
+--- a/PerlMagick/quantum/quantum.xs.in
++++ b/PerlMagick/quantum/quantum.xs.in
+@@ -580,6 +580,9 @@ static struct
+     { "ColorThreshold", { {"start-color", StringReference},
+       {"stop-color", StringReference}, {"channel", MagickChannelOptions} } },
+     { "WhiteBalance", { { (const char *) NULL, NullReference } } },
++    { "BilateralFilter", { {"geometry", StringReference},
++      {"radius", RealReference}, {"sigma", RealReference},
++      {"channel", MagickChannelOptions} } },
+   };
+ 
+ static SplayTreeInfo
+@@ -7668,6 +7671,8 @@ Mogrify(ref,...)
+     ColorThresholdImage= 302
+     WhiteBalance       = 303
+     WhiteBalanceImage  = 304
++    BilateralFilter    =  305
++    BilateralFilterImage =  306
+     MogrifyRegion      = 666
+   PPCODE:
+   {
+@@ -11576,6 +11581,28 @@ Mogrify(ref,...)
+           (void) WhiteBalanceImage(image,exception);
+           break;
+         }
++        case 153:  /* BilateralFilter */
++        {
++          if (attribute_flag[0] != 0)
++            {
++              flags=ParseGeometry(argument_list[0].string_reference,
++                &geometry_info);
++              if ((flags & SigmaValue) == 0)
++                geometry_info.sigma=1.0;
++            }
++          if (attribute_flag[1] != 0)
++            geometry_info.rho=argument_list[1].real_reference;
++          if (attribute_flag[2] != 0)
++            geometry_info.sigma=argument_list[2].real_reference;
++          if (attribute_flag[3] != 0)
++            channel=(ChannelType) argument_list[3].integer_reference;
++          channel_mask=SetImageChannelMask(image,channel);
++          image=BilateralFilterImage(image,geometry_info.rho,
++            geometry_info.sigma,exception);
++          if (image != (Image *) NULL)
++            (void) SetImageChannelMask(image,channel_mask);
++          break;
++        }
+       }
+       if (next != (Image *) NULL)
+         (void) CatchImageException(next);
+diff --git a/utilities/convert.1 b/utilities/convert.1
+index a1dbed2532b..a24a64e4791 100644
+--- a/utilities/convert.1
++++ b/utilities/convert.1
+@@ -129,6 +129,8 @@ Image Operators:
+   \-auto-threshold method
+                        automatically perform image thresholding
+   \-bench iterations    measure performance
++  \-bilateral-filter geometry
++                        smooth and reduce noise while preserving edges
+   \-black-threshold value
+                        force all pixels below the threshold into black
+   \-blue-shift factor   simulate a scene at nighttime in the moonlight
+diff --git a/utilities/convert.1.in b/utilities/convert.1.in
+index 6e7b09b3308..a4c8138cfd1 100644
+--- a/utilities/convert.1.in
++++ b/utilities/convert.1.in
+@@ -129,6 +129,8 @@ Image Operators:
+   \-auto-threshold method
+                        automatically perform image thresholding
+   \-bench iterations    measure performance
++  \-bilateral-filter geometry
++                        smooth and reduce noise while preserving edges
+   \-black-threshold value
+                        force all pixels below the threshold into black
+   \-blue-shift factor   simulate a scene at nighttime in the moonlight
+diff --git a/utilities/magick.1 b/utilities/magick.1
+index a8e4de6265a..0bf86c490fb 100644
+--- a/utilities/magick.1
++++ b/utilities/magick.1
+@@ -110,6 +110,8 @@ Image Operators:
+   \-annotate geometry text
+                        annotate the image with text
+   \-auto-orient         automatically orient image
++  \-bilateral-filter geometry     
++                        smooth and reduce noise while preserving edges
+   \-black-threshold value
+                        force all pixels below the threshold into black
+   \-blur geometry       reduce image noise and reduce detail levels
+diff --git a/utilities/magick.1.in b/utilities/magick.1.in
+index f43667da7bb..a0baa714c3f 100644
+--- a/utilities/magick.1.in
++++ b/utilities/magick.1.in
+@@ -110,6 +110,8 @@ Image Operators:
+   \-annotate geometry text
+                        annotate the image with text
+   \-auto-orient         automatically orient image
++  \-bilateral-filter geometry     
++                        smooth and reduce noise while preserving edges
+   \-black-threshold value
+                        force all pixels below the threshold into black
+   \-blur geometry       reduce image noise and reduce detail levels
+diff --git a/utilities/mogrify.1 b/utilities/mogrify.1
+index 5eef2087504..d3256aa307c 100644
+--- a/utilities/mogrify.1
++++ b/utilities/mogrify.1
+@@ -127,6 +127,8 @@ Image Operators:
+   \-auto-threshold method
+                        automatically perform image thresholding
+   \-bench iterations    measure performance
++  \-bilateral-filter geometry     
++                        smooth and reduce noise while preserving edges
+   \-black-threshold value
+                        force all pixels below the threshold into black
+   \-blue-shift          simulate a scene at nighttime in the moonlight
+diff --git a/utilities/mogrify.1.in b/utilities/mogrify.1.in
+index 87a6896f0e6..fc28bbe93a0 100644
+--- a/utilities/mogrify.1.in
++++ b/utilities/mogrify.1.in
+@@ -127,6 +127,8 @@ Image Operators:
+   \-auto-threshold method
+                        automatically perform image thresholding
+   \-bench iterations    measure performance
++  \-bilateral-filter geometry     
++                        smooth and reduce noise while preserving edges
+   \-black-threshold value
+                        force all pixels below the threshold into black
+   \-blue-shift          simulate a scene at nighttime in the moonlight

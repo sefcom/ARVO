@@ -1,0 +1,96 @@
+From 6491e2e722c893b258e07565da9e0a1233321bcb Mon Sep 17 00:00:00 2001
+From: Marti Maria <marti.maria@littlecms.com>
+Date: Wed, 8 Nov 2023 12:17:54 +0100
+Subject: [PATCH] Some housekeeping
+
+Clean resources on error
+Guard against null dereferences
+---
+ src/cmsps2.c  | 18 +++++++++++-------
+ src/cmsvirt.c |  7 +++----
+ 2 files changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/src/cmsps2.c b/src/cmsps2.c
+index 20e0899a..3ab60ab6 100644
+--- a/src/cmsps2.c
++++ b/src/cmsps2.c
+@@ -1267,7 +1267,7 @@ int WriteOutputLUT(cmsIOHANDLER* m, cmsHPROFILE hProfile, cmsUInt32Number Intent
+     cmsUInt32Number InFrm = TYPE_Lab_16;
+     cmsUInt32Number RelativeEncodingIntent;
+     cmsColorSpaceSignature ColorSpace;
+-
++    cmsStage* first;
+ 
+     hLab = cmsCreateLab4ProfileTHR(m ->ContextID, NULL);
+     if (hLab == NULL) return 0;
+@@ -1295,6 +1295,7 @@ int WriteOutputLUT(cmsIOHANDLER* m, cmsHPROFILE hProfile, cmsUInt32Number Intent
+ 
+     if (xform == NULL) {
+ 
++        cmsDeleteTransform(xform);
+         cmsSignalError(m ->ContextID, cmsERROR_COLORSPACE_CHECK, "Cannot create transform Lab -> Profile in CRD creation");
+         return 0;
+     }
+@@ -1302,10 +1303,12 @@ int WriteOutputLUT(cmsIOHANDLER* m, cmsHPROFILE hProfile, cmsUInt32Number Intent
+     // Get a copy of the internal devicelink
+     v = (_cmsTRANSFORM*) xform;
+     DeviceLink = cmsPipelineDup(v ->Lut);
+-    if (DeviceLink == NULL) return 0;
+-
++    if (DeviceLink == NULL) {
++        cmsDeleteTransform(xform);
++        return 0;
++    }
+ 
+-    // We need a CLUT
++     // We need a CLUT
+     dwFlags |= cmsFLAGS_FORCE_CLUT;
+     _cmsOptimizePipeline(m->ContextID, &DeviceLink, RelativeEncodingIntent, &InFrm, &OutputFormat, &dwFlags);
+ 
+@@ -1332,8 +1335,10 @@ int WriteOutputLUT(cmsIOHANDLER* m, cmsHPROFILE hProfile, cmsUInt32Number Intent
+ 
+     _cmsIOPrintf(m, "/RenderTable ");
+ 
+-
+-    WriteCLUT(m, cmsPipelineGetPtrToFirstStage(DeviceLink), "<", ">\n", "", "", lFixWhite, ColorSpace);
++    first = cmsPipelineGetPtrToFirstStage(DeviceLink);
++    if (first != NULL) {
++        WriteCLUT(m, first, "<", ">\n", "", "", lFixWhite, ColorSpace);
++    }
+ 
+     _cmsIOPrintf(m, " %d {} bind ", nChannels);
+ 
+@@ -1342,7 +1347,6 @@ int WriteOutputLUT(cmsIOHANDLER* m, cmsHPROFILE hProfile, cmsUInt32Number Intent
+ 
+     _cmsIOPrintf(m, "]\n");
+ 
+-
+     EmitIntent(m, Intent);
+ 
+     _cmsIOPrintf(m, ">>\n");
+diff --git a/src/cmsvirt.c b/src/cmsvirt.c
+index ca2860db..3d662b2c 100644
+--- a/src/cmsvirt.c
++++ b/src/cmsvirt.c
+@@ -406,10 +406,9 @@ cmsHPROFILE CMSEXPORT cmsCreateInkLimitingDeviceLinkTHR(cmsContext ContextID,
+ 
+     if (Limit < 0.0 || Limit > 400) {
+ 
+-        cmsSignalError(ContextID, cmsERROR_RANGE, "InkLimiting: Limit should be between 0..400");
+-        if (Limit < 0) Limit = 0;
++        cmsSignalError(ContextID, cmsERROR_RANGE, "InkLimiting: Limit should be between 1..400");
++        if (Limit < 1) Limit = 1;
+         if (Limit > 400) Limit = 400;
+-
+     }
+ 
+     hICC = cmsCreateProfilePlaceholder(ContextID);
+@@ -1152,7 +1151,7 @@ cmsBool CheckOne(const cmsAllowedLUT* Tab, const cmsPipeline* Lut)
+ 
+     for (n=0, mpe = Lut ->Elements; mpe != NULL; mpe = mpe ->Next, n++) {
+ 
+-        if (n > Tab ->nTypes) return FALSE;
++        if (n >= Tab ->nTypes) return FALSE;
+         if (cmsStageType(mpe) != Tab ->MpeTypes[n]) return FALSE;
+     }
+ 

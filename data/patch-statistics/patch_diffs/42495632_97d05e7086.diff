@@ -1,0 +1,158 @@
+From 79255ba1dbbb476e57a5f450eb0bbe1b84ef0f01 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Mon, 12 Apr 2021 16:24:34 +0300
+Subject: [PATCH] Restict opcodes during expression evaluation
+
+---
+ source/m3_compile.c | 19 +++++++++++++++----
+ source/m3_compile.h |  9 +++++++++
+ source/m3_env.c     |  7 +++++++
+ source/m3_env.h     |  2 ++
+ source/m3_exec.h    |  2 +-
+ source/wasm3.h      |  1 +
+ 6 files changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/source/m3_compile.c b/source/m3_compile.c
+index b9bd21cb..ca0fe830 100644
+--- a/source/m3_compile.c
++++ b/source/m3_compile.c
+@@ -1495,7 +1495,7 @@ _   (ReadLEB_i7 (& reserved, & o->wasm, o->wasmEnd));
+ 
+ _   (PreserveRegisterIfOccupied (o, c_m3Type_i32));
+ 
+-_   (EmitOp     (o, op_MemCurrent));
++_   (EmitOp     (o, op_MemSize));
+ 
+ _   (PushRegister (o, c_m3Type_i32));
+ 
+@@ -1972,7 +1972,7 @@ const M3OpInfo c_operations [] =
+     M3OP( "i64.store16",        -2, none,   d_binOpList (i64, Store_i16),       Compile_Load_Store ),   // 0x3d
+     M3OP( "i64.store32",        -2, none,   d_binOpList (i64, Store_i32),       Compile_Load_Store ),   // 0x3e
+ 
+-    M3OP( "memory.size",        1,  i_32,   d_logOp (MemCurrent),               Compile_Memory_Size ),  // 0x3f
++    M3OP( "memory.size",        1,  i_32,   d_logOp (MemSize),                  Compile_Memory_Size ),  // 0x3f
+     M3OP( "memory.grow",        1,  i_32,   d_logOp (MemGrow),                  Compile_Memory_Grow ),  // 0x40
+ 
+     M3OP( "i32.const",          1,  i_32,   d_logOp (Const32),                  Compile_Const_i32 ),    // 0x41
+@@ -2213,6 +2213,17 @@ M3Result  Compile_BlockStatements  (IM3Compilation o)
+         o->lastOpcodeStart = o->wasm;
+ _       (Read_opcode (& opcode, & o->wasm, o->wasmEnd));                log_opcode (o, opcode);
+ 
++        if (IsCompilingExpressions(o)) {
++            switch (opcode) {
++            case c_waOp_i32_const: case c_waOp_i64_const:
++            case c_waOp_f32_const: case c_waOp_f64_const:
++            case c_waOp_getGlobal: case c_waOp_end:
++                break;
++            default:
++                _throw(m3Err_restictedOpcode);
++            }
++        }
++
+         IM3OpInfo opinfo = GetOpInfo(opcode);
+         _throwif (m3Err_unknownOpcode, opinfo == NULL);
+ 
+@@ -2341,9 +2352,9 @@ M3Result  Compile_ReserveConstants  (IM3Compilation o)
+     {
+         u8 code = * wa++;
+ 
+-        if (code == 0x41 or code == 0x43)       // i32, f32
++        if (code == c_waOp_i32_const or code == c_waOp_f32_const)
+             numConstantSlots += 1;
+-        else if (code == 0x42 or code == 0x44)  // i64, f64
++        else if (code == c_waOp_i64_const or code == c_waOp_f64_const)
+             numConstantSlots += GetTypeNumSlots (c_m3Type_i64);
+     }
+ 
+diff --git a/source/m3_compile.h b/source/m3_compile.h
+index db4e0d28..cb61001d 100644
+--- a/source/m3_compile.h
++++ b/source/m3_compile.h
+@@ -28,6 +28,13 @@ enum
+     c_waOp_getLocal             = 0x20,
+     c_waOp_setLocal             = 0x21,
+     c_waOp_teeLocal             = 0x22,
++
++    c_waOp_getGlobal            = 0x23,
++
++    c_waOp_i32_const            = 0x41,
++    c_waOp_i64_const            = 0x42,
++    c_waOp_f32_const            = 0x43,
++    c_waOp_f64_const            = 0x44,
+ };
+ 
+ 
+@@ -82,8 +89,10 @@ typedef struct
+ 
+     IM3BranchPatch      releasedPatches;
+ 
++#ifdef DEBUG
+     u32                 numEmits;
+     u32                 numOpcodes;
++#endif
+ 
+     u16                 stackFirstDynamicIndex;
+     u16                 stackIndex;                 // current stack index
+diff --git a/source/m3_env.c b/source/m3_env.c
+index 6b87f661..316f57fd 100644
+--- a/source/m3_env.c
++++ b/source/m3_env.c
+@@ -260,6 +260,12 @@ void  m3_FreeRuntime  (IM3Runtime i_runtime)
+     }
+ }
+ 
++static char* c_compilingExprsFlag = "m3_exprs";
++
++bool  IsCompilingExpressions  (IM3Compilation i_compilation)
++{
++    return i_compilation->runtime && i_compilation->runtime->userdata == c_compilingExprsFlag;
++}
+ 
+ M3Result  EvaluateExpression  (IM3Module i_module, void * o_expressed, u8 i_type, bytes_t * io_bytes, cbytes_t i_end)
+ {
+@@ -276,6 +282,7 @@ M3Result  EvaluateExpression  (IM3Module i_module, void * o_expressed, u8 i_type
+     runtime.environment = i_module->runtime->environment;
+     runtime.numStackSlots = i_module->runtime->numStackSlots;
+     runtime.stack = i_module->runtime->stack;
++    runtime.userdata = c_compilingExprsFlag;
+ 
+     m3stack_t stack = (m3stack_t)runtime.stack;
+ 
+diff --git a/source/m3_env.h b/source/m3_env.h
+index 9d3a12f7..64cdcf1c 100644
+--- a/source/m3_env.h
++++ b/source/m3_env.h
+@@ -190,6 +190,8 @@ M3Runtime;
+ void                        InitRuntime                 (IM3Runtime io_runtime, u32 i_stackSizeInBytes);
+ void                        Runtime_Release             (IM3Runtime io_runtime);
+ 
++bool                        IsCompilingExpressions            (IM3Compilation i_compilation);
++
+ M3Result                    ResizeMemory                (IM3Runtime io_runtime, u32 i_numPages);
+ 
+ typedef void *              (* ModuleVisitor)           (IM3Module i_module, void * i_info);
+diff --git a/source/m3_exec.h b/source/m3_exec.h
+index cdc8a96b..db007c5e 100644
+--- a/source/m3_exec.h
++++ b/source/m3_exec.h
+@@ -653,7 +653,7 @@ d_m3Op  (CallRawFunction)
+ }
+ 
+ 
+-d_m3Op  (MemCurrent)
++d_m3Op  (MemSize)
+ {
+     IM3Memory memory            = m3MemInfo (_mem);
+ 
+diff --git a/source/wasm3.h b/source/wasm3.h
+index c1097cb8..caf7cbd1 100644
+--- a/source/wasm3.h
++++ b/source/wasm3.h
+@@ -144,6 +144,7 @@ d_m3ErrorConst  (malformedFunctionSignature,    "malformed function signature")
+ // compilation errors
+ d_m3ErrorConst  (noCompiler,                    "no compiler found for opcode")
+ d_m3ErrorConst  (unknownOpcode,                 "unknown opcode")
++d_m3ErrorConst  (restictedOpcode,               "restricted opcode")
+ d_m3ErrorConst  (functionStackOverflow,         "compiling function overran its stack height limit")
+ d_m3ErrorConst  (functionStackUnderrun,         "compiling function underran the stack")
+ d_m3ErrorConst  (mallocFailedCodePage,          "memory allocation failed when acquiring a new M3 code page")

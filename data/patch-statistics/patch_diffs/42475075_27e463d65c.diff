@@ -1,0 +1,55 @@
+From 9ad6eb501b55f27a17d6383fa5bdcb2328147685 Mon Sep 17 00:00:00 2001
+From: Leandro Pereira <leandro@hardinfo.org>
+Date: Sat, 4 May 2019 18:15:10 -0700
+Subject: [PATCH] Ensure there's a full request after ignoring leading
+ whitespace
+
+Credit to OSS-Fuzz: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=14582
+---
+ ...se-minimized-request_fuzzer-5729298679332864 | Bin 0 -> 32773 bytes
+ src/lib/lwan-request.c                          |   8 ++++++++
+ 2 files changed, 8 insertions(+)
+ create mode 100644 fuzz/clusterfuzz-testcase-minimized-request_fuzzer-5729298679332864
+
+diff --git a/fuzz/clusterfuzz-testcase-minimized-request_fuzzer-5729298679332864 b/fuzz/clusterfuzz-testcase-minimized-request_fuzzer-5729298679332864
+new file mode 100644
+index 0000000000000000000000000000000000000000..e234374b7b505a19ceb944abeaa06579855d7f8c
+GIT binary patch
+literal 32773
+zcmeI(p$&jQ5Jb__n`{s3=>U&Fl5iEEp?}F$K}hcX4(9pE$Y>cy-_NLOB?1Hp5FkK+
+z009C72oNAZfB*pk1ilwY5g<T-009C72oNAZfB*pk1PBlyK!5-N0t5&UAV7cs0RjXF
+z5FkK+009D13XH4ol)H^4K!5-N0t5&UAV7cs0RjXF5FkK+009C72oNAZfB*pk1PBly
+wK!5-N0t5&UAV7cs0RjXF5FkK+009C72oNAZfB*pk1PBly@Kb^9xt4o<0kE3)sQ>@~
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/lib/lwan-request.c b/src/lib/lwan-request.c
+index be3d42f76..5a28ae5f8 100644
+--- a/src/lib/lwan-request.c
++++ b/src/lib/lwan-request.c
+@@ -1192,9 +1192,13 @@ parse_proxy_protocol(struct lwan_request *request, char *buffer)
+ 
+ static enum lwan_http_status parse_http_request(struct lwan_request *request)
+ {
++    const size_t min_request_size = sizeof("GET / HTTP/1.1\r\n\r\n") - 1;
+     struct lwan_request_parser_helper *helper = request->helper;
+     char *buffer = helper->buffer->value;
+ 
++    if (UNLIKELY(helper->buffer->len < min_request_size))
++        return HTTP_BAD_REQUEST;
++
+     if (request->flags & REQUEST_ALLOW_PROXY_REQS) {
+         /* REQUEST_ALLOW_PROXY_REQS will be cleared in lwan_process_request() */
+ 
+@@ -1205,6 +1209,10 @@ static enum lwan_http_status parse_http_request(struct lwan_request *request)
+ 
+     buffer = ignore_leading_whitespace(buffer);
+ 
++    if (UNLIKELY(buffer >= helper->buffer->value + helper->buffer->len -
++                               min_request_size))
++        return HTTP_BAD_REQUEST;
++
+     char *path = identify_http_method(request, buffer);
+     if (UNLIKELY(!path))
+         return HTTP_NOT_ALLOWED;

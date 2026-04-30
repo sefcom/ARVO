@@ -1,0 +1,80 @@
+From 498d3d820c17cedd9e33742f050adeca1e9bd6b0 Mon Sep 17 00:00:00 2001
+From: Ken Sharp <Ken.Sharp@artifex.com>
+Date: Tue, 6 Aug 2024 09:50:48 +0100
+Subject: pdfwrite - fix negative array offset
+
+OSS fuzz #70967
+
+The initial problem is caused by a signed/unsigned mismatch. the
+pdf_font_resource_t member 'count' is an unsigned int, and we were
+passing 'chars_count' as a signed int. Because the signed int was
+promoted to an unsigned in the comparison of the two, this passed.
+
+We then tried to use the signed int in a memset leading to the address
+sanitizer error.
+
+Fix that by turning ghe signed integer into unsigned. The original
+value is actually a uint64_t, but making it fully consistent would be
+'awkward'.
+
+This then led to an integer overflow, because we add 7 and divide by 8
+to 'round up' the chars_count and pfres->count. If either were within
+7 of the maximum uint then we would overflow which again would
+potentially lead to an incorrect calculation in pdf_resize_array, which
+is supposed to be guarded against by the comparison of the two values.
+
+Add a specific test to ensure that neither can overflow.
+---
+ devices/vector/gdevpdtf.c | 8 ++++++--
+ devices/vector/gdevpdtf.h | 2 +-
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/devices/vector/gdevpdtf.c b/devices/vector/gdevpdtf.c
+index 1e5efba22..f88278923 100644
+--- a/devices/vector/gdevpdtf.c
++++ b/devices/vector/gdevpdtf.c
+@@ -353,7 +353,7 @@ pdf_clean_standard_fonts(const gx_device_pdf *pdev)
+ /* ------ Private ------ */
+ 
+ static int
+-pdf_resize_array(gs_memory_t *mem, void **p, int elem_size, int old_size, int new_size)
++pdf_resize_array(gs_memory_t *mem, void **p, int elem_size, uint old_size, uint new_size)
+ {
+     void *q = gs_alloc_byte_array(mem, new_size, elem_size, "pdf_resize_array");
+ 
+@@ -658,7 +658,7 @@ set_is_MM_instance(pdf_font_resource_t *pdfont, const gs_font_base *pfont)
+ 
+ /* Resize font resource arrays. */
+ int
+-pdf_resize_resource_arrays(gx_device_pdf *pdev, pdf_font_resource_t *pfres, int chars_count)
++pdf_resize_resource_arrays(gx_device_pdf *pdev, pdf_font_resource_t *pfres, uint chars_count)
+ {
+     /* This function fixes CID fonts that provide a lesser CIDCount than
+        CIDs used in a document. Rather PS requires to print CID=0,
+@@ -668,6 +668,10 @@ pdf_resize_resource_arrays(gx_device_pdf *pdev, pdf_font_resource_t *pfres, int
+     gs_memory_t *mem = pdev->pdf_memory;
+     int code;
+ 
++    /* Ensure the 'round up' code below doesn't overflow an unsigned int when adding 7 */
++    if (pfres->count >= max_uint - 7 || chars_count > max_uint - 7)
++        return_error(gs_error_rangecheck);
++
+     if (chars_count < pfres->count)
+         return 0;
+     if (pfres->Widths != NULL) {
+diff --git a/devices/vector/gdevpdtf.h b/devices/vector/gdevpdtf.h
+index bd1085771..641d855be 100644
+--- a/devices/vector/gdevpdtf.h
++++ b/devices/vector/gdevpdtf.h
+@@ -409,7 +409,7 @@ int font_resource_free(gx_device_pdf *pdev, pdf_font_resource_t *pdfont);
+ 
+ /* Resize font resource arrays. */
+ int pdf_resize_resource_arrays(gx_device_pdf *pdev, pdf_font_resource_t *pfres,
+-        int chars_count);
++        uint chars_count);
+ 
+ /*
+  * Return the (copied, subset or complete) font associated with a font resource.
+-- 
+cgit v1.2.3
+

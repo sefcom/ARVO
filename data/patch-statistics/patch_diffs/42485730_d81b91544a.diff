@@ -1,0 +1,661 @@
+From 6304ec7041f12084b2447e54da0d0118fe30300c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Juan=20Pedro=20Bol=C3=ADvar=20Puente?= <raskolnikov@gnu.org>
+Date: Tue, 21 Jul 2020 17:55:37 +0200
+Subject: [PATCH] Fix flex-vector-gc fuzzer issues related to large concats
+
+Given that flex-vector suports confluent concatenation, we can produce
+absurdly large structures.  At some point, we saturate the internal
+data-structure, producing structures that are simply too deep, and not
+indexable with the given `shift`.
+
+Here, we modify the fuzzer to prevent building such absurdly large
+structures once we reach a saturation point.
+---
+ extra/fuzzer/flex-vector-gc.cpp               |   4 +-
+ immer/detail/rbts/rbtree.hpp                  |   6 ++
+ immer/detail/rbts/rrbtree.hpp                 |  18 +++-
+ immer/detail/util.hpp                         |   6 ++
+ immer/flex_vector.hpp                         |   6 ++
+ immer/vector.hpp                              |   6 ++
+ ...-minimized-flex-vector-gc-4787718039797760 | Bin 0 -> 499 bytes
+ ...-minimized-flex-vector-gc-4855756386729984 | Bin 0 -> 9537 bytes
+ ...-minimized-flex-vector-gc-4872518268354560 | Bin 0 -> 2564 bytes
+ ...-minimized-flex-vector-gc-5194423089233920 | Bin 0 -> 1172 bytes
+ ...-minimized-flex-vector-gc-5635385259196416 | Bin 0 -> 655 bytes
+ ...-minimized-flex-vector-gc-5660697665732608 | Bin 0 -> 2380 bytes
+ ...-minimized-flex-vector-gc-6017886557306880 | Bin 0 -> 383307 bytes
+ ...-minimized-flex-vector-gc-6265466893631488 | Bin 0 -> 137776 bytes
+ ...-minimized-flex-vector-gc-6595824679911424 | Bin 0 -> 39681 bytes
+ test/oss-fuzz/flex-vector-gc-0.cpp            |  93 +++++++++++++++++-
+ 16 files changed, 132 insertions(+), 7 deletions(-)
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4787718039797760
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4855756386729984
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4872518268354560
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5194423089233920
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5635385259196416
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5660697665732608
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6017886557306880
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6265466893631488
+ create mode 100644 test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6595824679911424
+
+diff --git a/extra/fuzzer/flex-vector-gc.cpp b/extra/fuzzer/flex-vector-gc.cpp
+index 00c30289..362ee792 100644
+--- a/extra/fuzzer/flex-vector-gc.cpp
++++ b/extra/fuzzer/flex-vector-gc.cpp
+@@ -46,9 +46,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data,
+         return [&](auto idx) { return idx >= 0 && idx <= v.size(); };
+     };
+     auto can_concat = [](auto&& v1, auto&& v2) {
+-        using size_type = decltype(v1.size());
+-        auto max        = std::numeric_limits<size_type>::max() >> (bits * 4);
+-        return v1.size() < max && v2.size() < max;
++        return v1.size() + v2.size() < vector_t::max_size();
+     };
+ 
+     return fuzzer_input{data, size}.run([&](auto& in) {
+diff --git a/immer/detail/rbts/rbtree.hpp b/immer/detail/rbts/rbtree.hpp
+index b31f5e9b..2ad8da86 100644
+--- a/immer/detail/rbts/rbtree.hpp
++++ b/immer/detail/rbts/rbtree.hpp
+@@ -34,6 +34,12 @@ struct rbtree
+     node_t* root;
+     node_t* tail;
+ 
++    constexpr static size_t max_size()
++    {
++        auto S = sizeof(size_t) * 8;
++        return (size_t{1} << BL) * ipow(size_t{1} << B, (S - BL) / B);
++    }
++
+     static const rbtree& empty()
+     {
+         static const rbtree empty_{
+diff --git a/immer/detail/rbts/rrbtree.hpp b/immer/detail/rbts/rrbtree.hpp
+index 7bf59e6e..1e8f168f 100644
+--- a/immer/detail/rbts/rrbtree.hpp
++++ b/immer/detail/rbts/rrbtree.hpp
+@@ -38,6 +38,13 @@ struct rrbtree
+     node_t* root;
+     node_t* tail;
+ 
++    constexpr static size_t max_size()
++    {
++        auto S = sizeof(size_t) * 8;
++        return std::max(((size_t{1} << BL) - 1), size_t{1}) *
++               ipow((size_t{1} << B) - 1, (S - BL - B) / B);
++    }
++
+     static const rrbtree& empty()
+     {
+         static const rrbtree empty_{
+@@ -661,7 +668,7 @@ struct rrbtree
+ 
+     rrbtree concat(const rrbtree& r) const
+     {
+-        assert(r.size < (std::numeric_limits<size_t>::max() - size));
++        assert(r.size + size <= max_size());
+         using std::get;
+         if (size == 0)
+             return r;
+@@ -807,6 +814,7 @@ struct rrbtree
+                 l.shift = concated.shift();
+                 l.root  = concated.node();
+                 l.tail  = r.tail;
++                assert(l.check_tree());
+             } else {
+                 auto tail_offst = l.tail_offset();
+                 auto tail_size  = l.size - tail_offst;
+@@ -816,6 +824,7 @@ struct rrbtree
+                      concated.shift(),
+                      concated.node(),
+                      r.tail->inc()};
++                assert(l.check_tree());
+                 return;
+             }
+         } else {
+@@ -842,6 +851,7 @@ struct rrbtree
+                 l.shift = concated.shift();
+                 l.root  = concated.node();
+                 l.tail  = r.tail;
++                assert(l.check_tree());
+             } else {
+                 auto tail_offst = l.tail_offset();
+                 auto tail_size  = l.size - tail_offst;
+@@ -949,6 +959,7 @@ struct rrbtree
+                 r.size += l.size;
+                 r.shift = concated.shift();
+                 r.root  = concated.node();
++                assert(r.check_tree());
+             } else {
+                 auto tail_offst = l.tail_offset();
+                 auto tail_size  = l.size - tail_offst;
+@@ -983,6 +994,7 @@ struct rrbtree
+                 r.size += l.size;
+                 r.shift = concated.shift();
+                 r.root  = concated.node();
++                assert(r.check_tree());
+                 return;
+             } else {
+                 auto tail_offst = l.tail_offset();
+@@ -1082,6 +1094,7 @@ struct rrbtree
+                 l.shift = concated.shift();
+                 l.root  = concated.node();
+                 l.tail  = r.tail;
++                assert(l.check_tree());
+                 r.hard_reset();
+             } else {
+                 auto tail_offst = l.tail_offset();
+@@ -1117,6 +1130,7 @@ struct rrbtree
+                 l.shift = concated.shift();
+                 l.root  = concated.node();
+                 l.tail  = r.tail;
++                assert(l.check_tree());
+                 r.hard_reset();
+             } else {
+                 auto tail_offst = l.tail_offset();
+@@ -1223,6 +1237,7 @@ struct rrbtree
+                 r.size += l.size;
+                 r.shift = concated.shift();
+                 r.root  = concated.node();
++                assert(r.check_tree());
+                 l.hard_reset();
+             } else {
+                 auto tail_offst = l.tail_offset();
+@@ -1257,6 +1272,7 @@ struct rrbtree
+                 r.size += l.size;
+                 r.shift = concated.shift();
+                 r.root  = concated.node();
++                assert(r.check_tree());
+                 l.hard_reset();
+             } else {
+                 auto tail_offst = l.tail_offset();
+diff --git a/immer/detail/util.hpp b/immer/detail/util.hpp
+index fb2a520f..0c454ab4 100644
+--- a/immer/detail/util.hpp
++++ b/immer/detail/util.hpp
+@@ -123,6 +123,12 @@ inline constexpr auto log2(T x)
+     return log2_aux(x);
+ }
+ 
++template <typename T>
++constexpr T ipow(T num, unsigned int pow)
++{
++    return pow == 0 ? 1 : num * ipow(num, pow - 1);
++}
++
+ template <bool b, typename F>
+ auto static_if(F&& f) -> std::enable_if_t<b>
+ {
+diff --git a/immer/flex_vector.hpp b/immer/flex_vector.hpp
+index d03c3f7e..0845e3cb 100644
+--- a/immer/flex_vector.hpp
++++ b/immer/flex_vector.hpp
+@@ -83,6 +83,12 @@ class flex_vector
+ 
+     using transient_type = flex_vector_transient<T, MemoryPolicy, B, BL>;
+ 
++    /*!
++     * Returns the maximum theoretical size supported by the internal structure
++     * given the current B, BL.
++     */
++    constexpr static size_type max_size() { return impl_t::max_size(); }
++
+     /*!
+      * Default constructor.  It creates a flex_vector of `size() == 0`.
+      * It does not allocate memory and its complexity is @f$ O(1) @f$.
+diff --git a/immer/vector.hpp b/immer/vector.hpp
+index 4f1a148c..0191d3ce 100644
+--- a/immer/vector.hpp
++++ b/immer/vector.hpp
+@@ -97,6 +97,12 @@ class vector
+ 
+     using transient_type = vector_transient<T, MemoryPolicy, B, BL>;
+ 
++    /*!
++     * Returns the maximum theoretical size supported by the internal structure
++     * given the current B, BL.
++     */
++    constexpr static size_type max_size() { return impl_t::max_size(); }
++
+     /*!
+      * Default constructor.  It creates a vector of `size() == 0`.  It
+      * does not allocate memory and its complexity is @f$ O(1) @f$.
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4787718039797760 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4787718039797760
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f016b77e9291ee7b28ce5646e819d8fa35e2365
+GIT binary patch
+literal 499
+zcmaKpQ4Yf}2t(-?AJgvO`=4^QAqiEhRcb;2KOjLQaD74xqAWySiTKhdM+Y2*RxA2g
+zj-9(z6*f?G|H-WZ6qx;%&y-bqTLTAvg?m6$$C(`G$*3-lRvf2k7ja1%A(uIh-h!(L
+rl^QM;6s6CcQW@h8H#<&;$46`4bWq-4f&O0A4Wbt2Yq1BnH*vrZiZ&jh
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4855756386729984 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4855756386729984
+new file mode 100644
+index 0000000000000000000000000000000000000000..32e91d674ca94b242abdfcd4fc5af81b9945a05d
+GIT binary patch
+literal 9537
+zcmeI2F%H5o3`NtaLKPB%V|3sMy%jUeEWimmasgDaAtnTuKyUzt?v&bTNt#4WIxryp
+zrBWg{iXHpeahr%(WKkmIBNpT7B%<+?9%cTnR=ZlFoz2cgbXp62hTc^I_v4aRQ!~Sc
+zqO%&mdp!(W?82L^7m^zE?mwL`QYq-uAxug)g-3B{+IX7BPV8SeQ?im7eehn}cMzu<
+z$!zoV0SZI{k?iyvgS}vH7*)fh`ViDDCNmHTL;{g03<yDGj=K!U1L|J8umgKh_gX$+
+zx(V{>kMrqcx$opFXFJR~CZ`n2B<gseAmnZ=+X0PGhexo3;EGBPg7zTTtMZ!#Ph=VO
+z8Oum3#t>zaawBgU0``KvVXO(0@;aP~V#F!pw3G7Xbpb>Ik-}ILCIuqV<>FszB=>3Y
+e{&gL0+eWDo^$ln8rzc&Y)%jIyzW*Op4uKCs6y@yz
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4872518268354560 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-4872518268354560
+new file mode 100644
+index 0000000000000000000000000000000000000000..6fd4b403642d66d6aa30f09ebc3c90f34dfe103b
+GIT binary patch
+literal 2564
+zcmeH|U223d5XWbrB};?g?mdJg6BDISU-kffDeU9!O-hfj^g!OM&4*Ri>aJ@)K-i!n
+z6DOI;{O2bJ1{rCg3Pr}0N|aP+L+&E0jj)=eHH8vNkbFnJg^I0`P0E2GgE$^I-1~_~
+zXN1Jxn`f*l<k5tkgZE6)&p`WlIj}t>(RbW$-S~wF!pHq}V27D3v^G|2VabXz&!v%h
+z8`${b--B|=?ID|(@Ey2(-0ou5R==6QRx~RHHdd~6sPoc}A}H~K>_UZ|9C1LB&0H(d
+zAlCmjrdVTrJl1d5wbMs4e2<(Q!L5TLG0qcYeh2j_)>3i^dQnW1pckqbir2k4fO>{L
+ry?%jo*JU*kz9+=}d8~u9Uy5-Y0ZYKc+5c@%I5!D7CjNyi7cHSrqfO1~
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5194423089233920 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5194423089233920
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6a1593ae7b5595917662ebf42940051851f7c12
+GIT binary patch
+literal 1172
+zcmd;PU}vyr<kn*Vkqq|M+@BXT?qy)NXZ&f+{r}UA_y58ec^MaSgC)6vYI%hO7*_&S
+z@`BYf*vo=7vH$${gW(4QFGv=ol%WnxLXBkLU}R@!c+^PPP-||O+U0Pgz$Q`6Rc87o
+zflLex3{<uW<UKSeLp=`)8s!H&n|X!AfdRwL2o6GPP*_tMoTS)?)4TR)4ui%Yseukk
+tIm9Ib5?qZZDUo0b-NPE5m9R%W?x+AI3P><wCKyuUg@KW9UL4E;2mpTV+S334
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5635385259196416 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5635385259196416
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2ccf202ed57d688ff992e83da1628a545afd242
+GIT binary patch
+literal 655
+zcmZWnNfLuF3{!l7Lx(^3|DU8<0)f^u1Y4372hynSYB2V(clY=-^kS|D2j3TH8aM_M
+zMM$z>!A2r_W{Yxhah%%7#3-=DR;@*Hhc<`0v_yXq;k5x~YEfJVG|w<GSx<h?Ebw8h
+ziXCitC}<sxwVBBS5m(?6XFy{)@r#|Kgn{~AU)5%@ibLGi-m8TSi#egiT<q(kuprGP
+z<K@SJXA%xaDNZ2_bZyDHcn@Z!>?{_NlGu1bs?}4nDAbEJi17>m=~{iar|ums7r^|i
+EFOGgSX8-^I
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5660697665732608 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-5660697665732608
+new file mode 100644
+index 0000000000000000000000000000000000000000..7779b93f89d43f87274280e59769f2c50ec89f69
+GIT binary patch
+literal 2380
+zcmZQzXRv4FW&jcy4EEOC4D4WnfmcX?5h~6GlGN2TH8V6dHnA`?HZ?UcGPX1^vE+tm
+z0O=MAV6+D*2Ww_z=KyNwX86I#K82Cn1tJJE5n0Xq-TQG^WB@Z|5E%>e5$6xE*FZt@
+zc|pTsZU#o6pOL)?4>WLyf(THMlCB*R=9Z=grh_mvXcTv(htePjWX#y*W}q;Ypk*6g
+zUb^HQx`+N~<e`+W6cu}Pk32~EWN2h&VP;`$X<<lyDK%s=5DD3u8l^Yxa1jz18ubru
+q9{}41kTQ}8uOPJ_pp`4NM4;IZy^=;Nei7{;tOXWOH7xN91polSgc5iF
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6017886557306880 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6017886557306880
+new file mode 100644
+index 0000000000000000000000000000000000000000..6745fd205668d1f8624791039bef95a6375c9850
+GIT binary patch
+literal 383307
+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
+aQVa%wS3Uq*Zb5;h3OCK~HSpR$y#61{^I=E;
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6265466893631488 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6265466893631488
+new file mode 100644
+index 0000000000000000000000000000000000000000..788c4b423163937fc7efc138fea3a2c6ae8dbbfe
+GIT binary patch
+literal 137776
+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
+S>>uiRHm?4Q=earM=lKIQ$N}d7
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6595824679911424 b/test/oss-fuzz/data/clusterfuzz-testcase-minimized-flex-vector-gc-6595824679911424
+new file mode 100644
+index 0000000000000000000000000000000000000000..ccd165b798a95719563dac6b4a0bac78349838a4
+GIT binary patch
+literal 39681
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/oss-fuzz/flex-vector-gc-0.cpp b/test/oss-fuzz/flex-vector-gc-0.cpp
+index d9ab5b4c..e44879de 100644
+--- a/test/oss-fuzz/flex-vector-gc-0.cpp
++++ b/test/oss-fuzz/flex-vector-gc-0.cpp
+@@ -63,9 +63,7 @@ int run_input(const std::uint8_t* data, std::size_t size)
+         return [&](auto idx) { return idx >= 0 && idx <= v.size(); };
+     };
+     auto can_concat = [](auto&& v1, auto&& v2) {
+-        using size_type = decltype(v1.size());
+-        auto max        = std::numeric_limits<size_type>::max() >> (Bits * 4);
+-        return v1.size() < max && v2.size() < max;
++        return v1.size() + v2.size() < vector_t::max_size();
+     };
+ 
+     return fuzzer_input{data, size}.run([&](auto& in) {
+@@ -270,3 +268,92 @@ TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24162")
+     }
+ }
+ 
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24155")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-5194423089233920");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}
++
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24136")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-5635385259196416");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}
++
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24142")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-4787718039797760");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}
++
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24172")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-6595824679911424");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}
++
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24173")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-4872518268354560");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}
++
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24213")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-6265466893631488");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}
++
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24264")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-4855756386729984");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}
++
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24286")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-6017886557306880");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}
++
++TEST_CASE("https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24287")
++{
++    SECTION("fuzzer")
++    {
++        auto input = load_input(
++            "clusterfuzz-testcase-minimized-flex-vector-gc-5660697665732608");
++        CHECK(run_input(input.data(), input.size()) == 0);
++    }
++}

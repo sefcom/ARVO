@@ -1,0 +1,50 @@
+From 4021b784376c3790c077e9b8deedbb6a4f016687 Mon Sep 17 00:00:00 2001
+From: brailovich <91924341+brailovich@users.noreply.github.com>
+Date: Mon, 24 Jan 2022 17:42:21 -0800
+Subject: [PATCH] fix for error message in recursive mode for an empty folder
+
+-r on empty directory resulted in zstd waiting input from stdin. now zstd exits without error and prints a warning message explaining why no processing happened (no files or directories to process).
+---
+ programs/zstdcli.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/programs/zstdcli.c b/programs/zstdcli.c
+index fd563e1c24d..34d2fa6e0d9 100644
+--- a/programs/zstdcli.c
++++ b/programs/zstdcli.c
+@@ -834,6 +834,7 @@ int main(int argCount, const char* argv[])
+     size_t streamSrcSize = 0;
+     size_t targetCBlockSize = 0;
+     size_t srcSizeHint = 0;
++    size_t nbInputFileNames = 0;
+     int dictCLevel = g_defaultDictCLevel;
+     unsigned dictSelect = g_defaultSelectivityLevel;
+ #ifndef ZSTD_NODICT
+@@ -1256,6 +1257,8 @@ int main(int argCount, const char* argv[])
+         }
+     }
+ 
++    nbInputFileNames = filenames->tableSize; /* saving number of input files */
++    
+     if (recursive) {  /* at this stage, filenameTable is a list of paths, which can contain both files and directories */
+         UTIL_expandFNT(&filenames, followLinks);
+     }
+@@ -1358,7 +1361,17 @@ int main(int argCount, const char* argv[])
+ #endif
+ 
+     /* No input filename ==> use stdin and stdout */
+-    if (filenames->tableSize == 0) UTIL_refFilename(filenames, stdinmark);
++    if (filenames->tableSize == 0) {
++      /* It is possible that the input
++       was a number of empty directories. In this case
++       stdin and stdout should not be used */
++       if (nbInputFileNames > 0 ){
++        DISPLAYLEVEL(2, "please provide correct input file(s) or non-empty directories -- ignored \n");
++        CLEAN_RETURN(2);
++       }
++       UTIL_refFilename(filenames, stdinmark);
++    }
++    
+     if (!strcmp(filenames->fileNames[0], stdinmark) && !outFileName)
+         outFileName = stdoutmark;  /* when input is stdin, default output is stdout */
+ 

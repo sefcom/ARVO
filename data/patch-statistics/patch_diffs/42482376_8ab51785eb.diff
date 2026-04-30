@@ -1,0 +1,229 @@
+From 6ebfbda5fa424a1462c823bc8dd94f8c3d792bef Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dbaryshkov@gmail.com>
+Date: Thu, 12 Mar 2020 12:56:37 +0300
+Subject: [PATCH] lib/x509: use common routine for parsing data version
+
+OSS Fuzzer noted an issue in parsing (incorrect) CRL files with
+zero-length version field. Certificate parser does not have this issue,
+while CRL and OCSP Request and Response parsers shows this problem. To
+remove code duplication extract common function and use it from all four
+parsers.
+
+Signed-off-by: Dmitry Baryshkov <dbaryshkov@gmail.com>
+---
+ .../698e01fdc3f9a4c402424302768da75f2464a63f  | Bin 0 -> 554 bytes
+ lib/x509/common.c                             |  20 +++++++++++
+ lib/x509/common.h                             |   2 ++
+ lib/x509/crl.c                                |  13 +-------
+ lib/x509/ocsp.c                               |  31 ++----------------
+ lib/x509/output.c                             |   4 +--
+ lib/x509/x509.c                               |  19 +----------
+ tests/cert-tests/data/crl-demo3.pem           |   2 +-
+ 8 files changed, 28 insertions(+), 63 deletions(-)
+ create mode 100644 fuzz/gnutls_x509_crl_parser_fuzzer.repro/698e01fdc3f9a4c402424302768da75f2464a63f
+
+diff --git a/fuzz/gnutls_x509_crl_parser_fuzzer.repro/698e01fdc3f9a4c402424302768da75f2464a63f b/fuzz/gnutls_x509_crl_parser_fuzzer.repro/698e01fdc3f9a4c402424302768da75f2464a63f
+new file mode 100644
+index 0000000000000000000000000000000000000000..9cc53a3e7d5a94ab538fd3584079c9b118d7ee5b
+GIT binary patch
+literal 554
+zcmXqLVp20`ywB9gU|`F}sQ?ECa2Ama1AaqZ18z2Eka89fA<k=PVPI)!W@Kh=U||v^
+z!Eb44X=!L=Y-nU`YH4a2WuR`L$|M3(iH^m24J-{zOf3wI%uLM;qZTL_*c-@$O=gim
+uR}14C$Uqc`!URxgGW_-*0>H*FH!(7T8AKBQiBw0TG8!36j4S>tC;$MxvQp*%
+
+literal 0
+HcmV?d00001
+
+diff --git a/lib/x509/common.c b/lib/x509/common.c
+index 4939d07d2b..fbc7cc975f 100644
+--- a/lib/x509/common.c
++++ b/lib/x509/common.c
+@@ -1926,3 +1926,23 @@ gnutls_gost_paramset_t gnutls_oid_to_gost_paramset(const char *oid)
+ 	else
+ 		return gnutls_assert_val(GNUTLS_GOST_PARAMSET_UNKNOWN);
+ }
++
++int _gnutls_x509_get_version(ASN1_TYPE root, const char *name)
++{
++	uint8_t version[8];
++	int len, result;
++
++	len = sizeof(version);
++	result = asn1_read_value(root, name, version, &len);
++	if (result != ASN1_SUCCESS) {
++		if (result == ASN1_ELEMENT_NOT_FOUND)
++			return 1;	/* the DEFAULT version */
++		gnutls_assert();
++		return _gnutls_asn2err(result);
++	}
++
++	if (len != 1 || version[0] >= 0x80)
++		return gnutls_assert_val(GNUTLS_E_ASN1_DER_ERROR);
++
++	return (int) version[0] + 1;
++}
+diff --git a/lib/x509/common.h b/lib/x509/common.h
+index 498ccc4e97..54ded21188 100644
+--- a/lib/x509/common.h
++++ b/lib/x509/common.h
+@@ -264,6 +264,8 @@ int _gnutls_x509_decode_ext(const gnutls_datum_t *der, gnutls_x509_ext_st *out);
+ int _gnutls_x509_raw_crt_to_raw_pubkey(const gnutls_datum_t * cert,
+ 			   gnutls_datum_t * rpubkey);
+ 
++int _gnutls_x509_get_version(ASN1_TYPE root, const char *name);
++
+ int x509_crt_to_raw_pubkey(gnutls_x509_crt_t crt,
+ 			   gnutls_datum_t * rpubkey);
+ 
+diff --git a/lib/x509/crl.c b/lib/x509/crl.c
+index 82deb5e60a..76d90925e8 100644
+--- a/lib/x509/crl.c
++++ b/lib/x509/crl.c
+@@ -484,23 +484,12 @@ gnutls_x509_crl_get_signature(gnutls_x509_crl_t crl,
+  **/
+ int gnutls_x509_crl_get_version(gnutls_x509_crl_t crl)
+ {
+-	uint8_t version[8];
+-	int len, result;
+-
+ 	if (crl == NULL) {
+ 		gnutls_assert();
+ 		return GNUTLS_E_INVALID_REQUEST;
+ 	}
+ 
+-	len = sizeof(version);
+-	if ((result =
+-	     asn1_read_value(crl->crl, "tbsCertList.version", version,
+-			     &len)) != ASN1_SUCCESS) {
+-		gnutls_assert();
+-		return _gnutls_asn2err(result);
+-	}
+-
+-	return (int) version[0] + 1;
++	return _gnutls_x509_get_version(crl->crl, "tbsCertList.version");
+ }
+ 
+ /**
+diff --git a/lib/x509/ocsp.c b/lib/x509/ocsp.c
+index 38df56ef1c..caa511e9db 100644
+--- a/lib/x509/ocsp.c
++++ b/lib/x509/ocsp.c
+@@ -456,25 +456,12 @@ int gnutls_ocsp_resp_export2(gnutls_ocsp_resp_const_t resp, gnutls_datum_t * dat
+  **/
+ int gnutls_ocsp_req_get_version(gnutls_ocsp_req_const_t req)
+ {
+-	uint8_t version[8];
+-	int len, ret;
+-
+ 	if (req == NULL) {
+ 		gnutls_assert();
+ 		return GNUTLS_E_INVALID_REQUEST;
+ 	}
+ 
+-	len = sizeof(version);
+-	ret =
+-	    asn1_read_value(req->req, "tbsRequest.version", version, &len);
+-	if (ret != ASN1_SUCCESS) {
+-		if (ret == ASN1_ELEMENT_NOT_FOUND)
+-			return 1;	/* the DEFAULT version */
+-		gnutls_assert();
+-		return _gnutls_asn2err(ret);
+-	}
+-
+-	return (int) version[0] + 1;
++	return _gnutls_x509_get_version(req->req, "tbsRequest.version");
+ }
+ 
+ /**
+@@ -1153,26 +1140,12 @@ gnutls_ocsp_resp_get_response(gnutls_ocsp_resp_const_t resp,
+  **/
+ int gnutls_ocsp_resp_get_version(gnutls_ocsp_resp_const_t resp)
+ {
+-	uint8_t version[8];
+-	int len, ret;
+-
+ 	if (resp == NULL) {
+ 		gnutls_assert();
+ 		return GNUTLS_E_INVALID_REQUEST;
+ 	}
+ 
+-	len = sizeof(version);
+-	ret =
+-	    asn1_read_value(resp->resp, "tbsResponseData.version", version,
+-			    &len);
+-	if (ret != ASN1_SUCCESS) {
+-		if (ret == ASN1_ELEMENT_NOT_FOUND)
+-			return 1;	/* the DEFAULT version */
+-		gnutls_assert();
+-		return _gnutls_asn2err(ret);
+-	}
+-
+-	return (int) version[0] + 1;
++	return _gnutls_x509_get_version(resp->resp, "tbsResponseData.version");
+ }
+ 
+ /**
+diff --git a/lib/x509/output.c b/lib/x509/output.c
+index 7278c3c0f8..8084b92b29 100644
+--- a/lib/x509/output.c
++++ b/lib/x509/output.c
+@@ -2204,9 +2204,7 @@ print_crl(gnutls_buffer_st * str, gnutls_x509_crl_t crl, int notsigned)
+ 	/* Version. */
+ 	{
+ 		int version = gnutls_x509_crl_get_version(crl);
+-		if (version == GNUTLS_E_ASN1_ELEMENT_NOT_FOUND)
+-			adds(str, _("\tVersion: 1 (default)\n"));
+-		else if (version < 0)
++		if (version < 0)
+ 			addf(str, "error: get_version: %s\n",
+ 			     gnutls_strerror(version));
+ 		else
+diff --git a/lib/x509/x509.c b/lib/x509/x509.c
+index 57c7182894..2091f3ae64 100644
+--- a/lib/x509/x509.c
++++ b/lib/x509/x509.c
+@@ -1177,29 +1177,12 @@ gnutls_x509_crt_get_signature(gnutls_x509_crt_t cert,
+  **/
+ int gnutls_x509_crt_get_version(gnutls_x509_crt_t cert)
+ {
+-	uint8_t version[8];
+-	int len, result;
+-
+ 	if (cert == NULL) {
+ 		gnutls_assert();
+ 		return GNUTLS_E_INVALID_REQUEST;
+ 	}
+ 
+-	len = sizeof(version);
+-	if ((result =
+-	     asn1_read_value(cert->cert, "tbsCertificate.version", version,
+-			     &len)) != ASN1_SUCCESS) {
+-
+-		if (result == ASN1_ELEMENT_NOT_FOUND)
+-			return 1;	/* the DEFAULT version */
+-		gnutls_assert();
+-		return _gnutls_asn2err(result);
+-	}
+-
+-	if (len != 1 || version[0] >= 0x80)
+-		return gnutls_assert_val(GNUTLS_E_CERTIFICATE_ERROR);
+-
+-	return (int) version[0] + 1;
++	return _gnutls_x509_get_version(cert->cert, "tbsCertificate.version");
+ }
+ 
+ /**
+diff --git a/tests/cert-tests/data/crl-demo3.pem b/tests/cert-tests/data/crl-demo3.pem
+index 1e04338c67..a91b1f905a 100644
+--- a/tests/cert-tests/data/crl-demo3.pem
++++ b/tests/cert-tests/data/crl-demo3.pem
+@@ -1,5 +1,5 @@
+ X.509 Certificate Revocation List Information:
+-	Version: 1 (default)
++	Version: 1
+ 	Issuer: OU=VeriSign Commercial Software Publishers CA,O=VeriSign\, Inc.,L=Internet
+ 	Update dates:
+ 		Issued: Wed Mar 08 09:00:11 UTC 2017
+-- 
+GitLab
+

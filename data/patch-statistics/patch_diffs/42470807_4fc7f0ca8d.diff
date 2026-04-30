@@ -1,0 +1,51 @@
+From f54c5e5986cf8192c8741d5f482ab5d11ec55455 Mon Sep 17 00:00:00 2001
+From: Ben Pfaff <blp@ovn.org>
+Date: Thu, 11 Oct 2018 12:44:33 -0700
+Subject: [PATCH] expr: Disallow < <= >= > comparisons against empty value set.
+
+OVN expression syntax does not allow a literal empty value set, like {}.
+Rather, any literal value set has to have at least one value.  However,
+value sets that originate from address sets or from port groups can be
+empty.  In such a case, == and != comparisons are allowed but < <= >= >
+should be errors.  The actual implementation failed to properly disallow
+the latter and instead tried to access the first element of the value set,
+a bad read.  This fixes the problem.
+
+Reported-at: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=10731
+Reported-at: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=10767
+Signed-off-by: Ben Pfaff <blp@ovn.org>
+Reviewed-by: Yifeng Sun <pkusunyifeng@gmail.com>
+---
+ ovn/lib/expr.c | 5 +++++
+ tests/ovn.at   | 2 ++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/ovn/lib/expr.c b/ovn/lib/expr.c
+index b50475245a4..8cfdf34fa6a 100644
+--- a/ovn/lib/expr.c
++++ b/ovn/lib/expr.c
+@@ -581,6 +581,11 @@ make_cmp(struct expr_context *ctx,
+                         f->symbol->name);
+             goto exit;
+         }
++        if (!cs->n_values) {
++            lexer_error(ctx->lexer, "Only == and != operators may be used "
++                        "to compare a field against an empty value set.");
++            goto exit;
++        }
+         if (cs->values[0].masked) {
+             lexer_error(ctx->lexer, "Only == and != operators may be used "
+                         "with masked constants.  Consider using subfields "
+diff --git a/tests/ovn.at b/tests/ovn.at
+index 886981d5183..71518d97db4 100644
+--- a/tests/ovn.at
++++ b/tests/ovn.at
+@@ -355,6 +355,8 @@ ip4.src == {1.2.3.4, $set1, $unknownset} => Syntax error at `$unknownset' expect
+ eth.src == {$set3, badmac, 00:00:00:00:00:01} => Syntax error at `badmac' expecting constant.
+ 
+ ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((())))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) => Parentheses nested too deeply.
++
++ct_label > $set4 => Only == and != operators may be used to compare a field against an empty value set.
+ ]])
+ sed 's/ =>.*//' test-cases.txt > input.txt
+ sed 's/.* => //' test-cases.txt > expout

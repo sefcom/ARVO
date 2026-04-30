@@ -1,0 +1,75 @@
+From f99464b8c9c37ffa9d07f2bc5b088572d5e5ca06 Mon Sep 17 00:00:00 2001
+From: Chris Liddell <chris.liddell@artifex.com>
+Date: Mon, 24 Jan 2022 08:43:03 +0000
+Subject: Don't countdown a non-existent pattern
+
+One error case where we're handling a pattern, but the error occurs before the
+pattern object is created. In that case, we shouldn't attempt to decrement the
+reference count of the local pattern reference.
+
+Noticed investigating oss-fuzz issue: 43991 but the error location doesn't
+match what oss-fuzz reports, so I'm not sure it's the same probem.
+---
+ pdf/pdf_colour.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/pdf/pdf_colour.c b/pdf/pdf_colour.c
+index d34561e6c..a07dcf705 100644
+--- a/pdf/pdf_colour.c
++++ b/pdf/pdf_colour.c
+@@ -764,7 +764,7 @@ pdfi_setcolorN(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict, boo
+ 
+     if (pdfi_count_stack(ctx) < 1) {
+         code = gs_note_error(gs_error_stackunderflow);
+-        goto cleanupExit;
++        goto cleanupExit1;
+     }
+ 
+     if (pcs->type == &gs_color_space_type_Pattern)
+@@ -773,7 +773,7 @@ pdfi_setcolorN(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict, boo
+         if (ctx->stack_top[-1]->type != PDF_NAME) {
+             pdfi_clearstack(ctx);
+             code = gs_note_error(gs_error_syntaxerror);
+-            goto cleanupExit;
++            goto cleanupExit0;
+         }
+         base_space = pcs->base_space;
+         code = pdfi_pattern_set(ctx, stream_dict, page_dict, (pdf_name *)ctx->stack_top[-1], &cc);
+@@ -782,7 +782,7 @@ pdfi_setcolorN(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict, boo
+             /* Ignore the pattern if we failed to set it */
+             pdfi_set_warning(ctx, 0, NULL, W_PDF_BADPATTERN, "pdfi_setcolorN", (char *)"PATTERN: Error setting pattern");
+             code = 0;
+-            goto cleanupExit;
++            goto cleanupExit1;
+         }
+         if (base_space && pattern_instance_uses_base_space(cc.pattern))
+             ncomps = cs_num_components(base_space);
+@@ -796,7 +796,7 @@ pdfi_setcolorN(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict, boo
+     if (ncomps > 0)
+         code = pdfi_get_color_from_stack(ctx, &cc, ncomps);
+     if (code < 0)
+-        goto cleanupExit;
++        goto cleanupExit1;
+ 
+     if (pcs->type == &gs_color_space_type_Indexed) {
+         if (cc.paint.values[0] < 0)
+@@ -820,7 +820,7 @@ pdfi_setcolorN(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict, boo
+ 
+     code = gs_setcolor(ctx->pgs, &cc);
+ 
+-cleanupExit:
++cleanupExit1:
+     if (is_pattern)
+         /* cc is a local scope variable, holding a reference to a pattern.
+          * We need to count the refrence down before the variable goes out of scope
+@@ -828,6 +828,7 @@ cleanupExit:
+          */
+         rc_decrement(cc.pattern, "pdfi_setcolorN");
+ 
++cleanupExit0:
+     if (!is_fill)
+         gs_swapcolors_quick(ctx->pgs);
+     return code;
+-- 
+cgit v1.2.3
+

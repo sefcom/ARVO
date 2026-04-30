@@ -1,0 +1,78 @@
+From 62aca4b8148bcfb85d798e2a70612e0ce833551b Mon Sep 17 00:00:00 2001
+From: Marti Maria <marti.maria@littlecms.com>
+Date: Wed, 31 Aug 2022 23:49:31 +0200
+Subject: [PATCH] Allow transform templates to be executed directly (it does
+ nothing, though)
+
+You may create transforms with formatters 0, that means the format is to be specified latter on. So, you were not supposed to call this template with cmsDoTransform before setting the format, but fuzzer did. So I am putting code to prevent this... without including a condition that  would ruin all cache and instruction branch guessing.
+---
+ src/cmsxform.c     | 34 +++++++++++++++++++++++++++++++++-
+ testbed/testcms2.c |  2 +-
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/src/cmsxform.c b/src/cmsxform.c
+index b7903885f..0b709b5cc 100644
+--- a/src/cmsxform.c
++++ b/src/cmsxform.c
+@@ -818,6 +818,36 @@ void ParalellizeIfSuitable(_cmsTRANSFORM* p)
+     }
+ }
+ 
++
++/**
++* An empty unroll to avoid a check with NULL on cmsDoTransform()
++*/
++static
++cmsUInt8Number* UnrollNothing(CMSREGISTER _cmsTRANSFORM* info,
++                              CMSREGISTER cmsUInt16Number wIn[],
++                              CMSREGISTER cmsUInt8Number* accum,
++                              CMSREGISTER cmsUInt32Number Stride)
++{    
++    return accum;
++
++    cmsUNUSED_PARAMETER(info);
++    cmsUNUSED_PARAMETER(wIn);
++    cmsUNUSED_PARAMETER(Stride);
++}
++
++static
++cmsUInt8Number* PackNothing(CMSREGISTER _cmsTRANSFORM* info,
++                           CMSREGISTER cmsUInt16Number wOut[],
++                           CMSREGISTER cmsUInt8Number* output,
++                           CMSREGISTER cmsUInt32Number Stride)
++{
++    return output;
++
++    cmsUNUSED_PARAMETER(info);
++    cmsUNUSED_PARAMETER(wOut);
++    cmsUNUSED_PARAMETER(Stride);
++}
++
+ // Allocate transform struct and set it to defaults. Ask the optimization plug-in about if those formats are proper
+ // for separated transforms. If this is the case,
+ static
+@@ -910,8 +940,10 @@ _cmsTRANSFORM* AllocEmptyTransform(cmsContext ContextID, cmsPipeline* lut,
+     }
+     else {
+ 
++        // Formats are intended to be changed before use
+         if (*InputFormat == 0 && *OutputFormat == 0) {
+-            p ->FromInput = p ->ToOutput = NULL;
++            p->FromInput = UnrollNothing;
++            p->ToOutput = PackNothing;
+             *dwFlags |= cmsFLAGS_CAN_CHANGE_FORMATTER;
+         }
+         else {
+diff --git a/testbed/testcms2.c b/testbed/testcms2.c
+index 0513e0919..ea398be6d 100644
+--- a/testbed/testcms2.c
++++ b/testbed/testcms2.c
+@@ -9263,7 +9263,7 @@ int main(int argc, char* argv[])
+     printf("Installing error logger ... ");
+     cmsSetLogErrorHandler(FatalErrorQuit);
+     printf("done.\n");
+-             
++         
+     PrintSupportedIntents();
+     
+     Check("Base types", CheckBaseTypes);

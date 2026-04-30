@@ -1,0 +1,336 @@
+From b676eae90fc9c620a214889ed040d356638a18f6 Mon Sep 17 00:00:00 2001
+From: Varun Khaneja <ca.aawc@yahoo.com>
+Date: Mon, 12 Feb 2018 10:57:52 -0800
+Subject: [PATCH] 5.6.1.8: Fixes fuzzing bugs. Additional changes.
+
+---
+ archive.cpp |  6 ++++--
+ archive.hpp |  3 ---
+ arcread.cpp | 31 +++++++------------------------
+ dll.rc      |  6 +++---
+ extract.cpp | 38 ++++++++++++++------------------------
+ headers.hpp | 31 ++-----------------------------
+ loclang.hpp |  2 --
+ version.hpp |  6 +++---
+ 8 files changed, 33 insertions(+), 90 deletions(-)
+
+diff --git a/archive.cpp b/archive.cpp
+index 1f3c3af..6532869 100644
+--- a/archive.cpp
++++ b/archive.cpp
+@@ -194,6 +194,7 @@ bool Archive::IsArchive(bool EnableBroken)
+ #endif
+ 
+   bool HeadersLeft; // Any headers left to read.
++  bool StartFound=false; // Main or encryption headers found.
+   // Skip the archive encryption header if any and read the main header.
+   while ((HeadersLeft=(ReadHeader()!=0))==true) // Additional parentheses to silence Clang.
+   {
+@@ -202,7 +203,8 @@ bool Archive::IsArchive(bool EnableBroken)
+     HEADER_TYPE Type=GetHeaderType();
+     // In RAR 5.0 we need to quit after reading HEAD_CRYPT if we wish to
+     // avoid the password prompt.
+-    if (Type==HEAD_MAIN || SilentOpen && Type==HEAD_CRYPT)
++    StartFound=Type==HEAD_MAIN || SilentOpen && Type==HEAD_CRYPT;
++    if (StartFound)
+       break;
+   }
+ 
+@@ -212,7 +214,7 @@ bool Archive::IsArchive(bool EnableBroken)
+   if (FailedHeaderDecryption && !EnableBroken)
+     return false;
+ 
+-  if (BrokenHeader) // Main archive header is corrupt.
++  if (BrokenHeader || !StartFound) // Main archive header is corrupt or missing.
+   {
+     uiMsg(UIERROR_MHEADERBROKEN,FileName);
+     if (!EnableBroken)
+diff --git a/archive.hpp b/archive.hpp
+index b68e435..da59973 100644
+--- a/archive.hpp
++++ b/archive.hpp
+@@ -107,10 +107,7 @@ class Archive:public File
+     FileHeader SubHead;
+     CommentHeader CommHead;
+     ProtectHeader ProtectHead;
+-    AVHeader AVHead;
+-    SignHeader SignHead;
+     UnixOwnersHeader UOHead;
+-    MacFInfoHeader MACHead;
+     EAHeader EAHead;
+     StreamHeader StreamHead;
+ 
+diff --git a/arcread.cpp b/arcread.cpp
+index 7694e01..e1e04f7 100644
+--- a/arcread.cpp
++++ b/arcread.cpp
+@@ -449,19 +449,6 @@ size_t Archive::ReadHeader15()
+       CommHead.Method=Raw.Get1();
+       CommHead.CommCRC=Raw.Get2();
+       break;
+-    case HEAD3_SIGN:
+-      *(BaseBlock *)&SignHead=ShortBlock;
+-      SignHead.CreationTime=Raw.Get4();
+-      SignHead.ArcNameSize=Raw.Get2();
+-      SignHead.UserNameSize=Raw.Get2();
+-      break;
+-    case HEAD3_AV:
+-      *(BaseBlock *)&AVHead=ShortBlock;
+-      AVHead.UnpVer=Raw.Get1();
+-      AVHead.Method=Raw.Get1();
+-      AVHead.AVVer=Raw.Get1();
+-      AVHead.AVInfoCRC=Raw.Get4();
+-      break;
+     case HEAD3_PROTECT:
+       *(BaseBlock *)&ProtectHead=ShortBlock;
+       ProtectHead.DataSize=Raw.Get4();
+@@ -471,7 +458,7 @@ size_t Archive::ReadHeader15()
+       Raw.GetB(ProtectHead.Mark,8);
+       NextBlockPos+=ProtectHead.DataSize;
+       break;
+-    case HEAD3_OLDSERVICE:
++    case HEAD3_OLDSERVICE: // RAR 2.9 and earlier.
+       *(BaseBlock *)&SubBlockHead=ShortBlock;
+       SubBlockHead.DataSize=Raw.Get4();
+       NextBlockPos+=SubBlockHead.DataSize;
+@@ -492,13 +479,6 @@ size_t Archive::ReadHeader15()
+           UOHead.OwnerName[UOHead.OwnerNameSize]=0;
+           UOHead.GroupName[UOHead.GroupNameSize]=0;
+           break;
+-        case MAC_HEAD:
+-          *(SubBlockHeader *)&MACHead=SubBlockHead;
+-          MACHead.fileType=Raw.Get4();
+-          MACHead.fileCreator=Raw.Get4();
+-          break;
+-        case EA_HEAD:
+-        case BEEA_HEAD:
+         case NTACL_HEAD:
+           *(SubBlockHeader *)&EAHead=SubBlockHead;
+           EAHead.UnpSize=Raw.Get4();
+@@ -920,11 +900,10 @@ void Archive::RequestArcPassword()
+       ErrHandler.Exit(RARX_USERBREAK);
+     }
+ #else
+-    if (!uiGetPassword(UIPASSWORD_ARCHIVE,FileName,&Cmd->Password) ||
+-        !Cmd->Password.IsSet())
++    if (!uiGetPassword(UIPASSWORD_ARCHIVE,FileName,&Cmd->Password))
+     {
+       Close();
+-      uiMsg(UIERROR_INCERRCOUNT);
++      uiMsg(UIERROR_INCERRCOUNT); // Prevent archive deleting if delete after extraction is on.
+       ErrHandler.Exit(RARX_USERBREAK);
+     }
+ #endif
+@@ -1186,6 +1165,8 @@ size_t Archive::ReadHeader14()
+     byte Mark[4];
+     Raw.GetB(Mark,4);
+     uint HeadSize=Raw.Get2();
++    if (HeadSize<7)
++      return false;
+     byte Flags=Raw.Get1();
+     NextBlockPos=CurBlockPos+HeadSize;
+     CurHeaderType=HEAD_MAIN;
+@@ -1207,6 +1188,8 @@ size_t Archive::ReadHeader14()
+     FileHead.FileHash.Type=HASH_RAR14;
+     FileHead.FileHash.CRC32=Raw.Get2();
+     FileHead.HeadSize=Raw.Get2();
++    if (FileHead.HeadSize<21)
++      return false;
+     uint FileTime=Raw.Get4();
+     FileHead.FileAttr=Raw.Get1();
+     FileHead.Flags=Raw.Get1()|LONG_BLOCK;
+diff --git a/dll.rc b/dll.rc
+index 430e9cc..09ed31a 100644
+--- a/dll.rc
++++ b/dll.rc
+@@ -2,8 +2,8 @@
+ #include <commctrl.h>
+ 
+ VS_VERSION_INFO VERSIONINFO
+-FILEVERSION 5, 60, 1, 2512
+-PRODUCTVERSION 5, 60, 1, 2512
++FILEVERSION 5, 60, 1, 2595
++PRODUCTVERSION 5, 60, 1, 2595
+ FILEOS VOS__WINDOWS32
+ FILETYPE VFT_APP
+ {
+@@ -16,7 +16,7 @@ FILETYPE VFT_APP
+       VALUE "FileDescription", "RAR decompression library\0"
+       VALUE "FileVersion", "5.60.1\0"
+       VALUE "ProductVersion", "5.60.1\0"
+-      VALUE "LegalCopyright", "Copyright © Alexander Roshal 1993-2017\0"
++      VALUE "LegalCopyright", "Copyright © Alexander Roshal 1993-2018\0"
+       VALUE "OriginalFilename", "Unrar.dll\0"
+     }
+   }
+diff --git a/extract.cpp b/extract.cpp
+index abdd928..119b4bc 100644
+--- a/extract.cpp
++++ b/extract.cpp
+@@ -249,7 +249,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+   if (HeaderType!=HEAD_FILE)
+   {
+ #ifndef SFX_MODULE
+-    if (HeaderType==HEAD3_OLDSERVICE && PrevProcessed)
++    if (Arc.Format==RARFMT15 && HeaderType==HEAD3_OLDSERVICE && PrevProcessed)
+       SetExtraInfo20(Cmd,Arc,DestFileName);
+ #endif
+     if (HeaderType==HEAD_SERVICE && PrevProcessed)
+@@ -429,7 +429,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+       return !Arc.Solid; // Can try extracting next file only in non-solid archive.
+     }
+ 
+-    while (true) // Repeat the password prompt for wrong passwords.
++    while (true) // Repeat the password prompt for wrong and empty passwords.
+     {
+       if (Arc.FileHead.Encrypted)
+       {
+@@ -447,21 +447,8 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+           return false;
+         }
+ #endif
+-        // Skip only the current encrypted file if empty password is entered.
+-        // Actually our "cancel" code above intercepts empty passwords too now,
+-        // so we keep the code below just in case we'll decide process empty
+-        // and cancelled passwords differently sometimes.
+-        if (!Cmd->Password.IsSet())
+-        {
+-          ErrHandler.SetErrorCode(RARX_WARNING);
+-#ifdef RARDLL
+-          Cmd->DllError=ERAR_MISSING_PASSWORD;
+-#endif
+-          ExtrFile=false;
+-        }
+       }
+ 
+-
+       // Set a password before creating the file, so we can skip creating
+       // in case of wrong password.
+       SecPassword FilePassword=Cmd->Password;
+@@ -481,12 +468,17 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+           memcmp(Arc.FileHead.PswCheck,PswCheck,SIZE_PSWCHECK)!=0 &&
+           !Arc.BrokenHeader)
+       {
+-        // This message is used by Android GUI and Windows GUI and SFX to
+-        // reset cached passwords. Update appropriate code if changed.
+-        uiMsg(UIWAIT_BADPSW,ArcFileName);
+-
+-        if (!PasswordAll) // If entered manually and not through -p<pwd>.
++        if (PasswordAll) // For -p<pwd> or Ctrl+P.
+         {
++          // This message is used by Android GUI to reset cached passwords.
++          // Update appropriate code if changed.
++          uiMsg(UIERROR_BADPSW,ArcFileName);
++        }
++        else // For passwords entered manually.
++        {
++          // This message is used by Android GUI and Windows GUI and SFX to
++          // reset cached passwords. Update appropriate code if changed.
++          uiMsg(UIWAIT_BADPSW,ArcFileName);
+           Cmd->Password.Clean();
+           continue; // Request a password again.
+         }
+@@ -961,12 +953,10 @@ bool CmdExtract::ExtrGetPassword(Archive &Arc,const wchar *ArcFileName)
+ {
+   if (!Cmd->Password.IsSet())
+   {
+-    if (!uiGetPassword(UIPASSWORD_FILE,ArcFileName,&Cmd->Password) || !Cmd->Password.IsSet())
++    if (!uiGetPassword(UIPASSWORD_FILE,ArcFileName,&Cmd->Password)/* || !Cmd->Password.IsSet()*/)
+     {
+-      // Suppress "test is ok" message in GUI if user entered
+-      // an empty password or cancelled a password prompt.
++      // Suppress "test is ok" message if user cancelled the password prompt.
+       uiMsg(UIERROR_INCERRCOUNT);
+-
+       return false;
+     }
+     Cmd->ManualPassword=true;
+diff --git a/headers.hpp b/headers.hpp
+index 9486478..488960a 100644
+--- a/headers.hpp
++++ b/headers.hpp
+@@ -11,12 +11,7 @@
+ #define  SIZEOF_SUBBLOCKHEAD    14
+ #define  SIZEOF_COMMHEAD        13
+ #define  SIZEOF_PROTECTHEAD     26
+-#define  SIZEOF_AVHEAD          14
+-#define  SIZEOF_SIGNHEAD        15
+ #define  SIZEOF_UOHEAD          18
+-#define  SIZEOF_MACHEAD         22
+-#define  SIZEOF_EAHEAD          24
+-#define  SIZEOF_BEEAHEAD        24
+ #define  SIZEOF_STREAMHEAD      26
+ 
+ #define  VER_PACK               29
+@@ -86,6 +81,8 @@ enum HEADER_TYPE {
+   HEAD3_SERVICE=0x7a,HEAD3_ENDARC=0x7b
+ };
+ 
++
++// RAR 2.9 and earlier.
+ enum { EA_HEAD=0x100,UO_HEAD=0x101,MAC_HEAD=0x102,BEEA_HEAD=0x103,
+        NTACL_HEAD=0x104,STREAM_HEAD=0x105 };
+ 
+@@ -323,23 +320,6 @@ struct ProtectHeader:BlockHeader
+ };
+ 
+ 
+-struct AVHeader:BaseBlock
+-{
+-  byte UnpVer;
+-  byte Method;
+-  byte AVVer;
+-  uint AVInfoCRC;
+-};
+-
+-
+-struct SignHeader:BaseBlock
+-{
+-  uint CreationTime;
+-  ushort ArcNameSize;
+-  ushort UserNameSize;
+-};
+-
+-
+ struct UnixOwnersHeader:SubBlockHeader
+ {
+   ushort OwnerNameSize;
+@@ -370,11 +350,4 @@ struct StreamHeader:SubBlockHeader
+ };
+ 
+ 
+-struct MacFInfoHeader:SubBlockHeader
+-{
+-  uint fileType;
+-  uint fileCreator;
+-};
+-
+-
+ #endif
+diff --git a/loclang.hpp b/loclang.hpp
+index 1f0a5e2..87499bb 100644
+--- a/loclang.hpp
++++ b/loclang.hpp
+@@ -311,8 +311,6 @@
+ #define   MErrLnkRead        L"\nWARNING: Cannot read symbolic link %s"
+ #define   MSymLinkExists     L"\nWARNING: Symbolic link %s already exists"
+ #define   MAskRetryCreate    L"\nCannot create %s. Retry ?"
+-#define   MListMACHead1      L"\n Mac OS file type:  %c%c%c%c  ; "
+-#define   MListMACHead2      L"file creator:  %c%c%c%c\n"
+ #define   MDataBadCRC        L"\n%-20s : packed data checksum error in volume %s"
+ #define   MFileRO            L"\n%s is read-only"
+ #define   MACLGetError       L"\nWARNING: Cannot get %s security data\n"
+diff --git a/version.hpp b/version.hpp
+index 6684b12..ebbf10b 100644
+--- a/version.hpp
++++ b/version.hpp
+@@ -1,6 +1,6 @@
+ #define RARVER_MAJOR     5
+ #define RARVER_MINOR    60
+ #define RARVER_BETA      1
+-#define RARVER_DAY      13
+-#define RARVER_MONTH    11
+-#define RARVER_YEAR   2017
++#define RARVER_DAY       3
++#define RARVER_MONTH     2
++#define RARVER_YEAR   2018

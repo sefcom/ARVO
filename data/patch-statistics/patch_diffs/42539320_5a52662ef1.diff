@@ -1,0 +1,56 @@
+From 143c136ac6e566d95436c852686f9b1fd4084b5c Mon Sep 17 00:00:00 2001
+From: "Philip.Hazel" <Philip.Hazel@gmail.com>
+Date: Fri, 10 Mar 2017 15:53:49 +0000
+Subject: [PATCH] Fix oss-fuzz issue 781: read from bad memory when fewer
+ capturing parens than space in the external ovector.
+
+---
+ ChangeLog         | 14 ++++++++++++--
+ src/pcre2_match.c |  6 ++++--
+ 2 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index 107a6fe26..0169af130 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -14,10 +14,20 @@ hard-to-do issues such as #1887 in Bugzilla. The code is also cleaner because
+ the old code had a number of fudges to try to reduce stack usage. It seems to 
+ run no slower than the old code.
+ 
++A number of bugs in the refactored code were subsequently fixed during testing
++before release, but after the code was made available in the repository. Many
++of the bugs were discovered by fuzzing testing. These bugs were never in fully
++released code, but are noted here for the record.
++
++  (a) If a pattern had fewer capturing parentheses than the ovector supplied in 
++      the match data block, a memory error (detectable by ASAN) occurred after
++      a match, because the external block was being set from non-existent
++      internal ovector fields. Fixes oss-fuzz issue 781.
++
+ 2. Hardened pcre2test so as to reduce the number of bugs reported by fuzzers:
+ 
+-   (a) Check for malloc failures when getting memory for the ovector (POSIX) or 
+-       the match data block (non-POSIX). 
++  (a) Check for malloc failures when getting memory for the ovector (POSIX) or 
++      the match data block (non-POSIX). 
+        
+ 3. In the 32-bit library in non-UTF mode, an attempt to find a Unicode property
+ for a character with a code point greater than 0x10ffff (the Unicode maximum)
+diff --git a/src/pcre2_match.c b/src/pcre2_match.c
+index eec390a46..734ee80c4 100644
+--- a/src/pcre2_match.c
++++ b/src/pcre2_match.c
+@@ -816,9 +816,11 @@ fprintf(stderr, "++ op=%d\n", *Fecode);
+ 
+     ovector[0] = Fstart_match - mb->start_subject;
+     ovector[1] = Feptr - mb->start_subject;
+-    memcpy(ovector+2, Fovector, (oveccount - 1) * 2 * sizeof(PCRE2_SIZE));
+-
++    
++    /* Set i to the smaller of the sizes of the external and frame ovectors. */
++    
+     i = 2 * ((top_bracket + 1 > oveccount)? oveccount : top_bracket + 1);
++    memcpy(ovector + 2, Fovector, (i - 2) * sizeof(PCRE2_SIZE));
+     while (--i >= Foffset_top + 2) ovector[i] = PCRE2_UNSET;
+     return MATCH_MATCH;  /* Note: NOT RRETURN */
+ 

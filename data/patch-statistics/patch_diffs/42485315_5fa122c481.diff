@@ -1,0 +1,93 @@
+From 19bdfbf5111c75944405ad25e3e0995b6e9622d6 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Sat, 24 Jun 2017 18:46:52 +0000
+Subject: [PATCH] libLERC: avoid write heap buffer overflow. Credit to OSS Fuzz
+ (run locally)
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@39281 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/frmts/mrf/libLERC/Lerc2.cpp |  2 +-
+ gdal/frmts/mrf/libLERC/RLE.cpp   | 20 +++++++++++++++-----
+ gdal/frmts/mrf/libLERC/RLE.h     |  2 +-
+ 3 files changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/gdal/frmts/mrf/libLERC/Lerc2.cpp b/gdal/frmts/mrf/libLERC/Lerc2.cpp
+index 07aed00be0a1..6fbcb7c64f74 100644
+--- a/gdal/frmts/mrf/libLERC/Lerc2.cpp
++++ b/gdal/frmts/mrf/libLERC/Lerc2.cpp
+@@ -312,7 +312,7 @@ bool Lerc2::ReadMask(const Byte** ppByte, size_t& nRemainingSizeInOut)
+       LERC_BRKPNT();
+       return false;
+     }
+-    if (!rle.decompress(ptr, nRemainingSize, m_bitMask.Bits()))
++    if (!rle.decompress(ptr, nRemainingSize, m_bitMask.Bits(), m_bitMask.Size()))
+     {
+       LERC_BRKPNT();
+       return false;
+diff --git a/gdal/frmts/mrf/libLERC/RLE.cpp b/gdal/frmts/mrf/libLERC/RLE.cpp
+index 41947343fd44..82b83f21c637 100644
+--- a/gdal/frmts/mrf/libLERC/RLE.cpp
++++ b/gdal/frmts/mrf/libLERC/RLE.cpp
+@@ -290,18 +290,18 @@ bool RLE::decompress(const Byte* arrRLE, size_t nRemainingSizeIn, Byte** arr, si
+   if (!*arr)
+     return false;
+ 
+-  return decompress(arrRLE, nRemainingSizeIn, *arr);
++  return decompress(arrRLE, nRemainingSizeIn, *arr, numBytes);
+ }
+ 
+ // -------------------------------------------------------------------------- ;
+ 
+-bool RLE::decompress(const Byte* arrRLE, size_t nRemainingSize, Byte* arr)
++bool RLE::decompress(const Byte* arrRLE, size_t nRemainingSize, Byte* arr, size_t arrSize)
+ {
+   if (!arrRLE || !arr)
+     return false;
+ 
+   const Byte* srcPtr = arrRLE;
+-  Byte* dstPtr = arr;
++  size_t arrIdx = 0;
+   if( nRemainingSize < 2 )
+   {
+     LERC_BRKPNT();
+@@ -320,7 +320,12 @@ bool RLE::decompress(const Byte* arrRLE, size_t nRemainingSize, Byte* arr)
+         return false;
+       }
+       nRemainingSize -= i;
+-      while (i--) *dstPtr++ = *srcPtr++;
++      if( arrIdx + i > arrSize )
++      {
++        LERC_BRKPNT();
++        return false;
++      }
++      while (i--) arr[arrIdx++] = *srcPtr++;
+     }
+     else
+     {
+@@ -331,7 +336,12 @@ bool RLE::decompress(const Byte* arrRLE, size_t nRemainingSize, Byte* arr)
+       }
+       nRemainingSize -= 1;
+       Byte b = *srcPtr++;
+-      while (i--) *dstPtr++ = b;
++      if( arrIdx + i > arrSize )
++      {
++        LERC_BRKPNT();
++        return false;
++      }
++      while (i--) arr[arrIdx++] = b;
+     }
+     if( nRemainingSize < 2 )
+     {
+diff --git a/gdal/frmts/mrf/libLERC/RLE.h b/gdal/frmts/mrf/libLERC/RLE.h
+index f5d9f7ebb199..b168f47a7c60 100644
+--- a/gdal/frmts/mrf/libLERC/RLE.h
++++ b/gdal/frmts/mrf/libLERC/RLE.h
+@@ -57,7 +57,7 @@ class RLE
+   bool decompress(const Byte* arrRLE, size_t nRemainingSize, Byte** arr, size_t& numBytes) const;
+ 
+   // arr already allocated, just fill
+-  static bool decompress(const Byte* arrRLE, size_t nRemainingSize, Byte* arr);
++  static bool decompress(const Byte* arrRLE, size_t nRemainingSize, Byte* arr, size_t arrSize);
+ 
+ protected:
+   int m_minNumEven;

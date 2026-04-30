@@ -1,0 +1,167 @@
+From fa757f344626bd3a42a86f42ca903a1d9e6e9030 Mon Sep 17 00:00:00 2001
+From: Mike Pall <mike>
+Date: Sun, 10 Mar 2024 17:23:21 +0100
+Subject: [PATCH] Prevent down-recursion for side traces.
+
+Thanks to Sergey Kaplun.
+
+(cherry picked from commit cae361187e7e1e3545353fb560c032cdace32d5f)
+
+Assume we have the root trace that uses some spill slots with the
+corresponding stack adjustment. Then its side trace will restore the
+stack only at its tail. It may look like the following:
+
+| ---- TRACE 4 mcode 1247
+| 55557f7df953  mov rax, [r14-0xe28]
+| 55557f7df95a  mov rax, [rax+0x30]
+| 55557f7df95e  sub rax, rdx
+| 55557f7df961  cmp rax, +0x68
+| 55557f7df965  jb 0x55557f7d004c       ->0
+| 55557f7df96b  add rsp, -0x10
+| ...
+| 55557f6efa71  cmp dword [rdx+0x4], -0x05
+| 55557f6efa75  jnz 0x55557f6e004c      ->0
+| ...
+| 55557f7dfe29  add rsp, +0x10
+| 55557f7dfe2d  jmp 0x5555556fe573
+| ---- TRACE 4 stop -> stitch
+|
+| ---- TRACE 5 start 4/0
+| ---- TRACE 5 mcode 101
+| 55557f6ef9d4  mov dword [0x40000518], 0x5
+| ...
+| 55557f6efa30  add rsp, +0x10
+| 55557f6efa34  jmp 0x55557f6ef9d4
+| ---- TRACE 5 stop -> down-recursion
+
+Such side traces have no stack adjustment at their heads since their
+stack adjustment is inherited from the parent trace. The issue occurs if
+the side trace has a down-recursion, as mentioned above. Before any
+exit, we can jump back to the start of the trace several times with
+growing `rsp`. In that case, the `rsp` is restored incorrectly after
+exiting from the trace.
+
+This patch forbids down-recursion for non-root traces.
+
+Sergey Kaplun:
+* added the description and the test for the problem
+
+Part of tarantool/tarantool#9595
+
+Reviewed-by: Maxim Kokryashkin <m.kokryashkin@tarantool.org>
+Reviewed-by: Sergey Bronnikov <sergeyb@tarantool.org>
+Signed-off-by: Sergey Kaplun <skaplun@tarantool.org>
+---
+ src/lj_record.c                               |  2 +-
+ .../lj-1169-down-rec-side.test.lua            | 89 +++++++++++++++++++
+ 2 files changed, 90 insertions(+), 1 deletion(-)
+ create mode 100644 test/tarantool-tests/lj-1169-down-rec-side.test.lua
+
+diff --git a/src/lj_record.c b/src/lj_record.c
+index a6c48747a6..7fa56834c0 100644
+--- a/src/lj_record.c
++++ b/src/lj_record.c
+@@ -867,7 +867,7 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
+     if ((pt->flags & PROTO_NOJIT))
+       lj_trace_err(J, LJ_TRERR_CJITOFF);
+     if (J->framedepth == 0 && J->pt && frame == J->L->base - 1) {
+-      if (check_downrec_unroll(J, pt)) {
++      if (!J->cur.root && check_downrec_unroll(J, pt)) {
+ 	J->maxslot = (BCReg)(rbase + gotresults);
+ 	lj_snap_purge(J);
+ 	lj_record_stop(J, LJ_TRLINK_DOWNREC, J->cur.traceno);  /* Down-rec. */
+diff --git a/test/tarantool-tests/lj-1169-down-rec-side.test.lua b/test/tarantool-tests/lj-1169-down-rec-side.test.lua
+new file mode 100644
+index 0000000000..6363edd7be
+--- /dev/null
++++ b/test/tarantool-tests/lj-1169-down-rec-side.test.lua
+@@ -0,0 +1,89 @@
++local tap = require('tap')
++
++-- Test file to demonstrate the LuaJIT misbehaviour when recording
++-- and executing a side trace with down-recursion.
++-- See also: https://github.com/LuaJIT/LuaJIT/issues/1169.
++
++local test = tap.test('lj-1169-down-rec-side'):skipcond({
++  ['Test requires JIT enabled'] = not jit.status(),
++})
++
++local ffi = require('ffi')
++
++-- XXX: simplify `jit.dump()` output.
++local modf = math.modf
++local ffi_new = ffi.new
++
++local int64_t = ffi.typeof('int64_t')
++
++test:plan(1)
++
++-- If a parent trace has more than the default amount of spill
++-- slots, the `rsp` register is adjusted at the start of the trace
++-- and restored after. If there is a side trace created, it
++-- modifies the stack only at exit (since adjustment is inherited
++-- from a parent trace). If the side trace has a down-recursion
++-- (for now only the down-recursion to itself is used), `rsp` may
++-- be modified several times before exit, so the host stack
++-- becomes corrupted.
++--
++-- This test provides the example of a side trace (5) with
++-- down-recursion.
++
++local function trace_ret(arg) -- TRACE 1 start.
++  return arg -- TRACE 4 start 1/0; TRACE 5 start 4/0.
++end
++
++local function extra_frame()
++  -- Stitch the trace (4) to prevent early down-recursion.
++  modf(1)
++  -- Start the side trace (5) with a down-recursion.
++  return trace_ret({})
++end
++
++local call_counter = 0
++local function recursive_f() -- TRACE 2 start.
++  -- XXX: 4 calls are needed to record the necessary traces after
++  -- return. With the 5th call, the traces are executed.
++  if call_counter > 4 then return end -- TRACE 3 start 2/1.
++  call_counter = call_counter + 1
++
++  -- Compile the root trace first.
++  trace_ret(1)
++  trace_ret(1)
++
++  recursive_f()
++  -- Stop the side trace (3) here after exiting the trace (2) with
++  -- up-recursion.
++  modf(1)
++
++  -- Start the side trace (4).
++  trace_ret('')
++  -- luacheck: no unused
++  -- Generate register pressure to force spills.
++  -- The amount is well-suited for arm64 and x86_64.
++  local l1 = ffi_new(int64_t, call_counter + 1)
++  local l2 = ffi_new(int64_t, call_counter + 2)
++  local l3 = ffi_new(int64_t, call_counter + 3)
++  local l4 = ffi_new(int64_t, call_counter + 4)
++  local l5 = ffi_new(int64_t, call_counter + 5)
++  local l6 = ffi_new(int64_t, call_counter + 6)
++  local l7 = ffi_new(int64_t, call_counter + 7)
++  local l8 = ffi_new(int64_t, call_counter + 8)
++  local l9 = ffi_new(int64_t, call_counter + 9)
++  local l10 = ffi_new(int64_t, call_counter + 10)
++  local l11 = ffi_new(int64_t, call_counter + 11)
++  local l12 = ffi_new(int64_t, call_counter + 12)
++  local l13 = ffi_new(int64_t, call_counter + 13)
++  -- Simulate the return to the same function using the additional
++  -- frame for down-recursion.
++  return trace_ret(extra_frame())
++end
++
++jit.opt.start('hotloop=1', 'hotexit=1', 'recunroll=1')
++
++recursive_f()
++
++test:ok(true, 'no crash during execution of a trace with down-recursion')
++
++test:done(true)

@@ -1,0 +1,96 @@
+From 2deda6adef2ade332f460ae3fe2c8504d7e0b401 Mon Sep 17 00:00:00 2001
+From: Sam Ansmink <samansmink@hotmail.com>
+Date: Mon, 13 Jun 2022 16:06:46 +0200
+Subject: [PATCH] enable static link build for MacOS, hide symbols for
+ linux+mac
+
+---
+ .github/workflows/OSX.yml            |  1 +
+ CMakeLists.txt                       | 14 +++++++++-----
+ src/include/duckdb.h                 | 13 +++++++++++++
+ src/include/duckdb/common/winapi.hpp |  2 +-
+ 4 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/OSX.yml b/.github/workflows/OSX.yml
+index ec33301b59bf..bd3c656891e6 100644
+--- a/.github/workflows/OSX.yml
++++ b/.github/workflows/OSX.yml
+@@ -163,6 +163,7 @@ jobs:
+           post_install: rm build/release/src/libduckdb*
+           run_tests: 0
+           out_of_tree_ext: 1
++          static_link_build: 1
+ 
+       - name: Deploy
+         shell: bash
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2def19757bd9..95df65c36e0b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -681,21 +681,25 @@ function(build_loadable_extension_directory NAME OUTPUT_DIRECTORY)
+   # Windows:  For windows, delay loading could be used to achieve similar behaviour as MacOS, but since this requires
+   #           setting the _declspec header for every function used from an extension, we have also opted for the
+   #           EXTENSION_STATIC_BUILD approach
+-  if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+-    set_target_properties(${TARGET_NAME} PROPERTIES LINK_FLAGS "-undefined dynamic_lookup")
+-  endif()
+-
+   if (EXTENSION_STATIC_BUILD)
+     if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+-      target_link_libraries(${TARGET_NAME} duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS} -Wl,--gc-sections -Wl,--exclude-libs,ALL)
++      # For GNU we rely on fvisibility=hidden to hide the extension symbols and use -exclude-libs to hide the duckdb symbols
++      set_target_properties(${TARGET_NAME} PROPERTIES CXX_VISIBILITY_PRESET hidden)
++      target_link_libraries(${TARGET_NAME} PRIVATE duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS} -Wl,--gc-sections -Wl,--exclude-libs,ALL)
+     elseif (WIN32)
+       target_link_libraries(${TARGET_NAME} duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
++    elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
++      set_target_properties(${TARGET_NAME} PROPERTIES CXX_VISIBILITY_PRESET hidden)
++      # Note that on MacOS we need to use the -exported_symbol whitelist feature due to a lack of -exclude-libs flag in mac's ld variant
++      target_link_libraries(${TARGET_NAME} duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS} -Wl,-dead_strip -Wl,-exported_symbol,_${NAME}_init -Wl,-exported_symbol,_${NAME}_version)
+     else()
+       error("EXTENSION static build is only intended for Linux and Windows on MVSC")
+     endif()
+   else()
+     if (WIN32)
+       target_link_libraries(${TARGET_NAME} duckdb ${DUCKDB_EXTRA_LINK_FLAGS})
++    elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
++      set_target_properties(${TARGET_NAME} PROPERTIES LINK_FLAGS "-undefined dynamic_lookup")
+     endif()
+   endif()
+ 
+diff --git a/src/include/duckdb.h b/src/include/duckdb.h
+index 3a18fe56bce6..ad89d3f81246 100644
+--- a/src/include/duckdb.h
++++ b/src/include/duckdb.h
+@@ -22,6 +22,19 @@
+ #endif
+ #endif
+ 
++// duplicate of duckdb/main/winapi.hpp
++#ifndef DUCKDB_EXTENSION_API
++#ifdef _WIN32
++#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
++#define DUCKDB_EXTENSION_API __declspec(dllexport)
++#else
++#define DUCKDB_EXTENSION_API
++#endif
++#else
++#define DUCKDB_EXTENSION_API __attribute__((visibility("default")))
++#endif
++#endif
++
+ // duplicate of duckdb/common/constants.hpp
+ #ifndef DUCKDB_API_0_3_1
+ #define DUCKDB_API_0_3_1 1
+diff --git a/src/include/duckdb/common/winapi.hpp b/src/include/duckdb/common/winapi.hpp
+index 9a5bff528808..2cff5d12d486 100644
+--- a/src/include/duckdb/common/winapi.hpp
++++ b/src/include/duckdb/common/winapi.hpp
+@@ -28,6 +28,6 @@
+ #define DUCKDB_EXTENSION_API
+ #endif
+ #else
+-#define DUCKDB_EXTENSION_API
++#define DUCKDB_EXTENSION_API __attribute__((visibility("default")))
+ #endif
+ #endif

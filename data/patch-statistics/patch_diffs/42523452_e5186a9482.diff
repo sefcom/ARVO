@@ -1,0 +1,59 @@
+From 95a78c08c17b73a50ad64c1b82e47970a3f2bc41 Mon Sep 17 00:00:00 2001
+From: James Almer <jamrial@gmail.com>
+Date: Thu, 20 Apr 2023 10:12:47 -0300
+Subject: [PATCH] avcodec/hevcdec: further constrain some slice header field
+ values
+
+num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1,
+num_ref_idx_l0_default_active_minus1, and num_ref_idx_l1_default_active_minus1
+are all in the range 0 to 14, inclusive.
+
+Signed-off-by: James Almer <jamrial@gmail.com>
+---
+ libavcodec/hevc_ps.c | 10 ++++++++--
+ libavcodec/hevcdec.c |  6 +++---
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/libavcodec/hevc_ps.c b/libavcodec/hevc_ps.c
+index 7401ea23f5..f29f783f77 100644
+--- a/libavcodec/hevc_ps.c
++++ b/libavcodec/hevc_ps.c
+@@ -1762,8 +1762,14 @@ int ff_hevc_decode_nal_pps(GetBitContext *gb, AVCodecContext *avctx,
+ 
+     pps->cabac_init_present_flag = get_bits1(gb);
+ 
+-    pps->num_ref_idx_l0_default_active = get_ue_golomb_long(gb) + 1;
+-    pps->num_ref_idx_l1_default_active = get_ue_golomb_long(gb) + 1;
++    pps->num_ref_idx_l0_default_active = get_ue_golomb_31(gb) + 1;
++    pps->num_ref_idx_l1_default_active = get_ue_golomb_31(gb) + 1;
++    if (pps->num_ref_idx_l0_default_active >= HEVC_MAX_REFS ||
++        pps->num_ref_idx_l1_default_active >= HEVC_MAX_REFS) {
++        av_log(avctx, AV_LOG_ERROR, "Too many default refs in PPS: %d/%d.\n",
++               pps->num_ref_idx_l0_default_active, pps->num_ref_idx_l1_default_active);
++        goto err;
++    }
+ 
+     pps->pic_init_qp_minus26 = get_se_golomb(gb);
+ 
+diff --git a/libavcodec/hevcdec.c b/libavcodec/hevcdec.c
+index 1a0beac901..0fa4fdd59d 100644
+--- a/libavcodec/hevcdec.c
++++ b/libavcodec/hevcdec.c
+@@ -773,11 +773,11 @@ static int hls_slice_header(HEVCContext *s)
+                 sh->nb_refs[L1] = s->ps.pps->num_ref_idx_l1_default_active;
+ 
+             if (get_bits1(gb)) { // num_ref_idx_active_override_flag
+-                sh->nb_refs[L0] = get_ue_golomb_long(gb) + 1;
++                sh->nb_refs[L0] = get_ue_golomb_31(gb) + 1;
+                 if (sh->slice_type == HEVC_SLICE_B)
+-                    sh->nb_refs[L1] = get_ue_golomb_long(gb) + 1;
++                    sh->nb_refs[L1] = get_ue_golomb_31(gb) + 1;
+             }
+-            if (sh->nb_refs[L0] > HEVC_MAX_REFS || sh->nb_refs[L1] > HEVC_MAX_REFS) {
++            if (sh->nb_refs[L0] >= HEVC_MAX_REFS || sh->nb_refs[L1] >= HEVC_MAX_REFS) {
+                 av_log(s->avctx, AV_LOG_ERROR, "Too many refs: %d/%d.\n",
+                        sh->nb_refs[L0], sh->nb_refs[L1]);
+                 return AVERROR_INVALIDDATA;
+-- 
+2.25.1
+

@@ -1,0 +1,192 @@
+From 143a12bd5a5402231bde748cbbdc22bb3984a522 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Fri, 28 Apr 2023 11:11:09 +0930
+Subject: [PATCH] Re: Keeping track of rs6000-coff archive element pointers
+
+Commit de7b90610e9e left a hole in the element checking, explained by
+the comment added to _bfd_xcoff_openr_next_archived_file.  While
+fixing this, tidy some types used to hold unsigned values so that
+casts are not needed to avoid signed/unsigned comparison warnings.
+Also tidy a few things in xcoff.h.
+
+bfd/
+	* coff-rs6000.c (_bfd_xcoff_openr_next_archived_file): Check
+	that we aren't pointing back at the last element.  Make
+	filestart a ufile_ptr.  Update for xcoff_artdata change.
+	(_bfd_strntol, _bfd_strntoll): Return unsigned values.
+	(_bfd_xcoff_slurp_armap): Make off a ufile_ptr.
+	(add_ranges): Update for xcoff_artdata change.
+	* libbfd-in.h (struct artdata): Make first_file_filepos a
+	ufile_ptr.
+	* libbfd.h: Regenerate.
+include/
+	* coff/xcoff.h (struct xcoff_artdata): Replace min_elt with
+	ar_hdr_size.
+	(xcoff_big_format_p): In the !SMALL_ARCHIVE case return true
+	for anything but a small archive.
+---
+ bfd/coff-rs6000.c    | 35 ++++++++++++++++++++++++++---------
+ bfd/libbfd-in.h      |  2 +-
+ bfd/libbfd.h         |  2 +-
+ include/coff/xcoff.h | 10 +++++-----
+ 4 files changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/bfd/coff-rs6000.c b/bfd/coff-rs6000.c
+index 3b451912df7..421dc8f7ee5 100644
+--- a/bfd/coff-rs6000.c
++++ b/bfd/coff-rs6000.c
+@@ -1294,7 +1294,7 @@ _bfd_xcoff_reloc_name_lookup (bfd *abfd ATTRIBUTE_UNUSED,
+    take a maximum length as an additional parameter.  Also - just to save space,
+    we omit the endptr return parameter, since we know that it is never used.  */
+ 
+-static long
++static unsigned long
+ _bfd_strntol (const char * nptr, int base, unsigned int maxlen)
+ {
+   char buf[24]; /* Should be enough.  */
+@@ -1306,7 +1306,7 @@ _bfd_strntol (const char * nptr, int base, unsigned int maxlen)
+   return strtol (buf, NULL, base);
+ }
+ 
+-static long long
++static unsigned long long
+ _bfd_strntoll (const char * nptr, int base, unsigned int maxlen)
+ {
+   char buf[32]; /* Should be enough.  */
+@@ -1338,7 +1338,7 @@ _bfd_strntoll (const char * nptr, int base, unsigned int maxlen)
+ bool
+ _bfd_xcoff_slurp_armap (bfd *abfd)
+ {
+-  file_ptr off;
++  ufile_ptr off;
+   size_t namlen;
+   bfd_size_type sz;
+   bfd_byte *contents, *cend;
+@@ -1636,7 +1636,8 @@ add_range (bfd *abfd, ufile_ptr start, ufile_ptr end)
+     /* Overlap with another element.  */
+     goto err;
+ 
+-  unsigned min_elt = x_artdata (abfd)->min_elt;
++  /* A zero size element with a one char name is this big.  */
++  unsigned min_elt = x_artdata (abfd)->ar_hdr_size + 2 + SXCOFFARFMAG;
+   if (start - lo->end < min_elt)
+     {
+       /* Merge into an existing range.  */
+@@ -1757,7 +1758,7 @@ _bfd_xcoff_read_ar_hdr (bfd *abfd)
+ bfd *
+ _bfd_xcoff_openr_next_archived_file (bfd *archive, bfd *last_file)
+ {
+-  file_ptr filestart;
++  ufile_ptr filestart;
+ 
+   if (x_artdata (archive) == NULL)
+     {
+@@ -1770,10 +1771,10 @@ _bfd_xcoff_openr_next_archived_file (bfd *archive, bfd *last_file)
+       if (last_file == NULL)
+ 	{
+ 	  filestart = bfd_ardata (archive)->first_file_filepos;
+-	  if (x_artdata (archive)->min_elt == 0)
++	  if (x_artdata (archive)->ar_hdr_size == 0)
+ 	    {
+ 	      x_artdata (archive)->ranges.end = SIZEOF_AR_FILE_HDR;
+-	      x_artdata (archive)->min_elt = SIZEOF_AR_HDR + SXCOFFARFMAG + 2;
++	      x_artdata (archive)->ar_hdr_size = SIZEOF_AR_HDR;
+ 	    }
+ 	}
+       else
+@@ -1794,10 +1795,10 @@ _bfd_xcoff_openr_next_archived_file (bfd *archive, bfd *last_file)
+       if (last_file == NULL)
+ 	{
+ 	  filestart = bfd_ardata (archive)->first_file_filepos;
+-	  if (x_artdata (archive)->min_elt == 0)
++	  if (x_artdata (archive)->ar_hdr_size == 0)
+ 	    {
+ 	      x_artdata (archive)->ranges.end = SIZEOF_AR_FILE_HDR_BIG;
+-	      x_artdata (archive)->min_elt = SIZEOF_AR_HDR_BIG + SXCOFFARFMAG + 2;
++	      x_artdata (archive)->ar_hdr_size = SIZEOF_AR_HDR_BIG;
+ 	    }
+ 	}
+       else
+@@ -1814,6 +1815,22 @@ _bfd_xcoff_openr_next_archived_file (bfd *archive, bfd *last_file)
+ 	}
+     }
+ 
++  /* Check that we aren't pointing back at the last element.  This is
++     necessary depite the add_range checking in _bfd_xcoff_read_ar_hdr
++     because archive.c leaves the last element open and thus in the
++     archive element cache until the next element is opened.  */
++  if (last_file != NULL)
++    {
++      ufile_ptr laststart = last_file->proxy_origin;
++      laststart -= x_artdata (archive)->ar_hdr_size;
++      laststart -= arch_eltdata (last_file)->extra_size;
++      if (filestart == laststart)
++	{
++	  bfd_set_error (bfd_error_malformed_archive);
++	  return NULL;
++	}
++    }
++
+   return _bfd_get_elt_at_filepos (archive, filestart, NULL);
+ }
+ 
+diff --git a/bfd/libbfd-in.h b/bfd/libbfd-in.h
+index 68b5343fd2e..4305b8416ea 100644
+--- a/bfd/libbfd-in.h
++++ b/bfd/libbfd-in.h
+@@ -72,7 +72,7 @@ extern unsigned int _bfd_section_id ATTRIBUTE_HIDDEN;
+ 
+ struct artdata
+ {
+-  file_ptr first_file_filepos;
++  ufile_ptr first_file_filepos;
+   /* Speed up searching the armap */
+   htab_t cache;
+   carsym *symdefs;		/* The symdef entries.  */
+diff --git a/bfd/libbfd.h b/bfd/libbfd.h
+index bb7f2f1efcf..aceec4ab9c0 100644
+--- a/bfd/libbfd.h
++++ b/bfd/libbfd.h
+@@ -78,7 +78,7 @@ extern unsigned int _bfd_section_id ATTRIBUTE_HIDDEN;
+ 
+ struct artdata
+ {
+-  file_ptr first_file_filepos;
++  ufile_ptr first_file_filepos;
+   /* Speed up searching the armap */
+   htab_t cache;
+   carsym *symdefs;		/* The symdef entries.  */
+diff --git a/include/coff/xcoff.h b/include/coff/xcoff.h
+index 08afc000bf0..7e86cc37d5c 100644
+--- a/include/coff/xcoff.h
++++ b/include/coff/xcoff.h
+@@ -653,7 +653,7 @@ struct xcoff_artdata
+   } u;
+   struct ar_ranges ranges;
+   /* Anything less than this size can't hold an archive element.  */
+-  unsigned int min_elt;
++  unsigned int ar_hdr_size;
+ };
+ 
+ #define x_artdata(abfd) ((struct xcoff_artdata *) bfd_ardata (abfd)->tdata)
+@@ -663,13 +663,13 @@ struct xcoff_artdata
+ #ifndef SMALL_ARCHIVE
+ /* Creates big archives by default */
+ #define xcoff_big_format_p(abfd) \
+-  (bfd_ardata (abfd) != NULL				\
+-   && (x_artdata (abfd) == NULL			\
+-       || x_artdata (abfd)->u.hdr.magic[1] == 'b'))
++  (bfd_ardata (abfd) == NULL			\
++   || x_artdata (abfd) == NULL			\
++   || x_artdata (abfd)->u.hdr.magic[1] != 'a')
+ #else
+ /* Creates small archives by default. */
+ #define xcoff_big_format_p(abfd) \
+-  (bfd_ardata (abfd) != NULL				\
++  (bfd_ardata (abfd) != NULL			\
+    && x_artdata (abfd) != NULL			\
+    && x_artdata (abfd)->u.hdr.magic[1] == 'b')
+ #endif
+-- 
+GitLab
+

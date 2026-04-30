@@ -1,0 +1,83 @@
+From 01d97526bd8cf1da723b27dc55ccc73887012973 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Thu, 8 Mar 2018 20:36:54 +0000
+Subject: [PATCH] DGN: avoid index-out-of-bounds read. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=6793. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@41667 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/ogr/ogrsf_frmts/dgn/dgnlibp.h   |  2 +-
+ gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp | 34 ++++++++++++++++++++++++++--
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/gdal/ogr/ogrsf_frmts/dgn/dgnlibp.h b/gdal/ogr/ogrsf_frmts/dgn/dgnlibp.h
+index afaa14ca90cb..0120a0396ee9 100644
+--- a/gdal/ogr/ogrsf_frmts/dgn/dgnlibp.h
++++ b/gdal/ogr/ogrsf_frmts/dgn/dgnlibp.h
+@@ -39,7 +39,7 @@ typedef struct {
+     int         next_element_id;
+ 
+     int         nElemBytes;
+-    GByte       abyElem[131076];
++    GByte       abyElem[131076+1];
+ 
+     bool        got_tcb;
+     int         dimension;
+diff --git a/gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp b/gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp
+index d7452534de0a..2051196cedea 100644
+--- a/gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp
++++ b/gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp
+@@ -109,12 +109,14 @@ int DGNLoadRawElement( DGNInfo *psDGN, int *pnType, int *pnLevel )
+ /* -------------------------------------------------------------------- */
+ /*      Read the rest of the element data into the working buffer.      */
+ /* -------------------------------------------------------------------- */
+-    if( nWords * 2 + 4 > (int) sizeof(psDGN->abyElem) )
++    if( nWords * 2 + 4 >= (int) sizeof(psDGN->abyElem) )
+         return FALSE;
+ 
+     /* coverity[tainted_data] */
+     if( (int) VSIFReadL( psDGN->abyElem + 4, 2, nWords, psDGN->fp ) != nWords )
+         return FALSE;
++    psDGN->abyElem[4 + 2 * nWords] = 0;
++    psDGN->abyElem[sizeof(psDGN->abyElem)-1] = 0;
+ 
+     psDGN->nElemBytes = nWords * 2 + 4;
+ 
+@@ -1383,7 +1385,35 @@ static DGNElemCore *DGNParseTagSet( DGNInfo * psDGN )
+     {
+         DGNTagDef *tagDef = psTagSet->tagList + iTag;
+ 
+-        if( nDataOffset >= static_cast<size_t>(psDGN->nElemBytes) )
++        // Check the buffer is large enough to read all tagDef components
++        size_t nDataOffsetEnd = nDataOffset;
++        if( nDataOffsetEnd <= static_cast<size_t>(psDGN->nElemBytes) )
++        {
++            nDataOffsetEnd += strlen((char *)psDGN->abyElem + nDataOffsetEnd)+1 +
++                              2;
++        }
++        if( nDataOffsetEnd <= static_cast<size_t>(psDGN->nElemBytes) )
++        {
++            nDataOffsetEnd += strlen((char *)psDGN->abyElem + nDataOffsetEnd)+1 +
++                              2 + 5;
++            if( tagDef->type == 1 )
++            {
++                nDataOffsetEnd += strlen(tagDef->defaultValue.string)+1;
++            }
++            else if( tagDef->type == 3 || tagDef->type == 5 )
++            {
++                nDataOffsetEnd += 4;
++            }
++            else if( tagDef->type == 4 )
++            {
++                nDataOffsetEnd += 8;
++            }
++            else
++            {
++                nDataOffsetEnd += 4;
++            }
++        }
++        if( nDataOffsetEnd > static_cast<size_t>(psDGN->nElemBytes) )
+         {
+             CPLError(CE_Failure, CPLE_AssertionFailed,
+                      "nDataOffset >= static_cast<size_t>(psDGN->nElemBytes)");

@@ -1,0 +1,77 @@
+From 5681c6275b5ad9cf3d84af243a66b900a0628f72 Mon Sep 17 00:00:00 2001
+From: James Carter <jwcart2@gmail.com>
+Date: Wed, 28 Apr 2021 16:06:58 -0400
+Subject: [PATCH] libsepol/cil: Fix instances where an error returns SEPOL_OK
+
+There are six instances when the CIL policy is being built or
+resolved where an error can be detected, but SEPOL_OK is returned
+instead of SEPOL_ERR. This causes the policy compiler to continue
+when it should exit with an error.
+
+Return SEPOL_ERR in these cases, so the compiler exits with an
+error.
+
+Two of the instances were found by the secilc-fuzzer.
+
+Signed-off-by: James Carter <jwcart2@gmail.com>
+---
+ libsepol/cil/src/cil_build_ast.c   | 3 +++
+ libsepol/cil/src/cil_resolve_ast.c | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/libsepol/cil/src/cil_build_ast.c b/libsepol/cil/src/cil_build_ast.c
+index 5b1e28246b..87043a8fa1 100644
+--- a/libsepol/cil/src/cil_build_ast.c
++++ b/libsepol/cil/src/cil_build_ast.c
+@@ -444,6 +444,7 @@ int cil_gen_class(struct cil_db *db, struct cil_tree_node *parse_current, struct
+ 		}
+ 		if (class->num_perms > CIL_PERMS_PER_CLASS) {
+ 			cil_tree_log(parse_current, CIL_ERR, "Too many permissions in class '%s'", class->datum.name);
++			rc = SEPOL_ERR;
+ 			goto exit;
+ 		}
+ 
+@@ -1018,6 +1019,7 @@ int cil_gen_common(struct cil_db *db, struct cil_tree_node *parse_current, struc
+ 	}
+ 	if (common->num_perms > CIL_PERMS_PER_CLASS) {
+ 		cil_tree_log(parse_current, CIL_ERR, "Too many permissions in common '%s'", common->datum.name);
++		rc = SEPOL_ERR;
+ 		goto exit;
+ 	}
+ 
+@@ -3209,6 +3211,7 @@ int cil_gen_expandtypeattribute(struct cil_db *db, struct cil_tree_node *parse_c
+ 		expandattr->expand = CIL_FALSE;
+ 	} else {
+ 		cil_log(CIL_ERR, "Value must be either \'true\' or \'false\'");
++		rc = SEPOL_ERR;
+ 		goto exit;
+ 	}
+ 
+diff --git a/libsepol/cil/src/cil_resolve_ast.c b/libsepol/cil/src/cil_resolve_ast.c
+index 872b6799b0..5389df43fe 100644
+--- a/libsepol/cil/src/cil_resolve_ast.c
++++ b/libsepol/cil/src/cil_resolve_ast.c
+@@ -772,6 +772,7 @@ int cil_resolve_classcommon(struct cil_tree_node *current, void *extra_args)
+ 	class->num_perms += common->num_perms;
+ 	if (class->num_perms > CIL_PERMS_PER_CLASS) {
+ 		cil_tree_log(current, CIL_ERR, "Too many permissions in class '%s' when including common permissions", class->datum.name);
++		rc = SEPOL_ERR;
+ 		goto exit;
+ 	}
+ 
+@@ -1484,6 +1485,7 @@ int cil_resolve_classorder(struct cil_tree_node *current, void *extra_args)
+ 		rc = cil_resolve_name(current, (char *)curr->data, CIL_SYM_CLASSES, extra_args, &datum);
+ 		if (rc != SEPOL_OK) {
+ 			cil_log(CIL_ERR, "Failed to resolve class %s in classorder\n", (char *)curr->data);
++			rc = SEPOL_ERR;
+ 			goto exit;
+ 		}
+ 		cil_list_append(new, CIL_CLASS, datum);
+@@ -2464,6 +2466,7 @@ int cil_resolve_blockabstract(struct cil_tree_node *current, void *extra_args)
+ 	block_node = NODE(block_datum);
+ 	if (block_node->flavor != CIL_BLOCK) {
+ 		cil_log(CIL_ERR, "Failed to resolve blockabstract to a block, rc: %d\n", rc);
++		rc = SEPOL_ERR;
+ 		goto exit;
+ 	}
+ 

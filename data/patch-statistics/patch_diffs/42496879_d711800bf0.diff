@@ -1,0 +1,294 @@
+From 78370ed7849e09bd946b96aa78e1f34683f74665 Mon Sep 17 00:00:00 2001
+From: David Garske <david@wolfssl.com>
+Date: Wed, 2 Jun 2021 15:35:50 -0700
+Subject: [PATCH] Fixes for three multi-thread issues: 1) The client lock is
+ needed earlier to protect the "reset the packet state". 2) The subscribe ack
+ was using an unprotected pointer to response code list. Now it makes a copy
+ of those codes. 3) Add protection to multi-thread example "stop" variable.
+ Thanks to Fatimah Aljaafari (@fatimahkj) for the report. ZD 12379 and PR #198
+
+---
+ examples/multithread/multithread.c | 42 +++++++++++++------
+ src/mqtt_client.c                  | 66 +++++++++++++++---------------
+ src/mqtt_packet.c                  |  5 ++-
+ wolfmqtt/mqtt_packet.h             |  9 +++-
+ 4 files changed, 74 insertions(+), 48 deletions(-)
+
+diff --git a/examples/multithread/multithread.c b/examples/multithread/multithread.c
+index fc1926b8d..7e54bd955 100755
+--- a/examples/multithread/multithread.c
++++ b/examples/multithread/multithread.c
+@@ -67,7 +67,7 @@ static int mNumMsgsRecvd;
+     #define THREAD_EXIT(e)         pthread_exit((void*)e)
+ #endif
+ 
+-static wm_Sem packetIdLock; /* Protect access to mqtt_get_packetid() */
++static wm_Sem mtLock; /* Protect "packetId" and "stop" */
+ static wm_Sem pingSignal;
+ 
+ static MQTTCtx gMqttCtx;
+@@ -75,12 +75,28 @@ static MQTTCtx gMqttCtx;
+ static word16 mqtt_get_packetid_threadsafe(void)
+ {
+     word16 packet_id;
+-    wm_SemLock(&packetIdLock);
++    wm_SemLock(&mtLock);
+     packet_id = mqtt_get_packetid();
+-    wm_SemUnlock(&packetIdLock);
++    wm_SemUnlock(&mtLock);
+     return packet_id;
+ }
+ 
++static void mqtt_stop_set(void)
++{
++    wm_SemLock(&mtLock);
++    mStopRead = 1;
++    wm_SemUnlock(&mtLock);
++}
++
++static int mqtt_stop_get(void)
++{
++    int rc;
++    wm_SemLock(&mtLock);
++    rc = mStopRead;
++    wm_SemUnlock(&mtLock);
++    return rc;
++}
++
+ #ifdef WOLFMQTT_DISCONNECT_CB
+ /* callback indicates a network error occurred */
+ static int mqtt_disconnect_cb(MqttClient* client, int error_code, void* ctx)
+@@ -123,7 +139,7 @@ static int mqtt_message_cb(MqttClient *client, MqttMessage *msg,
+             {
+                 mNumMsgsRecvd++;
+                 if (mNumMsgsRecvd == NUM_PUB_TASKS) {
+-                    mStopRead = 1;
++                    mqtt_stop_set();
+                 }
+             }
+         }
+@@ -193,13 +209,13 @@ static int multithread_test_init(MQTTCtx *mqttCtx)
+     mNumMsgsRecvd = 0;
+ 
+     /* Create a demo mutex for making packet id values */
+-    rc = wm_SemInit(&packetIdLock);
++    rc = wm_SemInit(&mtLock);
+     if (rc != 0) {
+         client_exit(mqttCtx);
+     }
+     rc = wm_SemInit(&pingSignal);
+     if (rc != 0) {
+-        wm_SemFree(&packetIdLock);
++        wm_SemFree(&mtLock);
+         client_exit(mqttCtx);
+     }
+     wm_SemLock(&pingSignal); /* default to locked */
+@@ -309,7 +325,7 @@ static int multithread_test_finish(MQTTCtx *mqttCtx)
+     client_disconnect(mqttCtx);
+ 
+     wm_SemFree(&pingSignal);
+-    wm_SemFree(&packetIdLock);
++    wm_SemFree(&mtLock);
+ 
+     return mqttCtx->return_code;
+ }
+@@ -390,7 +406,7 @@ static void *waitMessage_task(void *param)
+         rc = MqttClient_WaitMessage(&mqttCtx->client, mqttCtx->cmd_timeout_ms);
+ 
+         /* check for test mode */
+-        if (mStopRead) {
++        if (mqtt_stop_get()) {
+             rc = MQTT_CODE_SUCCESS;
+             PRINTF("MQTT Exiting...");
+             break;
+@@ -440,7 +456,7 @@ static void *waitMessage_task(void *param)
+                 MqttClient_ReturnCodeToString(rc), rc);
+             break;
+         }
+-    } while (!mStopRead);
++    } while (!mqtt_stop_get());
+ 
+     mqttCtx->return_code = rc;
+     wm_SemUnlock(&pingSignal); /* wake ping thread */
+@@ -497,7 +513,7 @@ static void *ping_task(void *param)
+ 
+     do {
+         wm_SemLock(&pingSignal);
+-        if (mStopRead)
++        if (mqtt_stop_get())
+             break;
+ 
+         /* Keep Alive Ping */
+@@ -509,7 +525,7 @@ static void *ping_task(void *param)
+                 MqttClient_ReturnCodeToString(rc), rc);
+             break;
+         }
+-    } while (!mStopRead);
++    } while (!mqtt_stop_get());
+ 
+     THREAD_EXIT(0);
+ }
+@@ -599,7 +615,7 @@ int multithread_test(MQTTCtx *mqttCtx)
+         static BOOL CtrlHandler(DWORD fdwCtrlType)
+         {
+             if (fdwCtrlType == CTRL_C_EVENT) {
+-                mStopRead = 1;
++                mqtt_stop_set();
+                 PRINTF("Received Ctrl+c");
+             #ifdef WOLFMQTT_ENABLE_STDIN_CAP
+                 MqttClientNet_Wake(&gMqttCtx.net);
+@@ -613,7 +629,7 @@ int multithread_test(MQTTCtx *mqttCtx)
+         static void sig_handler(int signo)
+         {
+             if (signo == SIGINT) {
+-                mStopRead = 1;
++                mqtt_stop_set();
+                 PRINTF("Received SIGINT");
+             #ifdef WOLFMQTT_ENABLE_STDIN_CAP
+                 MqttClientNet_Wake(&gMqttCtx.net);
+diff --git a/src/mqtt_client.c b/src/mqtt_client.c
+index d5a857793..741dd58e0 100644
+--- a/src/mqtt_client.c
++++ b/src/mqtt_client.c
+@@ -766,6 +766,24 @@ static int MqttClient_WaitType(MqttClient *client, void *packet_obj,
+     {
+         case MQTT_MSG_BEGIN:
+         {
++        #ifdef WOLFMQTT_MULTITHREAD
++            /* Lock recv socket mutex */
++            rc = wm_SemLock(&client->lockRecv);
++            if (rc != 0) {
++                PRINTF("MqttClient_WaitType: recv lock error!\n");
++                return rc;
++            }
++            readLocked = 1;
++
++            /* Lock client */
++            rc = wm_SemLock(&client->lockClient);
++            if (rc != 0) {
++                PRINTF("MqttClient_WaitType: click lock error!\n");
++                wm_SemUnlock(&client->lockRecv);
++                return rc;
++            }
++        #endif
++
+             /* reset the packet state */
+             client->packet.stat = MQTT_PK_BEGIN;
+             client->read.pos = 0;
+@@ -778,38 +796,23 @@ static int MqttClient_WaitType(MqttClient *client, void *packet_obj,
+         case MQTT_MSG_WAIT:
+         {
+         #ifdef WOLFMQTT_MULTITHREAD
+-            /* Lock recv socket mutex */
+-            rc = wm_SemLock(&client->lockRecv);
+-            if (rc != 0) {
+-                PRINTF("!!!!LOCK ERROR!!!!\n");
+-                return rc;
+-            }
+-            readLocked = 1;
+-
+             /* Check to see if packet type and id have already completed */
+             pendResp = NULL;
+-            rc = wm_SemLock(&client->lockClient);
+-            if (rc == 0) {
+-                if (MqttClient_RespList_Find(client, (MqttPacketType)wait_type, 
+-                        wait_packet_id, &pendResp)) {
+-                    if (pendResp->packetDone) {
+-                        /* pending response is already done, so return */
+-                        rc = pendResp->packet_ret;
+-                    #ifdef WOLFMQTT_DEBUG_CLIENT
+-                        PRINTF("PendResp already Done %p: Rc %d", pendResp, rc);
+-                    #endif
+-                        MqttClient_RespList_Remove(client, pendResp);
+-                        wm_SemUnlock(&client->lockClient);
+-                        wm_SemUnlock(&client->lockRecv);
+-                        return rc;
+-                    }
++            if (MqttClient_RespList_Find(client, (MqttPacketType)wait_type, 
++                    wait_packet_id, &pendResp)) {
++                if (pendResp->packetDone) {
++                    /* pending response is already done, so return */
++                    rc = pendResp->packet_ret;
++                #ifdef WOLFMQTT_DEBUG_CLIENT
++                    PRINTF("PendResp already Done %p: Rc %d", pendResp, rc);
++                #endif
++                    MqttClient_RespList_Remove(client, pendResp);
++                    wm_SemUnlock(&client->lockClient);
++                    wm_SemUnlock(&client->lockRecv);
++                    return rc;
+                 }
+-                wm_SemUnlock(&client->lockClient);
+-            }
+-            else {
+-                wm_SemUnlock(&client->lockRecv);
+-                return rc;
+             }
++            wm_SemUnlock(&client->lockClient);
+         #endif /* WOLFMQTT_MULTITHREAD */
+ 
+             *mms_stat = MQTT_MSG_WAIT;
+@@ -821,6 +824,7 @@ static int MqttClient_WaitType(MqttClient *client, void *packet_obj,
+             if (rc <= 0) {
+                 break;
+             }
++
+             /* capture length read */
+             client->packet.buf_len = rc;
+ 
+@@ -1711,11 +1715,9 @@ int MqttClient_Subscribe(MqttClient *client, MqttSubscribe *subscribe)
+ 
+     /* Populate return codes */
+     if (rc == MQTT_CODE_SUCCESS) {
+-        for (i = 0; i < subscribe->topic_count; i++) {
++        for (i = 0; i < subscribe->topic_count && i < MAX_MQTT_TOPICS; i++) {
+             topic = &subscribe->topics[i];
+-            if (subscribe->ack.return_codes) {
+-                topic->return_code = subscribe->ack.return_codes[i];
+-            }
++            topic->return_code = subscribe->ack.return_codes[i];
+         }
+     }
+ 
+diff --git a/src/mqtt_packet.c b/src/mqtt_packet.c
+index 2bdc1503c..8206ca796 100755
+--- a/src/mqtt_packet.c
++++ b/src/mqtt_packet.c
+@@ -1276,7 +1276,10 @@ int MqttDecode_SubscribeAck(byte* rx_buf, int rx_buf_len,
+         }
+ #endif
+ 
+-        subscribe_ack->return_codes = rx_payload; /* List of return codes */
++        /* payload is list of return codes (MqttSubscribeAckReturnCodes) */
++        if (remain_len > MAX_MQTT_TOPICS)
++            remain_len = MAX_MQTT_TOPICS;
++        XMEMCMP(subscribe_ack->return_codes, rx_payload, remain_len);
+     }
+ 
+     /* Return total length of packet */
+diff --git a/wolfmqtt/mqtt_packet.h b/wolfmqtt/mqtt_packet.h
+index f1e5bd02d..8bb1b69b1 100644
+--- a/wolfmqtt/mqtt_packet.h
++++ b/wolfmqtt/mqtt_packet.h
+@@ -40,7 +40,12 @@
+ #define MQTT_DATA_INT_SIZE   4
+ 
+ #ifndef MAX_PACKET_ID
+-#define MAX_PACKET_ID           ((1 << 16) - 1)
++#define MAX_PACKET_ID        ((1 << 16) - 1)
++#endif
++
++/* maximum list of topics to subscribe at once */
++#ifndef MAX_MQTT_TOPICS
++#define MAX_MQTT_TOPICS      12
+ #endif
+ 
+ #ifdef WOLFMQTT_V5
+@@ -509,7 +514,7 @@ typedef struct _MqttSubscribeAck {
+     MqttMsgStat stat; /* must be first member at top */
+ 
+     word16      packet_id;
+-    byte       *return_codes; /* MqttSubscribeAckReturnCodes */
++    byte        return_codes[MAX_MQTT_TOPICS];
+ #ifdef WOLFMQTT_V5
+     MqttProp* props;
+     byte protocol_level;

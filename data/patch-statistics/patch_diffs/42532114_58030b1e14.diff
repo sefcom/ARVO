@@ -1,0 +1,38 @@
+From 0318ddbee92ccdb4c6ea86c1ccfefd7e58e5c5a3 Mon Sep 17 00:00:00 2001
+From: Arne Welzel <arne.welzel@corelight.com>
+Date: Fri, 19 Jan 2024 11:52:03 +0100
+Subject: [PATCH] SMTP: Reject BDAT chunks larger than int64_t's max value
+
+The ContentLine analyzer does not support uint64_t.
+---
+ src/analyzer/protocol/smtp/SMTP.cc | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/analyzer/protocol/smtp/SMTP.cc b/src/analyzer/protocol/smtp/SMTP.cc
+index b70dd91ba81..1b0e36d8b34 100644
+--- a/src/analyzer/protocol/smtp/SMTP.cc
++++ b/src/analyzer/protocol/smtp/SMTP.cc
+@@ -5,6 +5,7 @@
+ #include "zeek/zeek-config.h"
+ 
+ #include <cstdlib>
++#include <limits>
+ 
+ #include "zeek/Event.h"
+ #include "zeek/NetVar.h"
+@@ -857,6 +858,15 @@ bool SMTP_Analyzer::ProcessBdatArg(int arg_len, const char* arg, bool orig) {
+         return false;
+     }
+ 
++    // The ContentLine analyzer only supports int64_t, but BDAT could deal
++    // with uint64_t sized chunks. Weird if the chunk size is larger and
++    // do not configure the ContentLine analyzer for plain delivery.
++    if ( chunk_size > std::numeric_limits<int64_t>::max() ) {
++        const char* addl = zeek::util::fmt("%" PRIu64, chunk_size);
++        Weird("smtp_huge_bdat_chunk", addl);
++        return false;
++    }
++
+     auto* cl = orig ? cl_orig : cl_resp;
+     cl->SetPlainDelivery(chunk_size);
+ 

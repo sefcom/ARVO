@@ -1,0 +1,351 @@
+From 134d4cca670476480dbf813efd93c8c1264a3086 Mon Sep 17 00:00:00 2001
+From: Sean Parkinson <sean@wolfssl.com>
+Date: Fri, 27 Jan 2023 10:13:56 +1000
+Subject: [PATCH] DH and SP: sp_DhExp_* called with uninitialized outLen
+
+Fix for GeneratePublicDh was not right in #6002.
+sp_DhExp_* are called from multiple functions.
+Sometimes outLen contains a value and sometimes not.
+Check public key output size in GeneratePublicDh before calling SP.
+---
+ wolfcrypt/src/dh.c          | 14 +++++---------
+ wolfcrypt/src/sp_arm32.c    |  9 ---------
+ wolfcrypt/src/sp_arm64.c    |  9 ---------
+ wolfcrypt/src/sp_armthumb.c |  9 ---------
+ wolfcrypt/src/sp_c32.c      | 15 ---------------
+ wolfcrypt/src/sp_c64.c      | 18 ------------------
+ wolfcrypt/src/sp_cortexm.c  |  9 ---------
+ wolfcrypt/src/sp_x86_64.c   |  9 ---------
+ 8 files changed, 5 insertions(+), 87 deletions(-)
+
+diff --git a/wolfcrypt/src/dh.c b/wolfcrypt/src/dh.c
+index 26f1b4ebb65..ef65ed15f07 100644
+--- a/wolfcrypt/src/dh.c
++++ b/wolfcrypt/src/dh.c
+@@ -1291,7 +1291,6 @@ static int GeneratePublicDh(DhKey* key, byte* priv, word32 privSz,
+ {
+     int ret = 0;
+ #ifndef WOLFSSL_SP_MATH
+-    word32 binSz = 0;
+ #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_NO_MALLOC)
+     mp_int* x;
+     mp_int* y;
+@@ -1301,6 +1300,10 @@ static int GeneratePublicDh(DhKey* key, byte* priv, word32 privSz,
+ #endif
+ #endif
+ 
++    if (*pubSz < (word32)mp_unsigned_bin_size(&key->p)) {
++        return WC_KEY_SIZE_E;
++    }
++
+ #ifdef WOLFSSL_HAVE_SP_DH
+ #ifndef WOLFSSL_SP_NO_2048
+     if (mp_count_bits(&key->p) == 2048)
+@@ -1341,18 +1344,11 @@ static int GeneratePublicDh(DhKey* key, byte* priv, word32 privSz,
+     if (ret == 0 && mp_exptmod(&key->g, x, &key->p, y) != MP_OKAY)
+         ret = MP_EXPTMOD_E;
+ 
+-    if (ret == 0) {
+-        binSz = mp_unsigned_bin_size(y);
+-        if (binSz > *pubSz) {
+-            ret = WC_KEY_SIZE_E;
+-        }
+-    }
+-
+     if (ret == 0 && mp_to_unsigned_bin(y, pub) != MP_OKAY)
+         ret = MP_TO_E;
+ 
+     if (ret == 0)
+-        *pubSz = binSz;
++        *pubSz = mp_unsigned_bin_size(y);
+ 
+     mp_clear(y);
+     mp_clear(x);
+diff --git a/wolfcrypt/src/sp_arm32.c b/wolfcrypt/src/sp_arm32.c
+index b8709505511..93b1144f6d2 100644
+--- a/wolfcrypt/src/sp_arm32.c
++++ b/wolfcrypt/src/sp_arm32.c
+@@ -17700,9 +17700,6 @@ int sp_DhExp_2048(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 2048) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 256U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -44900,9 +44897,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -60475,9 +60469,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+diff --git a/wolfcrypt/src/sp_arm64.c b/wolfcrypt/src/sp_arm64.c
+index b3536b71a04..bd75632f11e 100644
+--- a/wolfcrypt/src/sp_arm64.c
++++ b/wolfcrypt/src/sp_arm64.c
+@@ -6866,9 +6866,6 @@ int sp_DhExp_2048(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 2048) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 256U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -16472,9 +16469,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -21682,9 +21676,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+diff --git a/wolfcrypt/src/sp_armthumb.c b/wolfcrypt/src/sp_armthumb.c
+index 86374137186..f02df823e4e 100644
+--- a/wolfcrypt/src/sp_armthumb.c
++++ b/wolfcrypt/src/sp_armthumb.c
+@@ -30159,9 +30159,6 @@ int sp_DhExp_2048(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 2048) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 256U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -83251,9 +83248,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -96595,9 +96589,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+diff --git a/wolfcrypt/src/sp_c32.c b/wolfcrypt/src/sp_c32.c
+index 4f7462efc29..49838d855aa 100644
+--- a/wolfcrypt/src/sp_c32.c
++++ b/wolfcrypt/src/sp_c32.c
+@@ -4640,9 +4640,6 @@ int sp_DhExp_2048(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 2048) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 256U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -7951,9 +7948,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -12293,9 +12287,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -15615,9 +15606,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -19924,9 +19912,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+diff --git a/wolfcrypt/src/sp_c64.c b/wolfcrypt/src/sp_c64.c
+index 40b846b2e92..318ff17c4f4 100644
+--- a/wolfcrypt/src/sp_c64.c
++++ b/wolfcrypt/src/sp_c64.c
+@@ -3162,9 +3162,6 @@ int sp_DhExp_2048(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 2048) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 256U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -6834,9 +6831,6 @@ int sp_DhExp_2048(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 2048) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 256U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -10051,9 +10045,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -13908,9 +13899,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -17126,9 +17114,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -21087,9 +21072,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+diff --git a/wolfcrypt/src/sp_cortexm.c b/wolfcrypt/src/sp_cortexm.c
+index 2c16e776946..5d6f4eedc48 100644
+--- a/wolfcrypt/src/sp_cortexm.c
++++ b/wolfcrypt/src/sp_cortexm.c
+@@ -5785,9 +5785,6 @@ int sp_DhExp_2048(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 2048) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 256U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -11598,9 +11595,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -15589,9 +15583,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+diff --git a/wolfcrypt/src/sp_x86_64.c b/wolfcrypt/src/sp_x86_64.c
+index 3efdba2dbc4..4304d212187 100644
+--- a/wolfcrypt/src/sp_x86_64.c
++++ b/wolfcrypt/src/sp_x86_64.c
+@@ -2863,9 +2863,6 @@ int sp_DhExp_2048(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 2048) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 256U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -5764,9 +5761,6 @@ int sp_DhExp_3072(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 3072) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 384U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }
+@@ -7891,9 +7885,6 @@ int sp_DhExp_4096(const mp_int* base, const byte* exp, word32 expLen,
+     else if (mp_count_bits(mod) != 4096) {
+         err = MP_READ_E;
+     }
+-    else if (*outLen < 512U) {
+-        err = BUFFER_E;
+-    }
+     else if (mp_iseven(mod)) {
+         err = MP_VAL;
+     }

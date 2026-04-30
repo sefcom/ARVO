@@ -1,0 +1,88 @@
+From a981cefdd239ca44bfd12eb7d78dc0c0560f016d Mon Sep 17 00:00:00 2001
+From: Mirco Miranda <mirco.miranda@systemceramics.com>
+Date: Thu, 7 Sep 2023 16:22:33 +0000
+Subject: [PATCH] hdr: fix crash (oss-fuzz)
+
+This patch Fixes crash when RLE data is corrupted (test cases attached).
+
+Should also fixes (no test cases available):
+- Issue 62044 in oss-fuzz: kimageformats:kimgio_hdr_fuzzer: Undefined-shift in RGBE_To_QRgbLine
+- Issue 62057 in oss-fuzz: kimageformats:kimgio_hdr_fuzzer: Heap-buffer-overflow in Read_Old_Line
+
+
+[crash-646a4364479f54278ff8c30c69b0c9665e5869af.hdr](/uploads/44760f0286cde4236feab8e352493556/crash-646a4364479f54278ff8c30c69b0c9665e5869af.hdr)
+
+[crash-88c33e2b49e57e6d1d4ec6945476f605f00e714a.hdr](/uploads/e35bf53ee717134a796c4b17cfacca42/crash-88c33e2b49e57e6d1d4ec6945476f605f00e714a.hdr)
+---
+ src/imageformats/hdr.cpp | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/src/imageformats/hdr.cpp b/src/imageformats/hdr.cpp
+index 5eb5fe0c..6dca6eb4 100644
+--- a/src/imageformats/hdr.cpp
++++ b/src/imageformats/hdr.cpp
+@@ -40,6 +40,7 @@ static bool Read_Old_Line(uchar *image, int width, QDataStream &s)
+     int rshift = 0;
+     int i;
+ 
++    uchar *start = image;
+     while (width > 0) {
+         s >> image[0];
+         s >> image[1];
+@@ -51,7 +52,11 @@ static bool Read_Old_Line(uchar *image, int width, QDataStream &s)
+         }
+ 
+         if ((image[0] == 1) && (image[1] == 1) && (image[2] == 1)) {
+-            for (i = image[3] << rshift; i > 0; i--) {
++            // NOTE: we don't have an image sample that cover this code
++            for (i = image[3] << rshift; i > 0 && width > 0; i--) {
++                if (image == start) {
++                    return false; // you cannot be here at the first run
++                }
+                 // memcpy(image, image-4, 4);
+                 (uint &)image[0] = (uint &)image[0 - 4];
+                 image += 4;
+@@ -72,7 +77,7 @@ static void RGBE_To_QRgbLine(uchar *image, QRgb *scanline, int width)
+     for (int j = 0; j < width; j++) {
+         // v = ldexp(1.0, int(image[3]) - 128);
+         float v;
+-        int e = int(image[3]) - 128;
++        int e = qBound(-31, int(image[3]) - 128, 31);
+         if (e > 0) {
+             v = float(1 << e);
+         } else {
+@@ -146,7 +151,7 @@ static bool LoadHDR(QDataStream &s, const int width, const int height, QImage &i
+         }
+ 
+         // read each component
+-        for (int i = 0; i < 4; i++) {
++        for (int i = 0, len = int(lineArray.size()); i < 4; i++) {
+             for (int j = 0; j < width;) {
+                 s >> code;
+                 if (s.atEnd()) {
+@@ -158,14 +163,20 @@ static bool LoadHDR(QDataStream &s, const int width, const int height, QImage &i
+                     code &= 127;
+                     s >> val;
+                     while (code != 0) {
+-                        image[i + j * 4] = val;
++                        auto idx = i + j * 4;
++                        if (idx < len) {
++                            image[idx] = val;
++                        }
+                         j++;
+                         code--;
+                     }
+                 } else {
+                     // non-run
+                     while (code != 0) {
+-                        s >> image[i + j * 4];
++                        auto idx = i + j * 4;
++                        if (idx < len) {
++                            s >> image[idx];
++                        }
+                         j++;
+                         code--;
+                     }
+-- 
+GitLab
+

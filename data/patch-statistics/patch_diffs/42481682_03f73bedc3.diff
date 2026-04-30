@@ -1,0 +1,56 @@
+From 03cfcd34a472e1a249221a8fb1d275784ee63ea3 Mon Sep 17 00:00:00 2001
+From: Lorenzo Miniero <lminiero@gmail.com>
+Date: Wed, 5 Feb 2020 11:48:57 +0100
+Subject: [PATCH] Fixed RTCP parsing issue found by OSS-fuzz
+
+---
+ ...-crash-1640b2f21ba20409d930e9653052d579d450073a | Bin 0 -> 24 bytes
+ rtcp.c                                             |  10 ++++++++--
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+ create mode 100644 fuzzers/corpora/rtcp_fuzzer/1meetecho/rtcp_fuzzer-crash-1640b2f21ba20409d930e9653052d579d450073a
+
+diff --git a/fuzzers/corpora/rtcp_fuzzer/1meetecho/rtcp_fuzzer-crash-1640b2f21ba20409d930e9653052d579d450073a b/fuzzers/corpora/rtcp_fuzzer/1meetecho/rtcp_fuzzer-crash-1640b2f21ba20409d930e9653052d579d450073a
+new file mode 100644
+index 0000000000000000000000000000000000000000..22892eb5534f7f3939559c8436e9b0062512cbda
+GIT binary patch
+literal 24
+ccmZ2~mVvQm9RuTfAl=v&@f1WeHugmT0CoupPXGV_
+
+literal 0
+HcmV?d00001
+
+diff --git a/rtcp.c b/rtcp.c
+index 8364e3352c..5d1f99da7f 100644
+--- a/rtcp.c
++++ b/rtcp.c
+@@ -168,7 +168,9 @@ static void janus_rtcp_incoming_sr(janus_rtcp_context *ctx, janus_rtcp_sr *sr) {
+ 
+ /* Helper to handle an incoming transport-cc feedback: triggered by a call to janus_rtcp_fix_ssrc a valid context pointer */
+ static void janus_rtcp_incoming_transport_cc(janus_rtcp_context *ctx, janus_rtcp_fb *twcc, int total) {
+-	if(ctx == NULL || twcc == NULL || total < 16)
++	if(ctx == NULL || twcc == NULL || total < 20)
++		return;
++	if(!janus_rtcp_check_fci((janus_rtcp_header *)twcc, total, 4))
+ 		return;
+ 	/* Parse the header first */
+ 	uint8_t *data = (uint8_t *)twcc->fci;
+@@ -185,7 +187,7 @@ static void janus_rtcp_incoming_transport_cc(janus_rtcp_context *ctx, janus_rtcp
+ 	JANUS_LOG(LOG_HUGE, "[TWCC] seq=%"SCNu16", psc=%"SCNu16", ref=%"SCNu32", fbpc=%"SCNu8"\n",
+ 		base_seq, status_count, reference, fb_pkt);
+ 	/* Now traverse the feedback: packet chunks first, and then recv deltas */
+-	total -= 16;
++	total -= 20;
+ 	data += 8;
+ 	int psc = status_count;
+ 	uint16_t chunk = 0;
+@@ -229,6 +231,10 @@ static void janus_rtcp_incoming_transport_cc(janus_rtcp_context *ctx, janus_rtcp
+ 		total -= 2;
+ 		data += 2;
+ 	}
++	if(psc > 0) {
++		/* Incomplete feedback? Drop... */
++		return;
++	}
+ 	/* Iterate on all recv deltas */
+ 	JANUS_LOG(LOG_HUGE, "[TWCC] Recv Deltas (%d/%"SCNu16"):\n", g_list_length(list), status_count);
+ 	num = 0;

@@ -1,0 +1,58 @@
+From df82e56d5561e05529dff3369106f08a647b8a8a Mon Sep 17 00:00:00 2001
+From: Reini Urban <rurban@cpan.org>
+Date: Tue, 16 Mar 2021 09:34:09 +0100
+Subject: [PATCH] indxf: improve fuzzer zero-termination
+
+don't allow \n without \0 in DXF.
+Fail earlier when the ASCII DXF buffer has none to avoid strtol overflows.
+Fixes oss-fuzz issue 32022
+
+Also clear errno before calling strtol.
+---
+ examples/llvmfuzz.c |  4 ++--
+ src/in_dxf.c        | 10 ++++++++--
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/examples/llvmfuzz.c b/examples/llvmfuzz.c
+index 9a391d8270..878cdcad58 100644
+--- a/examples/llvmfuzz.c
++++ b/examples/llvmfuzz.c
+@@ -47,8 +47,8 @@ static int enforce_null_termination(Bit_Chain *dat, bool enforce)
+     if (!dat->size)
+       return 0;
+     c = dat->chain[dat->size - 1];
+-    // Allow \n termination
+-    if (!enforce && (c == '\0' || c == '\n'))
++    // Allow \n termination without \0 in DXF? No, still crashes
++    if (!enforce && ((c == '\n' && c+1 == '\0') || c == '\0'))
+       return 0;
+ #ifdef STANDALONE
+     fprintf (stderr, "llvmfuzz_standalone: enforce libfuzzer buffer NULL termination\n");
+diff --git a/src/in_dxf.c b/src/in_dxf.c
+index e45b82fbff..6660307350 100644
+--- a/src/in_dxf.c
++++ b/src/in_dxf.c
+@@ -253,8 +253,8 @@ dxf_skip_ws (Bit_Chain *dat)
+       dat->byte = dat->size;                                                  \
+       return (rettype)ret;                                                    \
+     }                                                                         \
+-  else                                                                        \
+-    num = strtol ((char *)&dat->chain[dat->byte], &endptr, 10);               \
++  errno = 0;                                                                  \
++  num = strtol ((char *)&dat->chain[dat->byte], &endptr, 10);                 \
+   if (endptr)                                                                 \
+     {                                                                         \
+       if (endptr == (char *)&dat->chain[dat->byte])                           \
+@@ -12681,6 +12681,12 @@ dwg_read_dxf (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+       LOG_ERROR ("This is a DWG, not a DXF\n");
+       return DWG_ERR_INVALIDDWG;
+     }
++  /* Fuzzers like to skip zero-termination. And fail loudly on strtol */
++  if (!memchr (&dat->chain[dat->size], '\0', 2))
++    {
++      LOG_ERROR ("This buffer is not zero-terminated\n");
++      return DWG_ERR_INVALIDDWG;
++    }
+ 
+   dat->opts |= DWG_OPTS_INDXF;
+   dwg->opts |= DWG_OPTS_INDXF;

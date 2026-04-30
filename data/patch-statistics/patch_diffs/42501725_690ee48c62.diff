@@ -1,0 +1,327 @@
+From 15bbf6f3377e6446e88300b9c5383179091fe270 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Fri, 24 Sep 2021 13:11:11 +0200
+Subject: [PATCH] Automatically determine whether to reuse get_iterator()
+
+Same as with the IteratorAggregate case, allow reusing get_iterator
+if none of the Iterator methods are overridden. Drop the
+REUSE_GET_ITERATOR flag that previously allowed ArrayIterator to
+opt-in to unconditional get_iterator reuse, and drop the override
+handling it did, in favor of the automated approach.
+---
+ Zend/tests/foreach_004.phpt                   | 65 -----------------
+ Zend/zend_compile.h                           |  5 +-
+ Zend/zend_interfaces.c                        | 17 +++--
+ ext/spl/spl_array.c                           | 72 +++----------------
+ ext/spl/tests/bug54281.phpt                   |  5 +-
+ ...iveIteratorIterator_endchildren_error.phpt |  5 +-
+ 6 files changed, 24 insertions(+), 145 deletions(-)
+ delete mode 100644 Zend/tests/foreach_004.phpt
+
+diff --git a/Zend/tests/foreach_004.phpt b/Zend/tests/foreach_004.phpt
+deleted file mode 100644
+index afb98a9988137..0000000000000
+--- a/Zend/tests/foreach_004.phpt
++++ /dev/null
+@@ -1,65 +0,0 @@
+---TEST--
+-Iterator exceptions in foreach by reference
+---FILE--
+-<?php
+-class IT extends ArrayIterator {
+-    private $n = 0;
+-
+-    function __construct($trap = null) {
+-        parent::__construct([0, 1]);
+-        $this->trap = $trap;
+-    }
+-
+-    function trap($trap) {
+-        if ($trap === $this->trap) {
+-            throw new Exception($trap);
+-        }
+-    }
+-
+-    function rewind(): void  {$this->trap(__FUNCTION__); parent::rewind();}
+-    function valid(): bool   {$this->trap(__FUNCTION__); return parent::valid();}
+-    function key(): string|int|null { $this->trap(__FUNCTION__); return parent::key(); }
+-    function next(): void    {$this->trap(__FUNCTION__); parent::next();}
+-}
+-
+-foreach(['rewind', 'valid', 'key', 'next'] as $trap) {
+-    $obj = new IT($trap);
+-    try {
+-        // IS_CV
+-        foreach ($obj as $key => &$val) echo "$val\n";
+-    } catch (Exception $e) {
+-        echo $e->getMessage() . "\n";
+-    }
+-    unset($obj);
+-
+-    try {
+-        // IS_VAR
+-        foreach (new IT($trap) as $key => &$val) echo "$val\n";
+-    } catch (Exception $e) {
+-        echo $e->getMessage() . "\n";
+-    }
+-
+-    try {
+-        // IS_TMP_VAR
+-        foreach ((object)new IT($trap) as $key => &$val) echo "$val\n";
+-    } catch (Exception $e) {
+-        echo $e->getMessage() . "\n";
+-    }
+-}
+-?>
+---EXPECT--
+-rewind
+-rewind
+-rewind
+-valid
+-valid
+-valid
+-key
+-key
+-key
+-0
+-next
+-0
+-next
+-0
+-next
+diff --git a/Zend/zend_compile.h b/Zend/zend_compile.h
+index 462fc3f7c0276..90ce5504499b8 100644
+--- a/Zend/zend_compile.h
++++ b/Zend/zend_compile.h
+@@ -240,7 +240,7 @@ typedef struct _zend_oparray_context {
+ /* or IS_CONSTANT_VISITED_MARK                            |     |     |     */
+ #define ZEND_CLASS_CONST_IS_CASE         (1 << 6)  /*     |     |     |  X  */
+ /*                                                        |     |     |     */
+-/* Class Flags (unused: 15,21,30,31)                      |     |     |     */
++/* Class Flags (unused: 15,16,21,30,31)                   |     |     |     */
+ /* ===========                                            |     |     |     */
+ /*                                                        |     |     |     */
+ /* Special class types                                    |     |     |     */
+@@ -269,9 +269,6 @@ typedef struct _zend_oparray_context {
+ /* User class has methods with static variables           |     |     |     */
+ #define ZEND_HAS_STATIC_IN_METHODS       (1 << 14) /*  X  |     |     |     */
+ /*                                                        |     |     |     */
+-/* Children must reuse parent get_iterator()              |     |     |     */
+-#define ZEND_ACC_REUSE_GET_ITERATOR      (1 << 16) /*  X  |     |     |     */
+-/*                                                        |     |     |     */
+ /* Parent class is resolved (CE).                         |     |     |     */
+ #define ZEND_ACC_RESOLVED_PARENT         (1 << 17) /*  X  |     |     |     */
+ /*                                                        |     |     |     */
+diff --git a/Zend/zend_interfaces.c b/Zend/zend_interfaces.c
+index c972234049598..595bc3924ffe4 100644
+--- a/Zend/zend_interfaces.c
++++ b/Zend/zend_interfaces.c
+@@ -332,20 +332,23 @@ static int zend_implement_iterator(zend_class_entry *interface, zend_class_entry
+ 			ZEND_ASSERT(class_type->type == ZEND_INTERNAL_CLASS);
+ 			return SUCCESS;
+ 		}
+-		/* Otherwise get_iterator was inherited from the parent by default. */
+-	}
+ 
+-	if (class_type->parent && (class_type->parent->ce_flags & ZEND_ACC_REUSE_GET_ITERATOR)) {
+-		/* Keep the inherited get_iterator handler. */
+-		class_type->ce_flags |= ZEND_ACC_REUSE_GET_ITERATOR;
+-	} else {
+-		class_type->get_iterator = zend_user_it_get_iterator;
++		/* None of the Iterator methods have been overwritten, use inherited get_iterator(). */
++		if (zf_rewind->common.scope != class_type && zf_valid->common.scope != class_type &&
++				zf_key->common.scope != class_type && zf_current->common.scope != class_type &&
++				zf_next->common.scope != class_type) {
++			return SUCCESS;
++		}
++
++		/* One of the Iterator methods has been overwritten,
++		 * switch to zend_user_it_get_new_iterator. */
+ 	}
+ 
+ 	ZEND_ASSERT(!class_type->iterator_funcs_ptr && "Iterator funcs already set?");
+ 	zend_class_iterator_funcs *funcs_ptr = class_type->type == ZEND_INTERNAL_CLASS
+ 		? pemalloc(sizeof(zend_class_iterator_funcs), 1)
+ 		: zend_arena_alloc(&CG(arena), sizeof(zend_class_iterator_funcs));
++	class_type->get_iterator = zend_user_it_get_iterator;
+ 	class_type->iterator_funcs_ptr = funcs_ptr;
+ 
+ 	memset(funcs_ptr, 0, sizeof(zend_class_iterator_funcs));
+diff --git a/ext/spl/spl_array.c b/ext/spl/spl_array.c
+index 167d1941ecce9..0fa34b3d40428 100644
+--- a/ext/spl/spl_array.c
++++ b/ext/spl/spl_array.c
+@@ -44,11 +44,6 @@ PHPAPI zend_class_entry  *spl_ce_RecursiveArrayIterator;
+ #define SPL_ARRAY_STD_PROP_LIST      0x00000001
+ #define SPL_ARRAY_ARRAY_AS_PROPS     0x00000002
+ #define SPL_ARRAY_CHILD_ARRAYS_ONLY  0x00000004
+-#define SPL_ARRAY_OVERLOADED_REWIND  0x00010000
+-#define SPL_ARRAY_OVERLOADED_VALID   0x00020000
+-#define SPL_ARRAY_OVERLOADED_KEY     0x00040000
+-#define SPL_ARRAY_OVERLOADED_CURRENT 0x00080000
+-#define SPL_ARRAY_OVERLOADED_NEXT    0x00100000
+ #define SPL_ARRAY_IS_SELF            0x01000000
+ #define SPL_ARRAY_USE_OTHER          0x02000000
+ #define SPL_ARRAY_INT_MASK           0xFFFF0000
+@@ -229,19 +224,6 @@ static zend_object *spl_array_object_new_ex(zend_class_entry *class_type, zend_o
+ 			intern->fptr_count = NULL;
+ 		}
+ 	}
+-	/* Cache iterator functions if ArrayIterator or derived. Check current's */
+-	/* cache since only current is always required */
+-	if (intern->std.handlers == &spl_handler_ArrayIterator) {
+-		zend_class_iterator_funcs *funcs_ptr = class_type->iterator_funcs_ptr;
+-
+-		if (inherited) {
+-			if (funcs_ptr->zf_rewind->common.scope  != parent) intern->ar_flags |= SPL_ARRAY_OVERLOADED_REWIND;
+-			if (funcs_ptr->zf_valid->common.scope   != parent) intern->ar_flags |= SPL_ARRAY_OVERLOADED_VALID;
+-			if (funcs_ptr->zf_key->common.scope     != parent) intern->ar_flags |= SPL_ARRAY_OVERLOADED_KEY;
+-			if (funcs_ptr->zf_current->common.scope != parent) intern->ar_flags |= SPL_ARRAY_OVERLOADED_CURRENT;
+-			if (funcs_ptr->zf_next->common.scope    != parent) intern->ar_flags |= SPL_ARRAY_OVERLOADED_NEXT;
+-		}
+-	}
+ 
+ 	intern->ht_iter = (uint32_t)-1;
+ 	return &intern->std;
+@@ -952,12 +934,7 @@ static int spl_array_it_valid(zend_object_iterator *iter) /* {{{ */
+ {
+ 	spl_array_object *object = Z_SPLARRAY_P(&iter->data);
+ 	HashTable *aht = spl_array_get_hash_table(object);
+-
+-	if (object->ar_flags & SPL_ARRAY_OVERLOADED_VALID) {
+-		return zend_user_it_valid(iter);
+-	} else {
+-		return zend_hash_has_more_elements_ex(aht, spl_array_get_pos_ptr(aht, object));
+-	}
++	return zend_hash_has_more_elements_ex(aht, spl_array_get_pos_ptr(aht, object));
+ }
+ /* }}} */
+ 
+@@ -965,16 +942,11 @@ static zval *spl_array_it_get_current_data(zend_object_iterator *iter) /* {{{ */
+ {
+ 	spl_array_object *object = Z_SPLARRAY_P(&iter->data);
+ 	HashTable *aht = spl_array_get_hash_table(object);
+-
+-	if (object->ar_flags & SPL_ARRAY_OVERLOADED_CURRENT) {
+-		return zend_user_it_get_current_data(iter);
+-	} else {
+-		zval *data = zend_hash_get_current_data_ex(aht, spl_array_get_pos_ptr(aht, object));
+-		if (data && Z_TYPE_P(data) == IS_INDIRECT) {
+-			data = Z_INDIRECT_P(data);
+-		}
+-		return data;
++	zval *data = zend_hash_get_current_data_ex(aht, spl_array_get_pos_ptr(aht, object));
++	if (data && Z_TYPE_P(data) == IS_INDIRECT) {
++		data = Z_INDIRECT_P(data);
+ 	}
++	return data;
+ }
+ /* }}} */
+ 
+@@ -982,12 +954,7 @@ static void spl_array_it_get_current_key(zend_object_iterator *iter, zval *key)
+ {
+ 	spl_array_object *object = Z_SPLARRAY_P(&iter->data);
+ 	HashTable *aht = spl_array_get_hash_table(object);
+-
+-	if (object->ar_flags & SPL_ARRAY_OVERLOADED_KEY) {
+-		zend_user_it_get_current_key(iter, key);
+-	} else {
+-		zend_hash_get_current_key_zval_ex(aht, key, spl_array_get_pos_ptr(aht, object));
+-	}
++	zend_hash_get_current_key_zval_ex(aht, key, spl_array_get_pos_ptr(aht, object));
+ }
+ /* }}} */
+ 
+@@ -995,13 +962,8 @@ static void spl_array_it_move_forward(zend_object_iterator *iter) /* {{{ */
+ {
+ 	spl_array_object *object = Z_SPLARRAY_P(&iter->data);
+ 	HashTable *aht = spl_array_get_hash_table(object);
+-
+-	if (object->ar_flags & SPL_ARRAY_OVERLOADED_NEXT) {
+-		zend_user_it_move_forward(iter);
+-	} else {
+-		zend_user_it_invalidate_current(iter);
+-		spl_array_next_ex(object, aht);
+-	}
++	zend_user_it_invalidate_current(iter);
++	spl_array_next_ex(object, aht);
+ }
+ /* }}} */
+ 
+@@ -1021,13 +983,8 @@ static void spl_array_rewind(spl_array_object *intern) /* {{{ */
+ static void spl_array_it_rewind(zend_object_iterator *iter) /* {{{ */
+ {
+ 	spl_array_object *object = Z_SPLARRAY_P(&iter->data);
+-
+-	if (object->ar_flags & SPL_ARRAY_OVERLOADED_REWIND) {
+-		zend_user_it_rewind(iter);
+-	} else {
+ 		zend_user_it_invalidate_current(iter);
+ 		spl_array_rewind(object);
+-	}
+ }
+ /* }}} */
+ 
+@@ -1099,16 +1056,7 @@ static const zend_object_iterator_funcs spl_array_it_funcs = {
+ 
+ zend_object_iterator *spl_array_get_iterator(zend_class_entry *ce, zval *object, int by_ref) /* {{{ */
+ {
+-	zend_user_iterator *iterator;
+-	spl_array_object *array_object = Z_SPLARRAY_P(object);
+-
+-	if (by_ref && (array_object->ar_flags & SPL_ARRAY_OVERLOADED_CURRENT)) {
+-		zend_throw_error(NULL, "An iterator cannot be used with foreach by reference");
+-		return NULL;
+-	}
+-
+-	iterator = emalloc(sizeof(zend_user_iterator));
+-
++	zend_user_iterator *iterator = emalloc(sizeof(zend_user_iterator));
+ 	zend_iterator_init(&iterator->it);
+ 
+ 	ZVAL_OBJ_COPY(&iterator->it.data, Z_OBJ_P(object));
+@@ -1864,7 +1812,6 @@ PHP_MINIT_FUNCTION(spl_array)
+ 	spl_ce_ArrayIterator = register_class_ArrayIterator(spl_ce_SeekableIterator, zend_ce_arrayaccess, zend_ce_serializable, zend_ce_countable);
+ 	spl_ce_ArrayIterator->create_object = spl_array_object_new;
+ 	spl_ce_ArrayIterator->get_iterator = spl_array_get_iterator;
+-	spl_ce_ArrayIterator->ce_flags |= ZEND_ACC_REUSE_GET_ITERATOR;
+ 
+ 	memcpy(&spl_handler_ArrayIterator, &spl_handler_ArrayObject, sizeof(zend_object_handlers));
+ 
+@@ -1877,7 +1824,6 @@ PHP_MINIT_FUNCTION(spl_array)
+ 	spl_ce_RecursiveArrayIterator = register_class_RecursiveArrayIterator(spl_ce_ArrayIterator, spl_ce_RecursiveIterator);
+ 	spl_ce_RecursiveArrayIterator->create_object = spl_array_object_new;
+ 	spl_ce_RecursiveArrayIterator->get_iterator = spl_array_get_iterator;
+-	spl_ce_RecursiveArrayIterator->ce_flags |= ZEND_ACC_REUSE_GET_ITERATOR;
+ 
+ 	REGISTER_SPL_CLASS_CONST_LONG(RecursiveArrayIterator, "CHILD_ARRAYS_ONLY", SPL_ARRAY_CHILD_ARRAYS_ONLY);
+ 
+diff --git a/ext/spl/tests/bug54281.phpt b/ext/spl/tests/bug54281.phpt
+index a2dbcd74476f0..f2ac782e41ead 100644
+--- a/ext/spl/tests/bug54281.phpt
++++ b/ext/spl/tests/bug54281.phpt
+@@ -12,8 +12,7 @@ foreach($it as $k=>$v) { }
+ 
+ ?>
+ --EXPECTF--
+-Fatal error: Uncaught Error: The object is in an invalid state as the parent constructor was not called in %s:%d
++Fatal error: Uncaught Error: Object is not initialized in %s:%d
+ Stack trace:
+-#0 %s%ebug54281.php(8): RecursiveIteratorIterator->rewind()
+-#1 {main}
++#0 {main}
+   thrown in %s%ebug54281.php on line 8
+diff --git a/ext/spl/tests/recursiveIteratorIterator_endchildren_error.phpt b/ext/spl/tests/recursiveIteratorIterator_endchildren_error.phpt
+index 7f9f9411dd98b..13af7ce01986d 100644
+--- a/ext/spl/tests/recursiveIteratorIterator_endchildren_error.phpt
++++ b/ext/spl/tests/recursiveIteratorIterator_endchildren_error.phpt
+@@ -36,7 +36,6 @@ foreach ($recItIt2 as $val) echo "$val\n";
+ 
+ Fatal error: Uncaught Exception in %s
+ Stack trace:
+-#0 [internal function]: MyRecursiveIteratorIterator->endchildren()
+-#1 %s: RecursiveIteratorIterator->next()
+-#2 {main}
++#0 %s(%d): MyRecursiveIteratorIterator->endchildren()
++#1 {main}
+   thrown in %s on line %d

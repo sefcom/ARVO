@@ -1,0 +1,77 @@
+From 9b7e822916a0ccd6fa961e5364f99112bed964c6 Mon Sep 17 00:00:00 2001
+From: Reini Urban <rurban@cpan.org>
+Date: Thu, 8 Jun 2023 13:10:28 +0200
+Subject: [PATCH] outdxf: fix unsigned loop overflow
+
+which never goes < 0 when decr len -= 255.
+Fixes GH #759, thanks to @weikenxq
+---
+ src/decode.h  |  2 +-
+ src/out_dxf.c | 14 ++++++++------
+ 2 files changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/src/decode.h b/src/decode.h
+index 9c8cc18706..48fab63c37 100644
+--- a/src/decode.h
++++ b/src/decode.h
+@@ -29,7 +29,7 @@
+ #  error in_dxf.h must be included after decode.h because of FORMAT_BD
+ #endif
+ 
+-#define REFS_PER_REALLOC 128
++#define REFS_PER_REALLOC 16384
+ 
+ typedef enum ENTITY_SECTION_INDEX_R11
+ {
+diff --git a/src/out_dxf.c b/src/out_dxf.c
+index da314fbc43..33381a9b63 100644
+--- a/src/out_dxf.c
++++ b/src/out_dxf.c
+@@ -1232,7 +1232,7 @@ dxf_fixup_string (Bit_Chain *restrict dat, char *restrict str, const int opts,
+         {
+           static char _buf[1024] = { 0 };
+           const size_t origlen = strlen (str);
+-          size_t len = (2 * origlen) + 1;
++          long len = (long)((2 * origlen) + 1);
+           if (len > 1024)
+             { // FIXME: maybe we need this for chunked strings
+               fprintf (dat->fh, "\r\n");
+@@ -1240,14 +1240,15 @@ dxf_fixup_string (Bit_Chain *restrict dat, char *restrict str, const int opts,
+               return;
+             }
+           *_buf = '\0';
+-          len = strlen (cquote (_buf, len, str));
++          len = (long)strlen (cquote (_buf, len, str));
+           if (len > 255 && dxf == 1)
+             {
+               char *bufp = &_buf[0];
+               // GROUP 1 already printed
+               while (len > 0)
+                 {
+-                  fprintf (dat->fh, "%.*s\r\n", len > 255 ? 255 : (int)len, bufp);
++                  int rlen = len > 255 ? 255 : len;
++                  fprintf (dat->fh, "%.*s\r\n", rlen, bufp);
+                   len -= 255;
+                   bufp += 255;
+                   if (len > 0)
+@@ -1259,16 +1260,17 @@ dxf_fixup_string (Bit_Chain *restrict dat, char *restrict str, const int opts,
+         }
+       else
+         {
+-          size_t len = strlen (str);
++          long len = (long)strlen (str);
+           if (len > 255 && dxf == 1)
+             {
+               // GROUP 1 already printed
+               while (len > 0)
+                 {
+-                  fprintf (dat->fh, "%.*s\r\n", len > 255 ? 255 : (int)len, str);
++                  int rlen = len > 255 ? 255 : len;
++                  fprintf (dat->fh, "%.*s\r\n", (int)rlen, str);
+                   len -= 255;
+                   str += 255;
+-                  if (len > 0)
++                  if (len > 255)
+                     fprintf (dat->fh, "  3\r\n");
+                 }
+             }

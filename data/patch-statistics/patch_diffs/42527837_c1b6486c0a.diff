@@ -1,0 +1,192 @@
+From b4296e1c9b01be7c8b052ae023e0927cc6762b1b Mon Sep 17 00:00:00 2001
+From: Tim Ledbetter <timledbetter@gmail.com>
+Date: Wed, 25 Oct 2023 23:45:56 +0100
+Subject: [PATCH] LibPDF: Don't use unsanitized values in error messages
+
+Previously, constructing error messages with unsanitized input could
+fail because error message strings must be UTF-8.
+---
+ Tests/LibPDF/CMakeLists.txt                        |   1 +
+ Tests/LibPDF/TestPDF.cpp                           |  13 +++++++++++++
+ Tests/LibPDF/oss-fuzz-testcase-62065.pdf           | Bin 0 -> 8 bytes
+ Userland/Libraries/LibPDF/ColorSpace.cpp           |   3 ++-
+ Userland/Libraries/LibPDF/DocumentParser.cpp       |  12 ++++++++----
+ Userland/Libraries/LibPDF/Filter.cpp               |   3 ++-
+ Userland/Libraries/LibPDF/Fonts/PDFFont.cpp        |  12 +++++++-----
+ .../Libraries/LibPDF/Fonts/Type1FontProgram.cpp    |   8 +++++---
+ Userland/Libraries/LibPDF/Parser.cpp               |   3 ++-
+ 9 files changed, 40 insertions(+), 15 deletions(-)
+ create mode 100644 Tests/LibPDF/oss-fuzz-testcase-62065.pdf
+
+diff --git a/Tests/LibPDF/CMakeLists.txt b/Tests/LibPDF/CMakeLists.txt
+index b466a25a827a71..402f9686abb545 100644
+--- a/Tests/LibPDF/CMakeLists.txt
++++ b/Tests/LibPDF/CMakeLists.txt
+@@ -11,6 +11,7 @@ set(TEST_FILES
+     encryption_nocopy.pdf
+     linearized.pdf
+     non-linearized.pdf
++    oss-fuzz-testcase-62065.pdf
+     password-is-sup.pdf
+     type1.pdf
+ )
+diff --git a/Tests/LibPDF/TestPDF.cpp b/Tests/LibPDF/TestPDF.cpp
+index d82762506fae2b..fe70dd109a05eb 100644
+--- a/Tests/LibPDF/TestPDF.cpp
++++ b/Tests/LibPDF/TestPDF.cpp
+@@ -73,3 +73,16 @@ TEST_CASE(encrypted_object_stream)
+     EXPECT_EQ(MUST(info_dict.author()).value(), "van der Knijff");
+     EXPECT_EQ(MUST(info_dict.creator()).value(), "Acrobat PDFMaker 9.1 voor Word");
+ }
++
++TEST_CASE(malformed_pdf_document)
++{
++    Array test_inputs = {
++        "oss-fuzz-testcase-62065.pdf"sv
++    };
++
++    for (auto test_input : test_inputs) {
++        auto file = MUST(Core::MappedFile::map(test_input));
++        auto document_or_error = PDF::Document::create(file->bytes());
++        EXPECT(document_or_error.is_error());
++    }
++}
+diff --git a/Tests/LibPDF/oss-fuzz-testcase-62065.pdf b/Tests/LibPDF/oss-fuzz-testcase-62065.pdf
+new file mode 100644
+index 0000000000000000000000000000000000000000..c35b0ceaeea8998f3b54e0e8279b2f9c68dabf02
+GIT binary patch
+literal 8
+PcmY!laB<W9|NlP#4Fm)#
+
+literal 0
+HcmV?d00001
+
+diff --git a/Userland/Libraries/LibPDF/ColorSpace.cpp b/Userland/Libraries/LibPDF/ColorSpace.cpp
+index 58f30c39877dc0..35e264c2a74f4a 100644
+--- a/Userland/Libraries/LibPDF/ColorSpace.cpp
++++ b/Userland/Libraries/LibPDF/ColorSpace.cpp
+@@ -27,7 +27,8 @@ PDFErrorOr<ColorSpaceFamily> ColorSpaceFamily::get(DeprecatedFlyString const& fa
+     }
+     ENUMERATE_COLOR_SPACE_FAMILIES(ENUMERATE)
+ #undef ENUMERATE
+-    return Error(Error::Type::MalformedPDF, DeprecatedString::formatted("Unknown ColorSpace family {}", family_name));
++    dbgln_if(PDF_DEBUG, "Unknown ColorSpace family: {}", family_name);
++    return Error(Error::Type::MalformedPDF, "Unknown ColorSpace family"_string);
+ }
+ 
+ PDFErrorOr<NonnullRefPtr<ColorSpace>> ColorSpace::create(DeprecatedFlyString const& name)
+diff --git a/Userland/Libraries/LibPDF/DocumentParser.cpp b/Userland/Libraries/LibPDF/DocumentParser.cpp
+index a4f775fdf219ca..29b0dc05a882d2 100644
+--- a/Userland/Libraries/LibPDF/DocumentParser.cpp
++++ b/Userland/Libraries/LibPDF/DocumentParser.cpp
+@@ -81,15 +81,19 @@ PDFErrorOr<Version> DocumentParser::parse_header()
+     m_reader.move_by(5);
+ 
+     char major_ver = m_reader.read();
+-    if (major_ver != '1' && major_ver != '2')
+-        return error(DeprecatedString::formatted("Unknown major version \"{}\"", major_ver));
++    if (major_ver != '1' && major_ver != '2') {
++        dbgln_if(PDF_DEBUG, "Unknown major version \"{}\"", major_ver);
++        return error("Unknown major version");
++    }
+ 
+     if (m_reader.read() != '.')
+         return error("Malformed PDF version");
+ 
+     char minor_ver = m_reader.read();
+-    if (minor_ver < '0' || minor_ver > '7')
+-        return error(DeprecatedString::formatted("Unknown minor version \"{}\"", minor_ver));
++    if (minor_ver < '0' || minor_ver > '7') {
++        dbgln_if(PDF_DEBUG, "Unknown minor version \"{}\"", minor_ver);
++        return error("Unknown minor version");
++    }
+ 
+     m_reader.consume_eol();
+     m_reader.consume_whitespace();
+diff --git a/Userland/Libraries/LibPDF/Filter.cpp b/Userland/Libraries/LibPDF/Filter.cpp
+index 7d5b3936ab4439..c9dc45f998646d 100644
+--- a/Userland/Libraries/LibPDF/Filter.cpp
++++ b/Userland/Libraries/LibPDF/Filter.cpp
+@@ -51,7 +51,8 @@ PDFErrorOr<ByteBuffer> Filter::decode(ReadonlyBytes bytes, DeprecatedFlyString c
+     if (encoding_type == CommonNames::Crypt)
+         return decode_crypt(bytes);
+ 
+-    return Error::malformed_error("Unrecognized filter encoding {}", encoding_type);
++    dbgln_if(PDF_DEBUG, "Unrecognized filter encoding {}", encoding_type);
++    return Error::malformed_error("Unrecognized filter encoding");
+ }
+ 
+ PDFErrorOr<ByteBuffer> Filter::decode_ascii_hex(ReadonlyBytes bytes)
+diff --git a/Userland/Libraries/LibPDF/Fonts/PDFFont.cpp b/Userland/Libraries/LibPDF/Fonts/PDFFont.cpp
+index b7e9390ff844ef..0d89baa3bc9223 100644
+--- a/Userland/Libraries/LibPDF/Fonts/PDFFont.cpp
++++ b/Userland/Libraries/LibPDF/Fonts/PDFFont.cpp
+@@ -37,14 +37,16 @@ PDFErrorOr<NonnullRefPtr<PDFFont>> PDFFont::create(Document* document, NonnullRe
+     auto subtype = TRY(dict->get_name(document, CommonNames::Subtype))->name();
+ 
+     RefPtr<PDFFont> font;
+-    if (subtype == "Type1")
++    if (subtype == "Type1") {
+         font = adopt_ref(*new Type1Font());
+-    else if (subtype == "TrueType")
++    } else if (subtype == "TrueType") {
+         font = adopt_ref(*new TrueTypeFont());
+-    else if (subtype == "Type0")
++    } else if (subtype == "Type0")
+         font = adopt_ref(*new Type0Font());
+-    else
+-        return Error::internal_error("Unhandled font subtype: {}", subtype);
++    else {
++        dbgln_if(PDF_DEBUG, "Unhandled font subtype: {}", subtype);
++        return Error::internal_error("Unhandled font subtype");
++    }
+ 
+     TRY(font->initialize(document, dict, font_size));
+     return font.release_nonnull();
+diff --git a/Userland/Libraries/LibPDF/Fonts/Type1FontProgram.cpp b/Userland/Libraries/LibPDF/Fonts/Type1FontProgram.cpp
+index 003ed0a150f575..04bc7d17d598b9 100644
+--- a/Userland/Libraries/LibPDF/Fonts/Type1FontProgram.cpp
++++ b/Userland/Libraries/LibPDF/Fonts/Type1FontProgram.cpp
+@@ -284,7 +284,7 @@ PDFErrorOr<Type1FontProgram::Glyph> Type1FontProgram::parse_glyph(ReadonlyBytes
+                 i += 2;
+                 TRY(push(a));
+             } else {
+-                return error(DeprecatedString::formatted("CFF Subr command 28 only valid in type2 data"));
++                return error("CFF Subr command 28 only valid in type2 data");
+             }
+         } else {
+             // Not a parameter but a command byte.
+@@ -494,7 +494,8 @@ PDFErrorOr<Type1FontProgram::Glyph> Type1FontProgram::parse_glyph(ReadonlyBytes
+                     break;
+ 
+                 default:
+-                    return error(DeprecatedString::formatted("Unhandled command: 12 {}", data[i]));
++                    dbgln_if(PDF_DEBUG, "Unhandled command: 12 {}", data[i]);
++                    return error("Unhandled command");
+                 }
+                 break;
+             }
+@@ -578,7 +579,8 @@ PDFErrorOr<Type1FontProgram::Glyph> Type1FontProgram::parse_glyph(ReadonlyBytes
+             }
+ 
+             default:
+-                return error(DeprecatedString::formatted("Unhandled command: {}", v));
++                dbgln_if(PDF_DEBUG, "Unhandled command: {}", v);
++                return error("Unhandled command");
+             }
+ 
+             is_first_command = false;
+diff --git a/Userland/Libraries/LibPDF/Parser.cpp b/Userland/Libraries/LibPDF/Parser.cpp
+index cde258ed9983db..00a428e7eb4f36 100644
+--- a/Userland/Libraries/LibPDF/Parser.cpp
++++ b/Userland/Libraries/LibPDF/Parser.cpp
+@@ -101,7 +101,8 @@ PDFErrorOr<Value> Parser::parse_value(CanBeIndirectValue can_be_indirect_value)
+     if (m_reader.matches('['))
+         return TRY(parse_array());
+ 
+-    return error(DeprecatedString::formatted("Unexpected char \"{}\"", m_reader.peek()));
++    dbgln_if(PDF_DEBUG, "Unexpected char \"{}\"", m_reader.peek());
++    return error("Unexpected character");
+ }
+ 
+ PDFErrorOr<Value> Parser::parse_possible_indirect_value_or_ref()

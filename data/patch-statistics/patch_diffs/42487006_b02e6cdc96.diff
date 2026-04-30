@@ -1,0 +1,45 @@
+From 2e9e706a8271bbb42ad696c3383912facdd7d45f Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Wed, 2 Sep 2020 10:50:14 +0200
+Subject: [PATCH] Fix throwing of yield from related exceptions into generator
+
+Use the general zend_generator_throw_exception() helper for this.
+Otherwise we don't handle the off-by-one opline correctly (should
+we maybe just stop doing that?)
+
+This is a followup to ad750c3bb6e7b48384c6265eb9d3bcf5b4000652,
+which fixed a different yield from exception handling problem that
+happened to show up in the same test case from oss-fuzz #25321.
+Now both issues should be fixed.
+---
+ Zend/tests/generators/yield_from_valid_exception.phpt | 3 ++-
+ Zend/zend_generators.c                                | 2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/Zend/tests/generators/yield_from_valid_exception.phpt b/Zend/tests/generators/yield_from_valid_exception.phpt
+index 3af35f53af668..d3e054bfafb9d 100644
+--- a/Zend/tests/generators/yield_from_valid_exception.phpt
++++ b/Zend/tests/generators/yield_from_valid_exception.phpt
+@@ -15,7 +15,8 @@ class FooBar implements Iterator {
+ 
+ function gen() {
+     try {
+-        yield from new FooBar;
++        // the fact that the yield from result is used is relevant.
++        var_dump(yield from new FooBar);
+     } catch (Exception $e) {
+         echo $e->getMessage(), "\n";
+     }
+diff --git a/Zend/zend_generators.c b/Zend/zend_generators.c
+index bb3260b11bfff..0ed92f4ca28cb 100644
+--- a/Zend/zend_generators.c
++++ b/Zend/zend_generators.c
+@@ -740,7 +740,7 @@ static int zend_generator_get_next_delegated_value(zend_generator *generator) /*
+ 	return SUCCESS;
+ 
+ exception:
+-	zend_rethrow_exception(generator->execute_data);
++	zend_generator_throw_exception(generator, NULL);
+ 
+ failure:
+ 	zval_ptr_dtor(&generator->values);

@@ -1,0 +1,282 @@
+From 35cc9d1409ed4bab07a40af704a13a6b2011f691 Mon Sep 17 00:00:00 2001
+From: Antoine Pitrou <antoine@python.org>
+Date: Wed, 17 Nov 2021 11:02:38 +0100
+Subject: [PATCH] ARROW-14721: [C++] Strengthen DELTA_BYTE_ARRAY decoder
+
+OSS-Fuzz found situations where invalid data could crash the DELTA_BYTE_ARRAY decoder.
+
+Should fix the following issues:
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=40865
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=40902
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=40922
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=41003
+
+Closes #11710 from pitrou/ARROW-14721-parquet-fuzz
+
+Authored-by: Antoine Pitrou <antoine@python.org>
+Signed-off-by: Antoine Pitrou <antoine@python.org>
+---
+ cpp/src/arrow/util/windows_compatibility.h |  2 --
+ cpp/src/parquet/arrow/reader_internal.cc   |  3 +-
+ cpp/src/parquet/column_reader.cc           |  3 +-
+ cpp/src/parquet/encoding.cc                | 37 ++++++++++++++++------
+ cpp/src/parquet/schema.h                   |  1 +
+ cpp/src/parquet/thrift_internal.h          |  2 +-
+ cpp/src/parquet/types.h                    | 10 +-----
+ cpp/src/parquet/windows_compatibility.h    | 11 +------
+ cpp/src/parquet/windows_fixup.h            | 29 +++++++++++++++++
+ testing                                    |  2 +-
+ 10 files changed, 64 insertions(+), 36 deletions(-)
+ create mode 100644 cpp/src/parquet/windows_fixup.h
+
+diff --git a/cpp/src/arrow/util/windows_compatibility.h b/cpp/src/arrow/util/windows_compatibility.h
+index 64a2772c41c..ea0d0167569 100644
+--- a/cpp/src/arrow/util/windows_compatibility.h
++++ b/cpp/src/arrow/util/windows_compatibility.h
+@@ -15,8 +15,6 @@
+ // specific language governing permissions and limitations
+ // under the License.
+ 
+-#pragma once
+-
+ #ifdef _WIN32
+ 
+ // Windows defines min and max macros that mess up std::min/max
+diff --git a/cpp/src/parquet/arrow/reader_internal.cc b/cpp/src/parquet/arrow/reader_internal.cc
+index f13687079d4..62e6579dddc 100644
+--- a/cpp/src/parquet/arrow/reader_internal.cc
++++ b/cpp/src/parquet/arrow/reader_internal.cc
+@@ -55,8 +55,7 @@
+ #include "parquet/schema.h"
+ #include "parquet/statistics.h"
+ #include "parquet/types.h"
+-// Required after "arrow/util/int_util_internal.h" (for OPTIONAL)
+-#include "parquet/windows_compatibility.h"
++#include "parquet/windows_fixup.h"  // for OPTIONAL
+ 
+ using arrow::Array;
+ using arrow::BooleanArray;
+diff --git a/cpp/src/parquet/column_reader.cc b/cpp/src/parquet/column_reader.cc
+index c05f3564236..8d0abe122bb 100644
+--- a/cpp/src/parquet/column_reader.cc
++++ b/cpp/src/parquet/column_reader.cc
+@@ -50,8 +50,7 @@
+ #include "parquet/properties.h"
+ #include "parquet/statistics.h"
+ #include "parquet/thrift_internal.h"  // IWYU pragma: keep
+-// Required after "arrow/util/int_util_internal.h" (for OPTIONAL)
+-#include "parquet/windows_compatibility.h"
++#include "parquet/windows_fixup.h"    // for OPTIONAL
+ 
+ using arrow::MemoryPool;
+ using arrow::internal::AddWithOverflow;
+diff --git a/cpp/src/parquet/encoding.cc b/cpp/src/parquet/encoding.cc
+index 549f3566fe9..4c980dfe938 100644
+--- a/cpp/src/parquet/encoding.cc
++++ b/cpp/src/parquet/encoding.cc
+@@ -38,8 +38,10 @@
+ #include "arrow/util/byte_stream_split.h"
+ #include "arrow/util/checked_cast.h"
+ #include "arrow/util/hashing.h"
++#include "arrow/util/int_util_internal.h"
+ #include "arrow/util/logging.h"
+ #include "arrow/util/rle_encoding.h"
++#include "arrow/util/string_view.h"
+ #include "arrow/util/ubsan.h"
+ #include "arrow/visitor_inline.h"
+ #include "parquet/exception.h"
+@@ -51,7 +53,9 @@ namespace BitUtil = arrow::BitUtil;
+ 
+ using arrow::Status;
+ using arrow::VisitNullBitmapInline;
++using arrow::internal::AddWithOverflow;
+ using arrow::internal::checked_cast;
++using arrow::util::string_view;
+ 
+ template <typename T>
+ using ArrowPoolVector = std::vector<T, ::arrow::stl::allocator<T>>;
+@@ -2265,21 +2269,27 @@ class DeltaLengthByteArrayDecoder : public DecoderImpl,
+   }
+ 
+   int Decode(ByteArray* buffer, int max_values) override {
++    // Decode up to `max_values` strings into an internal buffer
++    // and reference them into `buffer`.
+     max_values = std::min(max_values, num_valid_values_);
+ 
+-    int64_t data_size = 0;
++    int32_t data_size = 0;
+     const int32_t* length_ptr =
+         reinterpret_cast<const int32_t*>(buffered_length_->data()) + length_idx_;
+     for (int i = 0; i < max_values; ++i) {
+       int32_t len = length_ptr[i];
++      if (ARROW_PREDICT_FALSE(len < 0)) {
++        throw ParquetException("negative string delta length");
++      }
+       buffer[i].len = len;
+-      data_size += len;
++      if (AddWithOverflow(data_size, len, &data_size)) {
++        throw ParquetException("excess expansion in DELTA_(LENGTH_)BYTE_ARRAY");
++      }
+     }
+     length_idx_ += max_values;
+ 
+     PARQUET_THROW_NOT_OK(buffered_data_->Resize(data_size));
+-    if (decoder_->GetBatch(8, buffered_data_->mutable_data(),
+-                           static_cast<int>(data_size)) != static_cast<int>(data_size)) {
++    if (decoder_->GetBatch(8, buffered_data_->mutable_data(), data_size) != data_size) {
+       ParquetException::EofException();
+     }
+     const uint8_t* data_ptr = buffered_data_->data();
+@@ -2393,6 +2403,8 @@ class DeltaByteArrayDecoder : public DecoderImpl,
+ 
+  private:
+   int GetInternal(ByteArray* buffer, int max_values) {
++    // Decode up to `max_values` strings into an internal buffer
++    // and reference them into `buffer`.
+     max_values = std::min(max_values, num_valid_values_);
+     suffix_decoder_.Decode(buffer, max_values);
+ 
+@@ -2401,24 +2413,31 @@ class DeltaByteArrayDecoder : public DecoderImpl,
+         reinterpret_cast<const int32_t*>(buffered_prefix_length_->data()) +
+         prefix_len_offset_;
+     for (int i = 0; i < max_values; ++i) {
+-      data_size += prefix_len_ptr[i] + buffer[i].len;
++      if (AddWithOverflow(data_size, prefix_len_ptr[i], &data_size) ||
++          AddWithOverflow(data_size, buffer[i].len, &data_size)) {
++        throw ParquetException("excess expansion in DELTA_BYTE_ARRAY");
++      }
+     }
+     PARQUET_THROW_NOT_OK(buffered_data_->Resize(data_size));
+ 
++    string_view prefix{last_value_};
+     uint8_t* data_ptr = buffered_data_->mutable_data();
+     for (int i = 0; i < max_values; ++i) {
+-      DCHECK_LE(static_cast<const size_t>(prefix_len_ptr[i]), last_value_.length());
+-      memcpy(data_ptr, last_value_.data(), prefix_len_ptr[i]);
++      if (ARROW_PREDICT_FALSE(static_cast<size_t>(prefix_len_ptr[i]) > prefix.length())) {
++        throw ParquetException("prefix length too large");
++      }
++      memcpy(data_ptr, prefix.data(), prefix_len_ptr[i]);
++      // buffer[i] currently points to the string suffix
+       memcpy(data_ptr + prefix_len_ptr[i], buffer[i].ptr, buffer[i].len);
+       buffer[i].ptr = data_ptr;
+       buffer[i].len += prefix_len_ptr[i];
+       data_ptr += buffer[i].len;
+-      last_value_ =
+-          std::string(reinterpret_cast<const char*>(buffer[i].ptr), buffer[i].len);
++      prefix = string_view{reinterpret_cast<const char*>(buffer[i].ptr), buffer[i].len};
+     }
+     prefix_len_offset_ += max_values;
+     this->num_values_ -= max_values;
+     num_valid_values_ -= max_values;
++    last_value_ = std::string{prefix};
+ 
+     if (num_valid_values_ == 0) {
+       last_value_in_previous_page_ = last_value_;
+diff --git a/cpp/src/parquet/schema.h b/cpp/src/parquet/schema.h
+index 83d0cf24f1e..9e06040226b 100644
+--- a/cpp/src/parquet/schema.h
++++ b/cpp/src/parquet/schema.h
+@@ -30,6 +30,7 @@
+ 
+ #include "parquet/platform.h"
+ #include "parquet/types.h"
++#include "parquet/windows_fixup.h"  // for OPTIONAL
+ 
+ namespace parquet {
+ 
+diff --git a/cpp/src/parquet/thrift_internal.h b/cpp/src/parquet/thrift_internal.h
+index 99bd39c6528..cebc5d4f498 100644
+--- a/cpp/src/parquet/thrift_internal.h
++++ b/cpp/src/parquet/thrift_internal.h
+@@ -17,7 +17,7 @@
+ 
+ #pragma once
+ 
+-#include "arrow/util/windows_compatibility.h"
++#include "parquet/windows_compatibility.h"
+ 
+ #include <cstdint>
+ #include <limits>
+diff --git a/cpp/src/parquet/types.h b/cpp/src/parquet/types.h
+index 505a6c5cba8..b419bf5dcf9 100644
+--- a/cpp/src/parquet/types.h
++++ b/cpp/src/parquet/types.h
+@@ -28,15 +28,7 @@
+ 
+ #include "parquet/platform.h"
+ #include "parquet/type_fwd.h"
+-
+-#ifdef _WIN32
+-
+-// Repetition::OPTIONAL conflicts with a #define, so we undefine it
+-#ifdef OPTIONAL
+-#undef OPTIONAL
+-#endif
+-
+-#endif  // _WIN32
++#include "parquet/windows_fixup.h"  // for OPTIONAL
+ 
+ namespace arrow {
+ namespace util {
+diff --git a/cpp/src/parquet/windows_compatibility.h b/cpp/src/parquet/windows_compatibility.h
+index 31ca04c8b66..fe84d8c6ce0 100644
+--- a/cpp/src/parquet/windows_compatibility.h
++++ b/cpp/src/parquet/windows_compatibility.h
+@@ -18,13 +18,4 @@
+ #pragma once
+ 
+ #include "arrow/util/windows_compatibility.h"
+-
+-#ifdef _WIN32
+-
+-// parquet.thrift's OPTIONAL RepetitionType conflicts with a #define from
+-// above, so we undefine it
+-#ifdef OPTIONAL
+-#undef OPTIONAL
+-#endif
+-
+-#endif
++#include "parquet/windows_fixup.h"
+diff --git a/cpp/src/parquet/windows_fixup.h b/cpp/src/parquet/windows_fixup.h
+new file mode 100644
+index 00000000000..ce44480c573
+--- /dev/null
++++ b/cpp/src/parquet/windows_fixup.h
+@@ -0,0 +1,29 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++// This header needs to be included multiple times.
++
++#include "arrow/util/windows_fixup.h"
++
++#ifdef _WIN32
++
++// parquet.thrift's OPTIONAL RepetitionType conflicts with a Windows #define
++#ifdef OPTIONAL
++#undef OPTIONAL
++#endif
++
++#endif  // _WIN32
+diff --git a/testing b/testing
+index 065f6f2019b..1d8525e109a 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit 065f6f2019b7523dd0f68430790073d4ede5a058
++Subproject commit 1d8525e109a12a8c67c489eba48715a199609153

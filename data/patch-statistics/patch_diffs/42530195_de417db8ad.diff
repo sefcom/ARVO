@@ -1,0 +1,271 @@
+From f112d0adcae6b75531894b3c1cb29f97bfdad171 Mon Sep 17 00:00:00 2001
+From: Alex <aleksandrosansan@gmail.com>
+Date: Wed, 22 Nov 2023 01:55:06 +0100
+Subject: [PATCH]  Fix oss-fuzz issue 61820 (#1234)
+
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=61820
+---
+ Packet++/header/DhcpLayer.h      | 20 +++++++++++++++++
+ Packet++/header/IPv4Layer.h      | 37 ++++++++++++++++++++++++++++----
+ Packet++/header/IPv6Extensions.h | 21 ++++++++++++++++++
+ Packet++/header/NflogLayer.h     | 11 ++++++++++
+ Packet++/header/TLVData.h        | 34 +++++++++++++++++++++++------
+ Packet++/header/TcpLayer.h       | 21 ++++++++++++++++++
+ Packet++/src/NflogLayer.cpp      |  2 +-
+ 7 files changed, 135 insertions(+), 11 deletions(-)
+
+diff --git a/Packet++/header/DhcpLayer.h b/Packet++/header/DhcpLayer.h
+index 331ef58ca5..82d9791294 100644
+--- a/Packet++/header/DhcpLayer.h
++++ b/Packet++/header/DhcpLayer.h
+@@ -469,6 +469,26 @@ namespace pcpp
+ 			memcpy(m_Data->recordValue + valueOffset, stringValue.data(), len);
+ 		}
+ 
++		/**
++		 * Check if a pointer can be assigned to the TLV record data
++		 * @param[in] recordRawData A pointer to the TLV record raw data
++		 * @param[in] tlvDataLen The size of the TLV record raw data
++		 * @return True if data is valid and can be assigned
++		 */
++		static bool canAssign(const uint8_t* recordRawData, size_t tlvDataLen)
++		{
++			auto data = (TLVRawData*)recordRawData;
++			if (data == nullptr)
++				return false;
++
++			if (tlvDataLen < sizeof(TLVRawData::recordType))
++				return false;
++
++			if (data->recordType == (uint8_t)DHCPOPT_END || data->recordType == (uint8_t)DHCPOPT_PAD)
++				return true;
++
++			return TLVRecord<uint8_t, uint8_t>::canAssign(recordRawData, tlvDataLen);
++		}
+ 
+ 		// implement abstract methods
+ 
+diff --git a/Packet++/header/IPv4Layer.h b/Packet++/header/IPv4Layer.h
+index 52762e3807..ee959d1b92 100644
+--- a/Packet++/header/IPv4Layer.h
++++ b/Packet++/header/IPv4Layer.h
+@@ -313,12 +313,29 @@ namespace pcpp
+ 		 */
+ 		IPv4OptionTypes getIPv4OptionType() const
+ 		{
+-			if (m_Data == nullptr)
+-				return IPV4OPT_Unknown;
+-
+-			return (IPv4OptionTypes)m_Data->recordType;
++			return getIPv4OptionType(m_Data);
+ 		}
+ 
++		/**
++		 * Check if a pointer can be assigned to the TLV record data
++		 * @param[in] recordRawData A pointer to the TLV record raw data
++		 * @param[in] tlvDataLen The size of the TLV record raw data
++		 * @return True if data is valid and can be assigned
++		 */
++		static bool canAssign(const uint8_t* recordRawData, size_t tlvDataLen)
++		{
++			auto data = (TLVRawData*)recordRawData;
++			if (data == nullptr)
++				return false;
++
++			if (tlvDataLen < sizeof(TLVRawData::recordType))
++				return false;
++
++			if (getIPv4OptionType(data) == (uint8_t)IPV4OPT_EndOfOptionsList || data->recordType == (uint8_t)IPV4OPT_NOP)
++				return true;
++
++			return TLVRecord<uint8_t, uint8_t>::canAssign(recordRawData, tlvDataLen);
++		}
+ 
+ 		// implement abstract methods
+ 
+@@ -343,6 +360,18 @@ namespace pcpp
+ 
+ 			return (size_t)m_Data->recordLen - (2*sizeof(uint8_t));
+ 		}
++
++	private:
++		/**
++		 * @return IPv4 option type casted as pcpp::IPv4OptionTypes enum
++		 */
++		static IPv4OptionTypes getIPv4OptionType(const TLVRawData* data)
++		{
++			if (data == nullptr)
++				return IPV4OPT_Unknown;
++
++			return (IPv4OptionTypes)data->recordType;
++		}
+ 	};
+ 
+ 
+diff --git a/Packet++/header/IPv6Extensions.h b/Packet++/header/IPv6Extensions.h
+index a9df47c345..6e48695c37 100644
+--- a/Packet++/header/IPv6Extensions.h
++++ b/Packet++/header/IPv6Extensions.h
+@@ -212,6 +212,27 @@ namespace pcpp
+ 			 */
+ 			~IPv6Option() { }
+ 
++			/**
++			 * Check if a pointer can be assigned to the TLV record data
++			 * @param[in] recordRawData A pointer to the TLV record raw data
++			 * @param[in] tlvDataLen The size of the TLV record raw data
++			 * @return True if data is valid and can be assigned
++			 */
++			static bool canAssign(const uint8_t* recordRawData, size_t tlvDataLen)
++			{
++				auto data = (TLVRawData*)recordRawData;
++				if (data == nullptr)
++					return false;
++
++				if (tlvDataLen < sizeof(TLVRawData::recordType))
++					return false;
++
++				if (data->recordType == Pad0OptionType)
++					return true;
++
++				return TLVRecord<uint8_t, uint8_t>::canAssign(recordRawData, tlvDataLen);
++			}
++
+ 			// implement abstract methods
+ 
+ 			size_t getTotalSize() const
+diff --git a/Packet++/header/NflogLayer.h b/Packet++/header/NflogLayer.h
+index 5df6358fa3..c93d3064d1 100644
+--- a/Packet++/header/NflogLayer.h
++++ b/Packet++/header/NflogLayer.h
+@@ -117,6 +117,17 @@ namespace pcpp
+ 			m_Data = (NflogTLVRawData*)recordRawData;
+ 		}
+ 
++		/**
++		 * Check if a pointer can be assigned to the TLV record data
++		 * @param[in] recordRawData A pointer to the TLV record raw data
++		 * @param[in] tlvDataLen The size of the TLV record raw data
++		 * * @return True if data is valid and can be assigned
++		 */
++		static bool canAssign(const uint8_t* recordRawData, size_t tlvDataLen)
++		{
++			return recordRawData != nullptr && tlvDataLen >= sizeof(NflogTLVRawData::recordLen);
++		}
++
+ 		/**
+ 		 * @return True if the TLV record raw data is nullptr, false otherwise
+ 		 */
+diff --git a/Packet++/header/TLVData.h b/Packet++/header/TLVData.h
+index f1731e4388..84072931ca 100644
+--- a/Packet++/header/TLVData.h
++++ b/Packet++/header/TLVData.h
+@@ -70,10 +70,18 @@ namespace pcpp
+ 		 */
+ 		void assign(uint8_t* recordRawData)
+ 		{
+-			if(recordRawData == NULL)
+-				m_Data = NULL;
+-			else
+-				m_Data = (TLVRawData*)recordRawData;
++			m_Data = (TLVRawData*)recordRawData;
++		}
++
++		/**
++		 * Check if a pointer can be assigned to the TLV record data
++		 * @param[in] recordRawData A pointer to the TLV record raw data
++		 * @param[in] tlvDataLen The size of the TLV record raw data
++		 * @return True if data is valid and can be assigned
++		 */
++		static bool canAssign(const uint8_t* recordRawData, size_t tlvDataLen)
++		{
++			return recordRawData != nullptr && tlvDataLen >= (sizeof(TLVRawData::recordType) + sizeof(TLVRawData::recordLen));
+ 		}
+ 
+ 		/**
+@@ -155,7 +163,14 @@ namespace pcpp
+ 		/**
+ 		 * Free the memory of the TLV record raw data
+ 		 */
+-		void purgeRecordData() { if (!isNull()) delete [] m_Data; }
++		void purgeRecordData()
++		{
++			if (!isNull())
++			{
++				delete [] m_Data;
++				m_Data = nullptr;
++			}
++		}
+ 
+ 		/**
+ 		 * A templated method to retrieve the record data as a certain type T. For example, if record data is 4B long
+@@ -259,8 +274,11 @@ namespace pcpp
+ 		 */
+ 		TLVRecordType getFirstTLVRecord(uint8_t* tlvDataBasePtr, size_t tlvDataLen) const
+ 		{
+-			TLVRecordType resRec(tlvDataBasePtr); // for NRVO optimization
++			TLVRecordType resRec(NULL); // for NRVO optimization
++			if (!TLVRecordType::canAssign(tlvDataBasePtr, tlvDataLen))
++				return resRec;
+ 
++			resRec.assign(tlvDataBasePtr);
+ 			// resRec pointer is out-bounds of the TLV records memory
+ 			if (resRec.getRecordBasePtr() + resRec.getTotalSize() > tlvDataBasePtr + tlvDataLen)
+ 				resRec.assign(NULL);
+@@ -288,7 +306,11 @@ namespace pcpp
+ 			if (record.isNull())
+ 				return resRec;
+ 
++			if (!TLVRecordType::canAssign(record.getRecordBasePtr() + record.getTotalSize(), tlvDataBasePtr - record.getRecordBasePtr() + tlvDataLen - record.getTotalSize()))
++				return resRec;
++
+ 			resRec.assign(record.getRecordBasePtr() + record.getTotalSize());
++
+ 			if (resRec.getTotalSize() == 0)
+ 				resRec.assign(NULL);
+ 
+diff --git a/Packet++/header/TcpLayer.h b/Packet++/header/TcpLayer.h
+index 21e792679f..50b89ca9bc 100644
+--- a/Packet++/header/TcpLayer.h
++++ b/Packet++/header/TcpLayer.h
+@@ -222,6 +222,27 @@ namespace pcpp
+ 			return (TcpOptionType)m_Data->recordType;
+ 		}
+ 
++		/**
++		 * Check if a pointer can be assigned to the TLV record data
++		 * @param[in] recordRawData A pointer to the TLV record raw data
++		 * @param[in] tlvDataLen The size of the TLV record raw data
++		 * @return True if data is valid and can be assigned
++		 */
++		static bool canAssign(const uint8_t* recordRawData, size_t tlvDataLen)
++		{
++			auto data = (TLVRawData*)recordRawData;
++			if (data == nullptr)
++				return false;
++
++			if (tlvDataLen < sizeof(TLVRawData::recordType))
++				return false;
++
++			if (data->recordType == (uint8_t)PCPP_TCPOPT_NOP || data->recordType == (uint8_t)PCPP_TCPOPT_EOL)
++				return true;
++
++			return TLVRecord<uint8_t, uint8_t>::canAssign(recordRawData, tlvDataLen);
++		}
++
+ 		// implement abstract methods
+ 
+ 		size_t getTotalSize() const
+diff --git a/Packet++/src/NflogLayer.cpp b/Packet++/src/NflogLayer.cpp
+index bd3fe5d8ed..c7a067bd86 100644
+--- a/Packet++/src/NflogLayer.cpp
++++ b/Packet++/src/NflogLayer.cpp
+@@ -88,7 +88,7 @@ size_t NflogLayer::getHeaderLen() const
+ 		headerLen += currentTLV.getTotalSize();
+ 		currentTLV = m_TlvReader.getNextTLVRecord(currentTLV, getTlvsBasePtr(), m_DataLen - sizeof(nflog_header));
+ 	}
+-	if (currentTLV.getType() == static_cast<uint16_t> (NflogTlvType::NFULA_PAYLOAD))
++	if (!currentTLV.isNull() && currentTLV.getType() == static_cast<uint16_t> (NflogTlvType::NFULA_PAYLOAD))
+ 	{
+ 		// for the length and type of the payload TLV
+ 		headerLen += 2 * sizeof (uint16_t);

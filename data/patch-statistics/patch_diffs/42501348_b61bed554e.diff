@@ -1,0 +1,203 @@
+From 07527e688cfa41fa9406a1271052de3cd677069a Mon Sep 17 00:00:00 2001
+From: Eric Blankenhorn <eric@wolfssl.com>
+Date: Sun, 3 Oct 2021 14:05:14 -0500
+Subject: [PATCH] Fix v5 prop handling
+
+---
+ examples/mqttexample.h | 10 +++++++
+ examples/mqttnet.h     |  5 ----
+ src/mqtt_client.c      | 10 +++++--
+ src/mqtt_packet.c      | 66 ++++++++++++++++++++++++++++--------------
+ 4 files changed, 63 insertions(+), 28 deletions(-)
+
+diff --git a/examples/mqttexample.h b/examples/mqttexample.h
+index e315d2338..2783831f9 100644
+--- a/examples/mqttexample.h
++++ b/examples/mqttexample.h
+@@ -62,6 +62,16 @@
+ 
+ 
+ /* Default Configurations */
++
++#ifndef DEFAULT_MQTT_HOST
++    /* Default MQTT host broker to use,
++     * when none is specified in the examples */
++    #define DEFAULT_MQTT_HOST   "test.mosquitto.org"
++    /* "iot.eclipse.org" */
++    /* "broker.emqx.io" */
++    /* "broker.hivemq.com" */
++#endif
++
+ #define DEFAULT_CMD_TIMEOUT_MS  30000
+ #define DEFAULT_CON_TIMEOUT_MS  5000
+ #define DEFAULT_MQTT_QOS        MQTT_QOS_0
+diff --git a/examples/mqttnet.h b/examples/mqttnet.h
+index 383370b0e..c796db196 100644
+--- a/examples/mqttnet.h
++++ b/examples/mqttnet.h
+@@ -28,11 +28,6 @@
+ 
+ #include "examples/mqttexample.h"
+ 
+-/* Default MQTT host broker to use, when none is specified in the examples */
+-#ifndef DEFAULT_MQTT_HOST
+-#define DEFAULT_MQTT_HOST       "test.mosquitto.org" /* broker.hivemq.com */
+-#endif
+-
+ /* Functions used to handle the MqttNet structure creation / destruction */
+ int MqttClientNet_Init(MqttNet* net, MQTTCtx* mqttCtx);
+ int MqttClientNet_DeInit(MqttNet* net);
+diff --git a/src/mqtt_client.c b/src/mqtt_client.c
+index 224eba9a6..1f7061e8b 100644
+--- a/src/mqtt_client.c
++++ b/src/mqtt_client.c
+@@ -362,7 +362,10 @@ static int MqttClient_DecodePacket(MqttClient* client, byte* rx_buf,
+             rc = MqttDecode_ConnectAck(rx_buf, rx_len, p_connect_ack);
+         #ifdef WOLFMQTT_V5
+             if (rc >= 0) {
+-                rc = Handle_Props(client, p_connect_ack->props);
++                int tmp = Handle_Props(client, p_connect_ack->props);
++                if (tmp != MQTT_CODE_SUCCESS) {
++                    rc = tmp;
++                }
+             }
+         #endif
+             break;
+@@ -383,7 +386,10 @@ static int MqttClient_DecodePacket(MqttClient* client, byte* rx_buf,
+             if (rc >= 0) {
+                 packet_id = p_publish->packet_id;
+             #ifdef WOLFMQTT_V5
+-                rc = Handle_Props(client, p_publish->props);
++                int tmp = Handle_Props(client, p_publish->props);
++                if (tmp != MQTT_CODE_SUCCESS) {
++                    rc = tmp;
++                }
+             #endif
+             }
+             break;
+diff --git a/src/mqtt_packet.c b/src/mqtt_packet.c
+index d34517871..bc2ede21b 100755
+--- a/src/mqtt_packet.c
++++ b/src/mqtt_packet.c
+@@ -267,8 +267,8 @@ int MqttEncode_Vbi(byte *buf, word32 x)
+ int MqttDecode_Num(byte* buf, word16 *len)
+ {
+     if (len) {
+-        *len = buf[0];
+-        *len = (*len << 8) | buf[1];
++        *len =  (word32)buf[0] << 8;
++        *len += buf[1];
+     }
+     return MQTT_DATA_LEN_SIZE;
+ }
+@@ -288,10 +288,10 @@ int MqttEncode_Num(byte *buf, word16 len)
+ int MqttDecode_Int(byte* buf, word32* len)
+ {
+     if (len) {
+-        *len = buf[0];
+-        *len = (*len <<  8) | buf[1];
+-        *len = (*len << 16) | buf[2];
+-        *len = (*len << 24) | buf[3];
++        *len =  (word32)buf[0] << 24;
++        *len += (word32)buf[1] << 16;
++        *len += (word32)buf[2] << 8;
++        *len += buf[3];
+     }
+     return MQTT_DATA_INT_SIZE;
+ }
+@@ -487,7 +487,7 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
+ 
+     *props = NULL;
+ 
+-    while (prop_len > 0)
++    while ((prop_len > 0) && (rc >= 0))
+     {
+         /* Allocate a structure and add to head. */
+         cur_prop = MqttProps_Add(props);
+@@ -508,7 +508,8 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
+         (void)packet;
+ 
+         if (cur_prop->type >= sizeof(gPropMatrix) / sizeof(gPropMatrix[0])) {
+-            return MQTT_CODE_ERROR_PROPERTY;
++            rc = MQTT_CODE_ERROR_PROPERTY;
++            break;
+         }
+ 
+         switch (gPropMatrix[cur_prop->type].data)
+@@ -542,9 +543,15 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
+                 tmp = MqttDecode_String(buf,
+                         (const char**)&cur_prop->data_str.str,
+                         &cur_prop->data_str.len);
+-                buf += tmp;
+-                rc += (int)tmp;
+-                prop_len -= tmp;
++                if (cur_prop->data_str.len <= (buf_len - (buf - pbuf))) {
++                    buf += tmp;
++                    rc += (int)tmp;
++                    prop_len -= tmp;
++                }
++                else {
++                    /* Invalid length */
++                    rc = MQTT_CODE_ERROR_PROPERTY;
++                }
+                 break;
+             }
+             case MQTT_DATA_TYPE_VAR_INT:
+@@ -568,10 +575,16 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
+                 rc += (int)tmp;
+                 prop_len -= tmp;
+ 
+-                cur_prop->data_bin.data = buf;
+-                buf += cur_prop->data_bin.len;
+-                rc += (int)cur_prop->data_bin.len;
+-                prop_len -= cur_prop->data_bin.len;
++                if (cur_prop->data_bin.len <= (buf_len - (buf - pbuf))) {
++                    cur_prop->data_bin.data = buf;
++                    buf += cur_prop->data_bin.len;
++                    rc += (int)cur_prop->data_bin.len;
++                    prop_len -= cur_prop->data_bin.len;
++                }
++                else {
++                    /* Invalid length */
++                    rc = MQTT_CODE_ERROR_PROPERTY;
++                }
+                 break;
+             }
+             case MQTT_DATA_TYPE_STRING_PAIR:
+@@ -585,12 +598,18 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
+                 rc += (int)tmp;
+                 prop_len -= tmp;
+ 
+-                tmp = MqttDecode_String(buf,
+-                        (const char**)&cur_prop->data_str2.str,
+-                        &cur_prop->data_str2.len);
+-                buf += tmp;
+-                rc += (int)tmp;
+-                prop_len -= tmp;
++                if (cur_prop->data_str.len <= (buf_len - (buf - pbuf))) {
++                    tmp = MqttDecode_String(buf,
++                            (const char**)&cur_prop->data_str2.str,
++                            &cur_prop->data_str2.len);
++                    buf += tmp;
++                    rc += (int)tmp;
++                    prop_len -= tmp;
++                }
++                else {
++                    /* Invalid length */
++                    rc = MQTT_CODE_ERROR_PROPERTY;
++                }
+                 break;
+             }
+             case MQTT_DATA_TYPE_NONE:
+@@ -602,6 +621,11 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
+         }
+     };
+ 
++    if (rc < 0) {
++        /* Free the properties */
++        MqttProps_Free(*props);
++    }
++
+     return rc;
+ }
+ #endif

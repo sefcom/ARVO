@@ -1,0 +1,72 @@
+From 1141c81c411b599e40496679129d0884715e8650 Mon Sep 17 00:00:00 2001
+From: Khaled Hosny <khaled@aliftype.com>
+Date: Sun, 13 Dec 2020 13:03:58 +0200
+Subject: [PATCH] [glyf] Guard access to maxp version 1 fields
+
+They are not initialized otherwise (ugly design, but it matches the
+current code).
+
+A better approach is to reject maxp 0 if there is glyf table and maxp 1
+if there is CFF table, but that would require some surgery since maxp is
+parsed before all other tables.
+---
+ src/glyf.cc                                       |   9 ++++++---
+ .../adb242cbc61b3ca428903e397a2c9dcf97fe3042.ttf  | Bin 0 -> 879 bytes
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+ create mode 100644 tests/fonts/fuzzing/adb242cbc61b3ca428903e397a2c9dcf97fe3042.ttf
+
+diff --git a/src/glyf.cc b/src/glyf.cc
+index d0af962a..10341c14 100644
+--- a/src/glyf.cc
++++ b/src/glyf.cc
+@@ -99,7 +99,8 @@ bool OpenTypeGLYF::ParseSimpleGlyph(Buffer &glyph,
+     num_flags = tmp_index + 1;
+   }
+ 
+-  if (num_flags > this->maxp->max_points) {
++  if (this->maxp->version_1 &&
++      num_flags > this->maxp->max_points) {
+     Warning("Number of contour points exceeds maxp maxPoints, adjusting limit.");
+     this->maxp->max_points = num_flags;
+   }
+@@ -338,7 +339,8 @@ bool OpenTypeGLYF::Parse(const uint8_t *data, size_t length) {
+             std::numeric_limits<uint16_t>::max()) {
+           return Error("Illegal composite points value "
+                        "exceeding 0xFFFF for base glyph %d.", i);
+-        } else if (component_point_count.accumulated_component_points >
++        } else if (this->maxp->version_1 &&
++                   component_point_count.accumulated_component_points >
+                    this->maxp->max_c_points) {
+           Warning("Number of composite points in glyph %d exceeds "
+                   "maxp maxCompositePoints: %d vs %d, adjusting limit.",
+@@ -415,7 +417,8 @@ bool OpenTypeGLYF::TraverseComponentsCountingPoints(
+   if (level > std::numeric_limits<uint16_t>::max()) {
+     return Error("Illegal component depth exceeding 0xFFFF in base glyph id %d.",
+                  base_glyph_id);
+-  } else if (level > this->maxp->max_c_depth) {
++  } else if (this->maxp->version_1 &&
++             level > this->maxp->max_c_depth) {
+     this->maxp->max_c_depth = level;
+     Warning("Component depth exceeds maxp maxComponentDepth "
+             "in glyph %d, adjust limit to %d.",
+diff --git a/tests/fonts/fuzzing/adb242cbc61b3ca428903e397a2c9dcf97fe3042.ttf b/tests/fonts/fuzzing/adb242cbc61b3ca428903e397a2c9dcf97fe3042.ttf
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3729894022433c1f3aef6309bea74150c2d7ad6
+GIT binary patch
+literal 879
+zcmaiyPiPZC6vn@qNw-PtAEAGc9!eGxsS>ejQP3U&rj1}kX{84b)}^LKOzf5}*org@
+zy-4-oK?GCq5Ippdi=cuB5y4AQdQ{PiUL>GLZP6OXZ?-M1CkJNc{ocIy_M0~g0iXpw
+z6fR&eJ<zrntAKn=Z|7jn@t$_R93a0TCx<T=3h~M86+p$wCr=OWKX{`fe-{u{^2k`x
+zaT}K#ZZbYZ?(cD?+!vaaA<cRCQekGi_w~CH?QfiY`J8ic<<VL*^G}eE<ms@Es(WPC
+zKs;acrbF|hNcPF$!o-+^W^|ELhKtU$yVF9H93#iBI>nq!M(6mw6uHlxnDP?ucO}Rk
+z`7i`35GvhDFr&k+$V&Zu3q~MBR##;fi$-n2?y$w4XiQ`AH?YDRJPAVvDeP8vV3;Mj
+zX&FtXkDS#9nLDGc{XcL^)i#fP8cT0K?uM<aDlN;z&3aHZpPKBf$(3bY#W__opHk_d
+zA}!#{p<ol#UK8KZun%&weq3vD`_H_5t|dOfU1pMm6$v7_#Eh|~wdU3czdT-om9nhQ
+zDkhApjI$IG|7xPlFrS>|Y^Mx%0PVj*=m9JXA?jGa`+fR>F3MQ@X>Y0HX*Z)HP)hJE
+zUNK*UjE*Lfha86Bm3nb1w4fJI#5K<KdeC!xlb~zCPZBoe1Ec~Wg|dznX54(6l^M#Y
+zNh?#Bnav*no}msrM7vQSn>6LHo>{qHk3cS2>vjHJ1$JyX{(svu<$<7K8y#pgxooEX
+YpmSSgwpkn6`L4m(xS+o+!iZbNU*YVHE&u=k
+
+literal 0
+HcmV?d00001
+

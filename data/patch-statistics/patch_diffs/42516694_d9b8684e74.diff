@@ -1,0 +1,48 @@
+From 94ab139266a2d2d39f7254644f69fb699559e8e2 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Mon, 3 Oct 2022 08:27:55 +0200
+Subject: [PATCH] BUG/MEDIUM: config: count line arguments without
+ dereferencing the output
+
+Previous commit 8a6767d26 ("BUG/MINOR: config: don't count trailing spaces
+as empty arg (v2)") was still not enough. As reported by ClusterFuzz in
+issue 52049 (https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=52049),
+there remains a case where for the sake of reporting the correct argument
+count, the function may produce virtual args that span beyond the end of
+the output buffer if that one is too short. That's what's happening with
+a config file of one empty line followed by a large number of args.
+
+This means that what args[] points to cannot be relied on and that a
+different approach is needed. Since no output is produced for spaces and
+comments, we know that args[arg] continues to point to out+outpos as long
+as only comments or spaces are found, which is what we're interested in.
+
+As such it's safe to check the last arg's pointer against the one before
+the trailing zero was emitted, in order to decide to count one final arg.
+
+No backport is needed, unless the commit above is backported.
+---
+ src/tools.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/src/tools.c b/src/tools.c
+index 3796c98b11b1f..5f44a2f0c768c 100644
+--- a/src/tools.c
++++ b/src/tools.c
+@@ -5751,11 +5751,12 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
+ 	/* end of output string */
+ 	EMIT_CHAR(0);
+ 
+-	/* don't add empty arg after trailing spaces. Note that args[arg]
+-	 * may contain some distances relative to NULL if <out> was NULL,
+-	 * so we test <out> instead of args[arg].
++	/* Don't add an empty arg after trailing spaces. Note that args[arg]
++	 * may contain some distances relative to NULL if <out> was NULL, or
++	 * pointers beyond the end of <out> in case <outlen> is too short, thus
++	 * we must not dereference it.
+ 	 */
+-	if (arg < argsmax && out && *(args[arg]))
++	if (arg < argsmax && args[arg] != out + outpos - 1)
+ 		arg++;
+ 
+ 	if (quote) {

@@ -1,0 +1,118 @@
+From bb9303899b8bd7a9251a723393959c923d0c0196 Mon Sep 17 00:00:00 2001
+From: Ilya Maximets <i.maximets@ovn.org>
+Date: Mon, 19 Oct 2020 17:14:37 +0200
+Subject: [PATCH] odp-util: Fix overflow of nested netlink attributes.
+
+Length of nested attributes must be checked before storing to the
+header.  If current length exceeds the maximum value parsing should
+fail, otherwise the length value will be truncated leading to
+corrupted netlink message and out-of-bound memory accesses:
+
+  ERROR: AddressSanitizer: heap-buffer-overflow on address 0x6310002cc838
+         at pc 0x000000575470 bp 0x7ffc6c322d60 sp 0x7ffc6c322d58
+  READ of size 1 at 0x6310002cc838 thread T0
+  SCARINESS: 12 (1-byte-read-heap-buffer-overflow)
+    #0 0x57546f in format_generic_odp_key lib/odp-util.c:2738:39
+    #1 0x559e70 in check_attr_len lib/odp-util.c:3572:13
+    #2 0x56581a in format_odp_key_attr lib/odp-util.c:4392:9
+    #3 0x5563b9 in format_odp_action lib/odp-util.c:1192:9
+    #4 0x555d75 in format_odp_actions lib/odp-util.c:1279:13
+    ...
+
+Fix that by checking the length of nested netlink attributes before
+updating 'nla_len' inside the header.  Additionally introduced
+assertion inside nl_msg_end_nested() to catch this kind of issues
+before actual overflow happened.
+
+Credit to OSS-Fuzz.
+
+Reported-at: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20003
+Fixes: 65da723b40a5 ("odp-util: Format tunnel attributes directly from netlink.")
+Acked-by: Flavio Leitner <fbl@sysclose.org>
+Signed-off-by: Ilya Maximets <i.maximets@ovn.org>
+---
+ lib/netlink.c   |  1 +
+ lib/odp-util.c  | 17 ++++++++++-------
+ tests/tunnel.at | 29 +++++++++++++++++++++++++++++
+ 3 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/lib/netlink.c b/lib/netlink.c
+index de3ebcd0e79..26ab20bb4b4 100644
+--- a/lib/netlink.c
++++ b/lib/netlink.c
+@@ -498,6 +498,7 @@ void
+ nl_msg_end_nested(struct ofpbuf *msg, size_t offset)
+ {
+     struct nlattr *attr = ofpbuf_at_assert(msg, offset, sizeof *attr);
++    ovs_assert(!nl_attr_oversized(msg->size - offset - NLA_HDRLEN));
+     attr->nla_len = msg->size - offset;
+ }
+ 
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index 0bd2f9aa8a5..252a91bfa45 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -5557,13 +5557,16 @@ gtpu_to_attr(struct ofpbuf *a, const void *data_)
+         do {                                               \
+             len = 0;
+ 
+-#define SCAN_END_NESTED()                               \
+-        SCAN_FINISH();                                  \
+-        nl_msg_end_nested(key, key_offset);             \
+-        if (mask) {                                     \
+-            nl_msg_end_nested(mask, mask_offset);       \
+-        }                                               \
+-        return s - start;                               \
++#define SCAN_END_NESTED()                                                     \
++        SCAN_FINISH();                                                        \
++        if (nl_attr_oversized(key->size - key_offset - NLA_HDRLEN)) {         \
++            return -E2BIG;                                                    \
++        }                                                                     \
++        nl_msg_end_nested(key, key_offset);                                   \
++        if (mask) {                                                           \
++            nl_msg_end_nested(mask, mask_offset);                             \
++        }                                                                     \
++        return s - start;                                                     \
+     }
+ 
+ #define SCAN_FIELD_NESTED__(NAME, TYPE, SCAN_AS, ATTR, FUNC)  \
+diff --git a/tests/tunnel.at b/tests/tunnel.at
+index e08fd1e048f..b8ae7caa9b5 100644
+--- a/tests/tunnel.at
++++ b/tests/tunnel.at
+@@ -132,6 +132,35 @@ tunnel(src=3.3.3.200/255.255.255.0,dst=1.1.1.1,ttl=64,tp_src=1,tp_dst=123),recir
+ OVS_VSWITCHD_STOP
+ AT_CLEANUP
+ 
++AT_SETUP([tunnel - too long nested attributes])
++OVS_VSWITCHD_START([add-port br0 p1 \
++    -- set Interface p1 type=gre options:remote_ip=1.1.1.1 ofport_request=1 \
++    -- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2])
++
++AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
++    br0 65534/100: (dummy-internal)
++    p1 1/1: (gre: remote_ip=1.1.1.1)
++    p2 2/2: (dummy)
++])
++
++dst_single="dst=1.1.1.1"
++dst_rep=${dst_single}
++dnl Size of one OVS_TUNNEL_KEY_ATTR_IPV4_DST is 4 bytes + NLA_HDRLEN (4 bytes).
++dnl One nested message has room for UINT16_MAX - NLA_HDRLEN (4) bytes, i.e.
++dnl (UINT16_MAX - NLA_HDRLEN) / (4 + NLA_HDRLEN) = 8191.375 of dst addresses.
++for i in `seq 1 8192` ; do
++    dst_rep="${dst_rep},${dst_single}"
++done
++
++AT_CHECK([ovs-appctl dpctl/add-flow "tunnel(${dst_rep})" "2" 2>&1 | dnl
++          sed "s/${dst_single},//g"], [], [dnl
++ovs-vswitchd: parsing flow key (syntax error at tunnel(dst=1.1.1.1)) (Argument list too long)
++ovs-appctl: ovs-vswitchd: server returned an error
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
+ AT_SETUP([tunnel - output])
+ OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=gre \
+                     options:remote_ip=1.1.1.1 options:local_ip=2.2.2.2 \

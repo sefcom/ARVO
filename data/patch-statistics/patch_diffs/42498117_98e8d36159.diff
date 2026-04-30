@@ -1,0 +1,863 @@
+From 4ee19edd46e9f166b10330cd16ad1bcb255b808c Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Fri, 18 Jun 2021 11:39:00 +0100
+Subject: [PATCH 1/7] add another C example
+
+see https://github.com/libvips/libvips/issues/1167
+---
+ ChangeLog       |   3 ++
+ configure.ac    |   4 +-
+ doc/using-C.xml | 123 +++++++++++++++++++++++++++++++++++++++++++-----
+ 3 files changed, 116 insertions(+), 14 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index d728fb9648..62f6bc6641 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,6 @@
++14/8/20 started 8.11.1
++- add more example code to C docs
++
+ 14/8/20 started 8.11
+ - add vips_jpegload_source() and vips_svgload_source() to public C API
+ - integrate doxygen in build system to generate C++ API docs
+diff --git a/configure.ac b/configure.ac
+index aa53f7ba46..b009bde1ae 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2,7 +2,7 @@
+ 
+ # also update the version number in the m4 macros below
+ 
+-AC_INIT([vips], [8.11.0], [vipsip@jiscmail.ac.uk])
++AC_INIT([vips], [8.11.1], [vipsip@jiscmail.ac.uk])
+ # required for gobject-introspection
+ AC_PREREQ(2.62)
+ 
+@@ -18,7 +18,7 @@ AC_CONFIG_MACRO_DIR([m4])
+ # user-visible library versioning
+ m4_define([vips_major_version], [8])
+ m4_define([vips_minor_version], [11])
+-m4_define([vips_micro_version], [0])
++m4_define([vips_micro_version], [1])
+ m4_define([vips_version],
+           [vips_major_version.vips_minor_version.vips_micro_version])
+ 
+diff --git a/doc/using-C.xml b/doc/using-C.xml
+index ab43f2a671..2ad7083da1 100644
+--- a/doc/using-C.xml
++++ b/doc/using-C.xml
+@@ -76,9 +76,12 @@
+     </para>
+ 
+     <para>
+-      See #VipsOperation for more detail on VIPS 
+-      reference counting conventions.
++      See #VipsOperation for more detail on VIPS
++      reference counting conventions. See the <link
++      linkend="reference-pools-ref">Reference pools</link>
++      section below for a way to automate reference counting in C.
+     </para>
++
+   </refsect3>
+ 
+   <refsect3 id="using-C-operations">
+@@ -133,21 +136,21 @@ where:
+    in           - Input image, input VipsImage
+    out          - Output image, output VipsImage
+    x            - Left edge of input in output, input gint
+-			                default: 0
+-			                min: -1000000000, max: 1000000000
++                      default: 0
++                      min: -1000000000, max: 1000000000
+    y            - Top edge of input in output, input gint
+-			                default: 0
+-			                min: -1000000000, max: 1000000000
++                      default: 0
++                      min: -1000000000, max: 1000000000
+    width        - Image width in pixels, input gint
+-			                default: 1
+-			                min: 1, max: 1000000000
++                      default: 1
++                      min: 1, max: 1000000000
+    height       - Image height in pixels, input gint
+-			                default: 1
+-			                min: 1, max: 1000000000
++                      default: 1
++                      min: 1, max: 1000000000
+ optional arguments:
+    extend       - How to generate the extra pixels, input VipsExtend
+-			                default: black
+-			                allowed: black, copy, repeat, mirror, white, background
++                      default: black
++                      allowed: black, copy, repeat, mirror, white, background
+    background   - Colour for background pixels, input VipsArrayDouble
+ operation flags: sequential-unbuffered 
+ </programlisting>
+@@ -260,6 +263,102 @@ main( int argc, char **argv )
+   return( 0 );
+ }
+ </programlisting>
++</example>
++
++  </refsect3>
++
++  <refsect3 id="reference-pools-ref">
++    <title>Reference pools</title>
++    <para>
++      libvips has a simple system to automate at least some reference counting 
++      issues. Reference pools are arrays of object pointers which will be 
++      released automatically when some other object is finalized. 
++    </para>
++
++    <para>
++      The code below crops a many-page image (perhaps a GIF or PDF). It 
++      splits the image into separate pages, crops each page, reassembles the 
++      cropped areas, and saves again. It creates a <code>context</code> 
++      object representing the state of processing, and 
++      <code>crop_animation</code> allocates two reference pools off that using 
++      <code>vips_object_local_array</code>, one to hold the cropped frames, 
++      and one to assemble and copy the result.
++    </para>
++
++    <para>
++      All unreffing is handled by <code>main</code>, and it doesn't need to 
++      know anything about <code>crop_animation</code>.
++    </para>
++
++<example>
++<title>Reference pool example</title>
++<programlisting language="C">
++#include &lt;vips/vips.h&gt;
++
++static int
++crop_animation( VipsObject *context, VipsImage *image, VipsImage **out,
++  int left, int top, int width, int height )
++{
++  int page_height = vips_image_get_page_height( image );
++  int n_pages = image-&gt;Ysize / page_height;
++  VipsImage **page = (VipsImage **) vips_object_local_array( context, n_pages );
++  VipsImage **copy = (VipsImage **) vips_object_local_array( context, 1 );
++
++  int i;
++
++  /* Split the image into cropped frames.
++   */
++  for( i = 0; i &lt; n_pages; i++ )
++    if( vips_crop( image, &amp;page[i],
++      left, page_height * i + top, width, height, NULL ) )
++      return( -1 );
++
++  /* Reassemble the frames and set the page height. You must copy before 
++   * modifying metadata.
++   */
++  if( vips_arrayjoin( page, &amp;copy[0], n_pages, "across", 1, NULL ) ||
++    vips_copy( copy[0], out, NULL ) )
++    return( -1 );
++  vips_image_set_int( *out, "page-height", height );
++
++  return( 0 );
++}
++
++int 
++main( int argc, char **argv )
++{
++  VipsImage *image;
++  VipsObject *context;
++  VipsImage *x;
++
++  if( VIPS_INIT( NULL ) ) 
++    vips_error_exit( NULL ); 
++
++  if( !(image = vips_image_new_from_file( argv[1], 
++    "access", VIPS_ACCESS_SEQUENTIAL,
++    NULL )) )
++    vips_error_exit( NULL ); 
++
++  context = VIPS_OBJECT( vips_image_new() );
++  if( crop_animation( context, image, &amp;x, 10, 10, 500, 500 ) ) {
++    g_object_unref( image );
++    g_object_unref( context );
++    vips_error_exit( NULL ); 
++  }
++  g_object_unref( image );
++  g_object_unref( context );
++  image = x;
++
++  if( vips_image_write_to_file( image, argv[2], NULL ) ) {
++    g_object_unref( image );
++    vips_error_exit( NULL ); 
++  }
++
++  g_object_unref( image );
++
++  return( 0 );
++}
++</programlisting>
+ </example>
+ 
+   </refsect3>
+
+From 78c08650d326543d881e0427c1fb4cf301d22ec8 Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 22 Jun 2021 11:48:06 +0100
+Subject: [PATCH 2/7] revise win32 support in configure
+
+update LT_INIT with new dll option
+---
+ ChangeLog    |  1 +
+ configure.ac | 73 +++++++++++++++++++---------------------------------
+ 2 files changed, 28 insertions(+), 46 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index 62f6bc6641..c916d64dde 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,5 +1,6 @@
+ 14/8/20 started 8.11.1
+ - add more example code to C docs
++- update libtool support in configure.ac 
+ 
+ 14/8/20 started 8.11
+ - add vips_jpegload_source() and vips_svgload_source() to public C API
+diff --git a/configure.ac b/configure.ac
+index b009bde1ae..2ad6b8bf9b 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2,9 +2,9 @@
+ 
+ # also update the version number in the m4 macros below
+ 
+-AC_INIT([vips], [8.11.1], [vipsip@jiscmail.ac.uk])
++AC_INIT([vips],[8.11.1],[vipsip@jiscmail.ac.uk])
+ # required for gobject-introspection
+-AC_PREREQ(2.62)
++AC_PREREQ([2.69])
+ 
+ # gobject-introspection recommends -Wno-portability
+ # foreign stops complaints about a missing README (we use README.md instead)
+@@ -117,8 +117,7 @@ AC_DEFINE_UNQUOTED(G_LOG_DOMAIN, "VIPS", [Domain for glib logging messages.])
+ 
+ m4_define([debug_default], [no])
+ AC_ARG_ENABLE(debug,
+-  AC_HELP_STRING([--enable-debug=@<:@no/minimum/yes@:>@],
+-    [turn on debugging @<:@default=debug_default()@:>@]),,
++  AS_HELP_STRING([--enable-debug=@<:@no/minimum/yes@:>@],[turn on debugging @<:@default=debug_default()@:>@]),,
+   enable_debug=debug_default())
+ 
+ if test x"$enable_debug" = x"yes"; then
+@@ -180,8 +179,8 @@ AC_DEFINE_UNQUOTED(VIPS_ICC_DIR,"$profile_dir",[default directory for ICC profil
+ # we want largefile support, if possible
+ AC_SYS_LARGEFILE
+ 
+-# we use libtool
+-LT_INIT
++# we use libtool and can generate DLLs cleanly on win32 if necessary
++LT_INIT([win32-dll])
+ 
+ # Checks for programs.
+ AC_PROG_AWK
+@@ -285,21 +284,6 @@ AC_HEADER_DIRENT
+ AC_HEADER_STDC
+ AC_CHECK_HEADERS([errno.h math.h fcntl.h limits.h stdlib.h string.h sys/file.h sys/ioctl.h sys/param.h sys/time.h sys/mman.h sys/types.h sys/stat.h unistd.h io.h direct.h windows.h])
+ 
+-# uncomment to change which libs we build
+-# AC_DISABLE_SHARED
+-# AC_DISABLE_STATIC
+-AC_LIBTOOL_WIN32_DLL
+-AC_CHECK_TOOL(DLLWRAP, dllwrap)
+-AC_CHECK_TOOL(DLLTOOL, dlltool)
+-AC_CHECK_TOOL(OBJDUMP, objdump)
+-AC_CHECK_TOOL(RANLIB, ranlib)
+-AC_CHECK_TOOL(STRIP, strip)
+-AC_CHECK_TOOL(AR, ar)
+-AC_CHECK_TOOL(AS, as)
+-AC_CHECK_TOOL(LD, ld)
+-AC_PROVIDE([AC_LIBTOOL_WIN32_DLL])
+-AC_PROG_LIBTOOL
+-
+ # Checks for typedefs, structures, and compiler characteristics.
+ AC_C_RESTRICT
+ AX_GCC_VAR_ATTRIBUTE(vector_size)
+@@ -322,14 +306,14 @@ fi
+ if test x"$ax_cv_have_var_attribute_vector_size" = x"yes"; then
+   AC_MSG_CHECKING([for C++ vector shuffle])
+   AC_LANG_PUSH([C++])
+-  AC_TRY_COMPILE([
++  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+     typedef float v4f __attribute__((vector_size(4 * sizeof(float)),aligned(16)));
+-  ],[
++  ]], [[
+     v4f f; f[3] = 99;
+-  ],[
++  ]])],[
+     AC_MSG_RESULT([yes])
+     have_vector_shuffle=yes
+-  ], [
++  ],[
+     AC_MSG_RESULT([no])
+     have_vector_shuffle=no
+   ])
+@@ -345,15 +329,15 @@ fi
+ if test x"$have_vector_shuffle" = x"yes"; then
+   AC_MSG_CHECKING([for C++ vector arithmetic])
+   AC_LANG_PUSH([C++])
+-  AC_TRY_COMPILE([
++  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+     typedef float v4f __attribute__((vector_size(4 * sizeof(float)),aligned(16)));
+-  ],[
++  ]], [[
+     v4f f = {1, 2, 3, 4}; f *= 12.0; 
+     v4f g = {5, 6, 7, 8}; f = g > 0 ? g : -1 * g;
+-  ],[
++  ]])],[
+     AC_MSG_RESULT([yes])
+     have_vector_arith=yes
+-  ], [
++  ],[
+     AC_MSG_RESULT([no])
+     have_vector_arith=no
+   ])
+@@ -365,7 +349,7 @@ fi
+ if test x"$have_vector_arith" = x"yes"; then
+   AC_MSG_CHECKING([for C++ signed constants in vector templates])
+   AC_LANG_PUSH([C++])
+-  AC_TRY_COMPILE([
++  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+     typedef float v4f __attribute__((vector_size(4 * sizeof(float)),aligned(16)));
+     template <typename T>
+     static void
+@@ -374,10 +358,10 @@ if test x"$have_vector_arith" = x"yes"; then
+         v4f f;
+         f = -1 * B;
+     }
+-  ],[
+-  ],[
++  ]], [[
++  ]])],[
+     AC_MSG_RESULT([yes])
+-  ], [
++  ],[
+     AC_MSG_RESULT([no])
+     have_vector_arith=no
+   ])
+@@ -1429,32 +1413,29 @@ fi
+ VIPS_CFLAGS="$VIPS_CFLAGS $VIPS_DEBUG_FLAGS $REQUIRED_CFLAGS"
+ VIPS_LIBS="$VIPS_LIBS $REQUIRED_LIBS -lm"
+ 
+-# autoconf hates multi-line AC_SUBST so we have to have another copy of this
+-# thing
++# build options relevant at runtime ... this becomes `vips --vips-config`
++# output
+ VIPS_CONFIG="\
+ enable debug: $enable_debug, \
+ enable deprecated library components: $enable_deprecated, \
+ enable modules: $gmodule_supported_flag, \
+-enable docs with gtkdoc: $enable_gtk_doc, \
+-gobject introspection:  $found_introspection, \
+-RAD load/save: $with_radiance, \
+-Analyze7 load/save: $with_analyze, \
+-PPM load/save: $with_ppm, \
+-GIF load:  $with_nsgif, \
+-generate C++ docs: $with_doxygen, \
+ use fftw3 for FFT: $with_fftw, \
+ accelerate loops with orc: $with_orc, \
+ ICC profile support with lcms: $with_lcms, \
+ zlib: $with_zlib, \
+ text rendering with pangocairo: $with_pangocairo, \
+ font file support with fontconfig: $with_fontconfig, \
++RAD load/save: $with_radiance, \
++Analyze7 load/save: $with_analyze, \
++PPM load/save: $with_ppm, \
++GIF load:  $with_nsgif, \
+ EXIF metadata support with libexif: $with_libexif, \
+ JPEG load/save with libjpeg: $with_jpeg, \
+ JXL load/save with libjxl: $with_libjxl (dynamic module: $with_libjxl_module), \
+ JPEG2000 load/save with libopenjp2: $with_libopenjp2, \
+ PNG load with libspng: $with_libspng, \
+ PNG load/save with libpng: $with_png, \
+-8bpp PNG quantisation: $with_imagequant, \
++PNG quantisation to 8 bit: $with_imagequant, \
+ TIFF load/save with libtiff: $with_tiff, \
+ image pyramid save: $with_gsf, \
+ HEIC/AVIF load/save with libheif: $with_heif (dynamic module: $with_heif_module), \
+@@ -1463,7 +1444,7 @@ PDF load with PDFium:  $with_pdfium, \
+ PDF load with poppler-glib: $with_poppler (dynamic module: $with_poppler_module), \
+ SVG load with librsvg-2.0: $with_rsvg, \
+ EXR load with OpenEXR: $with_OpenEXR, \
+-slide load with OpenSlide: $with_openslide (dynamic module: $with_openslide_module), \
++OpenSlide load: $with_openslide (dynamic module: $with_openslide_module), \
+ Matlab load with matio: $with_matio, \
+ NIfTI load/save with niftiio: $with_nifti, \
+ FITS load/save with cfitsio: $with_cfitsio, \
+@@ -1568,7 +1549,7 @@ PNG load with libspng:                  $with_libspng
+  (requires libspng-0.6 or later)
+ PNG load/save with libpng:              $with_png
+  (requires libpng-1.2.9 or later)
+-8bpp PNG quantisation:                  $with_imagequant
++PNG quantisation to 8 bit:              $with_imagequant
+  (requires libimagequant)
+ TIFF load/save with libtiff:            $with_tiff
+ image pyramid save:                     $with_gsf
+@@ -1582,7 +1563,7 @@ PDF load with poppler-glib:             $with_poppler (dynamic module: $with_pop
+ SVG load with librsvg-2.0:              $with_rsvg
+  (requires librsvg-2.0 2.34.0 or later)
+ EXR load with OpenEXR:                  $with_OpenEXR
+-slide load with OpenSlide:              $with_openslide (dynamic module: $with_openslide_module)
++OpenSlide support:                      $with_openslide (dynamic module: $with_openslide_module)
+  (requires openslide-3.3.0 or later)
+ Matlab load with matio:                 $with_matio
+ NIfTI load/save with niftiio:           $with_nifti
+
+From 5f28f67d4c9ac549481eba7d265fe7612986f0f2 Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 22 Jun 2021 14:15:05 +0100
+Subject: [PATCH 3/7] fix build with jp2k debug enabled
+
+---
+ libvips/foreign/jp2ksave.c | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/libvips/foreign/jp2ksave.c b/libvips/foreign/jp2ksave.c
+index ac6b83c344..62420b1b64 100644
+--- a/libvips/foreign/jp2ksave.c
++++ b/libvips/foreign/jp2ksave.c
+@@ -182,17 +182,15 @@ static void
+ vips_foreign_save_jp2k_warning_callback( const char *msg, void *client )
+ {
+ #ifdef DEBUG
+-	g_warning( "jp2ksave: %s",  class->nickname, msg );
++	g_warning( "jp2ksave: %s", msg );
+ #endif /*DEBUG*/
+ }
+ 
+-/* The openjpeg info and warning callbacks are incredibly chatty.
+- */
+ static void 
+ vips_foreign_save_jp2k_info_callback( const char *msg, void *client )
+ {
+ #ifdef DEBUG
+-	g_info( "jp2ksave: %s",  class->nickname, msg );
++	g_info( "jp2ksave: %s", msg );
+ #endif /*DEBUG*/
+ }
+ 
+
+From b9034bf7314429fe687a584961a751fb4fa5d71e Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 22 Jun 2021 15:28:21 +0100
+Subject: [PATCH 4/7] more startup debug output
+
+if VIPS_INFO is set
+---
+ ChangeLog              |  2 ++
+ libvips/iofuncs/init.c | 59 +++++++++++-------------------------------
+ tools/vips.c           |  8 ++++++
+ tools/vipsedit.c       |  8 ++++++
+ tools/vipsheader.c     |  8 ++++++
+ tools/vipsthumbnail.c  | 10 ++++---
+ 6 files changed, 48 insertions(+), 47 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index c916d64dde..2a36e816d0 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,6 +1,8 @@
+ 14/8/20 started 8.11.1
+ - add more example code to C docs
+ - update libtool support in configure.ac 
++- more startup info if VIPS_INFO is set
++- command-line programs set glib prgname (no longer set for you by VIPS_INIT)
+ 
+ 14/8/20 started 8.11
+ - add vips_jpegload_source() and vips_svgload_source() to public C API
+diff --git a/libvips/iofuncs/init.c b/libvips/iofuncs/init.c
+index 74f9cdd93c..6b9ddc4aff 100644
+--- a/libvips/iofuncs/init.c
++++ b/libvips/iofuncs/init.c
+@@ -274,9 +274,7 @@ vips_load_plugins( const char *fmt, ... )
+         (void) vips_vsnprintf( dir_name, VIPS_PATH_MAX - 1, fmt, ap );
+         va_end( ap );
+ 
+-#ifdef DEBUG
+-	printf( "vips_load_plugins: searching \"%s\"\n", dir_name );
+-#endif /*DEBUG*/
++	g_info( "searching \"%s\"", dir_name );
+ 
+         if( !(dir = g_dir_open( dir_name, 0, NULL )) ) 
+ 		/* Silent success for dir not there.
+@@ -296,9 +294,7 @@ vips_load_plugins( const char *fmt, ... )
+ 			vips_snprintf( path, VIPS_PATH_MAX - 1, 
+ 				"%s" G_DIR_SEPARATOR_S "%s", dir_name, name );
+ 
+-#ifdef DEBUG
+-			printf( "vips_load_plugins: loading \"%s\"\n", path );
+-#endif /*DEBUG*/
++			g_info( "loading \"%s\"", path );
+ 
+ 			module = g_module_open( path, G_MODULE_BIND_LAZY );
+ 			if( !module ) {
+@@ -952,10 +948,7 @@ extract_prefix( const char *dir, const char *name )
+ 	char vname[VIPS_PATH_MAX];
+ 	int i;
+ 
+-#ifdef DEBUG
+-	printf( "extract_prefix: trying for dir = \"%s\", name = \"%s\"\n", 
+-		dir, name );
+-#endif /*DEBUG*/
++	g_info( "trying for dir = \"%s\", name = \"%s\"", dir, name );
+ 
+ 	/* Is dir relative? Prefix with cwd.
+ 	 */
+@@ -991,9 +984,7 @@ extract_prefix( const char *dir, const char *name )
+ 	if( vips_ispostfix( vname, G_DIR_SEPARATOR_S ) )
+ 		vname[strlen( vname ) - 1] = '\0';
+ 
+-#ifdef DEBUG
+-	printf( "extract_prefix: canonicalised path = \"%s\"\n", vname );
+-#endif /*DEBUG*/
++	g_info( "canonicalised path = \"%s\"", vname );
+ 
+ 	/* Ought to be a "/bin" at the end now.
+ 	 */
+@@ -1001,9 +992,7 @@ extract_prefix( const char *dir, const char *name )
+ 		return( NULL );
+ 	vname[strlen( vname ) - strlen( G_DIR_SEPARATOR_S "bin" )] = '\0';
+ 
+-#ifdef DEBUG
+-	printf( "extract_prefix: found \"%s\"\n", vname );
+-#endif /*DEBUG*/
++	g_info( "found \"%s\"", vname );
+ 
+ 	return( vips_strdup( NULL, vname ) );
+ }
+@@ -1025,10 +1014,8 @@ scan_path( char *path, const char *name )
+ 		vips_snprintf( str, VIPS_PATH_MAX, 
+ 			"%s" G_DIR_SEPARATOR_S "%s", p, name );
+ 
+-#ifdef DEBUG
+-		printf( "scan_path: looking in \"%s\" for \"%s\"\n", 
++		g_info( "looking in \"%s\" for \"%s\"", 
+ 			p, name );
+-#endif /*DEBUG*/
+ 
+ 		if( vips_existsf( "%s", str ) && 
+ 			(prefix = extract_prefix( str, name )) ) {
+@@ -1051,9 +1038,7 @@ find_file( const char *name )
+ 	if( !path )
+ 		return( NULL );
+ 
+-#ifdef DEBUG
+-	printf( "vips_guess_prefix: g_getenv( \"PATH\" ) == \"%s\"\n", path );
+-#endif /*DEBUG*/
++	g_info( "g_getenv( \"PATH\" ) == \"%s\"", path );
+ 
+ #ifdef G_OS_WIN32
+ {
+@@ -1090,10 +1075,7 @@ guess_prefix( const char *argv0, const char *name )
+ 			/* Must point to our executable.
+ 			 */
+ 			if( (prefix = extract_prefix( argv0, name )) ) {
+-#ifdef DEBUG
+-				printf( "vips_guess_prefix: found \"%s\" from "
+-					"argv0\n", prefix );
+-#endif /*DEBUG*/
++				g_info( "found \"%s\" from argv0", prefix );
+ 				return( prefix );
+ 			} 
+ 		}
+@@ -1101,10 +1083,7 @@ guess_prefix( const char *argv0, const char *name )
+ 		/* Look along path for name.
+ 		 */
+ 		if( (prefix = find_file( name )) ) {
+-#ifdef DEBUG
+-			printf( "vips_guess_prefix: found \"%s\" from "
+-				"PATH\n", prefix );
+-#endif /*DEBUG*/
++			g_info( "found \"%s\" from PATH", prefix );
+ 			return( prefix );
+ 		}
+         }
+@@ -1127,10 +1106,7 @@ guess_prefix( const char *argv0, const char *name )
+ 			g_free( resolved );
+ 
+ 			if( prefix ) { 
+-#ifdef DEBUG
+-				printf( "vips_guess_prefix: found \"%s\" "
+-					"from cwd\n", prefix );
+-#endif /*DEBUG*/
++				g_info( "found \"%s\" from cwd", prefix );
+ 				return( prefix );
+ 			}
+ 		}
+@@ -1168,10 +1144,7 @@ vips_guess_prefix( const char *argv0, const char *env_name )
+ 	/* Already set?
+ 	 */
+         if( (prefix = g_getenv( env_name )) ) {
+-#ifdef DEBUG
+-		printf( "vips_guess_prefix: found \"%s\" in environment\n", 
+-			prefix );
+-#endif /*DEBUG*/
++		g_info( "found \"%s\" in environment", prefix );
+                 return( prefix );
+ 	}
+ 
+@@ -1229,12 +1202,10 @@ vips_guess_libdir( const char *argv0, const char *env_name )
+ 	else
+ 		libdir = g_strdup_printf( "%s/lib", prefix );
+ 
+-#ifdef DEBUG
+-	printf( "vips_guess_libdir: VIPS_PREFIX = %s\n", VIPS_PREFIX );
+-	printf( "vips_guess_libdir: VIPS_LIBDIR = %s\n", VIPS_LIBDIR );
+-	printf( "vips_guess_libdir: prefix = %s\n", prefix );
+-	printf( "vips_guess_libdir: libdir = %s\n", libdir );
+-#endif /*DEBUG*/
++	g_info( "VIPS_PREFIX = %s", VIPS_PREFIX );
++	g_info( "VIPS_LIBDIR = %s", VIPS_LIBDIR );
++	g_info( "prefix = %s", prefix );
++	g_info( "libdir = %s", libdir );
+ 
+ 	return( libdir );
+ }
+diff --git a/tools/vips.c b/tools/vips.c
+index 3555235293..a88530e91e 100644
+--- a/tools/vips.c
++++ b/tools/vips.c
+@@ -528,6 +528,14 @@ main( int argc, char **argv )
+ 	textdomain( GETTEXT_PACKAGE );
+ 	setlocale( LC_ALL, "" );
+ 
++{
++	char *basename;
++
++	basename = g_path_get_basename( argv[0] );
++	g_set_prgname( basename );
++	g_free( basename );
++}
++
+ 	/* On Windows, argv is ascii-only .. use this to get a utf-8 version of
+ 	 * the args.
+ 	 */
+diff --git a/tools/vipsedit.c b/tools/vipsedit.c
+index 218e8dd758..5bffc9dec3 100644
+--- a/tools/vipsedit.c
++++ b/tools/vipsedit.c
+@@ -138,6 +138,14 @@ main( int argc, char **argv )
+ 	textdomain( GETTEXT_PACKAGE );
+ 	setlocale( LC_ALL, "" );
+ 
++{
++	char *basename;
++
++	basename = g_path_get_basename( argv[0] );
++	g_set_prgname( basename );
++	g_free( basename );
++}
++
+ 	/* On Windows, argv is ascii-only .. use this to get a utf-8 version of
+ 	 * the args.
+ 	 */
+diff --git a/tools/vipsheader.c b/tools/vipsheader.c
+index e634ccef99..47617cb7a8 100644
+--- a/tools/vipsheader.c
++++ b/tools/vipsheader.c
+@@ -177,6 +177,14 @@ main( int argc, char *argv[] )
+ 	textdomain( GETTEXT_PACKAGE );
+ 	setlocale( LC_ALL, "" );
+ 
++{
++	char *basename;
++
++	basename = g_path_get_basename( argv[0] );
++	g_set_prgname( basename );
++	g_free( basename );
++}
++
+ 	/* On Windows, argv is ascii-only .. use this to get a utf-8 version of
+ 	 * the args.
+ 	 */
+diff --git a/tools/vipsthumbnail.c b/tools/vipsthumbnail.c
+index ef23fc5a84..abbb6c6f6c 100644
+--- a/tools/vipsthumbnail.c
++++ b/tools/vipsthumbnail.c
+@@ -493,9 +493,13 @@ main( int argc, char **argv )
+ 	textdomain( GETTEXT_PACKAGE );
+ 	setlocale( LC_ALL, "" );
+ 
+-	/* The operation cache is not useful for processing many files.
+-	vips_cache_set_max( 0 );
+-	 */
++{
++	char *basename;
++
++	basename = g_path_get_basename( argv[0] );
++	g_set_prgname( basename );
++	g_free( basename );
++}
+ 
+ 	/* On Windows, argv is ascii-only .. use this to get a utf-8 version of
+ 	 * the args.
+
+From 1cd4b848e7941d5301917dc6b83b46b63b999ab7 Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 22 Jun 2021 15:38:54 +0100
+Subject: [PATCH 5/7] enable info output earlier
+
+---
+ libvips/iofuncs/init.c | 36 ++++++++++++++++++------------------
+ 1 file changed, 18 insertions(+), 18 deletions(-)
+
+diff --git a/libvips/iofuncs/init.c b/libvips/iofuncs/init.c
+index 6b9ddc4aff..494cfe128d 100644
+--- a/libvips/iofuncs/init.c
++++ b/libvips/iofuncs/init.c
+@@ -415,6 +415,24 @@ vips_init( const char *argv0 )
+ 		return( 0 );
+ 	started = TRUE;
+ 
++	if( g_getenv( "VIPS_INFO" )
++#if ENABLE_DEPRECATED
++		|| g_getenv( "IM_INFO" )
++#endif
++	)
++		vips_verbose();
++	if( g_getenv( "VIPS_PROFILE" ) )
++		vips_profile_set( TRUE );
++	if( g_getenv( "VIPS_LEAK" ) )
++		vips_leak_set( TRUE );
++	if( g_getenv( "VIPS_TRACE" ) )
++		vips_cache_set_trace( TRUE );
++	if( g_getenv( "VIPS_PIPE_READ_LIMIT" ) ) 
++		vips_pipe_read_limit = 
++			g_ascii_strtoll( g_getenv( "VIPS_PIPE_READ_LIMIT" ),
++				NULL, 10 );
++	vips_pipe_read_limit_set( vips_pipe_read_limit );
++
+ #ifdef G_OS_WIN32
+ 	/* Windows has a limit of 512 files open at once for the fopen() family
+ 	 * of functions, and 2048 for the _open() family. This raises the limit
+@@ -468,24 +486,6 @@ vips_init( const char *argv0 )
+ 	g_free( locale );
+ 	bind_textdomain_codeset( GETTEXT_PACKAGE, "UTF-8" );
+ 
+-	if( g_getenv( "VIPS_INFO" )
+-#if ENABLE_DEPRECATED
+-		|| g_getenv( "IM_INFO" )
+-#endif
+-	)
+-		vips_verbose();
+-	if( g_getenv( "VIPS_PROFILE" ) )
+-		vips_profile_set( TRUE );
+-	if( g_getenv( "VIPS_LEAK" ) )
+-		vips_leak_set( TRUE );
+-	if( g_getenv( "VIPS_TRACE" ) )
+-		vips_cache_set_trace( TRUE );
+-	if( g_getenv( "VIPS_PIPE_READ_LIMIT" ) ) 
+-		vips_pipe_read_limit = 
+-			g_ascii_strtoll( g_getenv( "VIPS_PIPE_READ_LIMIT" ),
+-				NULL, 10 );
+-	vips_pipe_read_limit_set( vips_pipe_read_limit );
+-
+ 	/* Register base vips types.
+ 	 */
+ 	(void) vips_image_get_type();
+
+From eeb64b6968ae60dabee5a0d28648f12d089b4810 Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 22 Jun 2021 18:09:57 +0100
+Subject: [PATCH 6/7] change init prefix fallback order
+
+Use the configure time prefix second rather than going straight to
+search. This should help ruby-vips on homebrew.
+---
+ libvips/iofuncs/init.c | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/libvips/iofuncs/init.c b/libvips/iofuncs/init.c
+index 494cfe128d..96b35e8248 100644
+--- a/libvips/iofuncs/init.c
++++ b/libvips/iofuncs/init.c
+@@ -479,6 +479,11 @@ vips_init( const char *argv0 )
+ 		!(libdir = vips_guess_libdir( argv0, "VIPSHOME" )) ) 
+ 		return( -1 );
+ 
++	g_info( "VIPS_PREFIX = %s", VIPS_PREFIX );
++	g_info( "VIPS_LIBDIR = %s", VIPS_LIBDIR );
++	g_info( "prefix = %s", prefix );
++	g_info( "libdir = %s", libdir );
++
+ 	/* Get i18n .mo files from $VIPSHOME/share/locale/.
+ 	 */
+ 	locale = g_build_filename( prefix, "share", "locale", NULL );
+@@ -1068,6 +1073,15 @@ guess_prefix( const char *argv0, const char *name )
+ {
+ 	char *prefix;
+ 
++	/* We've already checked for VIPSHOME. If the configure-time
++	 * library prefix looks OK, use the configure-time prefix.
++	 */
++	if( vips_existsf( "%s/vips-modules-%d.%d", 
++		VIPS_LIBDIR, VIPS_MAJOR_VERSION, VIPS_MINOR_VERSION ) ) {
++		g_info( "using configure-time prefix" );
++		return( VIPS_PREFIX );
++	}
++
+ 	/* Try to guess from argv0.
+ 	 */
+ 	if( argv0 ) {
+@@ -1202,11 +1216,6 @@ vips_guess_libdir( const char *argv0, const char *env_name )
+ 	else
+ 		libdir = g_strdup_printf( "%s/lib", prefix );
+ 
+-	g_info( "VIPS_PREFIX = %s", VIPS_PREFIX );
+-	g_info( "VIPS_LIBDIR = %s", VIPS_LIBDIR );
+-	g_info( "prefix = %s", prefix );
+-	g_info( "libdir = %s", libdir );
+-
+ 	return( libdir );
+ }
+ 
+
+From 40a04fdbc1e77ef194de0ca9269603d76fd07459 Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 22 Jun 2021 18:39:41 +0100
+Subject: [PATCH 7/7] improve startup info
+
+---
+ libvips/iofuncs/init.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/libvips/iofuncs/init.c b/libvips/iofuncs/init.c
+index 96b35e8248..fe39f9a0f8 100644
+--- a/libvips/iofuncs/init.c
++++ b/libvips/iofuncs/init.c
+@@ -475,6 +475,8 @@ vips_init( const char *argv0 )
+ 
+ 	/* Try to discover our prefix. 
+ 	 */
++        if( (prefix = g_getenv( "VIPSHOME" )) )
++		g_info( "VIPSHOME = %s", prefix );
+ 	if( !(prefix = vips_guess_prefix( argv0, "VIPSHOME" )) || 
+ 		!(libdir = vips_guess_libdir( argv0, "VIPSHOME" )) ) 
+ 		return( -1 );
+@@ -1078,6 +1080,8 @@ guess_prefix( const char *argv0, const char *name )
+ 	 */
+ 	if( vips_existsf( "%s/vips-modules-%d.%d", 
+ 		VIPS_LIBDIR, VIPS_MAJOR_VERSION, VIPS_MINOR_VERSION ) ) {
++		g_info( "found %s/vips-modules-%d.%d", 
++			VIPS_LIBDIR, VIPS_MAJOR_VERSION, VIPS_MINOR_VERSION );
+ 		g_info( "using configure-time prefix" );
+ 		return( VIPS_PREFIX );
+ 	}
+@@ -1157,10 +1161,8 @@ vips_guess_prefix( const char *argv0, const char *env_name )
+ 
+ 	/* Already set?
+ 	 */
+-        if( (prefix = g_getenv( env_name )) ) {
+-		g_info( "found \"%s\" in environment", prefix );
++        if( (prefix = g_getenv( env_name )) 
+                 return( prefix );
+-	}
+ 
+ #ifdef G_OS_WIN32
+ 	prefix = vips__windows_prefix();

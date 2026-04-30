@@ -1,0 +1,1289 @@
+From 090964cd1b15c247c45d41f54dc249acc047137d Mon Sep 17 00:00:00 2001
+From: hathach <thach@tinyusb.org>
+Date: Fri, 22 Nov 2024 12:25:37 +0700
+Subject: [PATCH] apply TUD_EPBUF_DEF for device: bth, dfu, hid, msc
+
+---
+ src/class/bth/bth_device.c |  34 ++---
+ src/class/cdc/cdc_device.c | 128 ++++++++++-------
+ src/class/dfu/dfu_device.c | 280 +++++++++++++++----------------------
+ src/class/hid/hid_device.c |  77 +++++-----
+ src/class/msc/msc_device.c |  38 ++---
+ src/common/tusb_types.h    |  10 +-
+ 6 files changed, 266 insertions(+), 301 deletions(-)
+
+diff --git a/src/class/bth/bth_device.c b/src/class/bth/bth_device.c
+index ea577db037..5e533cf354 100755
+--- a/src/class/bth/bth_device.c
++++ b/src/class/bth/bth_device.c
+@@ -37,8 +37,7 @@
+ //--------------------------------------------------------------------+
+ // MACRO CONSTANT TYPEDEF
+ //--------------------------------------------------------------------+
+-typedef struct
+-{
++typedef struct {
+   uint8_t itf_num;
+   uint8_t ep_ev;
+   uint8_t ep_acl_in;
+@@ -49,23 +48,18 @@ typedef struct
+ 
+   // Previous amount of bytes sent when issuing ZLP
+   uint32_t prev_xferred_bytes;
+-
+-  // Endpoint Transfer buffer
+-  union {
+-    CFG_TUD_MEM_ALIGN bt_hci_cmd_t hci_cmd;
+-    TUD_DCACHE_PADDING;
+-  };
+-  union {
+-    CFG_TUD_MEM_ALIGN uint8_t epout_buf[CFG_TUD_BTH_DATA_EPSIZE];
+-    TUD_DCACHE_PADDING;
+-  };
+-
+ } btd_interface_t;
+ 
++typedef struct {
++  TUD_EPBUF_DEF(epout_buf, CFG_TUD_BTH_DATA_EPSIZE);
++  TUD_EPBUF_TYPE_DEF(hci_cmd, bt_hci_cmd_t);
++} btd_epbuf_t;
++
+ //--------------------------------------------------------------------+
+ // INTERNAL OBJECT & FUNCTION DECLARATION
+ //--------------------------------------------------------------------+
+-CFG_TUD_MEM_SECTION btd_interface_t _btd_itf;
++static btd_interface_t _btd_itf;
++CFG_TUD_MEM_SECTION static btd_epbuf_t _btd_epbuf;
+ 
+ static bool bt_tx_data(uint8_t ep, void *data, uint16_t len)
+ {
+@@ -158,7 +152,7 @@ uint16_t btd_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_
+   itf_desc = (tusb_desc_interface_t const *)tu_desc_next(tu_desc_next(desc_ep));
+ 
+   // Prepare for incoming data from host
+-  TU_ASSERT(usbd_edpt_xfer(rhport, _btd_itf.ep_acl_out, _btd_itf.epout_buf, CFG_TUD_BTH_DATA_EPSIZE), 0);
++  TU_ASSERT(usbd_edpt_xfer(rhport, _btd_itf.ep_acl_out, _btd_epbuf.epout_buf, CFG_TUD_BTH_DATA_EPSIZE), 0);
+ 
+   drv_len = hci_itf_size;
+ 
+@@ -249,14 +243,16 @@ bool btd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t c
+     }
+     else return false;
+ 
+-    return tud_control_xfer(rhport, request, &_btd_itf.hci_cmd, sizeof(_btd_itf.hci_cmd));
++    return tud_control_xfer(rhport, request, &_btd_epbuf.hci_cmd, sizeof(bt_hci_cmd_t));
+   }
+   else if ( stage == CONTROL_STAGE_DATA )
+   {
+     // Handle class request only
+     TU_VERIFY(request->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS);
+ 
+-    if (tud_bt_hci_cmd_cb) tud_bt_hci_cmd_cb(&_btd_itf.hci_cmd, tu_min16(request->wLength, sizeof(_btd_itf.hci_cmd)));
++    if (tud_bt_hci_cmd_cb) {
++      tud_bt_hci_cmd_cb(&_btd_epbuf.hci_cmd, tu_min16(request->wLength, sizeof(bt_hci_cmd_t)));
++      }
+   }
+ 
+   return true;
+@@ -267,10 +263,10 @@ bool btd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
+   // received new data from host
+   if (ep_addr == _btd_itf.ep_acl_out)
+   {
+-    if (tud_bt_acl_data_received_cb) tud_bt_acl_data_received_cb(_btd_itf.epout_buf, xferred_bytes);
++    if (tud_bt_acl_data_received_cb) tud_bt_acl_data_received_cb(_btd_epbuf.epout_buf, xferred_bytes);
+ 
+     // prepare for next data
+-    TU_ASSERT(usbd_edpt_xfer(rhport, _btd_itf.ep_acl_out, _btd_itf.epout_buf, CFG_TUD_BTH_DATA_EPSIZE));
++    TU_ASSERT(usbd_edpt_xfer(rhport, _btd_itf.ep_acl_out, _btd_epbuf.epout_buf, CFG_TUD_BTH_DATA_EPSIZE));
+   }
+   else if (ep_addr == _btd_itf.ep_ev)
+   {
+diff --git a/src/class/cdc/cdc_device.c b/src/class/cdc/cdc_device.c
+index 3e856383ef..efb6722018 100644
+--- a/src/class/cdc/cdc_device.c
++++ b/src/class/cdc/cdc_device.c
+@@ -67,28 +67,27 @@ typedef struct {
+ 
+   OSAL_MUTEX_DEF(rx_ff_mutex);
+   OSAL_MUTEX_DEF(tx_ff_mutex);
+-
+-  // Endpoint Transfer buffer
+-  union {
+-    CFG_TUD_MEM_ALIGN uint8_t epout_buf[CFG_TUD_CDC_EP_BUFSIZE];
+-    TUD_DCACHE_PADDING;
+-  };
+-  union {
+-    CFG_TUD_MEM_ALIGN uint8_t epin_buf[CFG_TUD_CDC_EP_BUFSIZE];
+-    TUD_DCACHE_PADDING;
+-  };
+ } cdcd_interface_t;
+ 
+ #define ITF_MEM_RESET_SIZE   offsetof(cdcd_interface_t, wanted_char)
+ 
++typedef struct {
++  TUD_EPBUF_DEF(epout, CFG_TUD_CDC_EP_BUFSIZE);
++  TUD_EPBUF_DEF(epin, CFG_TUD_CDC_EP_BUFSIZE);
++} cdcd_epbuf_t;
++
+ //--------------------------------------------------------------------+
+ // INTERNAL OBJECT & FUNCTION DECLARATION
+ //--------------------------------------------------------------------+
+-CFG_TUD_MEM_SECTION static cdcd_interface_t _cdcd_itf[CFG_TUD_CDC];
++static cdcd_interface_t _cdcd_itf[CFG_TUD_CDC];
++CFG_TUD_MEM_SECTION static cdcd_epbuf_t _cdcd_epbuf[CFG_TUD_CDC];
++
+ static tud_cdc_configure_fifo_t _cdcd_fifo_cfg;
+ 
+-static bool _prep_out_transaction (cdcd_interface_t* p_cdc) {
+-  uint8_t const rhport = 0;
++static bool _prep_out_transaction(uint8_t itf) {
++  const uint8_t rhport = 0;
++  cdcd_interface_t* p_cdc = &_cdcd_itf[itf];
++  cdcd_epbuf_t* p_epbuf = &_cdcd_epbuf[itf];
+ 
+   // Skip if usb is not ready yet
+   TU_VERIFY(tud_ready() && p_cdc->ep_out);
+@@ -99,7 +98,7 @@ static bool _prep_out_transaction (cdcd_interface_t* p_cdc) {
+   // TODO Actually we can still carry out the transfer, keeping count of received bytes
+   // and slowly move it to the FIFO when read().
+   // This pre-check reduces endpoint claiming
+-  TU_VERIFY(available >= sizeof(p_cdc->epout_buf));
++  TU_VERIFY(available >= CFG_TUD_CDC_EP_BUFSIZE);
+ 
+   // claim endpoint
+   TU_VERIFY(usbd_edpt_claim(rhport, p_cdc->ep_out));
+@@ -107,9 +106,9 @@ static bool _prep_out_transaction (cdcd_interface_t* p_cdc) {
+   // fifo can be changed before endpoint is claimed
+   available = tu_fifo_remaining(&p_cdc->rx_ff);
+ 
+-  if ( available >= sizeof(p_cdc->epout_buf) ) {
+-    return usbd_edpt_xfer(rhport, p_cdc->ep_out, p_cdc->epout_buf, sizeof(p_cdc->epout_buf));
+-  }else {
++  if (available >= CFG_TUD_CDC_EP_BUFSIZE) {
++    return usbd_edpt_xfer(rhport, p_cdc->ep_out, p_epbuf->epout, CFG_TUD_CDC_EP_BUFSIZE);
++  } else {
+     // Release endpoint since we don't make any transfer
+     usbd_edpt_release(rhport, p_cdc->ep_out);
+     return false;
+@@ -120,7 +119,7 @@ static bool _prep_out_transaction (cdcd_interface_t* p_cdc) {
+ // APPLICATION API
+ //--------------------------------------------------------------------+
+ 
+-bool tud_cdc_configure_fifo(tud_cdc_configure_fifo_t const* cfg) {
++bool tud_cdc_configure_fifo(const tud_cdc_configure_fifo_t* cfg) {
+   TU_VERIFY(cfg);
+   _cdcd_fifo_cfg = (*cfg);
+   return true;
+@@ -157,7 +156,7 @@ uint32_t tud_cdc_n_available(uint8_t itf) {
+ uint32_t tud_cdc_n_read(uint8_t itf, void* buffer, uint32_t bufsize) {
+   cdcd_interface_t* p_cdc = &_cdcd_itf[itf];
+   uint32_t num_read = tu_fifo_read_n(&p_cdc->rx_ff, buffer, (uint16_t) TU_MIN(bufsize, UINT16_MAX));
+-  _prep_out_transaction(p_cdc);
++  _prep_out_transaction(itf);
+   return num_read;
+ }
+ 
+@@ -168,13 +167,13 @@ bool tud_cdc_n_peek(uint8_t itf, uint8_t* chr) {
+ void tud_cdc_n_read_flush(uint8_t itf) {
+   cdcd_interface_t* p_cdc = &_cdcd_itf[itf];
+   tu_fifo_clear(&p_cdc->rx_ff);
+-  _prep_out_transaction(p_cdc);
++  _prep_out_transaction(itf);
+ }
+ 
+ //--------------------------------------------------------------------+
+ // WRITE API
+ //--------------------------------------------------------------------+
+-uint32_t tud_cdc_n_write(uint8_t itf, void const* buffer, uint32_t bufsize) {
++uint32_t tud_cdc_n_write(uint8_t itf, const void* buffer, uint32_t bufsize) {
+   cdcd_interface_t* p_cdc = &_cdcd_itf[itf];
+   uint16_t ret = tu_fifo_write_n(&p_cdc->tx_ff, buffer, (uint16_t) TU_MIN(bufsize, UINT16_MAX));
+ 
+@@ -192,23 +191,26 @@ uint32_t tud_cdc_n_write(uint8_t itf, void const* buffer, uint32_t bufsize) {
+ 
+ uint32_t tud_cdc_n_write_flush(uint8_t itf) {
+   cdcd_interface_t* p_cdc = &_cdcd_itf[itf];
++  cdcd_epbuf_t* p_epbuf = &_cdcd_epbuf[itf];
+ 
+   // Skip if usb is not ready yet
+   TU_VERIFY(tud_ready(), 0);
+ 
+   // No data to send
+-  if (!tu_fifo_count(&p_cdc->tx_ff)) return 0;
++  if (!tu_fifo_count(&p_cdc->tx_ff)) {
++    return 0;
++  }
+ 
+-  uint8_t const rhport = 0;
++  const uint8_t rhport = 0;
+ 
+   // Claim the endpoint
+   TU_VERIFY(usbd_edpt_claim(rhport, p_cdc->ep_in), 0);
+ 
+   // Pull data from FIFO
+-  uint16_t const count = tu_fifo_read_n(&p_cdc->tx_ff, p_cdc->epin_buf, sizeof(p_cdc->epin_buf));
++  const uint16_t count = tu_fifo_read_n(&p_cdc->tx_ff, p_epbuf->epin, CFG_TUD_CDC_EP_BUFSIZE);
+ 
+   if (count) {
+-    TU_ASSERT(usbd_edpt_xfer(rhport, p_cdc->ep_in, p_cdc->epin_buf, count), 0);
++    TU_ASSERT(usbd_edpt_xfer(rhport, p_cdc->ep_in, p_epbuf->epin, count), 0);
+     return count;
+   } else {
+     // Release endpoint since we don't make any transfer
+@@ -292,32 +294,37 @@ void cdcd_reset(uint8_t rhport) {
+     cdcd_interface_t* p_cdc = &_cdcd_itf[i];
+ 
+     tu_memclr(p_cdc, ITF_MEM_RESET_SIZE);
+-    if (!_cdcd_fifo_cfg.rx_persistent) tu_fifo_clear(&p_cdc->rx_ff);
+-    if (!_cdcd_fifo_cfg.tx_persistent) tu_fifo_clear(&p_cdc->tx_ff);
++    if (!_cdcd_fifo_cfg.rx_persistent) {
++      tu_fifo_clear(&p_cdc->rx_ff);
++    }
++    if (!_cdcd_fifo_cfg.tx_persistent) {
++      tu_fifo_clear(&p_cdc->tx_ff);
++    }
+     tu_fifo_set_overwritable(&p_cdc->tx_ff, true);
+   }
+ }
+ 
+-uint16_t cdcd_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint16_t max_len) {
++uint16_t cdcd_open(uint8_t rhport, const tusb_desc_interface_t* itf_desc, uint16_t max_len) {
+   // Only support ACM subclass
+   TU_VERIFY( TUSB_CLASS_CDC                           == itf_desc->bInterfaceClass &&
+              CDC_COMM_SUBCLASS_ABSTRACT_CONTROL_MODEL == itf_desc->bInterfaceSubClass, 0);
+ 
+   // Find available interface
+-  cdcd_interface_t* p_cdc = NULL;
+-  for (uint8_t cdc_id = 0; cdc_id < CFG_TUD_CDC; cdc_id++) {
+-    if (_cdcd_itf[cdc_id].ep_in == 0) {
+-      p_cdc = &_cdcd_itf[cdc_id];
++  cdcd_interface_t* p_cdc;
++  uint8_t cdc_id;
++  for (cdc_id = 0; cdc_id < CFG_TUD_CDC; cdc_id++) {
++    p_cdc = &_cdcd_itf[cdc_id];
++    if (p_cdc->ep_in == 0) {
+       break;
+     }
+   }
+-  TU_ASSERT(p_cdc, 0);
++  TU_ASSERT(cdc_id < CFG_TUD_CDC, 0);
+ 
+   //------------- Control Interface -------------//
+   p_cdc->itf_num = itf_desc->bInterfaceNumber;
+ 
+   uint16_t drv_len = sizeof(tusb_desc_interface_t);
+-  uint8_t const* p_desc = tu_desc_next(itf_desc);
++  const uint8_t* p_desc = tu_desc_next(itf_desc);
+ 
+   // Communication Functional Descriptors
+   while (TUSB_DESC_CS_INTERFACE == tu_desc_type(p_desc) && drv_len <= max_len) {
+@@ -327,7 +334,7 @@ uint16_t cdcd_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint1
+ 
+   if (TUSB_DESC_ENDPOINT == tu_desc_type(p_desc)) {
+     // notification endpoint
+-    tusb_desc_endpoint_t const* desc_ep = (tusb_desc_endpoint_t const*) p_desc;
++    const tusb_desc_endpoint_t* desc_ep = (const tusb_desc_endpoint_t*) p_desc;
+ 
+     TU_ASSERT(usbd_edpt_open(rhport, desc_ep), 0);
+     p_cdc->ep_notif = desc_ep->bEndpointAddress;
+@@ -338,7 +345,7 @@ uint16_t cdcd_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint1
+ 
+   //------------- Data Interface (if any) -------------//
+   if ((TUSB_DESC_INTERFACE == tu_desc_type(p_desc)) &&
+-      (TUSB_CLASS_CDC_DATA == ((tusb_desc_interface_t const*) p_desc)->bInterfaceClass)) {
++      (TUSB_CLASS_CDC_DATA == ((const tusb_desc_interface_t*) p_desc)->bInterfaceClass)) {
+     // next to endpoint descriptor
+     drv_len += tu_desc_len(p_desc);
+     p_desc = tu_desc_next(p_desc);
+@@ -350,7 +357,7 @@ uint16_t cdcd_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint1
+   }
+ 
+   // Prepare for incoming data
+-  _prep_out_transaction(p_cdc);
++  _prep_out_transaction(cdc_id);
+ 
+   return drv_len;
+ }
+@@ -358,19 +365,21 @@ uint16_t cdcd_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint1
+ // Invoked when a control transfer occurred on an interface of this class
+ // Driver response accordingly to the request and the transfer stage (setup/data/ack)
+ // return false to stall control endpoint (e.g unsupported request)
+-bool cdcd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request) {
++bool cdcd_control_xfer_cb(uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
+   // Handle class request only
+   TU_VERIFY(request->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS);
+ 
+-  uint8_t itf = 0;
+-  cdcd_interface_t* p_cdc = _cdcd_itf;
++  uint8_t itf;
++  cdcd_interface_t* p_cdc;
+ 
+   // Identify which interface to use
+-  for (;; itf++, p_cdc++) {
+-    if (itf >= TU_ARRAY_SIZE(_cdcd_itf)) return false;
+-
+-    if (p_cdc->itf_num == request->wIndex) break;
++  for (itf = 0; itf < CFG_TUD_CDC; itf++) {
++    p_cdc = &_cdcd_itf[itf];
++    if (p_cdc->itf_num == request->wIndex) {
++      break;
++    }
+   }
++  TU_VERIFY(itf < CFG_TUD_CDC);
+ 
+   switch (request->bRequest) {
+     case CDC_REQUEST_SET_LINE_CODING:
+@@ -378,7 +387,9 @@ bool cdcd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t
+         TU_LOG_DRV("  Set Line Coding\r\n");
+         tud_control_xfer(rhport, request, &p_cdc->line_coding, sizeof(cdc_line_coding_t));
+       } else if (stage == CONTROL_STAGE_ACK) {
+-        if (tud_cdc_line_coding_cb) tud_cdc_line_coding_cb(itf, &p_cdc->line_coding);
++        if (tud_cdc_line_coding_cb) {
++          tud_cdc_line_coding_cb(itf, &p_cdc->line_coding);
++        }
+       }
+       break;
+ 
+@@ -409,7 +420,9 @@ bool cdcd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t
+         TU_LOG_DRV("  Set Control Line State: DTR = %d, RTS = %d\r\n", dtr, rts);
+ 
+         // Invoke callback
+-        if (tud_cdc_line_state_cb) tud_cdc_line_state_cb(itf, dtr, rts);
++        if (tud_cdc_line_state_cb) {
++          tud_cdc_line_state_cb(itf, dtr, rts);
++        }
+       }
+       break;
+ 
+@@ -418,7 +431,9 @@ bool cdcd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t
+         tud_control_status(rhport, request);
+       } else if (stage == CONTROL_STAGE_ACK) {
+         TU_LOG_DRV("  Send Break\r\n");
+-        if (tud_cdc_send_break_cb) tud_cdc_send_break_cb(itf, request->wValue);
++        if (tud_cdc_send_break_cb) {
++          tud_cdc_send_break_cb(itf, request->wValue);
++        }
+       }
+       break;
+ 
+@@ -438,28 +453,33 @@ bool cdcd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
+   // Identify which interface to use
+   for (itf = 0; itf < CFG_TUD_CDC; itf++) {
+     p_cdc = &_cdcd_itf[itf];
+-    if ((ep_addr == p_cdc->ep_out) || (ep_addr == p_cdc->ep_in)) break;
++    if ((ep_addr == p_cdc->ep_out) || (ep_addr == p_cdc->ep_in)) {
++      break;
++    }
+   }
+   TU_ASSERT(itf < CFG_TUD_CDC);
++  cdcd_epbuf_t* p_epbuf = &_cdcd_epbuf[itf];
+ 
+   // Received new data
+   if (ep_addr == p_cdc->ep_out) {
+-    tu_fifo_write_n(&p_cdc->rx_ff, p_cdc->epout_buf, (uint16_t) xferred_bytes);
++    tu_fifo_write_n(&p_cdc->rx_ff, p_epbuf->epout, (uint16_t) xferred_bytes);
+ 
+     // Check for wanted char and invoke callback if needed
+     if (tud_cdc_rx_wanted_cb && (((signed char) p_cdc->wanted_char) != -1)) {
+       for (uint32_t i = 0; i < xferred_bytes; i++) {
+-        if ((p_cdc->wanted_char == p_cdc->epout_buf[i]) && !tu_fifo_empty(&p_cdc->rx_ff)) {
++        if ((p_cdc->wanted_char == p_epbuf->epout[i]) && !tu_fifo_empty(&p_cdc->rx_ff)) {
+           tud_cdc_rx_wanted_cb(itf, p_cdc->wanted_char);
+         }
+       }
+     }
+ 
+     // invoke receive callback (if there is still data)
+-    if (tud_cdc_rx_cb && !tu_fifo_empty(&p_cdc->rx_ff)) tud_cdc_rx_cb(itf);
++    if (tud_cdc_rx_cb && !tu_fifo_empty(&p_cdc->rx_ff)) {
++      tud_cdc_rx_cb(itf);
++    }
+ 
+     // prepare for OUT transaction
+-    _prep_out_transaction(p_cdc);
++    _prep_out_transaction(itf);
+   }
+ 
+   // Data sent to host, we continue to fetch from tx fifo to send.
+@@ -467,7 +487,9 @@ bool cdcd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
+   //       Though maybe the baudrate is not really important !!!
+   if (ep_addr == p_cdc->ep_in) {
+     // invoke transmit callback to possibly refill tx fifo
+-    if (tud_cdc_tx_complete_cb) tud_cdc_tx_complete_cb(itf);
++    if (tud_cdc_tx_complete_cb) {
++      tud_cdc_tx_complete_cb(itf);
++    }
+ 
+     if (0 == tud_cdc_n_write_flush(itf)) {
+       // If there is no data left, a ZLP should be sent if
+diff --git a/src/class/dfu/dfu_device.c b/src/class/dfu/dfu_device.c
+index 875bd4e09d..d9e2d3f2f4 100644
+--- a/src/class/dfu/dfu_device.c
++++ b/src/class/dfu/dfu_device.c
+@@ -57,15 +57,14 @@ typedef struct {
+   bool flashing_in_progress;
+   uint16_t block;
+   uint16_t length;
+-
+-  union {
+-    CFG_TUD_MEM_ALIGN uint8_t transfer_buf[CFG_TUD_DFU_XFER_BUFSIZE];
+-    TUD_DCACHE_PADDING;
+-  };
+ } dfu_state_ctx_t;
+ 
+ // Only a single dfu state is allowed
+-CFG_TUD_MEM_SECTION tu_static dfu_state_ctx_t _dfu_ctx;
++static dfu_state_ctx_t _dfu_ctx;
++
++CFG_TUD_MEM_SECTION static struct {
++  TUD_EPBUF_DEF(transfer_buf, CFG_TUD_DFU_XFER_BUFSIZE);
++} _dfu_epbuf;
+ 
+ static void reset_state(void) {
+   _dfu_ctx.state = DFU_IDLE;
+@@ -73,55 +72,50 @@ static void reset_state(void) {
+   _dfu_ctx.flashing_in_progress = false;
+ }
+ 
+-static bool reply_getstatus(uint8_t rhport, tusb_control_request_t const * request, dfu_state_t state, dfu_status_t status, uint32_t timeout);
+-static bool process_download_get_status(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request);
+-static bool process_manifest_get_status(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request);
++static bool reply_getstatus(uint8_t rhport, const tusb_control_request_t* request, dfu_state_t state, dfu_status_t status, uint32_t timeout);
++static bool process_download_get_status(uint8_t rhport, uint8_t stage, const tusb_control_request_t* request);
++static bool process_manifest_get_status(uint8_t rhport, uint8_t stage, const tusb_control_request_t* request);
+ 
+ //--------------------------------------------------------------------+
+ // Debug
+ //--------------------------------------------------------------------+
+ #if CFG_TUSB_DEBUG >= 2
+ 
+-tu_static tu_lookup_entry_t const _dfu_request_lookup[] =
+-{
+-  { .key = DFU_REQUEST_DETACH         , .data = "DETACH"    },
+-  { .key = DFU_REQUEST_DNLOAD         , .data = "DNLOAD"    },
+-  { .key = DFU_REQUEST_UPLOAD         , .data = "UPLOAD"    },
+-  { .key = DFU_REQUEST_GETSTATUS      , .data = "GETSTATUS" },
+-  { .key = DFU_REQUEST_CLRSTATUS      , .data = "CLRSTATUS" },
+-  { .key = DFU_REQUEST_GETSTATE       , .data = "GETSTATE"  },
+-  { .key = DFU_REQUEST_ABORT          , .data = "ABORT"     },
++tu_static tu_lookup_entry_t const _dfu_request_lookup[] = {
++  { .key = DFU_REQUEST_DETACH   , .data = "DETACH"    },
++  { .key = DFU_REQUEST_DNLOAD   , .data = "DNLOAD"    },
++  { .key = DFU_REQUEST_UPLOAD   , .data = "UPLOAD"    },
++  { .key = DFU_REQUEST_GETSTATUS, .data = "GETSTATUS" },
++  { .key = DFU_REQUEST_CLRSTATUS, .data = "CLRSTATUS" },
++  { .key = DFU_REQUEST_GETSTATE , .data = "GETSTATE"  },
++  { .key = DFU_REQUEST_ABORT    , .data = "ABORT"     },
+ };
+ 
+-tu_static tu_lookup_table_t const _dfu_request_table =
+-{
++tu_static tu_lookup_table_t const _dfu_request_table = {
+   .count = TU_ARRAY_SIZE(_dfu_request_lookup),
+   .items = _dfu_request_lookup
+ };
+ 
+-tu_static tu_lookup_entry_t const _dfu_state_lookup[] =
+-{
+-  { .key = APP_IDLE                   , .data = "APP_IDLE"                },
+-  { .key = APP_DETACH                 , .data = "APP_DETACH"              },
+-  { .key = DFU_IDLE                   , .data = "IDLE"                },
+-  { .key = DFU_DNLOAD_SYNC            , .data = "DNLOAD_SYNC"         },
+-  { .key = DFU_DNBUSY                 , .data = "DNBUSY"              },
+-  { .key = DFU_DNLOAD_IDLE            , .data = "DNLOAD_IDLE"         },
+-  { .key = DFU_MANIFEST_SYNC          , .data = "MANIFEST_SYNC"       },
+-  { .key = DFU_MANIFEST               , .data = "MANIFEST"            },
+-  { .key = DFU_MANIFEST_WAIT_RESET    , .data = "MANIFEST_WAIT_RESET" },
+-  { .key = DFU_UPLOAD_IDLE            , .data = "UPLOAD_IDLE"         },
+-  { .key = DFU_ERROR                  , .data = "ERROR"               },
++tu_static tu_lookup_entry_t const _dfu_state_lookup[] = {
++  { .key = APP_IDLE               , .data = "APP_IDLE"            },
++  { .key = APP_DETACH             , .data = "APP_DETACH"          },
++  { .key = DFU_IDLE               , .data = "IDLE"                },
++  { .key = DFU_DNLOAD_SYNC        , .data = "DNLOAD_SYNC"         },
++  { .key = DFU_DNBUSY             , .data = "DNBUSY"              },
++  { .key = DFU_DNLOAD_IDLE        , .data = "DNLOAD_IDLE"         },
++  { .key = DFU_MANIFEST_SYNC      , .data = "MANIFEST_SYNC"       },
++  { .key = DFU_MANIFEST           , .data = "MANIFEST"            },
++  { .key = DFU_MANIFEST_WAIT_RESET, .data = "MANIFEST_WAIT_RESET" },
++  { .key = DFU_UPLOAD_IDLE        , .data = "UPLOAD_IDLE"         },
++  { .key = DFU_ERROR              , .data = "ERROR"               },
+ };
+ 
+-tu_static tu_lookup_table_t const _dfu_state_table =
+-{
++tu_static tu_lookup_table_t const _dfu_state_table = {
+   .count = TU_ARRAY_SIZE(_dfu_state_lookup),
+   .items = _dfu_state_lookup
+ };
+ 
+-tu_static tu_lookup_entry_t const _dfu_status_lookup[] =
+-{
++tu_static tu_lookup_entry_t const _dfu_status_lookup[] = {
+   { .key = DFU_STATUS_OK               , .data = "OK"              },
+   { .key = DFU_STATUS_ERR_TARGET       , .data = "errTARGET"       },
+   { .key = DFU_STATUS_ERR_FILE         , .data = "errFILE"         },
+@@ -140,8 +134,7 @@ tu_static tu_lookup_entry_t const _dfu_status_lookup[] =
+   { .key = DFU_STATUS_ERR_STALLEDPKT   , .data = "errSTALLEDPKT"   },
+ };
+ 
+-tu_static tu_lookup_table_t const _dfu_status_table =
+-{
++tu_static tu_lookup_table_t const _dfu_status_table = {
+   .count = TU_ARRAY_SIZE(_dfu_status_lookup),
+   .items = _dfu_status_lookup
+ };
+@@ -151,13 +144,10 @@ tu_static tu_lookup_table_t const _dfu_status_table =
+ //--------------------------------------------------------------------+
+ // USBD Driver API
+ //--------------------------------------------------------------------+
+-void dfu_moded_reset(uint8_t rhport)
+-{
++void dfu_moded_reset(uint8_t rhport) {
+   (void) rhport;
+-
+   _dfu_ctx.attrs = 0;
+   _dfu_ctx.alt = 0;
+-
+   reset_state();
+ }
+ 
+@@ -169,19 +159,17 @@ bool dfu_moded_deinit(void) {
+   return true;
+ }
+ 
+-uint16_t dfu_moded_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint16_t max_len)
+-{
++uint16_t dfu_moded_open(uint8_t rhport, const tusb_desc_interface_t* itf_desc, uint16_t max_len) {
+   (void) rhport;
+ 
+   //------------- Interface (with Alt) descriptor -------------//
+-  uint8_t const itf_num = itf_desc->bInterfaceNumber;
++  const uint8_t itf_num = itf_desc->bInterfaceNumber;
+   uint8_t alt_count = 0;
+ 
+   uint16_t drv_len = 0;
+   TU_VERIFY(itf_desc->bInterfaceSubClass == TUD_DFU_APP_SUBCLASS && itf_desc->bInterfaceProtocol == DFU_PROTOCOL_DFU, 0);
+ 
+-  while(itf_desc->bInterfaceSubClass == TUD_DFU_APP_SUBCLASS && itf_desc->bInterfaceProtocol == DFU_PROTOCOL_DFU)
+-  {
++  while(itf_desc->bInterfaceSubClass == TUD_DFU_APP_SUBCLASS && itf_desc->bInterfaceProtocol == DFU_PROTOCOL_DFU) {
+     TU_ASSERT(max_len > drv_len, 0);
+ 
+     // Alternate must have the same interface number
+@@ -192,18 +180,18 @@ uint16_t dfu_moded_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc,
+     alt_count++;
+ 
+     drv_len += tu_desc_len(itf_desc);
+-    itf_desc = (tusb_desc_interface_t const *) tu_desc_next(itf_desc);
++    itf_desc = (const tusb_desc_interface_t*) tu_desc_next(itf_desc);
+   }
+ 
+   //------------- DFU Functional descriptor -------------//
+-  tusb_desc_dfu_functional_t const *func_desc = (tusb_desc_dfu_functional_t const *) itf_desc;
++  const tusb_desc_dfu_functional_t*func_desc = (const tusb_desc_dfu_functional_t*) itf_desc;
+   TU_ASSERT(tu_desc_type(func_desc) == TUSB_DESC_FUNCTIONAL, 0);
+   drv_len += sizeof(tusb_desc_dfu_functional_t);
+ 
+   _dfu_ctx.attrs = func_desc->bAttributes;
+ 
+   // CFG_TUD_DFU_XFER_BUFSIZE has to be set to the buffer size used in TUD_DFU_DESCRIPTOR
+-  uint16_t const transfer_size = tu_le16toh( tu_unaligned_read16((uint8_t const*) func_desc + offsetof(tusb_desc_dfu_functional_t, wTransferSize)) );
++  const uint16_t transfer_size = tu_le16toh( tu_unaligned_read16((const uint8_t*) func_desc + offsetof(tusb_desc_dfu_functional_t, wTransferSize)) );
+   TU_ASSERT(transfer_size <= CFG_TUD_DFU_XFER_BUFSIZE, drv_len);
+ 
+   return drv_len;
+@@ -212,99 +200,85 @@ uint16_t dfu_moded_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc,
+ // Invoked when a control transfer occurred on an interface of this class
+ // Driver response accordingly to the request and the transfer stage (setup/data/ack)
+ // return false to stall control endpoint (e.g unsupported request)
+-bool dfu_moded_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
+-{
++bool dfu_moded_control_xfer_cb(uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
+   TU_VERIFY(request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_INTERFACE);
+-
+   TU_LOG_DRV("  DFU State  : %s, Status: %s\r\n", tu_lookup_find(&_dfu_state_table, _dfu_ctx.state), tu_lookup_find(&_dfu_status_table, _dfu_ctx.status));
+ 
+-  if ( request->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD )
+-  {
++  if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD) {
+     // Standard request include GET/SET_INTERFACE
+-    switch ( request->bRequest )
+-    {
++    switch (request->bRequest) {
+       case TUSB_REQ_SET_INTERFACE:
+-        if ( stage == CONTROL_STAGE_SETUP )
+-        {
++        if (stage == CONTROL_STAGE_SETUP) {
+           // Switch Alt interface and reset state machine
+-          _dfu_ctx.alt = (uint8_t) request->wValue;
++          _dfu_ctx.alt = (uint8_t)request->wValue;
+           reset_state();
+           return tud_control_status(rhport, request);
+         }
+-      break;
++        break;
+ 
+       case TUSB_REQ_GET_INTERFACE:
+-        if(stage == CONTROL_STAGE_SETUP)
+-        {
++        if (stage == CONTROL_STAGE_SETUP) {
+           return tud_control_xfer(rhport, request, &_dfu_ctx.alt, 1);
+         }
+-      break;
++        break;
+ 
+       // unsupported request
+       default: return false;
+     }
+-  }
+-  else if ( request->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS )
+-  {
++  } else if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS) {
+     TU_LOG_DRV("  DFU Request: %s\r\n", tu_lookup_find(&_dfu_request_table, request->bRequest));
+ 
+     // Class request
+-    switch ( request->bRequest )
+-    {
++    switch (request->bRequest) {
+       case DFU_REQUEST_DETACH:
+-        if ( stage == CONTROL_STAGE_SETUP )
+-        {
++        if (stage == CONTROL_STAGE_SETUP) {
+           tud_control_status(rhport, request);
++        } else if (stage == CONTROL_STAGE_ACK) {
++          if (tud_dfu_detach_cb) {
++            tud_dfu_detach_cb();
++          }
+         }
+-        else if ( stage == CONTROL_STAGE_ACK )
+-        {
+-          if ( tud_dfu_detach_cb ) tud_dfu_detach_cb();
+-        }
+-      break;
++        break;
+ 
+       case DFU_REQUEST_CLRSTATUS:
+-        if ( stage == CONTROL_STAGE_SETUP )
+-        {
++        if (stage == CONTROL_STAGE_SETUP) {
+           reset_state();
+           tud_control_status(rhport, request);
+         }
+-      break;
++        break;
+ 
+       case DFU_REQUEST_GETSTATE:
+-        if ( stage == CONTROL_STAGE_SETUP )
+-        {
++        if (stage == CONTROL_STAGE_SETUP) {
+           tud_control_xfer(rhport, request, &_dfu_ctx.state, 1);
+         }
+-      break;
++        break;
+ 
+       case DFU_REQUEST_ABORT:
+-        if ( stage == CONTROL_STAGE_SETUP )
+-        {
++        if (stage == CONTROL_STAGE_SETUP) {
+           reset_state();
+           tud_control_status(rhport, request);
++        } else if (stage == CONTROL_STAGE_ACK) {
++          if (tud_dfu_abort_cb) {
++            tud_dfu_abort_cb(_dfu_ctx.alt);
++          }
+         }
+-        else if ( stage == CONTROL_STAGE_ACK )
+-        {
+-          if ( tud_dfu_abort_cb ) tud_dfu_abort_cb(_dfu_ctx.alt);
+-        }
+-      break;
++        break;
+ 
+       case DFU_REQUEST_UPLOAD:
+-        if ( stage == CONTROL_STAGE_SETUP )
+-        {
++        if (stage == CONTROL_STAGE_SETUP) {
+           TU_VERIFY(_dfu_ctx.attrs & DFU_ATTR_CAN_UPLOAD);
+           TU_VERIFY(tud_dfu_upload_cb);
+           TU_VERIFY(request->wLength <= CFG_TUD_DFU_XFER_BUFSIZE);
+ 
+-          uint16_t const xfer_len = tud_dfu_upload_cb(_dfu_ctx.alt, request->wValue, _dfu_ctx.transfer_buf, request->wLength);
++          const uint16_t xfer_len = tud_dfu_upload_cb(_dfu_ctx.alt, request->wValue, _dfu_epbuf.transfer_buf,
++                                                      request->wLength);
+ 
+-          return tud_control_xfer(rhport, request, _dfu_ctx.transfer_buf, xfer_len);
++          return tud_control_xfer(rhport, request, _dfu_epbuf.transfer_buf, xfer_len);
+         }
+-      break;
++        break;
+ 
+       case DFU_REQUEST_DNLOAD:
+-        if ( stage == CONTROL_STAGE_SETUP )
+-        {
++        if (stage == CONTROL_STAGE_SETUP) {
+           TU_VERIFY(_dfu_ctx.attrs & DFU_ATTR_CAN_DOWNLOAD);
+           TU_VERIFY(_dfu_ctx.state == DFU_IDLE || _dfu_ctx.state == DFU_DNLOAD_IDLE);
+           TU_VERIFY(request->wLength <= CFG_TUD_DFU_XFER_BUFSIZE);
+@@ -313,104 +287,86 @@ bool dfu_moded_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_reque
+           _dfu_ctx.flashing_in_progress = true;
+ 
+           // save block and length for flashing
+-          _dfu_ctx.block  = request->wValue;
++          _dfu_ctx.block = request->wValue;
+           _dfu_ctx.length = request->wLength;
+ 
+-          if ( request->wLength )
+-          {
++          if (request->wLength) {
+             // Download with payload -> transition to DOWNLOAD SYNC
+             _dfu_ctx.state = DFU_DNLOAD_SYNC;
+-            return tud_control_xfer(rhport, request, _dfu_ctx.transfer_buf, request->wLength);
+-          }
+-          else
+-          {
++            return tud_control_xfer(rhport, request, _dfu_epbuf.transfer_buf, request->wLength);
++          } else {
+             // Download is complete -> transition to MANIFEST SYNC
+             _dfu_ctx.state = DFU_MANIFEST_SYNC;
+             return tud_control_status(rhport, request);
+           }
+         }
+-      break;
++        break;
+ 
+       case DFU_REQUEST_GETSTATUS:
+-        switch ( _dfu_ctx.state )
+-        {
++        switch (_dfu_ctx.state) {
+           case DFU_DNLOAD_SYNC:
+             return process_download_get_status(rhport, stage, request);
+-          break;
++            break;
+ 
+           case DFU_MANIFEST_SYNC:
+             return process_manifest_get_status(rhport, stage, request);
+-          break;
++            break;
+ 
+           default:
+-            if ( stage == CONTROL_STAGE_SETUP ) return reply_getstatus(rhport, request, _dfu_ctx.state, _dfu_ctx.status, 0);
+-          break;
++            if (stage == CONTROL_STAGE_SETUP) {
++              return reply_getstatus(rhport, request, _dfu_ctx.state, _dfu_ctx.status, 0);
++            }
++            break;
+         }
+-      break;
++        break;
+ 
+       default: return false; // stall unsupported request
+     }
+-  }else
+-  {
++  } else {
+     return false; // unsupported request
+   }
+ 
+   return true;
+ }
+ 
+-void tud_dfu_finish_flashing(uint8_t status)
+-{
++void tud_dfu_finish_flashing(uint8_t status) {
+   _dfu_ctx.flashing_in_progress = false;
+ 
+-  if ( status == DFU_STATUS_OK )
+-  {
+-    if (_dfu_ctx.state == DFU_DNBUSY)
+-    {
++  if (status == DFU_STATUS_OK) {
++    if (_dfu_ctx.state == DFU_DNBUSY) {
+       _dfu_ctx.state = DFU_DNLOAD_SYNC;
+-    }
+-    else if (_dfu_ctx.state == DFU_MANIFEST)
+-    {
++    } else if (_dfu_ctx.state == DFU_MANIFEST) {
+       _dfu_ctx.state = (_dfu_ctx.attrs & DFU_ATTR_MANIFESTATION_TOLERANT)
+-                               ? DFU_MANIFEST_SYNC : DFU_MANIFEST_WAIT_RESET;
++                         ? DFU_MANIFEST_SYNC
++                         : DFU_MANIFEST_WAIT_RESET;
+     }
+-  }
+-  else
+-  {
++  } else {
+     // failed while flashing, move to dfuError
+     _dfu_ctx.state = DFU_ERROR;
+     _dfu_ctx.status = (dfu_status_t)status;
+   }
+ }
+ 
+-static bool process_download_get_status(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
+-{
+-  if ( stage == CONTROL_STAGE_SETUP )
+-  {
++static bool process_download_get_status(uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
++  if (stage == CONTROL_STAGE_SETUP) {
+     // only transition to next state on CONTROL_STAGE_ACK
+     dfu_state_t next_state;
+     uint32_t timeout;
+ 
+-    if ( _dfu_ctx.flashing_in_progress )
+-    {
++    if (_dfu_ctx.flashing_in_progress) {
+       next_state = DFU_DNBUSY;
+-      timeout = tud_dfu_get_timeout_cb(_dfu_ctx.alt, (uint8_t) next_state);
+-    }
+-    else
+-    {
++      timeout = tud_dfu_get_timeout_cb(_dfu_ctx.alt, (uint8_t)next_state);
++    } else {
+       next_state = DFU_DNLOAD_IDLE;
+       timeout = 0;
+     }
+ 
+     return reply_getstatus(rhport, request, next_state, _dfu_ctx.status, timeout);
+-  }
+-  else if ( stage == CONTROL_STAGE_ACK )
+-  {
+-    if ( _dfu_ctx.flashing_in_progress )
+-    {
++  } else if (stage == CONTROL_STAGE_ACK) {
++    if (_dfu_ctx.flashing_in_progress) {
+       _dfu_ctx.state = DFU_DNBUSY;
+-      tud_dfu_download_cb(_dfu_ctx.alt, _dfu_ctx.block, _dfu_ctx.transfer_buf, _dfu_ctx.length);
+-    }else
+-    {
++      tud_dfu_download_cb(_dfu_ctx.alt, _dfu_ctx.block, _dfu_epbuf.transfer_buf, _dfu_ctx.length);
++    } else {
+       _dfu_ctx.state = DFU_DNLOAD_IDLE;
+     }
+   }
+@@ -418,36 +374,26 @@ static bool process_download_get_status(uint8_t rhport, uint8_t stage, tusb_cont
+   return true;
+ }
+ 
+-static bool process_manifest_get_status(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
+-{
+-  if ( stage == CONTROL_STAGE_SETUP )
+-  {
++static bool process_manifest_get_status(uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
++  if (stage == CONTROL_STAGE_SETUP) {
+     // only transition to next state on CONTROL_STAGE_ACK
+     dfu_state_t next_state;
+     uint32_t timeout;
+ 
+-    if ( _dfu_ctx.flashing_in_progress )
+-    {
++    if (_dfu_ctx.flashing_in_progress) {
+       next_state = DFU_MANIFEST;
+       timeout = tud_dfu_get_timeout_cb(_dfu_ctx.alt, next_state);
+-    }
+-    else
+-    {
++    } else {
+       next_state = DFU_IDLE;
+       timeout = 0;
+     }
+ 
+     return reply_getstatus(rhport, request, next_state, _dfu_ctx.status, timeout);
+-  }
+-  else if ( stage == CONTROL_STAGE_ACK )
+-  {
+-    if ( _dfu_ctx.flashing_in_progress )
+-    {
++  } else if (stage == CONTROL_STAGE_ACK) {
++    if (_dfu_ctx.flashing_in_progress) {
+       _dfu_ctx.state = DFU_MANIFEST;
+       tud_dfu_manifest_cb(_dfu_ctx.alt);
+-    }
+-    else
+-    {
++    } else {
+       _dfu_ctx.state = DFU_IDLE;
+     }
+   }
+@@ -455,15 +401,15 @@ static bool process_manifest_get_status(uint8_t rhport, uint8_t stage, tusb_cont
+   return true;
+ }
+ 
+-static bool reply_getstatus(uint8_t rhport, tusb_control_request_t const * request, dfu_state_t state, dfu_status_t status, uint32_t timeout)
+-{
++static bool reply_getstatus(uint8_t rhport, const tusb_control_request_t* request, dfu_state_t state,
++                            dfu_status_t status, uint32_t timeout) {
+   dfu_status_response_t resp;
+-  resp.bStatus          = (uint8_t) status;
++  resp.bStatus = (uint8_t)status;
+   resp.bwPollTimeout[0] = TU_U32_BYTE0(timeout);
+   resp.bwPollTimeout[1] = TU_U32_BYTE1(timeout);
+   resp.bwPollTimeout[2] = TU_U32_BYTE2(timeout);
+-  resp.bState           = (uint8_t) state;
+-  resp.iString          = 0;
++  resp.bState = (uint8_t)state;
++  resp.iString = 0;
+ 
+   return tud_control_xfer(rhport, request, &resp, sizeof(dfu_status_response_t));
+ }
+diff --git a/src/class/hid/hid_device.c b/src/class/hid/hid_device.c
+index 257af86e00..eedcba984c 100644
+--- a/src/class/hid/hid_device.c
++++ b/src/class/hid/hid_device.c
+@@ -51,23 +51,17 @@ typedef struct {
+ 
+   // TODO save hid descriptor since host can specifically request this after enumeration
+   // Note: HID descriptor may be not available from application after enumeration
+-  tusb_hid_descriptor_hid_t const *hid_descriptor;
+-
+-  union {
+-    CFG_TUD_MEM_ALIGN uint8_t ctrl_buf[CFG_TUD_HID_EP_BUFSIZE];
+-    TUD_DCACHE_PADDING;
+-  };
+-  union {
+-    CFG_TUD_MEM_ALIGN uint8_t epin_buf[CFG_TUD_HID_EP_BUFSIZE];
+-    TUD_DCACHE_PADDING;
+-  };
+-  union {
+-    CFG_TUD_MEM_ALIGN uint8_t epout_buf[CFG_TUD_HID_EP_BUFSIZE];
+-    TUD_DCACHE_PADDING;
+-  };
++  const tusb_hid_descriptor_hid_t*hid_descriptor;
+ } hidd_interface_t;
+ 
+-CFG_TUD_MEM_SECTION tu_static hidd_interface_t _hidd_itf[CFG_TUD_HID];
++typedef struct {
++  TUD_EPBUF_DEF(ctrl , CFG_TUD_HID_EP_BUFSIZE);
++  TUD_EPBUF_DEF(epin , CFG_TUD_HID_EP_BUFSIZE);
++  TUD_EPBUF_DEF(epout, CFG_TUD_HID_EP_BUFSIZE);
++} hidd_epbuf_t;
++
++static hidd_interface_t _hidd_itf[CFG_TUD_HID];
++CFG_TUD_MEM_SECTION static hidd_epbuf_t _hidd_epbuf[CFG_TUD_HID];
+ 
+ /*------------- Helpers -------------*/
+ TU_ATTR_ALWAYS_INLINE static inline uint8_t get_index_by_itfnum(uint8_t itf_num) {
+@@ -117,22 +111,24 @@ bool tud_hid_n_ready(uint8_t instance) {
+ }
+ 
+ bool tud_hid_n_report(uint8_t instance, uint8_t report_id, void const *report, uint16_t len) {
+-  uint8_t const rhport = 0;
++  TU_VERIFY(instance < CFG_TUD_HID);
++  const uint8_t rhport = 0;
+   hidd_interface_t *p_hid = &_hidd_itf[instance];
++  hidd_epbuf_t *p_epbuf = &_hidd_epbuf[instance];
+ 
+   // claim endpoint
+   TU_VERIFY(usbd_edpt_claim(rhport, p_hid->ep_in));
+ 
+   // prepare data
+   if (report_id) {
+-    p_hid->epin_buf[0] = report_id;
+-    TU_VERIFY(0 == tu_memcpy_s(p_hid->epin_buf + 1, CFG_TUD_HID_EP_BUFSIZE - 1, report, len));
++    p_epbuf->epin[0] = report_id;
++    TU_VERIFY(0 == tu_memcpy_s(p_epbuf->epin + 1, CFG_TUD_HID_EP_BUFSIZE - 1, report, len));
+     len++;
+   } else {
+-    TU_VERIFY(0 == tu_memcpy_s(p_hid->epin_buf, CFG_TUD_HID_EP_BUFSIZE, report, len));
++    TU_VERIFY(0 == tu_memcpy_s(p_epbuf->epin, CFG_TUD_HID_EP_BUFSIZE, report, len));
+   }
+ 
+-  return usbd_edpt_xfer(rhport, p_hid->ep_in, p_hid->epin_buf, len);
++  return usbd_edpt_xfer(rhport, p_hid->ep_in, p_epbuf->epin, len);
+ }
+ 
+ uint8_t tud_hid_n_interface_protocol(uint8_t instance) {
+@@ -223,15 +219,16 @@ uint16_t hidd_open(uint8_t rhport, tusb_desc_interface_t const *desc_itf, uint16
+   TU_ASSERT(max_len >= drv_len, 0);
+ 
+   // Find available interface
+-  hidd_interface_t *p_hid = NULL;
++  hidd_interface_t *p_hid;
+   uint8_t hid_id;
+   for (hid_id = 0; hid_id < CFG_TUD_HID; hid_id++) {
+-    if (_hidd_itf[hid_id].ep_in == 0) {
+-      p_hid = &_hidd_itf[hid_id];
++    p_hid = &_hidd_itf[hid_id];
++    if (p_hid->ep_in == 0) {
+       break;
+     }
+   }
+-  TU_ASSERT(p_hid, 0);
++  TU_ASSERT(hid_id < CFG_TUD_HID, 0);
++  hidd_epbuf_t *p_epbuf = &_hidd_epbuf[hid_id];
+ 
+   uint8_t const *p_desc = (uint8_t const *)desc_itf;
+ 
+@@ -256,10 +253,7 @@ uint16_t hidd_open(uint8_t rhport, tusb_desc_interface_t const *desc_itf, uint16
+ 
+   // Prepare for output endpoint
+   if (p_hid->ep_out) {
+-    if (!usbd_edpt_xfer(rhport, p_hid->ep_out, p_hid->epout_buf, sizeof(p_hid->epout_buf))) {
+-      TU_LOG_FAILED();
+-      TU_BREAKPOINT();
+-    }
++    TU_ASSERT(usbd_edpt_xfer(rhport, p_hid->ep_out, p_epbuf->epout, CFG_TUD_HID_EP_BUFSIZE), drv_len);
+   }
+ 
+   return drv_len;
+@@ -273,8 +267,8 @@ bool hidd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t
+ 
+   uint8_t const hid_itf = get_index_by_itfnum((uint8_t)request->wIndex);
+   TU_VERIFY(hid_itf < CFG_TUD_HID);
+-
+   hidd_interface_t *p_hid = &_hidd_itf[hid_itf];
++  hidd_epbuf_t *p_epbuf = &_hidd_epbuf[hid_itf];
+ 
+   if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD) {
+     //------------- STD Request -------------//
+@@ -300,7 +294,7 @@ bool hidd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t
+           uint8_t const report_type = tu_u16_high(request->wValue);
+           uint8_t const report_id = tu_u16_low(request->wValue);
+ 
+-          uint8_t* report_buf = p_hid->ctrl_buf;
++          uint8_t* report_buf = p_epbuf->ctrl;
+           uint16_t req_len = tu_min16(request->wLength, CFG_TUD_HID_EP_BUFSIZE);
+           uint16_t xferlen = 0;
+ 
+@@ -314,19 +308,19 @@ bool hidd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t
+           xferlen += tud_hid_get_report_cb(hid_itf, report_id, (hid_report_type_t) report_type, report_buf, req_len);
+           TU_ASSERT(xferlen > 0);
+ 
+-          tud_control_xfer(rhport, request, p_hid->ctrl_buf, xferlen);
++          tud_control_xfer(rhport, request, p_epbuf->ctrl, xferlen);
+         }
+         break;
+ 
+       case HID_REQ_CONTROL_SET_REPORT:
+         if (stage == CONTROL_STAGE_SETUP) {
+-          TU_VERIFY(request->wLength <= sizeof(p_hid->ctrl_buf));
+-          tud_control_xfer(rhport, request, p_hid->ctrl_buf, request->wLength);
++          TU_VERIFY(request->wLength <= CFG_TUD_HID_EP_BUFSIZE);
++          tud_control_xfer(rhport, request, p_epbuf->ctrl, request->wLength);
+         } else if (stage == CONTROL_STAGE_ACK) {
+           uint8_t const report_type = tu_u16_high(request->wValue);
+           uint8_t const report_id = tu_u16_low(request->wValue);
+ 
+-          uint8_t const* report_buf = p_hid->ctrl_buf;
++          uint8_t const* report_buf = p_epbuf->ctrl;
+           uint16_t report_len = tu_min16(request->wLength, CFG_TUD_HID_EP_BUFSIZE);
+ 
+           // If host request a specific Report ID, extract report ID in buffer before invoking callback
+@@ -380,8 +374,8 @@ bool hidd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t
+ }
+ 
+ bool hidd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
+-  uint8_t instance = 0;
+-  hidd_interface_t *p_hid = _hidd_itf;
++  uint8_t instance;
++  hidd_interface_t *p_hid;
+ 
+   // Identify which interface to use
+   for (instance = 0; instance < CFG_TUD_HID; instance++) {
+@@ -391,24 +385,25 @@ bool hidd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
+     }
+   }
+   TU_ASSERT(instance < CFG_TUD_HID);
++  hidd_epbuf_t *p_epbuf = &_hidd_epbuf[instance];
+ 
+   if (ep_addr == p_hid->ep_in) {
+     // Input report
+     if (XFER_RESULT_SUCCESS == result) {
+-      tud_hid_report_complete_cb(instance, p_hid->epin_buf, (uint16_t) xferred_bytes);
++      tud_hid_report_complete_cb(instance, p_epbuf->epin, (uint16_t) xferred_bytes);
+     } else {
+-      tud_hid_report_failed_cb(instance, HID_REPORT_TYPE_INPUT, p_hid->epin_buf, (uint16_t) xferred_bytes);
++      tud_hid_report_failed_cb(instance, HID_REPORT_TYPE_INPUT, p_epbuf->epin, (uint16_t) xferred_bytes);
+     }
+   } else {
+     // Output report
+     if (XFER_RESULT_SUCCESS == result) {
+-      tud_hid_set_report_cb(instance, 0, HID_REPORT_TYPE_OUTPUT, p_hid->epout_buf, (uint16_t)xferred_bytes);
++      tud_hid_set_report_cb(instance, 0, HID_REPORT_TYPE_OUTPUT, p_epbuf->epout, (uint16_t)xferred_bytes);
+     } else {
+-      tud_hid_report_failed_cb(instance, HID_REPORT_TYPE_OUTPUT, p_hid->epout_buf, (uint16_t) xferred_bytes);
++      tud_hid_report_failed_cb(instance, HID_REPORT_TYPE_OUTPUT, p_epbuf->epout, (uint16_t) xferred_bytes);
+     }
+ 
+     // prepare for new transfer
+-    TU_ASSERT(usbd_edpt_xfer(rhport, p_hid->ep_out, p_hid->epout_buf, sizeof(p_hid->epout_buf)));
++    TU_ASSERT(usbd_edpt_xfer(rhport, p_hid->ep_out, p_epbuf->epout, CFG_TUD_HID_EP_BUFSIZE));
+   }
+ 
+   return true;
+diff --git a/src/class/msc/msc_device.c b/src/class/msc/msc_device.c
+index 87626ad3b7..cfae646a1d 100644
+--- a/src/class/msc/msc_device.c
++++ b/src/class/msc/msc_device.c
+@@ -75,7 +75,7 @@ typedef struct {
+ static mscd_interface_t _mscd_itf;
+ 
+ CFG_TUD_MEM_SECTION static struct {
+-  TUD_EPBUF_DEF(ep_buf, CFG_TUD_MSC_EP_BUFSIZE);
++  TUD_EPBUF_DEF(buf, CFG_TUD_MSC_EP_BUFSIZE);
+ } _mscd_epbuf;
+ 
+ //--------------------------------------------------------------------+
+@@ -95,13 +95,13 @@ static inline bool send_csw(uint8_t rhport, mscd_interface_t* p_msc) {
+   // Data residue is always = host expect - actual transferred
+   p_msc->csw.data_residue = p_msc->cbw.total_bytes - p_msc->xferred_len;
+   p_msc->stage = MSC_STAGE_STATUS_SENT;
+-  memcpy(_mscd_epbuf.ep_buf, &p_msc->csw, sizeof(msc_csw_t));
+-  return usbd_edpt_xfer(rhport, p_msc->ep_in , _mscd_epbuf.ep_buf, sizeof(msc_csw_t));
++  memcpy(_mscd_epbuf.buf, &p_msc->csw, sizeof(msc_csw_t));
++  return usbd_edpt_xfer(rhport, p_msc->ep_in , _mscd_epbuf.buf, sizeof(msc_csw_t));
+ }
+ 
+ static inline bool prepare_cbw(uint8_t rhport, mscd_interface_t* p_msc) {
+   p_msc->stage = MSC_STAGE_CMD;
+-  return usbd_edpt_xfer(rhport, p_msc->ep_out,  _mscd_epbuf.ep_buf, sizeof(msc_cbw_t));
++  return usbd_edpt_xfer(rhport, p_msc->ep_out,  _mscd_epbuf.buf, sizeof(msc_cbw_t));
+ }
+ 
+ static void fail_scsi_op(uint8_t rhport, mscd_interface_t* p_msc, uint8_t status) {
+@@ -351,7 +351,7 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
+         return true;
+       }
+ 
+-      const uint32_t signature = tu_le32toh(tu_unaligned_read32(_mscd_epbuf.ep_buf));
++      const uint32_t signature = tu_le32toh(tu_unaligned_read32(_mscd_epbuf.buf));
+ 
+       if (!(xferred_bytes == sizeof(msc_cbw_t) && signature == MSC_CBW_SIGNATURE)) {
+         // BOT 6.6.1 If CBW is not valid stall both endpoints until reset recovery
+@@ -362,7 +362,7 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
+         return false;
+       }
+ 
+-      memcpy(p_cbw, _mscd_epbuf.ep_buf, sizeof(msc_cbw_t));
++      memcpy(p_cbw, _mscd_epbuf.buf, sizeof(msc_cbw_t));
+ 
+       TU_LOG_DRV("  SCSI Command [Lun%u]: %s\r\n", p_cbw->lun, tu_lookup_find(&_msc_scsi_cmd_table, p_cbw->command[0]));
+       //TU_LOG_MEM(MSC_DEBUG, p_cbw, xferred_bytes, 2);
+@@ -404,15 +404,15 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
+           } else {
+             // Didn't check for case 9 (Ho > Dn), which requires examining scsi command first
+             // but it is OK to just receive data then responded with failed status
+-            TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_out, _mscd_epbuf.ep_buf, (uint16_t) p_msc->total_len));
++            TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_out, _mscd_epbuf.buf, (uint16_t) p_msc->total_len));
+           }
+         } else {
+           // First process if it is a built-in commands
+-          int32_t resplen = proc_builtin_scsi(p_cbw->lun, p_cbw->command, _mscd_epbuf.ep_buf, CFG_TUD_MSC_EP_BUFSIZE);
++          int32_t resplen = proc_builtin_scsi(p_cbw->lun, p_cbw->command, _mscd_epbuf.buf, CFG_TUD_MSC_EP_BUFSIZE);
+ 
+           // Invoke user callback if not built-in
+           if ((resplen < 0) && (p_msc->sense_key == 0)) {
+-            resplen = tud_msc_scsi_cb(p_cbw->lun, p_cbw->command, _mscd_epbuf.ep_buf, (uint16_t)p_msc->total_len);
++            resplen = tud_msc_scsi_cb(p_cbw->lun, p_cbw->command, _mscd_epbuf.buf, (uint16_t)p_msc->total_len);
+           }
+ 
+           if (resplen < 0) {
+@@ -436,7 +436,7 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
+             } else {
+               // cannot return more than host expect
+               p_msc->total_len = tu_min32((uint32_t)resplen, p_cbw->total_bytes);
+-              TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_in, _mscd_epbuf.ep_buf, (uint16_t) p_msc->total_len));
++              TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_in, _mscd_epbuf.buf, (uint16_t) p_msc->total_len));
+             }
+           }
+         }
+@@ -445,7 +445,7 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
+ 
+     case MSC_STAGE_DATA:
+       TU_LOG_DRV("  SCSI Data [Lun%u]\r\n", p_cbw->lun);
+-      //TU_LOG_MEM(MSC_DEBUG, p_msc->ep_buf, xferred_bytes, 2);
++      //TU_LOG_MEM(MSC_DEBUG, _mscd_epbuf.buf, xferred_bytes, 2);
+ 
+       if (SCSI_CMD_READ_10 == p_cbw->command[0]) {
+         p_msc->xferred_len += xferred_bytes;
+@@ -463,7 +463,7 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
+ 
+         // OUT transfer, invoke callback if needed
+         if ( !is_data_in(p_cbw->dir) ) {
+-          int32_t cb_result = tud_msc_scsi_cb(p_cbw->lun, p_cbw->command, _mscd_epbuf.ep_buf, (uint16_t) p_msc->total_len);
++          int32_t cb_result = tud_msc_scsi_cb(p_cbw->lun, p_cbw->command, _mscd_epbuf.buf, (uint16_t) p_msc->total_len);
+ 
+           if ( cb_result < 0 ) {
+             // unsupported command
+@@ -686,8 +686,8 @@ static int32_t proc_builtin_scsi(uint8_t lun, uint8_t const scsi_cmd[16], uint8_
+       };
+ 
+       // vendor_id, product_id, product_rev is space padded string
+-      memset(inquiry_rsp.vendor_id, ' ', sizeof(inquiry_rsp.vendor_id));
+-      memset(inquiry_rsp.product_id, ' ', sizeof(inquiry_rsp.product_id));
++      memset(inquiry_rsp.vendor_id  , ' ', sizeof(inquiry_rsp.vendor_id));
++      memset(inquiry_rsp.product_id , ' ', sizeof(inquiry_rsp.product_id));
+       memset(inquiry_rsp.product_rev, ' ', sizeof(inquiry_rsp.product_rev));
+ 
+       tud_msc_inquiry_cb(lun, inquiry_rsp.vendor_id, inquiry_rsp.product_id, inquiry_rsp.product_rev);
+@@ -765,7 +765,7 @@ static void proc_read10_cmd(uint8_t rhport, mscd_interface_t* p_msc) {
+ 
+   // Application can consume smaller bytes
+   uint32_t const offset = p_msc->xferred_len % block_sz;
+-  nbytes = tud_msc_read10_cb(p_cbw->lun, lba, offset, _mscd_epbuf.ep_buf, (uint32_t)nbytes);
++  nbytes = tud_msc_read10_cb(p_cbw->lun, lba, offset, _mscd_epbuf.buf, (uint32_t)nbytes);
+ 
+   if (nbytes < 0) {
+     // negative means error -> endpoint is stalled & status in CSW set to failed
+@@ -779,7 +779,7 @@ static void proc_read10_cmd(uint8_t rhport, mscd_interface_t* p_msc) {
+     // zero means not ready -> simulate an transfer complete so that this driver callback will fired again
+     dcd_event_xfer_complete(rhport, p_msc->ep_in, 0, XFER_RESULT_SUCCESS, false);
+   } else {
+-    TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_in, _mscd_epbuf.ep_buf, (uint16_t) nbytes),);
++    TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_in, _mscd_epbuf.buf, (uint16_t) nbytes),);
+   }
+ }
+ 
+@@ -803,7 +803,7 @@ static void proc_write10_cmd(uint8_t rhport, mscd_interface_t* p_msc) {
+   uint16_t nbytes = (uint16_t)tu_min32(CFG_TUD_MSC_EP_BUFSIZE, p_cbw->total_bytes - p_msc->xferred_len);
+ 
+   // Write10 callback will be called later when usb transfer complete
+-  TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_out, _mscd_epbuf.ep_buf, nbytes),);
++  TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_out, _mscd_epbuf.buf, nbytes),);
+ }
+ 
+ // process new data arrived from WRITE10
+@@ -818,7 +818,7 @@ static void proc_write10_new_data(uint8_t rhport, mscd_interface_t* p_msc, uint3
+ 
+   // Invoke callback to consume new data
+   uint32_t const offset = p_msc->xferred_len % block_sz;
+-  int32_t nbytes = tud_msc_write10_cb(p_cbw->lun, lba, offset, _mscd_epbuf.ep_buf, xferred_bytes);
++  int32_t nbytes = tud_msc_write10_cb(p_cbw->lun, lba, offset, _mscd_epbuf.buf, xferred_bytes);
+ 
+   if (nbytes < 0) {
+     // negative means error -> failed this scsi op
+@@ -837,7 +837,7 @@ static void proc_write10_new_data(uint8_t rhport, mscd_interface_t* p_msc, uint3
+       uint32_t const left_over = xferred_bytes - (uint32_t)nbytes;
+       if (nbytes > 0) {
+         p_msc->xferred_len += (uint16_t)nbytes;
+-        memmove(_mscd_epbuf.ep_buf, _mscd_epbuf.ep_buf + nbytes, left_over);
++        memmove(_mscd_epbuf.buf, _mscd_epbuf.buf + nbytes, left_over);
+       }
+ 
+       // simulate an transfer complete with adjusted parameters --> callback will be invoked with adjusted parameter
+diff --git a/src/common/tusb_types.h b/src/common/tusb_types.h
+index d0a5c866fa..c726add847 100644
+--- a/src/common/tusb_types.h
++++ b/src/common/tusb_types.h
+@@ -36,14 +36,20 @@
+ #endif
+ 
+ // DCache padding for variable to occupy full cache line
+-#define TUD_DCACHE_PADDING    uint8_t TU_XSTRCAT(dcache_padding_, _TU_COUNTER_)[CFG_TUD_MEM_DCACHE_ENABLE ? CFG_TUD_MEM_DCACHE_LINE_SIZE : 1]
++#define TUD_EPBUF_DCACHE_SIZE(_size) \
++  (CFG_TUD_MEM_DCACHE_ENABLE ? (TU_DIV_CEIL(_size, CFG_TUD_MEM_DCACHE_LINE_SIZE) * CFG_TUD_MEM_DCACHE_LINE_SIZE) : (_size))
+ 
+ #define TUD_EPBUF_DEF(_name, _size) \
+   union { \
+     CFG_TUD_MEM_ALIGN uint8_t _name[_size]; \
+-    uint8_t _name##_dcache_padding[CFG_TUD_MEM_DCACHE_ENABLE ? (TU_DIV_CEIL(_size, CFG_TUD_MEM_DCACHE_LINE_SIZE) * CFG_TUD_MEM_DCACHE_LINE_SIZE) : 1]; \
++    uint8_t _name##_dcache_padding[TUD_EPBUF_DCACHE_SIZE(_size)]; \
+   };
+ 
++#define TUD_EPBUF_TYPE_DEF(_name, _type) \
++  union { \
++    CFG_TUD_MEM_ALIGN _type _name; \
++    uint8_t _name##_dcache_padding[TUD_EPBUF_DCACHE_SIZE(sizeof(_type))]; \
++  };
+ 
+ /*------------------------------------------------------------------*/
+ /* CONSTANTS

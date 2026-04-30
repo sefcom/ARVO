@@ -1,0 +1,58 @@
+From fa618f5f492f94d19dd8d32bcea084523fb4e2d8 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sun, 9 Apr 2023 15:31:32 +0200
+Subject: [PATCH] Revert "avcodec/er: remove check for fields"
+
+Fixes: out of array write on x86-32
+Fixes: 57825/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_MPEG2VIDEO_fuzzer-6094366187061248
+Fixes: 57829/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_MPEG2VIDEO_fuzzer-4526419991724032
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+This reverts commit f7abe92bd7939b6aeeb2393fe141033e733305d4.
+---
+ libavcodec/error_resilience.c | 9 ++-------
+ libavcodec/error_resilience.h | 1 -
+ 2 files changed, 2 insertions(+), 8 deletions(-)
+
+diff --git a/libavcodec/error_resilience.c b/libavcodec/error_resilience.c
+index bd7050062c..2aa6f1d864 100644
+--- a/libavcodec/error_resilience.c
++++ b/libavcodec/error_resilience.c
+@@ -805,7 +805,8 @@ void ff_er_frame_start(ERContext *s)
+ static int er_supported(ERContext *s)
+ {
+     if(s->avctx->hwaccel && s->avctx->hwaccel->decode_slice           ||
+-       !s->cur_pic.f
++       !s->cur_pic.f                                                  ||
++       s->cur_pic.field_picture
+     )
+         return 0;
+     return 1;
+@@ -907,12 +908,6 @@ void ff_er_frame_end(ERContext *s)
+                           (s->avctx->skip_top + s->avctx->skip_bottom)) {
+         return;
+     }
+-
+-    if (!s->warned_fields && (s->cur_pic.field_picture || s->cur_pic.f->interlaced_frame)) {
+-        av_log(s->avctx, AV_LOG_WARNING, "Error concealment is not fully implemented for field pictures.\n");
+-        s->warned_fields = 1;
+-    }
+-
+     linesize = s->cur_pic.f->linesize;
+ 
+     if (   s->avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO
+diff --git a/libavcodec/error_resilience.h b/libavcodec/error_resilience.h
+index 55efacaccc..47cc8a4fc6 100644
+--- a/libavcodec/error_resilience.h
++++ b/libavcodec/error_resilience.h
+@@ -87,7 +87,6 @@ typedef struct ERContext {
+                       int (*mv)[2][4][2],
+                       int mb_x, int mb_y, int mb_intra, int mb_skipped);
+     void *opaque;
+-    int warned_fields;
+ } ERContext;
+ 
+ void ff_er_frame_start(ERContext *s);
+-- 
+2.25.1
+

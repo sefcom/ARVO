@@ -1,0 +1,70 @@
+From e4f8545e36fb28249864ff7f3a73b6460f6882c3 Mon Sep 17 00:00:00 2001
+From: Sean Parkinson <sean@wolfssl.com>
+Date: Mon, 15 Feb 2021 10:29:45 +1000
+Subject: [PATCH] SP math all: sp_exch fixed up
+
+---
+ wolfcrypt/src/dh.c     | 5 +++++
+ wolfcrypt/src/dsa.c    | 5 +++++
+ wolfcrypt/src/sp_int.c | 9 ++++++++-
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/wolfcrypt/src/dh.c b/wolfcrypt/src/dh.c
+index 0c9f1827560..3315c2dfa74 100644
+--- a/wolfcrypt/src/dh.c
++++ b/wolfcrypt/src/dh.c
+@@ -2456,7 +2456,12 @@ int wc_DhGenerateParams(WC_RNG *rng, int modSz, DhKey *dh)
+ 
+     if (ret == 0) {
+         /* at this point tmp generates a group of order q mod p */
++#ifndef USE_FAST_MATH
++        /* Exchanging is quick when the data pointer can be copied. */
+         mp_exch(&tmp, &dh->g);
++#else
++        mp_copy(&tmp, &dh->g);
++#endif
+     }
+ 
+     /* clear the parameters if there was an error */
+diff --git a/wolfcrypt/src/dsa.c b/wolfcrypt/src/dsa.c
+index f62cec92d2c..dbfa010ef4e 100644
+--- a/wolfcrypt/src/dsa.c
++++ b/wolfcrypt/src/dsa.c
+@@ -412,7 +412,12 @@ int wc_MakeDsaParameters(WC_RNG *rng, int modulus_size, DsaKey *dsa)
+     } while (mp_cmp_d(&tmp, 1) == MP_EQ);
+ 
+     /* at this point tmp generates a group of order q mod p */
++#ifndef USE_FAST_MATH
++    /* Exchanging is quick when the data pointer can be copied. */
+     mp_exch(&tmp, &dsa->g);
++#else
++    mp_copy(&tmp, &dsa->g);
++#endif
+ 
+     mp_clear(&tmp);
+     mp_clear(&tmp2);
+diff --git a/wolfcrypt/src/sp_int.c b/wolfcrypt/src/sp_int.c
+index d51ab9a5751..4b760631d26 100644
+--- a/wolfcrypt/src/sp_int.c
++++ b/wolfcrypt/src/sp_int.c
+@@ -2425,12 +2425,19 @@ int sp_exch(sp_int* a, sp_int* b)
+     if ((a == NULL) || (b == NULL)) {
+         err = MP_VAL;
+     }
++    if ((err == MP_OKAY) && ((a->size < b->used) || (b->size < a->used))) {
++        err = MP_VAL;
++    }
+ 
+     ALLOC_SP_INT(t, a->used, err, NULL);
+     if (err == MP_OKAY) {
++        int asize = a->size;
++        int bsize = b->size;
+         XMEMCPY(t, a, MP_INT_SIZEOF(a->used));
+         XMEMCPY(a, b, MP_INT_SIZEOF(b->used));
+-        XMEMCPY(b, t, MP_INT_SIZEOF(a->used));
++        XMEMCPY(b, t, MP_INT_SIZEOF(t->used));
++        a->size = asize;
++        b->size = bsize;
+     }
+ 
+     FREE_SP_INT(t, NULL);

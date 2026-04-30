@@ -1,0 +1,78 @@
+From 465767437da1bcf99a375295799d33948d9fc5f0 Mon Sep 17 00:00:00 2001
+From: Sitsofe Wheeler <sitsofe@yahoo.com>
+Date: Sat, 16 Jan 2021 10:41:02 +0000
+Subject: [PATCH] options: fix buffer overrun
+
+Google's OSS-fuzz turned up a buffer overrun with value of the filename
+option due to an overrun in a MAX_PATH sized buffer. To reproduce
+compile fio with address sanitizer options like the following
+
+LDFLAGS="-fsanitize=address" ./configure --disable-optimizations \
+      --extra-cflags="-fsanitize=address"
+
+The issue is demonstrated by the following job:
+
+% COUNT=$(getconf PATH_MAX /); printf "[t]\nfilename=%${COUNT}s" \
+  | sed 's/ /@/g' | fio --parse-only -
+=================================================================
+==45748==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7ffee8e35780 at pc 0x00010735a343 bp 0x7ffee8e35270 sp 0x7ffee8e34a08
+WRITE of size 1025 at 0x7ffee8e35780 thread T0
+    #0 0x10735a342 in wrap_vsprintf (libclang_rt.asan_osx_dynamic.dylib:x86_64h+0x22342)
+    #1 0x10735a9ac in wrap_sprintf (libclang_rt.asan_osx_dynamic.dylib:x86_64h+0x229ac)
+    #2 0x106e83b01 in add_file filesetup.c:1656
+    #3 0x106ee8c87 in str_filename_cb options.c:1320
+    #4 0x106ee1b44 in __handle_option parse.c:792
+    #5 0x106ed99ad in handle_option parse.c:1014
+    #6 0x106eda07d in parse_option parse.c:1184
+    #7 0x106ef10ea in fio_options_parse options.c:5199
+    #8 0x106e27684 in __parse_jobs_ini init.c:2076
+    #9 0x106e25377 in parse_jobs_ini init.c:2127
+    #10 0x106e2c971 in parse_options init.c:2989
+    #11 0x106ffc884 in main fio.c:42
+    #12 0x7fff702f1cc8 in start (libdyld.dylib:x86_64+0x1acc8)
+
+Address 0x7ffee8e35780 is located in stack of thread T0 at offset 1056 in frame
+    #0 0x106e836ef in add_file filesetup.c:1644
+
+  This frame has 1 object(s):
+    [32, 1056) 'file_name' (line 1646) <== Memory access at offset 1056 overflows this variable
+
+Return an error message to the user by doing the following:
+
+- Allow "regular" string options to have a maxlen parameter
+- Set the filename option to have a maxlen of MAX_PATH
+
+Signed-off-by: Sitsofe Wheeler <sitsofe@yahoo.com>
+---
+ options.c | 1 +
+ parse.c   | 5 +++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/options.c b/options.c
+index 0b4c48d618..955bf959e4 100644
+--- a/options.c
++++ b/options.c
+@@ -1672,6 +1672,7 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
+ 		.lname	= "Filename(s)",
+ 		.type	= FIO_OPT_STR_STORE,
+ 		.off1	= offsetof(struct thread_options, filename),
++		.maxlen	= PATH_MAX,
+ 		.cb	= str_filename_cb,
+ 		.prio	= -1, /* must come after "directory" */
+ 		.help	= "File(s) to use for the workload",
+diff --git a/parse.c b/parse.c
+index c28d82efb0..44bf950768 100644
+--- a/parse.c
++++ b/parse.c
+@@ -786,6 +786,11 @@ static int __handle_option(const struct fio_option *o, const char *ptr,
+ 		if (o->off1) {
+ 			cp = td_var(data, o, o->off1);
+ 			*cp = strdup(ptr);
++			if (strlen(ptr) > o->maxlen - 1) {
++				log_err("value exceeds max length of %d\n",
++					o->maxlen);
++				return 1;
++			}
+ 		}
+ 
+ 		if (fn)

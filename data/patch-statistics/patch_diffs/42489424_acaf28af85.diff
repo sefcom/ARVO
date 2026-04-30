@@ -1,0 +1,208 @@
+From 4ee2df73d99d549aa9718549341c01484dfeb2ec Mon Sep 17 00:00:00 2001
+From: Henrique S Matulis <69014250+hsmatulisgoogle@users.noreply.github.com>
+Date: Wed, 27 Jan 2021 14:18:56 -0500
+Subject: [PATCH 1/2] flb_oauth2: add flb_oauth2_payload_clear function
+
+This is to allow re-using flb_oauth2 contexts, which is needed for making out_stackdriver thread safe.
+
+Signed-off-by: Henrique S Matulis <69014250+hsmatulisgoogle@users.noreply.github.com>
+---
+ include/fluent-bit/flb_oauth2.h |  1 +
+ src/flb_oauth2.c                | 15 +++++++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/include/fluent-bit/flb_oauth2.h b/include/fluent-bit/flb_oauth2.h
+index 71b237b4bc9..20e908455bd 100644
+--- a/include/fluent-bit/flb_oauth2.h
++++ b/include/fluent-bit/flb_oauth2.h
+@@ -61,6 +61,7 @@ struct flb_oauth2 *flb_oauth2_create(struct flb_config *config,
+                                      const char *auth_url, int expire_sec);
+ void flb_oauth2_destroy(struct flb_oauth2 *ctx);
+ int flb_oauth2_token_len(struct flb_oauth2 *ctx);
++void flb_oauth2_payload_clear(struct flb_oauth2 *ctx);
+ int flb_oauth2_payload_append(struct flb_oauth2 *ctx,
+                               const char *key_str, int key_len,
+                               const char *val_str, int val_len);
+diff --git a/src/flb_oauth2.c b/src/flb_oauth2.c
+index 44cad52f900..f223a2f7029 100644
+--- a/src/flb_oauth2.c
++++ b/src/flb_oauth2.c
+@@ -240,6 +240,21 @@ struct flb_oauth2 *flb_oauth2_create(struct flb_config *config,
+     return NULL;
+ }
+ 
++/* Clear the current payload and token */
++void flb_oauth2_payload_clear(struct flb_oauth2 *ctx)
++{
++    ctx->payload[0] = '\0';
++    ctx->expires_in = 0;
++    if (ctx->access_token){
++        flb_sds_destroy(ctx->access_token);
++        ctx->access_token = NULL;
++    }
++    if (ctx->token_type){
++        flb_sds_destroy(ctx->token_type);
++        ctx->token_type = NULL;
++    }
++}
++
+ /* Append a key/value to the request body */
+ int flb_oauth2_payload_append(struct flb_oauth2 *ctx,
+                               const char *key_str, int key_len,
+
+From 519915b5071305593bc14130a044c45529eba415 Mon Sep 17 00:00:00 2001
+From: Henrique S Matulis <69014250+hsmatulisgoogle@users.noreply.github.com>
+Date: Wed, 27 Jan 2021 14:20:26 -0500
+Subject: [PATCH 2/2] out_stackdriver: fix some thread-safety issues
+
+Signed-off-by: Henrique S Matulis <69014250+hsmatulisgoogle@users.noreply.github.com>
+---
+ plugins/out_stackdriver/stackdriver.c | 48 +++++++++++++++++++--------
+ plugins/out_stackdriver/stackdriver.h |  4 +++
+ 2 files changed, 38 insertions(+), 14 deletions(-)
+
+diff --git a/plugins/out_stackdriver/stackdriver.c b/plugins/out_stackdriver/stackdriver.c
+index fd761c0b156..6359a54acb2 100644
+--- a/plugins/out_stackdriver/stackdriver.c
++++ b/plugins/out_stackdriver/stackdriver.c
+@@ -38,6 +38,7 @@
+ #include "stackdriver_helper.h"
+ #include <mbedtls/base64.h>
+ #include <mbedtls/sha256.h>
++#include <pthread.h>
+ 
+ /*
+  * Base64 Encoding in JWT must:
+@@ -202,12 +203,7 @@ static int get_oauth2_token(struct flb_stackdriver *ctx)
+     time_t expires;
+     char payload[1024];
+ 
+-    /* Create oauth2 context */
+-    ctx->o = flb_oauth2_create(ctx->config, FLB_STD_AUTH_URL, 3000);
+-    if (!ctx->o) {
+-        flb_plg_error(ctx->ins, "cannot create oauth2 context");
+-        return -1;
+-    }
++    flb_oauth2_payload_clear(ctx->o);
+ 
+     /* In case of using metadata server, fetch token from there */
+     if (ctx->metadata_server_auth) {
+@@ -263,23 +259,32 @@ static int get_oauth2_token(struct flb_stackdriver *ctx)
+     return 0;
+ }
+ 
+-static char *get_google_token(struct flb_stackdriver *ctx)
++static flb_sds_t get_google_token(struct flb_stackdriver *ctx)
+ {
+     int ret = 0;
++    flb_sds_t output = NULL;
+ 
+-    if (!ctx->o) {
+-        ret = get_oauth2_token(ctx);
++    if (pthread_mutex_lock(&ctx->token_mutex)){
++        flb_plg_error(ctx->ins, "error locking mutex");
++        return NULL;
+     }
+-    else if (flb_oauth2_token_expired(ctx->o) == FLB_TRUE) {
+-        flb_oauth2_destroy(ctx->o);
++
++    if (flb_oauth2_token_expired(ctx->o) == FLB_TRUE) {
+         ret = get_oauth2_token(ctx);
+     }
+ 
+-    if (ret != 0) {
++    /* Copy string to prevent race conditions (get_oauth2 can free the string) */
++    if (ret == 0) {
++        output = flb_sds_create(ctx->o->access_token);
++    }
++
++    if (pthread_mutex_unlock(&ctx->token_mutex)){
++        flb_plg_error(ctx->ins, "error unlocking mutex");
+         return NULL;
+     }
+ 
+-    return ctx->o->access_token;
++
++    return output;
+ }
+ 
+ static bool validate_msgpack_unpacked_data(msgpack_object root)
+@@ -855,11 +860,18 @@ static int cb_stackdriver_init(struct flb_output_instance *ins,
+         io_flags |= FLB_IO_IPV6;
+     }
+ 
++    /* Create mutex for acquiring oauth tokens (they are shared across flush coroutines) */
++    pthread_mutex_init ( &ctx->token_mutex, NULL);
++
+     /* Create Upstream context for Stackdriver Logging (no oauth2 service) */
+     ctx->u = flb_upstream_create_url(config, FLB_STD_WRITE_URL,
+                                      io_flags, ins->tls);
+     ctx->metadata_u = flb_upstream_create_url(config, "http://metadata.google.internal",
+                                               FLB_IO_TCP, NULL);
++
++    /* Create oauth2 context */
++    ctx->o = flb_oauth2_create(ctx->config, FLB_STD_AUTH_URL, 3000);
++
+     if (!ctx->u) {
+         flb_plg_error(ctx->ins, "upstream creation failed");
+         return -1;
+@@ -868,6 +880,11 @@ static int cb_stackdriver_init(struct flb_output_instance *ins,
+         flb_plg_error(ctx->ins, "metadata upstream creation failed");
+         return -1;
+     }
++    if (!ctx->o) {
++        flb_plg_error(ctx->ins, "cannot create oauth2 context");
++        return -1;
++    }
++    flb_output_upstream_set(ctx->u, ins);
+ 
+     /* Metadata Upstream Sync flags */
+     ctx->metadata_u->flags &= ~FLB_IO_ASYNC;
+@@ -877,6 +894,8 @@ static int cb_stackdriver_init(struct flb_output_instance *ins,
+         token = get_google_token(ctx);
+         if (!token) {
+             flb_plg_warn(ctx->ins, "token retrieval failed");
++        } else {
++            flb_sds_destroy(token);
+         }
+     }
+ 
+@@ -1878,7 +1897,7 @@ static void cb_stackdriver_flush(const void *data, size_t bytes,
+     int ret;
+     int ret_code = FLB_RETRY;
+     size_t b_sent;
+-    char *token;
++    flb_sds_t token;
+     flb_sds_t payload_buf;
+     size_t payload_size;
+     void *out_buf;
+@@ -1958,6 +1977,7 @@ static void cb_stackdriver_flush(const void *data, size_t bytes,
+ 
+     /* Cleanup */
+     flb_sds_destroy(payload_buf);
++    flb_sds_destroy(token);
+     flb_http_client_destroy(c);
+     flb_upstream_conn_release(u_conn);
+ 
+diff --git a/plugins/out_stackdriver/stackdriver.h b/plugins/out_stackdriver/stackdriver.h
+index 32778117e01..37052b13929 100644
+--- a/plugins/out_stackdriver/stackdriver.h
++++ b/plugins/out_stackdriver/stackdriver.h
+@@ -25,6 +25,7 @@
+ #include <fluent-bit/flb_output.h>
+ #include <fluent-bit/flb_oauth2.h>
+ #include <fluent-bit/flb_sds.h>
++#include <pthread.h>
+ 
+ /* refresh token every 50 minutes */
+ #define FLB_STD_TOKEN_REFRESH 3000
+@@ -118,6 +119,9 @@ struct flb_stackdriver {
+     /* oauth2 context */
+     struct flb_oauth2 *o;
+ 
++    /* mutex for acquiring oauth tokens */
++    pthread_mutex_t token_mutex;
++
+     /* upstream context for stackdriver write end-point */
+     struct flb_upstream *u;
+ 

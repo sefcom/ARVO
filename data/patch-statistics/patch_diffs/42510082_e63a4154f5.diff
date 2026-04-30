@@ -1,0 +1,58 @@
+From 4560df3ddd9e7031a450acdca28884884bd4f5ff Mon Sep 17 00:00:00 2001
+From: oscargm98 <soscargm98@gmail.com>
+Date: Mon, 14 Mar 2022 21:20:21 +0100
+Subject: [PATCH] implementing 3rd partition in blosc2_getitem_ctx()
+
+---
+ blosc/blosc2.c  | 15 +++++++++++++++
+ blosc/context.h |  4 ++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+index 8b17c81ec..7f869f5ec 100644
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -2861,6 +2861,19 @@ int _blosc_getitem(blosc2_context* context, blosc_header* header, const void* sr
+       stopb = header->blocksize;
+     }
+     bsize2 = stopb - startb;
++#if defined(HAVE_PLUGINS)
++  uint8_t ndim;
++  for (int nmetalayer = 0; nmetalayer < context->schunk->nmetalayers; nmetalayer++) {
++      if (strcmp("caterva", context->schunk->metalayers[nmetalayer]->name) == 0) {
++          ndim = context->schunk->metalayers[nmetalayer]->content[2];
++      }
++  }
++  int cell_nitems = (int) (1u << (2 * ndim));
++  if ((context->compcode == BLOSC_CODEC_ZFP_FIXED_RATE) && (nitems <= cell_nitems)) {
++    context->cell_start = startb;
++    context->zfp_nitems = nitems;
++}
++#endif /* HAVE_PLUGINS */
+ 
+     /* Do the actual data copy */
+     // Regular decompression.  Put results in tmp2.
+@@ -2886,6 +2899,8 @@ int _blosc_getitem(blosc2_context* context, blosc_header* header, const void* sr
+     ntbytes += bsize2;
+   }
+ 
++  context->cell_start = -1;
++
+   return ntbytes;
+ }
+ 
+diff --git a/blosc/context.h b/blosc/context.h
+index 25582005b..a6e2f56c5 100644
+--- a/blosc/context.h
++++ b/blosc/context.h
+@@ -64,6 +64,10 @@ struct blosc2_context_s {
+   /* Type size */
+   int32_t* bstarts;
+   /* Starts for every block inside the compressed buffer */
++  int32_t cell_start;
++  /* Cell starter index for ZFP fixed-rate mode */
++  int32_t zfp_nitems;
++  /* Number of items to get for ZFP fixed-rate mode */
+   int32_t special_type;
+   /* Special type for chunk.  0 if not special. */
+   int compcode;

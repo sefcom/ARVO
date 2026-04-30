@@ -1,0 +1,128 @@
+From f00f545b17cbb9958e9da054d137dbf0edd60331 Mon Sep 17 00:00:00 2001
+From: Nathan Moinvaziri <nathan@nathanm.com>
+Date: Sat, 23 Jan 2021 18:41:11 -0800
+Subject: [PATCH 1/4] Fixed ASAN error due to invalid header length.
+ https://oss-fuzz.com/testcase-detail/6021380745330688
+
+---
+ blosc/frame.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/blosc/frame.c b/blosc/frame.c
+index a87d691eb..40b4a9b6c 100644
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -423,8 +423,8 @@ int get_header_info(blosc2_frame *frame, int32_t *header_len, int64_t *frame_len
+     swap_store(typesize, framep + FRAME_TYPESIZE, sizeof(*typesize));
+   }
+ 
+-  if (*header_len > *frame_len) {
+-    BLOSC_TRACE_ERROR("Header length exceeds length of the frame.");
++  if (*header_len <= 0 || *header_len > *frame_len) {
++    BLOSC_TRACE_ERROR("Header length is invalid or exceeds length of the frame.");
+     return -1;
+   }
+ 
+
+From bc4cc4dc0bcf6bef960908264e92c58f077f733f Mon Sep 17 00:00:00 2001
+From: Nathan Moinvaziri <nathan@nathanm.com>
+Date: Sat, 23 Jan 2021 18:47:43 -0800
+Subject: [PATCH 2/4] Fixed UBSAN error when offset exceeds header length.
+ https://oss-fuzz.com/testcase-detail/4800450727641088
+
+---
+ blosc/frame.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/blosc/frame.c b/blosc/frame.c
+index a87d691eb..a451fe149 100644
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -1278,6 +1278,14 @@ int frame_get_metalayers(blosc2_frame* frame, blosc2_schunk* schunk) {
+     swap_store(&offset, idxp, sizeof(offset));
+     idxp += 4;
+ 
++    if (offset >= header_len) {
++      // Offset exceeds header length
++      if (frame->sdata == NULL) {
++        free(header);
++      }
++      free(ns);
++      return -1;
++    }
+     // Go to offset and see if we have the correct marker
+     uint8_t* content_marker = header + offset;
+     if (*content_marker != 0xc6) {
+
+From b4fd1963415522bdb94de45e9f326867fdfdbc76 Mon Sep 17 00:00:00 2001
+From: Nathan Moinvaziri <nathan@nathanm.com>
+Date: Sat, 23 Jan 2021 18:57:11 -0800
+Subject: [PATCH 3/4] Fixed UBSAN divide-by-zero error in handle_runlen with
+ typesize.
+
+---
+ blosc/blosc2.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+index 35a851451..42cd77b2f 100644
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -2296,6 +2296,10 @@ int handle_runlen(blosc2_context* context, uint8_t* src, uint32_t nbytes, uint8_
+   context->header_overhead = BLOSC_EXTENDED_HEADER_LENGTH;  // a Blosc2 chunk
+   int32_t cbytes_chunk = src[BLOSC2_CHUNK_CBYTES];
+   int32_t typesize = src[BLOSC2_CHUNK_TYPESIZE];
++  // Some checks for malformed headers
++  if (typesize <= 0 || typesize > BLOSC_MAX_TYPESIZE) {
++    return -1;
++  }
+   bool all_zeros = src[BLOSC2_CHUNK_BLOSC2_FLAGS] & (BLOSC2_ZERO_RUNLEN << 4);
+   bool all_nans = src[BLOSC2_CHUNK_BLOSC2_FLAGS] & (BLOSC2_NAN_RUNLEN << 4);
+   if ((cbytes_chunk != context->header_overhead + typesize) && (cbytes_chunk != context->header_overhead)) {
+
+From 4f7cfdbde36917b3b6291492240fc9b128ace1d7 Mon Sep 17 00:00:00 2001
+From: Nathan Moinvaziri <nathan@nathanm.com>
+Date: Sat, 23 Jan 2021 19:25:37 -0800
+Subject: [PATCH 4/4] Prevent ASAN 64-bit memory allocation in fuzzers.
+ https://oss-fuzz.com/testcase-detail/5005175230169088
+
+---
+ tests/fuzz/fuzz_compress_chunk.c   | 6 ++++++
+ tests/fuzz/fuzz_decompress_frame.c | 7 ++++++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/tests/fuzz/fuzz_compress_chunk.c b/tests/fuzz/fuzz_compress_chunk.c
+index 298acf5e3..049393d81 100644
+--- a/tests/fuzz/fuzz_compress_chunk.c
++++ b/tests/fuzz/fuzz_compress_chunk.c
+@@ -46,6 +46,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+ 
+   blosc_cbuffer_sizes(output, &nbytes, &cbytes, &blocksize);
+ 
++  /* Don't allow address sanitizer to allocate more than INT32_MAX */
++  if (cbytes >= INT32_MAX) {
++    free(output);
++    return 0;
++  }
++
+   input = malloc(cbytes);
+   if (input != NULL) {
+     blosc_decompress(output, input, cbytes);
+diff --git a/tests/fuzz/fuzz_decompress_frame.c b/tests/fuzz/fuzz_decompress_frame.c
+index 7179b1e6c..d0af1ee49 100644
+--- a/tests/fuzz/fuzz_decompress_frame.c
++++ b/tests/fuzz/fuzz_decompress_frame.c
+@@ -25,7 +25,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+     blosc_destroy();
+     return 0;
+   }
+-
++  /* Don't allow address sanitizer to allocate more than INT32_MAX */
++  if (schunk->nbytes >= INT32_MAX) {
++    blosc2_schunk_free(schunk);
++    blosc_destroy();
++    return 0;
++  }
+   /* Decompress data */
+   uint8_t *uncompressed_data = (uint8_t *)malloc((size_t)schunk->nbytes+1);
+   if (uncompressed_data != NULL) {

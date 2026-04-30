@@ -1,0 +1,425 @@
+From c4ecd82f9399850a36bf2466d0a54a045b6dfa15 Mon Sep 17 00:00:00 2001
+From: Tyson Andre <tysonandre775@hotmail.com>
+Date: Mon, 24 Oct 2022 08:33:25 -0400
+Subject: [PATCH] Make inspecting SplFixedArray instances more memory
+ efficient/consistent, change print_r null props handling (#9757)
+
+* Make handling of SplFixedArray properties more consistent
+
+Create a brand new reference counted array every time in SplFixedArray
+to be freed by the callers (or return null).
+Switch from overriding `get_properties` to overriding `get_properties_for` handler
+
+* Print objects with null hash table like others in print_r
+
+Noticed when working on subsequent commits for SplFixedArray.
+Make whether zend_get_properties_for returns null or an empty array
+invisible to the end user - it would be always be a non-null array for
+user-defined classes.
+Always print newlines with `\n\s*(\n\s*)` after objects
+
+Noticed when working on SplFixedArray changes, e.g. in
+ext/spl/tests/SplFixedArray__construct_param_null.phpt
+---
+ .../sensitive_parameter_value.phpt            |  2 +
+ Zend/zend.c                                   |  1 +
+ ext/spl/spl_fixedarray.c                      | 79 +++++++----------
+ .../ArrayObject_overloaded_SplFixedArray.phpt | 28 ++++++
+ ...Object_overloaded_object_incompatible.phpt |  4 +-
+ .../SplFixedArray_get_properties_for.phpt     | 86 +++++++++++++++++++
+ ext/spl/tests/SplFixedArray_immediate_gc.phpt | 35 ++++++++
+ .../tests/SplFixedArray_setSize_destruct.phpt |  7 +-
+ 8 files changed, 190 insertions(+), 52 deletions(-)
+ create mode 100644 ext/spl/tests/ArrayObject_overloaded_SplFixedArray.phpt
+ create mode 100644 ext/spl/tests/SplFixedArray_get_properties_for.phpt
+ create mode 100644 ext/spl/tests/SplFixedArray_immediate_gc.phpt
+
+diff --git a/Zend/tests/function_arguments/sensitive_parameter_value.phpt b/Zend/tests/function_arguments/sensitive_parameter_value.phpt
+index accf19338a521..fc797fa1385ba 100644
+--- a/Zend/tests/function_arguments/sensitive_parameter_value.phpt
++++ b/Zend/tests/function_arguments/sensitive_parameter_value.phpt
+@@ -31,6 +31,8 @@ object(SensitiveParameterValue)#%d (0) {
+ object(SensitiveParameterValue)#%d (%d) refcount(%d){
+ }
+ SensitiveParameterValue Object
++(
++)
+ 
+ # var_export()
+ \SensitiveParameterValue::__set_state(array(
+diff --git a/Zend/zend.c b/Zend/zend.c
+index c6a5f7f91ce0f..46a0e1b4c0ea3 100644
+--- a/Zend/zend.c
++++ b/Zend/zend.c
+@@ -507,6 +507,7 @@ static void zend_print_zval_r_to_buf(smart_str *buf, zval *expr, int indent) /*
+ 				}
+ 
+ 				if ((properties = zend_get_properties_for(expr, ZEND_PROP_PURPOSE_DEBUG)) == NULL) {
++					print_hash(buf, (HashTable*) &zend_empty_array, indent, 1);
+ 					break;
+ 				}
+ 
+diff --git a/ext/spl/spl_fixedarray.c b/ext/spl/spl_fixedarray.c
+index f5a056558a928..465c649e980aa 100644
+--- a/ext/spl/spl_fixedarray.c
++++ b/ext/spl/spl_fixedarray.c
+@@ -48,8 +48,6 @@ typedef struct _spl_fixedarray {
+ 	zend_long size;
+ 	/* It is possible to resize this, so this can't be combined with the object */
+ 	zval *elements;
+-	/* True if this was modified after the last call to get_properties or the hash table wasn't rebuilt. */
+-	bool                 should_rebuild_properties;
+ } spl_fixedarray;
+ 
+ typedef struct _spl_fixedarray_object {
+@@ -107,7 +105,6 @@ static void spl_fixedarray_init_non_empty_struct(spl_fixedarray *array, zend_lon
+ 	array->size = 0; /* reset size in case ecalloc() fails */
+ 	array->elements = size ? safe_emalloc(size, sizeof(zval), 0) : NULL;
+ 	array->size = size;
+-	array->should_rebuild_properties = true;
+ }
+ 
+ static void spl_fixedarray_init(spl_fixedarray *array, zend_long size)
+@@ -177,7 +174,6 @@ static void spl_fixedarray_resize(spl_fixedarray *array, zend_long size)
+ 		/* nothing to do */
+ 		return;
+ 	}
+-	array->should_rebuild_properties = true;
+ 
+ 	/* first initialization */
+ 	if (array->size == 0) {
+@@ -211,47 +207,41 @@ static HashTable* spl_fixedarray_object_get_gc(zend_object *obj, zval **table, i
+ 	return ht;
+ }
+ 
+-static HashTable* spl_fixedarray_object_get_properties(zend_object *obj)
++static HashTable* spl_fixedarray_object_get_properties_for(zend_object *obj, zend_prop_purpose purpose)
+ {
+-	spl_fixedarray_object *intern = spl_fixed_array_from_obj(obj);
+-	HashTable *ht = zend_std_get_properties(obj);
+-
+-	if (!spl_fixedarray_empty(&intern->array)) {
+-		/*
+-		 * Usually, the reference count of the hash table is 1,
+-		 * except during cyclic reference cycles.
+-		 *
+-		 * Maintain the DEBUG invariant that a hash table isn't modified during iteration,
+-		 * and avoid unnecessary work rebuilding a hash table for unmodified properties.
+-		 *
+-		 * See https://github.com/php/php-src/issues/8079 and ext/spl/tests/fixedarray_022.phpt
+-		 * Also see https://github.com/php/php-src/issues/8044 for alternate considered approaches.
+-		 */
+-		if (!intern->array.should_rebuild_properties) {
+-			/* Return the same hash table so that recursion cycle detection works in internal functions. */
+-			return ht;
+-		}
+-		intern->array.should_rebuild_properties = false;
++	/* This has __serialize, so the purpose is not ZEND_PROP_PURPOSE_SERIALIZE, which would expect a non-null return value */
++	ZEND_ASSERT(purpose != ZEND_PROP_PURPOSE_SERIALIZE);
+ 
+-		zend_long j = zend_hash_num_elements(ht);
++	const spl_fixedarray_object *intern = spl_fixed_array_from_obj(obj);
++	/*
++	 * SplFixedArray can be subclassed or have dynamic properties (With or without AllowDynamicProperties in subclasses).
++	 * Instances of subclasses with declared properties may have properties but not yet have a property table.
++	 */
++	HashTable *source_properties = obj->properties ? obj->properties : (obj->ce->default_properties_count ? zend_std_get_properties(obj) : NULL);
+ 
+-		if (GC_REFCOUNT(ht) > 1) {
+-			intern->std.properties = zend_array_dup(ht);
+-			GC_TRY_DELREF(ht);
+-		}
+-		for (zend_long i = 0; i < intern->array.size; i++) {
+-			zend_hash_index_update(ht, i, &intern->array.elements[i]);
+-			Z_TRY_ADDREF(intern->array.elements[i]);
+-		}
+-		if (j > intern->array.size) {
+-			for (zend_long i = intern->array.size; i < j; ++i) {
+-				zend_hash_index_del(ht, i);
++	const zend_long size = intern->array.size;
++	if (size == 0 && (!source_properties || !zend_hash_num_elements(source_properties))) {
++		return NULL;
++	}
++	zval *const elements = intern->array.elements;
++	HashTable *ht = zend_new_array(size);
++
++	for (zend_long i = 0; i < size; i++) {
++		Z_TRY_ADDREF_P(&elements[i]);
++		zend_hash_next_index_insert(ht, &elements[i]);
++	}
++	if (source_properties && zend_hash_num_elements(source_properties) > 0) {
++		zend_long nkey;
++		zend_string *skey;
++		zval *value;
++		ZEND_HASH_MAP_FOREACH_KEY_VAL_IND(source_properties, nkey, skey, value) {
++			Z_TRY_ADDREF_P(value);
++			if (skey) {
++				zend_hash_add_new(ht, skey, value);
++			} else {
++				zend_hash_index_update(ht, nkey, value);
+ 			}
+-		}
+-		if (HT_IS_PACKED(ht)) {
+-			/* Engine doesn't expet packed array */
+-			zend_hash_packed_to_hash(ht);
+-		}
++		} ZEND_HASH_FOREACH_END();
+ 	}
+ 
+ 	return ht;
+@@ -394,9 +384,6 @@ static zval *spl_fixedarray_object_read_dimension(zend_object *object, zval *off
+ 	}
+ 
+ 	spl_fixedarray_object *intern = spl_fixed_array_from_obj(object);
+-	if (type != BP_VAR_IS && type != BP_VAR_R) {
+-		intern->array.should_rebuild_properties = true;
+-	}
+ 	return spl_fixedarray_object_read_dimension_helper(intern, offset);
+ }
+ 
+@@ -420,7 +407,6 @@ static void spl_fixedarray_object_write_dimension_helper(spl_fixedarray_object *
+ 		zend_throw_exception(spl_ce_RuntimeException, "Index invalid or out of range", 0);
+ 		return;
+ 	} else {
+-		intern->array.should_rebuild_properties = true;
+ 		/* Fix #81429 */
+ 		zval *ptr = &(intern->array.elements[index]);
+ 		zval tmp;
+@@ -461,7 +447,6 @@ static void spl_fixedarray_object_unset_dimension_helper(spl_fixedarray_object *
+ 		zend_throw_exception(spl_ce_RuntimeException, "Index invalid or out of range", 0);
+ 		return;
+ 	} else {
+-		intern->array.should_rebuild_properties = true;
+ 		zval_ptr_dtor(&(intern->array.elements[index]));
+ 		ZVAL_NULL(&intern->array.elements[index]);
+ 	}
+@@ -973,7 +958,7 @@ PHP_MINIT_FUNCTION(spl_fixedarray)
+ 	spl_handler_SplFixedArray.unset_dimension = spl_fixedarray_object_unset_dimension;
+ 	spl_handler_SplFixedArray.has_dimension   = spl_fixedarray_object_has_dimension;
+ 	spl_handler_SplFixedArray.count_elements  = spl_fixedarray_object_count_elements;
+-	spl_handler_SplFixedArray.get_properties  = spl_fixedarray_object_get_properties;
++	spl_handler_SplFixedArray.get_properties_for = spl_fixedarray_object_get_properties_for;
+ 	spl_handler_SplFixedArray.get_gc          = spl_fixedarray_object_get_gc;
+ 	spl_handler_SplFixedArray.free_obj        = spl_fixedarray_object_free_storage;
+ 
+diff --git a/ext/spl/tests/ArrayObject_overloaded_SplFixedArray.phpt b/ext/spl/tests/ArrayObject_overloaded_SplFixedArray.phpt
+new file mode 100644
+index 0000000000000..7abbd266e3371
+--- /dev/null
++++ b/ext/spl/tests/ArrayObject_overloaded_SplFixedArray.phpt
+@@ -0,0 +1,28 @@
++--TEST--
++SplFixedArray properties is compatible with ArrayObject
++--FILE--
++<?php
++$ao = new ArrayObject([1, 2, 3]);
++$fixedArray = new SplFixedArray(1);
++$fixedArray[0] = new SplDoublyLinkedList();
++$ao->exchangeArray($fixedArray);
++$ao[0] = new stdClass();
++var_dump($ao);
++?>
++--EXPECT--
++object(ArrayObject)#1 (1) {
++  ["storage":"ArrayObject":private]=>
++  object(SplFixedArray)#2 (2) {
++    [0]=>
++    object(SplDoublyLinkedList)#3 (2) {
++      ["flags":"SplDoublyLinkedList":private]=>
++      int(0)
++      ["dllist":"SplDoublyLinkedList":private]=>
++      array(0) {
++      }
++    }
++    ["0"]=>
++    object(stdClass)#4 (0) {
++    }
++  }
++}
+diff --git a/ext/spl/tests/ArrayObject_overloaded_object_incompatible.phpt b/ext/spl/tests/ArrayObject_overloaded_object_incompatible.phpt
+index 8c1121b8d01ad..67267f0ec6a12 100644
+--- a/ext/spl/tests/ArrayObject_overloaded_object_incompatible.phpt
++++ b/ext/spl/tests/ArrayObject_overloaded_object_incompatible.phpt
+@@ -5,7 +5,7 @@ Objects with overloaded get_properties are incompatible with ArrayObject
+ 
+ $ao = new ArrayObject([1, 2, 3]);
+ try {
+-    $ao->exchangeArray(new SplFixedArray);
++    $ao->exchangeArray(new DateInterval('P1D'));
+ } catch (Exception $e) {
+     echo $e->getMessage(), "\n";
+ }
+@@ -13,7 +13,7 @@ var_dump($ao);
+ 
+ ?>
+ --EXPECT--
+-Overloaded object of type SplFixedArray is not compatible with ArrayObject
++Overloaded object of type DateInterval is not compatible with ArrayObject
+ object(ArrayObject)#1 (1) {
+   ["storage":"ArrayObject":private]=>
+   array(3) {
+diff --git a/ext/spl/tests/SplFixedArray_get_properties_for.phpt b/ext/spl/tests/SplFixedArray_get_properties_for.phpt
+new file mode 100644
+index 0000000000000..24fa4bf1ae058
+--- /dev/null
++++ b/ext/spl/tests/SplFixedArray_get_properties_for.phpt
+@@ -0,0 +1,86 @@
++--TEST--
++SplFixedArray - get_properties_for handlers
++--FILE--
++<?php
++#[AllowDynamicProperties]
++class MySplFixedArray extends SplFixedArray {
++    public $x;
++    public int $y;
++}
++class X {}
++class Y {}
++$array = new MySplFixedArray(2);
++var_dump(get_mangled_object_vars($array));
++$array[0] = new stdClass();
++$array[1] = new Y();
++$array->x = new SplFixedArray();
++$array->{0} = new X();
++var_dump($array);
++// As of php 8.3, get_mangled_object_vars only contains object properties (dynamic properties and declared subclass properties)
++//                (Array elements in the SplFixedArray are deliberately excluded)
++// Before php 8.3, this would have array elements get removed in some cases but not others.
++var_dump(get_mangled_object_vars($array));
++echo "cast to array\n";
++var_dump((array)$array); // Adds the values from the underlying array, then the declared/dynamic object properties
++echo json_encode($array), "\n"; // From JsonSerializable::serialize()
++$ser = serialize($array);
++echo "$ser\n";
++// NOTE: The unserialize behavior for the property that is the string '0' is just because unserialize()
++// is coercing '0' to a string before calling SplFixedArray::__unserialize.
++//
++// Typical code would not use 0 as a property name, this test is just testing edge cases have proper reference counting and so on.
++var_dump(unserialize($ser));
++?>
++--EXPECT--
++array(1) {
++  ["x"]=>
++  NULL
++}
++object(MySplFixedArray)#1 (4) {
++  [0]=>
++  object(stdClass)#2 (0) {
++  }
++  [1]=>
++  object(Y)#3 (0) {
++  }
++  ["x"]=>
++  object(SplFixedArray)#4 (0) {
++  }
++  ["0"]=>
++  object(X)#5 (0) {
++  }
++}
++array(2) {
++  ["x"]=>
++  object(SplFixedArray)#4 (0) {
++  }
++  [0]=>
++  object(X)#5 (0) {
++  }
++}
++cast to array
++array(3) {
++  [0]=>
++  object(X)#5 (0) {
++  }
++  [1]=>
++  object(Y)#3 (0) {
++  }
++  ["x"]=>
++  object(SplFixedArray)#4 (0) {
++  }
++}
++[{},{}]
++O:15:"MySplFixedArray":5:{i:0;O:8:"stdClass":0:{}i:1;O:1:"Y":0:{}s:1:"x";i:0;s:1:"y";i:0;s:1:"0";O:1:"X":0:{}}
++object(MySplFixedArray)#6 (4) {
++  [0]=>
++  object(X)#9 (0) {
++  }
++  [1]=>
++  object(Y)#8 (0) {
++  }
++  ["x"]=>
++  int(0)
++  ["y"]=>
++  int(0)
++}
+diff --git a/ext/spl/tests/SplFixedArray_immediate_gc.phpt b/ext/spl/tests/SplFixedArray_immediate_gc.phpt
+new file mode 100644
+index 0000000000000..cead2238c190a
+--- /dev/null
++++ b/ext/spl/tests/SplFixedArray_immediate_gc.phpt
+@@ -0,0 +1,35 @@
++--TEST--
++SplFixedArray - values should be gced after var_export then being modified
++--FILE--
++<?php
++class HasDestructor {
++    public function __destruct() {
++        echo "In destructor\n";
++    }
++}
++$array = SplFixedArray::fromArray([new HasDestructor()]);
++var_dump($array);
++echo "Replacing\n";
++$array[0] = new stdClass();
++// As of php 8.3, this will be freed before the var_dump call
++echo "Dumping again\n";
++var_dump($array);
++// As of php 8.3, this only contain object properties (dynamic properties and declared subclass properties)
++var_dump(get_mangled_object_vars($array));
++?>
++--EXPECT--
++object(SplFixedArray)#2 (1) {
++  [0]=>
++  object(HasDestructor)#1 (0) {
++  }
++}
++Replacing
++In destructor
++Dumping again
++object(SplFixedArray)#2 (1) {
++  [0]=>
++  object(stdClass)#3 (0) {
++  }
++}
++array(0) {
++}
+diff --git a/ext/spl/tests/SplFixedArray_setSize_destruct.phpt b/ext/spl/tests/SplFixedArray_setSize_destruct.phpt
+index 8a07b1decccbc..24cfd9023b0c9 100644
+--- a/ext/spl/tests/SplFixedArray_setSize_destruct.phpt
++++ b/ext/spl/tests/SplFixedArray_setSize_destruct.phpt
+@@ -12,6 +12,7 @@ class HasDestructor {
+         global $values;
+         var_dump($values);
+         $values->setSize($values->getSize() - 1);
++        echo "After reducing size:\n";
+         var_dump($values);
+     }
+ }
+@@ -24,9 +25,8 @@ object(SplFixedArray)#1 (1) {
+   [0]=>
+   bool(false)
+ }
+-object(SplFixedArray)#1 (1) {
+-  [0]=>
+-  bool(false)
++After reducing size:
++object(SplFixedArray)#1 (0) {
+ }
+ Done
+ Done
+@@ -43,6 +43,7 @@ object(SplFixedArray)#1 (5) {
+   object(HasDestructor)#2 (0) {
+   }
+ }
++After reducing size:
+ object(SplFixedArray)#1 (4) {
+   [0]=>
+   NULL

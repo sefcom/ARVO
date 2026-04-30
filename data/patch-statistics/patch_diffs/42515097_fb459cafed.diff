@@ -1,0 +1,50 @@
+From f995000834a6bbee1c2a53114e0e41b596c33431 Mon Sep 17 00:00:00 2001
+From: Frederik Deweerdt <fdeweerdt@fastly.com>
+Date: Fri, 26 Aug 2022 13:58:43 -0700
+Subject: [PATCH] Avoid 0 sized VLAs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+They are undefined in C, from the c99 draft:
+
+> 6.7.5.2 Array declarators § 5
+> If the size is an expression that is not an integer constant
+> expression: if it occurs in a declaration at function prototype scope,
+> it is treated as if it were replaced by *; otherwise, each time it is
+> evaluated it shall have a value greater than zero.
+---
+ lib/common/socket.c | 3 +++
+ lib/http1.c         | 2 +-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/lib/common/socket.c b/lib/common/socket.c
+index 7b5f5ced56..9772a10e6a 100644
+--- a/lib/common/socket.c
++++ b/lib/common/socket.c
+@@ -900,6 +900,9 @@ void h2o_socket_sendvec(h2o_socket_t *sock, h2o_sendvec_t *vecs, size_t cnt, h2o
+ 
+     sock->_cb.write = cb;
+ 
++    if (cnt == 0)
++        return do_write(sock, NULL, 0);
++
+     h2o_iovec_t bufs[cnt];
+     size_t pull_index = SIZE_MAX;
+ 
+diff --git a/lib/http1.c b/lib/http1.c
+index 496e1b49c6..f12e121cf0 100644
+--- a/lib/http1.c
++++ b/lib/http1.c
+@@ -370,10 +370,10 @@ static const char *init_headers(h2o_mem_pool_t *pool, h2o_headers_t *headers, co
+         h2o_vector_reserve(pool, headers, len);
+         for (i = 0; i != len; ++i) {
+             const h2o_token_t *name_token;
+-            char orig_case[src[i].name_len];
+             /* reject multiline header */
+             if (src[i].name_len == 0)
+                 return "line folding of header fields is not supported";
++            char orig_case[src[i].name_len];
+             /* preserve the original case */
+             memcpy(orig_case, src[i].name, src[i].name_len);
+             /* convert to lower-case in-place */

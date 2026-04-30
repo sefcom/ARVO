@@ -1,0 +1,151 @@
+From 2305ab68ea2be5e2fcdee52b2929f21ebbc03059 Mon Sep 17 00:00:00 2001
+From: Reini Urban <rurban@cpan.org>
+Date: Sun, 30 Jan 2022 22:31:21 +0100
+Subject: [PATCH] indxf: stricter dxf import
+
+2/3DPOINT* import only from matching DXF codes, not just
+some irrelevant.
+
+special-case clip_verts pairs (WIPEOUT, SPATIAL_FILTER, ...)
+when the num_ value is set, do the vector alloc.
+Fixes oss-fuzz #39025 with WIPEOUT.clip_verts
+
+indxf now fails on unstable classes, where all DXF groups are known.
+---
+ src/classes.c | 21 +++++++++++++++++++++
+ src/classes.h |  1 +
+ src/dwg.spec  |  3 ++-
+ src/in_dxf.c  | 33 +++++++++++++++++++++++++++++----
+ 4 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/src/classes.c b/src/classes.c
+index 652a7f63bf..303cc90d5b 100644
+--- a/src/classes.c
++++ b/src/classes.c
+@@ -526,6 +526,27 @@ bool is_class_unhandled (const char* name)
+ #endif
+ }
+ 
++// if all DXF groups are known
++bool is_dxf_class_importable (const char* name)
++{
++  // hash lookup
++  Dwg_Class_Stability stability;
++  if (dwg_object_name (name, NULL, NULL, NULL, &stability)) {
++    if (stability == DWG_CLASS_UNSTABLE)
++      {
++        return !strEQc (name, "MATERIAL") &&      // 72 missing
++               !strEQc (name, "ARC_DIMENSION") && // 2 missing
++               !strEQc (name, "SUN") &&           // 421 missing
++               !strEQc (name, "PROXY_ENTITY") &&  // 90 missing
++               !strEQc (name, "PROXY_OBJECT");    // 90 missing
++      }
++    else
++      return stability == DWG_CLASS_STABLE;
++  }
++  else
++    return false;
++}
++
+ bool dwg_find_class (const Dwg_Data *restrict dwg, const char* dxfname, BITCODE_BS *numberp)
+ {
+   assert(dwg);
+diff --git a/src/classes.h b/src/classes.h
+index 20fd9576c4..9b82324bdc 100644
+--- a/src/classes.h
++++ b/src/classes.h
+@@ -37,6 +37,7 @@ bool is_class_stable (const char* name) __nonnull_all;
+ bool is_class_unstable (const char* name) __nonnull_all;
+ bool is_class_debugging (const char* name) __nonnull_all;
+ bool is_class_unhandled (const char* name) __nonnull_all;
++bool is_dxf_class_importable (const char* name) __nonnull_all;
+ bool dwg_find_class (const Dwg_Data *restrict dwg, const char* dxfname,
+                      BITCODE_BS *numberp) __nonnull ((1,2));
+ void object_alias (char *restrict name) __nonnull_all;
+diff --git a/src/dwg.spec b/src/dwg.spec
+index 700a1e0698..2757855abb 100644
+--- a/src/dwg.spec
++++ b/src/dwg.spec
+@@ -7775,6 +7775,7 @@ DWG_OBJECT_END
+ 
+ // hard-owned child of AcDbViewportTableRecord or AcDbViewport 361
+ // DXF docs put that as Entity, wrong!
++// Missing: 421
+ DWG_OBJECT (SUN)
+   SUBCLASS (AcDbSun)
+   FIELD_BL (class_version, 90);
+@@ -8060,7 +8061,7 @@ DWG_ENTITY (ARC_DIMENSION)
+ 
+   COMMON_ENTITY_HANDLE_DATA;
+   FIELD_HANDLE (dimstyle, 5, 0);
+-  FIELD_HANDLE (block, 5, 0);
++  FIELD_HANDLE (block, 5, 2);
+ DWG_ENTITY_END
+ 
+ // as ACAD_LAYERFILTERS in the NOD
+diff --git a/src/in_dxf.c b/src/in_dxf.c
+index 73505329ca..344e15e3ce 100644
+--- a/src/in_dxf.c
++++ b/src/in_dxf.c
+@@ -10835,8 +10835,32 @@ new_object (char *restrict name, char *restrict dxfname,
+                       && strNE (f->name, "parent")) // parent set in NEW_OBJECT
+                     {
+                       const Dwg_DYNAPI_field *num_f;
++
+                       // FIELD_2RD_VECTOR (clip_verts, num_clip_verts, 11|14);
+-                      if (pair->code >= 10 && pair->code <= 24
++                      if ((pair->code == 91 || pair->code == 70) && strEQc (f->name, "num_clip_verts"))
++                        {
++                          BITCODE_2RD *clip_verts;
++                          BITCODE_BL num_clip_verts = pair->value.u;
++                          if (pair->code == 91)
++                            dwg_dynapi_entity_set_value (_obj, obj->name, f->name, &num_clip_verts, 0);
++                          else
++                            {
++                              BITCODE_BS num = pair->value.i; // 70
++                              dwg_dynapi_entity_set_value (_obj, obj->name, f->name, &num, 0);
++                            }
++                          dwg_dynapi_entity_value (_obj, obj->name,
++                                                   "clip_verts", &clip_verts,
++                                                   NULL);
++                          clip_verts = (BITCODE_2RD *)realloc (clip_verts,
++                              num_clip_verts * sizeof (BITCODE_2RD));
++                          if (!clip_verts)
++                            goto invalid_dxf;
++                          dwg_dynapi_entity_set_value (
++                              _obj, obj->name, f->name, &clip_verts, 0);
++                          LOG_TRACE ("%s.num_clip_verts = %d [%s %d]\n", name,
++                                     num_clip_verts, f->type, pair->code);
++                        }
++                      else if (pair->code >= 10 && pair->code <= 24
+                           && strEQc (f->name, "clip_verts")) // 11 or 14
+                         {
+                           BITCODE_BL num_clip_verts = 0;
+@@ -10908,10 +10932,11 @@ new_object (char *restrict name, char *restrict dxfname,
+                             }
+                           goto next_pair;
+                         }
+-                      // point vectors with known num_field
++                      // point vectors with known num_field (not 210)
+                       else if ((*f->type == '2' || *f->type == '3')
+                                && (f->type[2] == 'D'
+                                    || strEQc (&f->type[1], "DPOINT*"))
++                               && pair->code >= 10 && pair->code <= 34
+                                && (num_f = find_numfield (fields, f->name)))
+                         {
+                           // how many points
+@@ -11874,12 +11899,12 @@ new_object (char *restrict name, char *restrict dxfname,
+                              "dim_rotation", ang, pair->value.d, "BD", 50);
+                 }
+               // accept wrong colors
+-              else if (is_class_stable (obj->name) && (pair->code < 60 || pair->code > 68))
++              else if (is_dxf_class_importable (obj->name) && (pair->code < 60 || pair->code > 68))
+                 {
+                   goto invalid_dxf;
+                 }
+               else
+-                LOG_WARN ("Unknown DXF code %d for %s", pair->code, name);
++                LOG_WARN ("Unknown DXF code %d for %s", pair->code, name); // Debugging or Unhandled class
+             }
+         }
+     next_pair:

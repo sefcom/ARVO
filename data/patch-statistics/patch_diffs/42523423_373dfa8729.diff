@@ -1,0 +1,1219 @@
+From 56462c122925f716865827cc5505f671c2933aca Mon Sep 17 00:00:00 2001
+From: "Roger A. Light" <roger@atchoo.org>
+Date: Wed, 19 Apr 2023 16:38:10 +0100
+Subject: [PATCH] Refactor for more consistent json helper use.
+
+---
+ apps/mosquitto_ctrl/broker.c           |  38 ++++-----
+ apps/mosquitto_ctrl/dynsec.c           | 114 +++++++++++++------------
+ apps/mosquitto_ctrl/dynsec_client.c    |   8 +-
+ common/json_help.c                     |   2 +-
+ plugins/dynamic-security/clients.c     |  85 +++++++++---------
+ plugins/dynamic-security/default_acl.c |  21 ++---
+ plugins/dynamic-security/groups.c      |  61 +++++++------
+ plugins/dynamic-security/rolelist.c    |   8 +-
+ plugins/dynamic-security/roles.c       |  92 ++++++++++----------
+ plugins/persist-sqlite/restore.c       |  61 +++++++------
+ 10 files changed, 252 insertions(+), 238 deletions(-)
+
+diff --git a/apps/mosquitto_ctrl/broker.c b/apps/mosquitto_ctrl/broker.c
+index 2308108682..7fea7b64e1 100644
+--- a/apps/mosquitto_ctrl/broker.c
++++ b/apps/mosquitto_ctrl/broker.c
+@@ -22,6 +22,7 @@ SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include "json_help.h"
+ #include "mosquitto_ctrl.h"
+ #include "mosquitto.h"
+ 
+@@ -43,6 +44,7 @@ void broker__print_usage(void)
+ static void print_listeners(cJSON *j_response)
+ {
+ 	cJSON *j_data, *j_listeners, *j_listener, *jtmp;
++	char *stmp;
+ 	int i=1;
+ 
+ 	j_data = cJSON_GetObjectItem(j_response, "data");
+@@ -65,19 +67,16 @@ static void print_listeners(cJSON *j_response)
+ 			printf("  Port:              %d\n", jtmp->valueint);
+ 		}
+ 
+-		jtmp = cJSON_GetObjectItem(j_listener, "protocol");
+-		if(jtmp && cJSON_IsString(jtmp)){
+-			printf("  Protocol:          %s\n", jtmp->valuestring);
++		if(json_get_string(j_listener, "protocol", &stmp, false) == MOSQ_ERR_SUCCESS){
++			printf("  Protocol:          %s\n", stmp);
+ 		}
+ 
+-		jtmp = cJSON_GetObjectItem(j_listener, "socket-path");
+-		if(jtmp && cJSON_IsString(jtmp)){
+-			printf("  Socket path:       %s\n", jtmp->valuestring);
++		if(json_get_string(j_listener, "socket-path", &stmp, false) == MOSQ_ERR_SUCCESS){
++			printf("  Socket path:       %s\n", stmp);
+ 		}
+ 
+-		jtmp = cJSON_GetObjectItem(j_listener, "bind-address");
+-		if(jtmp && cJSON_IsString(jtmp)){
+-			printf("  Bind address:      %s\n", jtmp->valuestring);
++		if(json_get_string(j_listener, "bind-address", &stmp, false) == MOSQ_ERR_SUCCESS){
++			printf("  Bind address:      %s\n", stmp);
+ 		}
+ 
+ 		jtmp = cJSON_GetObjectItem(j_listener, "tls");
+@@ -90,6 +89,7 @@ static void print_listeners(cJSON *j_response)
+ static void print_plugin_info(cJSON *j_response)
+ {
+ 	cJSON *j_data, *j_plugins, *j_plugin, *jtmp, *j_eps;
++	char *stmp;
+ 	bool first;
+ 
+ 	j_data = cJSON_GetObjectItem(j_response, "data");
+@@ -105,23 +105,21 @@ static void print_plugin_info(cJSON *j_response)
+ 	}
+ 
+ 	cJSON_ArrayForEach(j_plugin, j_plugins){
+-		jtmp = cJSON_GetObjectItem(j_plugin, "name");
+-		if(jtmp == NULL || !cJSON_IsString(jtmp)){
++		if(json_get_string(j_plugin, "name", &stmp, false) != MOSQ_ERR_SUCCESS){
+ 			fprintf(stderr, "Error: Invalid response from server.\n");
+ 			return;
+ 		}
+-		printf("Plugin:            %s\n", jtmp->valuestring);
++		printf("Plugin:            %s\n", stmp);
+ 
+-		jtmp = cJSON_GetObjectItem(j_plugin, "version");
+-		if(jtmp && cJSON_IsString(jtmp)){
+-			printf("Version:           %s\n", jtmp->valuestring);
++		if(json_get_string(j_plugin, "version", &stmp, false) != MOSQ_ERR_SUCCESS){
++			printf("Version:           %s\n", stmp);
+ 		}
+ 
+ 		j_eps = cJSON_GetObjectItem(j_plugin, "control-endpoints");
+ 		if(j_eps && cJSON_IsArray(j_eps)){
+ 			first = true;
+ 			cJSON_ArrayForEach(jtmp, j_eps){
+-				if(jtmp && cJSON_IsString(jtmp)){
++				if(jtmp && cJSON_IsString(jtmp) && jtmp->valuestring){
+ 					if(first){
+ 						first = false;
+ 						printf("Control endpoints: %s\n", jtmp->valuestring);
+@@ -137,7 +135,7 @@ static void print_plugin_info(cJSON *j_response)
+ 
+ static void broker__payload_callback(struct mosq_ctrl *ctrl, long payloadlen, const void *payload)
+ {
+-	cJSON *tree, *j_responses, *j_response, *j_command, *j_error;
++	cJSON *tree, *j_responses, *j_response, *j_command;
+ 
+ 	UNUSED(ctrl);
+ 
+@@ -173,9 +171,9 @@ static void broker__payload_callback(struct mosq_ctrl *ctrl, long payloadlen, co
+ 		return;
+ 	}
+ 
+-	j_error = cJSON_GetObjectItem(j_response, "error");
+-	if(j_error){
+-		fprintf(stderr, "%s: Error: %s.\n", j_command->valuestring, j_error->valuestring);
++	char *error;
++	if(json_get_string(j_response, "error", &error, false) == MOSQ_ERR_SUCCESS){
++		fprintf(stderr, "%s: Error: %s.\n", j_command->valuestring, error);
+ 	}else{
+ 		if(!strcasecmp(j_command->valuestring, "listPlugins")){
+ 			print_plugin_info(j_response);
+diff --git a/apps/mosquitto_ctrl/dynsec.c b/apps/mosquitto_ctrl/dynsec.c
+index 8a941ad2a7..151b5c74d2 100644
+--- a/apps/mosquitto_ctrl/dynsec.c
++++ b/apps/mosquitto_ctrl/dynsec.c
+@@ -29,6 +29,7 @@ SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
+ #include "mosquitto_ctrl.h"
+ #include "mosquitto.h"
+ #include "base64_mosq.h"
++#include "json_help.h"
+ #include "password_mosq.h"
+ #include "get_password.h"
+ 
+@@ -100,7 +101,7 @@ void dynsec__print_usage(void)
+ 
+ static void print_list(cJSON *j_response, const char *arrayname, const char *keyname)
+ {
+-	cJSON *j_data, *j_array, *j_elem, *j_name;
++	cJSON *j_data, *j_array, *j_elem;
+ 
+ 	j_data = cJSON_GetObjectItem(j_response, "data");
+ 	if(j_data == NULL){
+@@ -115,12 +116,13 @@ static void print_list(cJSON *j_response, const char *arrayname, const char *key
+ 	}
+ 
+ 	cJSON_ArrayForEach(j_elem, j_array){
++		char *stmp;
++
+ 		if(cJSON_IsObject(j_elem)){
+-			j_name = cJSON_GetObjectItem(j_elem, keyname);
+-			if(j_name && cJSON_IsString(j_name)){
+-				printf("%s\n", j_name->valuestring);
++			if(json_get_string(j_elem, keyname, &stmp, false) == MOSQ_ERR_SUCCESS){
++				printf("%s\n", stmp);
+ 			}
+-		}else if(cJSON_IsString(j_elem)){
++		}else if(cJSON_IsString(j_elem) && j_elem->valuestring){
+ 			printf("%s\n", j_elem->valuestring);
+ 		}
+ 	}
+@@ -130,7 +132,9 @@ static void print_json_value(cJSON *value, const char *null_value)
+ {
+ 	if(value){
+ 		if(cJSON_IsString(value)){
+-			printf("%s", value->valuestring);
++			if(value->valuestring){
++				printf("%s", value->valuestring);
++			}
+ 		}else{
+ 			char buffer[MAX_STRING_LEN];
+ 			cJSON_PrintPreallocated(value, buffer, sizeof(buffer), 0);
+@@ -148,17 +152,18 @@ static void print_json_array(cJSON *j_list, int slen, const char *label, const c
+ 	if(j_list && cJSON_IsArray(j_list)){
+ 		cJSON_ArrayForEach(j_elem, j_list){
+ 			if(cJSON_IsObject(j_elem)){
+-				cJSON *jtmp = cJSON_GetObjectItem(j_elem, element_name);
+-				if(!jtmp || !cJSON_IsString(jtmp)){
++				char *stmp;
++
++				if(json_get_string(j_elem, element_name, &stmp, false) != MOSQ_ERR_SUCCESS){
+ 					continue;
+ 				}
+-				printf("%-*s %s", (int)slen, label, jtmp->valuestring);
++				printf("%-*s %s", (int)slen, label, stmp);
+ 				if(optional_element_name){
+ 					printf(" (%s: ", optional_element_name);
+ 					print_json_value(cJSON_GetObjectItem(j_elem,optional_element_name),optional_element_null_value);
+ 					printf(")");
+ 				}
+-			}else if(cJSON_IsString(j_elem)){
++			}else if(cJSON_IsString(j_elem) && j_elem->valuestring){
+ 				printf("%-*s %s", (int)slen, label, j_elem->valuestring);
+ 			}
+ 			label = "";
+@@ -174,6 +179,7 @@ static void print_client(cJSON *j_response)
+ {
+ 	cJSON *j_data, *j_client, *jtmp;
+ 	const int label_width = strlen( "Connections:");
++	char *stmp;
+ 
+ 	j_data = cJSON_GetObjectItem(j_response, "data");
+ 	if(j_data == NULL || !cJSON_IsObject(j_data)){
+@@ -187,16 +193,14 @@ static void print_client(cJSON *j_response)
+ 		return;
+ 	}
+ 
+-	jtmp = cJSON_GetObjectItem(j_client, "username");
+-	if(jtmp == NULL || !cJSON_IsString(jtmp)){
++	if(json_get_string(j_client, "username", &stmp, false) != MOSQ_ERR_SUCCESS){
+ 		fprintf(stderr, "Error: Invalid response from server.\n");
+ 		return;
+ 	}
+-	printf("%-*s %s\n",  label_width, "Username:", jtmp->valuestring);
++	printf("%-*s %s\n",  label_width, "Username:", stmp);
+ 
+-	jtmp = cJSON_GetObjectItem(j_client, "clientid");
+-	if(jtmp && cJSON_IsString(jtmp)){
+-		printf("%-*s %s\n",  label_width, "Clientid:", jtmp->valuestring);
++	if(json_get_string(j_client, "clientid", &stmp, false) != MOSQ_ERR_SUCCESS){
++		printf("%-*s %s\n",  label_width, "Clientid:", stmp);
+ 	}else{
+ 		printf("Clientid:\n");
+ 	}
+@@ -214,8 +218,9 @@ static void print_client(cJSON *j_response)
+ 
+ static void print_group(cJSON *j_response)
+ {
+-	cJSON *j_data, *j_group, *jtmp;
++	cJSON *j_data, *j_group;
+ 	int label_width = strlen("Groupname:");
++	char *groupname;
+ 
+ 	j_data = cJSON_GetObjectItem(j_response, "data");
+ 	if(j_data == NULL || !cJSON_IsObject(j_data)){
+@@ -229,12 +234,11 @@ static void print_group(cJSON *j_response)
+ 		return;
+ 	}
+ 
+-	jtmp = cJSON_GetObjectItem(j_group, "groupname");
+-	if(jtmp == NULL || !cJSON_IsString(jtmp)){
++	if(json_get_string(j_group, "groupname", &groupname, false) != MOSQ_ERR_SUCCESS){
+ 		fprintf(stderr, "Error: Invalid response from server.\n");
+ 		return;
+ 	}
+-	printf("Groupname: %s\n", jtmp->valuestring);
++	printf("Groupname: %s\n", groupname);
+ 
+ 	print_json_array(cJSON_GetObjectItem(j_group, "roles"), label_width, "Roles:",  "rolename", "priority", "-1");
+ 	print_json_array(cJSON_GetObjectItem(j_group, "clients"), label_width, "Clients:",  "username", NULL, NULL);
+@@ -245,6 +249,7 @@ static void print_role(cJSON *j_response)
+ {
+ 	cJSON *j_data, *j_role, *j_array, *j_elem, *jtmp;
+ 	bool first;
++	char *stmp;
+ 
+ 	j_data = cJSON_GetObjectItem(j_response, "data");
+ 	if(j_data == NULL || !cJSON_IsObject(j_data)){
+@@ -258,33 +263,32 @@ static void print_role(cJSON *j_response)
+ 		return;
+ 	}
+ 
+-	jtmp = cJSON_GetObjectItem(j_role, "rolename");
+-	if(jtmp == NULL || !cJSON_IsString(jtmp)){
++	if(json_get_string(j_role, "rolename", &stmp, false) != MOSQ_ERR_SUCCESS){
+ 		fprintf(stderr, "Error: Invalid response from server.\n");
+ 		return;
+ 	}
+-	printf("Rolename: %s\n", jtmp->valuestring);
++	printf("Rolename: %s\n", stmp);
+ 
+ 	j_array = cJSON_GetObjectItem(j_role, "acls");
+ 	if(j_array && cJSON_IsArray(j_array)){
+ 		first = true;
+ 		cJSON_ArrayForEach(j_elem, j_array){
+-			jtmp = cJSON_GetObjectItem(j_elem, "acltype");
+-			if(jtmp && cJSON_IsString(jtmp)){
++			char *stmp;
++
++			if(json_get_string(j_role, "rolename", &stmp, false) == MOSQ_ERR_SUCCESS){
+ 				if(first){
+ 					first = false;
+-					printf("ACLs:     %-20s", jtmp->valuestring);
++					printf("ACLs:     %-20s", stmp);
+ 				}else{
+-					printf("          %-20s", jtmp->valuestring);
++					printf("          %-20s", stmp);
+ 				}
+ 
+ 				jtmp = cJSON_GetObjectItem(j_elem, "allow");
+ 				if(jtmp && cJSON_IsBool(jtmp)){
+ 					printf(" : %s", cJSON_IsTrue(jtmp)?"allow":"deny ");
+ 				}
+-				jtmp = cJSON_GetObjectItem(j_elem, "topic");
+-				if(jtmp && cJSON_IsString(jtmp)){
+-					printf(" : %s", jtmp->valuestring);
++				if(json_get_string(j_elem, "topic", &stmp, false) == MOSQ_ERR_SUCCESS){
++					printf(" : %s", stmp);
+ 				}
+ 				jtmp = cJSON_GetObjectItem(j_elem, "priority");
+ 				if(jtmp && cJSON_IsNumber(jtmp)){
+@@ -301,7 +305,8 @@ static void print_role(cJSON *j_response)
+ 
+ static void print_anonymous_group(cJSON *j_response)
+ {
+-	cJSON *j_data, *j_group, *j_groupname;
++	cJSON *j_data, *j_group;
++	char *groupname;
+ 
+ 	j_data = cJSON_GetObjectItem(j_response, "data");
+ 	if(j_data == NULL || !cJSON_IsObject(j_data)){
+@@ -315,17 +320,16 @@ static void print_anonymous_group(cJSON *j_response)
+ 		return;
+ 	}
+ 
+-	j_groupname = cJSON_GetObjectItem(j_group, "groupname");
+-	if(j_groupname == NULL || !cJSON_IsString(j_groupname)){
++	if(json_get_string(j_group, "groupname", &groupname, false) == MOSQ_ERR_SUCCESS){
+ 		fprintf(stderr, "Error: Invalid response from server.\n");
+ 		return;
+ 	}
+-	printf("%s\n", j_groupname->valuestring);
++	printf("%s\n", groupname);
+ }
+ 
+ static void print_default_acl_access(cJSON *j_response)
+ {
+-	cJSON *j_data, *j_acls, *j_acl, *j_acltype, *j_allow;
++	cJSON *j_data, *j_acls, *j_acl;
+ 
+ 	j_data = cJSON_GetObjectItem(j_response, "data");
+ 	if(j_data == NULL || !cJSON_IsObject(j_data)){
+@@ -340,23 +344,23 @@ static void print_default_acl_access(cJSON *j_response)
+ 	}
+ 
+ 	cJSON_ArrayForEach(j_acl, j_acls){
+-		j_acltype = cJSON_GetObjectItem(j_acl, "acltype");
+-		j_allow = cJSON_GetObjectItem(j_acl, "allow");
++		char *acltype;
++		bool allow;
+ 
+-		if(j_acltype == NULL || !cJSON_IsString(j_acltype)
+-				|| j_allow == NULL || !cJSON_IsBool(j_allow)
+-				){
++		if(json_get_string(j_acl, "acltype", &acltype, false) != MOSQ_ERR_SUCCESS
++				|| json_get_bool(j_acl, "allow", &allow, false, false) != MOSQ_ERR_SUCCESS){
+ 
+ 			fprintf(stderr, "Error: Invalid response from server.\n");
+ 			return;
+ 		}
+-		printf("%-20s : %s\n", j_acltype->valuestring, cJSON_IsTrue(j_allow)?"allow":"deny");
++		printf("%-20s : %s\n", acltype, allow?"allow":"deny");
+ 	}
+ }
+ 
+ static void dynsec__payload_callback(struct mosq_ctrl *ctrl, long payloadlen, const void *payload)
+ {
+-	cJSON *tree, *j_responses, *j_response, *j_command, *j_error;
++	cJSON *tree, *j_responses, *j_response;
++	char *command, *error;
+ 
+ 	UNUSED(ctrl);
+ 
+@@ -385,35 +389,33 @@ static void dynsec__payload_callback(struct mosq_ctrl *ctrl, long payloadlen, co
+ 		return;
+ 	}
+ 
+-	j_command = cJSON_GetObjectItem(j_response, "command");
+-	if(j_command == NULL){
++	if(json_get_string(j_response, "command", &command, false) != MOSQ_ERR_SUCCESS){
+ 		fprintf(stderr, "Error: Payload missing data.\n");
+ 		cJSON_Delete(tree);
+ 		return;
+ 	}
+ 
+-	j_error = cJSON_GetObjectItem(j_response, "error");
+-	if(j_error){
+-		fprintf(stderr, "%s: Error: %s.\n", j_command->valuestring, j_error->valuestring);
++	if(json_get_string(j_response, "error", &error, false) == MOSQ_ERR_SUCCESS){
++		fprintf(stderr, "%s: Error: %s.\n", command, error);
+ 	}else{
+-		if(!strcasecmp(j_command->valuestring, "listClients")){
++		if(!strcasecmp(command, "listClients")){
+ 			print_list(j_response, "clients", "username");
+-		}else if(!strcasecmp(j_command->valuestring, "listGroups")){
++		}else if(!strcasecmp(command, "listGroups")){
+ 			print_list(j_response, "groups", "groupname");
+-		}else if(!strcasecmp(j_command->valuestring, "listRoles")){
++		}else if(!strcasecmp(command, "listRoles")){
+ 			print_list(j_response, "roles", "rolename");
+-		}else if(!strcasecmp(j_command->valuestring, "getClient")){
++		}else if(!strcasecmp(command, "getClient")){
+ 			print_client(j_response);
+-		}else if(!strcasecmp(j_command->valuestring, "getGroup")){
++		}else if(!strcasecmp(command, "getGroup")){
+ 			print_group(j_response);
+-		}else if(!strcasecmp(j_command->valuestring, "getRole")){
++		}else if(!strcasecmp(command, "getRole")){
+ 			print_role(j_response);
+-		}else if(!strcasecmp(j_command->valuestring, "getDefaultACLAccess")){
++		}else if(!strcasecmp(command, "getDefaultACLAccess")){
+ 			print_default_acl_access(j_response);
+-		}else if(!strcasecmp(j_command->valuestring, "getAnonymousGroup")){
++		}else if(!strcasecmp(command, "getAnonymousGroup")){
+ 			print_anonymous_group(j_response);
+ 		}else{
+-			/* fprintf(stderr, "%s: Success\n", j_command->valuestring); */
++			/* fprintf(stderr, "%s: Success\n", command); */
+ 		}
+ 	}
+ 	cJSON_Delete(tree);
+diff --git a/apps/mosquitto_ctrl/dynsec_client.c b/apps/mosquitto_ctrl/dynsec_client.c
+index bd6fefdf44..d1498b0587 100644
+--- a/apps/mosquitto_ctrl/dynsec_client.c
++++ b/apps/mosquitto_ctrl/dynsec_client.c
+@@ -158,7 +158,7 @@ int dynsec_client__file_set_password(int argc, char *argv[], const char *file)
+ 	FILE *fptr;
+ 	char *fstr;
+ 	cJSON *j_tree, *j_clients, *j_client;
+-	cJSON *j_username, *j_password = NULL, *j_salt = NULL, *j_iterations = NULL;
++	cJSON *j_password = NULL, *j_salt = NULL, *j_iterations = NULL;
+ 	struct dynsec__client client;
+ 	char *pw_buf = NULL, *salt_buf = NULL;
+ 	char *json_str;
+@@ -231,9 +231,9 @@ int dynsec_client__file_set_password(int argc, char *argv[], const char *file)
+ 
+ 	cJSON_ArrayForEach(j_client, j_clients){
+ 		if(cJSON_IsObject(j_client) == true){
+-			j_username = cJSON_GetObjectItem(j_client, "username");
+-			if(j_username && cJSON_IsString(j_username)){
+-				if(!strcmp(j_username->valuestring, username)){
++			char *username_json;
++			if(json_get_string(j_client, "username", &username_json, false) == MOSQ_ERR_SUCCESS){
++				if(!strcmp(username_json, username)){
+ 					if(dynsec_auth__pw_hash(&client, password, client.pw.password_hash, sizeof(client.pw.password_hash), true) != MOSQ_ERR_SUCCESS){
+ 						fprintf(stderr, "Error: Problem generating password hash.\n");
+ 						goto error;
+diff --git a/common/json_help.c b/common/json_help.c
+index 944332b53f..2ca35729b1 100644
+--- a/common/json_help.c
++++ b/common/json_help.c
+@@ -84,7 +84,7 @@ int json_get_string(cJSON *json, const char *name, char **value, bool optional)
+ 		if(cJSON_IsString(jtmp) == false){
+ 			return MOSQ_ERR_INVAL;
+ 		}
+-		*value  = jtmp->valuestring;
++		*value = jtmp->valuestring;
+ 	}else{
+ 		if(optional == false){
+ 			return MOSQ_ERR_INVAL;
+diff --git a/plugins/dynamic-security/clients.c b/plugins/dynamic-security/clients.c
+index d3afd087f0..b2df0fae5e 100644
+--- a/plugins/dynamic-security/clients.c
++++ b/plugins/dynamic-security/clients.c
+@@ -108,14 +108,16 @@ void dynsec_clients__cleanup(struct dynsec__data *data)
+ int dynsec_clients__config_load(struct dynsec__data *data, cJSON *tree)
+ {
+ 	cJSON *j_clients, *j_client, *jtmp, *j_roles, *j_role;
+-	cJSON *j_salt, *j_password, *j_iterations;
+ 	struct dynsec__client *client;
+ 	struct dynsec__role *role;
+ 	unsigned char *buf;
+ 	unsigned int buf_len;
+ 	int priority;
+ 	int iterations;
++	char *username;
+ 	size_t username_len;
++	char *salt;
++	char *password;
+ 
+ 	j_clients = cJSON_GetObjectItem(tree, "clients");
+ 	if(j_clients == NULL){
+@@ -129,44 +131,36 @@ int dynsec_clients__config_load(struct dynsec__data *data, cJSON *tree)
+ 	cJSON_ArrayForEach(j_client, j_clients){
+ 		if(cJSON_IsObject(j_client) == true){
+ 			/* Username */
+-			jtmp = cJSON_GetObjectItem(j_client, "username");
+-			if(jtmp == NULL || !cJSON_IsString(jtmp)){
++			if(json_get_string(j_client, "username", &username, false) != MOSQ_ERR_SUCCESS){
+ 				continue;
+ 			}
+-			username_len = strlen(jtmp->valuestring);
++			username_len = strlen(username);
+ 			if(username_len == 0){
+ 				continue;
+ 			}
++			if(dynsec_clients__find(data, username)){
++				continue;
++			}
+ 
+ 			client = mosquitto_calloc(1, sizeof(struct dynsec__client) + username_len + 1);
+ 			if(client == NULL){
+ 				return MOSQ_ERR_NOMEM;
+ 			}
+-			strncpy(client->username, jtmp->valuestring, username_len);
++			strncpy(client->username, username, username_len);
+ 
+ 			jtmp = cJSON_GetObjectItem(j_client, "disabled");
+ 			if(jtmp && cJSON_IsBool(jtmp)){
+ 				client->disabled = cJSON_IsTrue(jtmp);
+ 			}
+ 
+-			/* Salt */
+-			j_salt = cJSON_GetObjectItem(j_client, "salt");
+-			j_password = cJSON_GetObjectItem(j_client, "password");
+-			j_iterations = cJSON_GetObjectItem(j_client, "iterations");
+-
+-			if(j_salt && cJSON_IsString(j_salt)
+-					&& j_password && cJSON_IsString(j_password)
+-					&& j_iterations && cJSON_IsNumber(j_iterations)){
++			json_get_int(j_client, "iterations", &iterations, 0, true);
++			if(json_get_string(j_client, "salt", &salt, false) == MOSQ_ERR_SUCCESS
++					&& json_get_string(j_client, "password", &password, false) == MOSQ_ERR_SUCCESS
++					&& iterations > 0){
+ 
+-				iterations = (int)j_iterations->valuedouble;
+-				if(iterations < 1){
+-					mosquitto_free(client);
+-					continue;
+-				}else{
+-					client->pw.iterations = iterations;
+-				}
++				client->pw.iterations = iterations;
+ 
+-				if(base64__decode(j_salt->valuestring, &buf, &buf_len) != MOSQ_ERR_SUCCESS
++				if(base64__decode(salt, &buf, &buf_len) != MOSQ_ERR_SUCCESS
+ 						|| buf_len > sizeof(client->pw.salt)){
+ 
+ 					mosquitto_free(client);
+@@ -176,9 +170,10 @@ int dynsec_clients__config_load(struct dynsec__data *data, cJSON *tree)
+ 				client->pw.salt_len = (size_t)buf_len;
+ 				mosquitto_free(buf);
+ 
+-				if(base64__decode(j_password->valuestring, &buf, &buf_len) != MOSQ_ERR_SUCCESS
++				if(base64__decode(password, &buf, &buf_len) != MOSQ_ERR_SUCCESS
+ 						|| buf_len != sizeof(client->pw.password_hash)){
+ 
++					mosquitto_free(buf);
+ 					mosquitto_free(client);
+ 					continue;
+ 				}
+@@ -190,9 +185,9 @@ int dynsec_clients__config_load(struct dynsec__data *data, cJSON *tree)
+ 			}
+ 
+ 			/* Client id */
+-			jtmp = cJSON_GetObjectItem(j_client, "clientid");
+-			if(jtmp != NULL && cJSON_IsString(jtmp)){
+-				client->clientid = mosquitto_strdup(jtmp->valuestring);
++			char *clientid;
++			if(json_get_string(j_client, "clientid", &clientid, false) == MOSQ_ERR_SUCCESS){
++				client->clientid = mosquitto_strdup(clientid);
+ 				if(client->clientid == NULL){
+ 					mosquitto_free(client);
+ 					continue;
+@@ -200,9 +195,9 @@ int dynsec_clients__config_load(struct dynsec__data *data, cJSON *tree)
+ 			}
+ 
+ 			/* Text name */
+-			jtmp = cJSON_GetObjectItem(j_client, "textname");
+-			if(jtmp != NULL && cJSON_IsString(jtmp)){
+-				client->text_name = mosquitto_strdup(jtmp->valuestring);
++			char *textname;
++			if(json_get_string(j_client, "textname", &textname, false) == MOSQ_ERR_SUCCESS){
++				client->text_name = mosquitto_strdup(textname);
+ 				if(client->text_name == NULL){
+ 					mosquitto_free(client->clientid);
+ 					mosquitto_free(client);
+@@ -211,9 +206,9 @@ int dynsec_clients__config_load(struct dynsec__data *data, cJSON *tree)
+ 			}
+ 
+ 			/* Text description */
+-			jtmp = cJSON_GetObjectItem(j_client, "textdescription");
+-			if(jtmp != NULL && cJSON_IsString(jtmp)){
+-				client->text_description = mosquitto_strdup(jtmp->valuestring);
++			char *textdescription;
++			if(json_get_string(j_client, "textdescription", &textdescription, false) == MOSQ_ERR_SUCCESS){
++				client->text_description = mosquitto_strdup(textdescription);
+ 				if(client->text_description == NULL){
+ 					mosquitto_free(client->text_name);
+ 					mosquitto_free(client->clientid);
+@@ -227,10 +222,10 @@ int dynsec_clients__config_load(struct dynsec__data *data, cJSON *tree)
+ 			if(j_roles && cJSON_IsArray(j_roles)){
+ 				cJSON_ArrayForEach(j_role, j_roles){
+ 					if(cJSON_IsObject(j_role)){
+-						jtmp = cJSON_GetObjectItem(j_role, "rolename");
+-						if(jtmp && cJSON_IsString(jtmp)){
++						char *rolename;
++						if(json_get_string(j_role, "rolename", &rolename, false) == MOSQ_ERR_SUCCESS){
+ 							json_get_int(j_role, "priority", &priority, true, -1);
+-							role = dynsec_roles__find(data, jtmp->valuestring);
++							role = dynsec_roles__find(data, rolename);
+ 							dynsec_rolelist__client_add(client, role, priority);
+ 						}
+ 					}
+@@ -322,7 +317,7 @@ int dynsec_clients__process_create(struct dynsec__data *data, struct mosquitto_c
+ 	char *text_name, *text_description;
+ 	struct dynsec__client *client;
+ 	int rc;
+-	cJSON *j_groups, *j_group, *jtmp;
++	cJSON *j_groups, *j_group;
+ 	int priority;
+ 	const char *admin_clientid, *admin_username;
+ 	size_t username_len;
+@@ -436,10 +431,10 @@ int dynsec_clients__process_create(struct dynsec__data *data, struct mosquitto_c
+ 	if(j_groups && cJSON_IsArray(j_groups)){
+ 		cJSON_ArrayForEach(j_group, j_groups){
+ 			if(cJSON_IsObject(j_group)){
+-				jtmp = cJSON_GetObjectItem(j_group, "groupname");
+-				if(jtmp && cJSON_IsString(jtmp)){
++				char *groupname;
++				if(json_get_string(j_group, "groupname", &groupname, false) == MOSQ_ERR_SUCCESS){
+ 					json_get_int(j_group, "priority", &priority, true, -1);
+-					rc = dynsec_groups__add_client(data, username, jtmp->valuestring, priority, false);
++					rc = dynsec_groups__add_client(data, username, groupname, priority, false);
+ 					if(rc == ERR_GROUP_NOT_FOUND){
+ 						mosquitto_control_command_reply(cmd, "Group not found");
+ 						client__free_item(data, client);
+@@ -728,7 +723,7 @@ int dynsec_clients__process_modify(struct dynsec__data *data, struct mosquitto_c
+ 	char *str;
+ 	int rc;
+ 	int priority;
+-	cJSON *j_group, *j_groups, *jtmp;
++	cJSON *j_group, *j_groups;
+ 	const char *admin_clientid, *admin_username;
+ 
+ 	if(json_get_string(cmd->j_command, "username", &username, false) != MOSQ_ERR_SUCCESS){
+@@ -810,9 +805,9 @@ int dynsec_clients__process_modify(struct dynsec__data *data, struct mosquitto_c
+ 		/* Iterate through list to check all groups are valid */
+ 		cJSON_ArrayForEach(j_group, j_groups){
+ 			if(cJSON_IsObject(j_group)){
+-				jtmp = cJSON_GetObjectItem(j_group, "groupname");
+-				if(jtmp && cJSON_IsString(jtmp)){
+-					group = dynsec_groups__find(data, jtmp->valuestring);
++				char *groupname;
++				if(json_get_string(j_group, "groupname", &groupname, false) == MOSQ_ERR_SUCCESS){
++					group = dynsec_groups__find(data, groupname);
+ 					if(group == NULL){
+ 						mosquitto_control_command_reply(cmd, "'groups' contains an object with a 'groupname' that does not exist");
+ 						rc = MOSQ_ERR_INVAL;
+@@ -829,10 +824,10 @@ int dynsec_clients__process_modify(struct dynsec__data *data, struct mosquitto_c
+ 		dynsec__remove_client_from_all_groups(data, username);
+ 		cJSON_ArrayForEach(j_group, j_groups){
+ 			if(cJSON_IsObject(j_group)){
+-				jtmp = cJSON_GetObjectItem(j_group, "groupname");
+-				if(jtmp && cJSON_IsString(jtmp)){
++				char *groupname;
++				if(json_get_string(j_group, "groupname", &groupname, false) == MOSQ_ERR_SUCCESS){
+ 					json_get_int(j_group, "priority", &priority, true, -1);
+-					dynsec_groups__add_client(data, username, jtmp->valuestring, priority, false);
++					dynsec_groups__add_client(data, username, groupname, priority, false);
+ 				}
+ 			}
+ 		}
+diff --git a/plugins/dynamic-security/default_acl.c b/plugins/dynamic-security/default_acl.c
+index 608023fe74..e806ece224 100644
+--- a/plugins/dynamic-security/default_acl.c
++++ b/plugins/dynamic-security/default_acl.c
+@@ -35,9 +35,10 @@ SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
+ 
+ int dynsec__process_set_default_acl_access(struct dynsec__data *data, struct mosquitto_control_cmd *cmd, struct mosquitto *context)
+ {
+-	cJSON *j_actions, *j_action, *j_acltype, *j_allow;
++	cJSON *j_actions, *j_action;
+ 	bool allow;
+ 	const char *admin_clientid, *admin_username;
++	char *acltype;
+ 
+ 	j_actions = cJSON_GetObjectItem(cmd->j_command, "acls");
+ 	if(j_actions == NULL || !cJSON_IsArray(j_actions)){
+@@ -49,24 +50,20 @@ int dynsec__process_set_default_acl_access(struct dynsec__data *data, struct mos
+ 	admin_username = mosquitto_client_username(context);
+ 
+ 	cJSON_ArrayForEach(j_action, j_actions){
+-		j_acltype = cJSON_GetObjectItem(j_action, "acltype");
+-		j_allow = cJSON_GetObjectItem(j_action, "allow");
+-		if(j_acltype && cJSON_IsString(j_acltype)
+-					&& j_allow && cJSON_IsBool(j_allow)){
++		if(json_get_string(j_action, "acltype", &acltype, false) == MOSQ_ERR_SUCCESS
++				&& json_get_bool(j_action, "allow", &allow, false, false) == MOSQ_ERR_SUCCESS){
+ 
+-			allow = cJSON_IsTrue(j_allow);
+-
+-			if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_PUB_C_SEND)){
++			if(!strcasecmp(acltype, ACL_TYPE_PUB_C_SEND)){
+ 				data->default_access.publish_c_send = allow;
+-			}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_PUB_C_RECV)){
++			}else if(!strcasecmp(acltype, ACL_TYPE_PUB_C_RECV)){
+ 				data->default_access.publish_c_recv = allow;
+-			}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_SUB_GENERIC)){
++			}else if(!strcasecmp(acltype, ACL_TYPE_SUB_GENERIC)){
+ 				data->default_access.subscribe = allow;
+-			}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_UNSUB_GENERIC)){
++			}else if(!strcasecmp(acltype, ACL_TYPE_UNSUB_GENERIC)){
+ 				data->default_access.unsubscribe = allow;
+ 			}
+ 			mosquitto_log_printf(MOSQ_LOG_INFO, "dynsec: %s/%s | setDefaultACLAccess | acltype=%s | allow=%s",
+-					admin_clientid, admin_username, j_acltype->valuestring, allow?"true":"false");
++					admin_clientid, admin_username, acltype, allow?"true":"false");
+ 		}
+ 	}
+ 
+diff --git a/plugins/dynamic-security/groups.c b/plugins/dynamic-security/groups.c
+index 37a67dc99c..12e0315f3b 100644
+--- a/plugins/dynamic-security/groups.c
++++ b/plugins/dynamic-security/groups.c
+@@ -189,13 +189,14 @@ void dynsec_groups__cleanup(struct dynsec__data *data)
+ int dynsec_groups__config_load(struct dynsec__data *data, cJSON *tree)
+ {
+ 	cJSON *j_groups, *j_group;
+-	cJSON *j_clientlist, *j_client, *j_username;
+-	cJSON *j_roles, *j_role, *j_rolename;
++	cJSON *j_clientlist;
++	cJSON *j_roles;
+ 
+ 	struct dynsec__group *group;
+ 	struct dynsec__role *role;
+-	char *str;
+ 	int priority;
++	char *textname, *textdescription;
++	char *groupname;
+ 	size_t groupname_len;
+ 
+ 	j_groups = cJSON_GetObjectItem(tree, "groups");
+@@ -210,24 +211,27 @@ int dynsec_groups__config_load(struct dynsec__data *data, cJSON *tree)
+ 	cJSON_ArrayForEach(j_group, j_groups){
+ 		if(cJSON_IsObject(j_group) == true){
+ 			/* Group name */
+-			if(json_get_string(j_group, "groupname", &str, false) != MOSQ_ERR_SUCCESS){
++			if(json_get_string(j_group, "groupname", &groupname, false) != MOSQ_ERR_SUCCESS){
+ 				continue;
+ 			}
+-			groupname_len = strlen(str);
++			groupname_len = strlen(groupname);
+ 			if(groupname_len == 0){
+ 				continue;
+ 			}
++			if(dynsec_groups__find(data, groupname)){
++				continue;
++			}
+ 
+ 			group = mosquitto_calloc(1, sizeof(struct dynsec__group) + groupname_len + 1);
+ 			if(group == NULL){
+ 				return MOSQ_ERR_NOMEM;
+ 			}
+-			strncpy(group->groupname, str, groupname_len+1);
++			strncpy(group->groupname, groupname, groupname_len+1);
+ 
+ 			/* Text name */
+-			if(json_get_string(j_group, "textname", &str, false) == MOSQ_ERR_SUCCESS){
+-				if(str){
+-					group->text_name = strdup(str);
++			if(json_get_string(j_group, "textname", &textname, false) == MOSQ_ERR_SUCCESS){
++				if(textname){
++					group->text_name = strdup(textname);
+ 					if(group->text_name == NULL){
+ 						mosquitto_free(group);
+ 						continue;
+@@ -236,9 +240,9 @@ int dynsec_groups__config_load(struct dynsec__data *data, cJSON *tree)
+ 			}
+ 
+ 			/* Text description */
+-			if(json_get_string(j_group, "textdescription", &str, false) == MOSQ_ERR_SUCCESS){
+-				if(str){
+-					group->text_description = strdup(str);
++			if(json_get_string(j_group, "textdescription", &textdescription, false) == MOSQ_ERR_SUCCESS){
++				if(textdescription){
++					group->text_description = strdup(textdescription);
+ 					if(group->text_description == NULL){
+ 						mosquitto_free(group->text_name);
+ 						mosquitto_free(group);
+@@ -250,12 +254,14 @@ int dynsec_groups__config_load(struct dynsec__data *data, cJSON *tree)
+ 			/* Roles */
+ 			j_roles = cJSON_GetObjectItem(j_group, "roles");
+ 			if(j_roles && cJSON_IsArray(j_roles)){
++				cJSON *j_role;
++
+ 				cJSON_ArrayForEach(j_role, j_roles){
+ 					if(cJSON_IsObject(j_role)){
+-						j_rolename = cJSON_GetObjectItem(j_role, "rolename");
+-						if(j_rolename && cJSON_IsString(j_rolename)){
++						char *rolename;
++						if(json_get_string(j_role, "rolename", &rolename, false) == MOSQ_ERR_SUCCESS){
+ 							json_get_int(j_role, "priority", &priority, true, -1);
+-							role = dynsec_roles__find(data, j_rolename->valuestring);
++							role = dynsec_roles__find(data, rolename);
+ 							dynsec_rolelist__group_add(group, role, priority);
+ 						}
+ 					}
+@@ -268,12 +274,13 @@ int dynsec_groups__config_load(struct dynsec__data *data, cJSON *tree)
+ 			/* Clients */
+ 			j_clientlist = cJSON_GetObjectItem(j_group, "clients");
+ 			if(j_clientlist && cJSON_IsArray(j_clientlist)){
++				cJSON *j_client;
+ 				cJSON_ArrayForEach(j_client, j_clientlist){
+ 					if(cJSON_IsObject(j_client)){
+-						j_username = cJSON_GetObjectItem(j_client, "username");
+-						if(j_username && cJSON_IsString(j_username)){
++						char *username;
++						if(json_get_string(j_client, "username", &username, false) == MOSQ_ERR_SUCCESS){
+ 							json_get_int(j_client, "priority", &priority, true, -1);
+-							dynsec_groups__add_client(data, j_username->valuestring, group->groupname, priority, false);
++							dynsec_groups__add_client(data, username, group->groupname, priority, false);
+ 						}
+ 					}
+ 				}
+@@ -282,9 +289,8 @@ int dynsec_groups__config_load(struct dynsec__data *data, cJSON *tree)
+ 	}
+ 	HASH_SORT(data->groups, group_cmp);
+ 
+-	j_group = cJSON_GetObjectItem(tree, "anonymousGroup");
+-	if(j_group && cJSON_IsString(j_group)){
+-		data->anonymous_group = dynsec_groups__find(data, j_group->valuestring);
++	if(json_get_string(tree, "anonymousGroup", &groupname, false) == MOSQ_ERR_SUCCESS){
++		data->anonymous_group = dynsec_groups__find(data, groupname);
+ 	}
+ 
+ 	return 0;
+@@ -918,8 +924,9 @@ int dynsec_groups__process_modify(struct dynsec__data *data, struct mosquitto_co
+ 	char *str;
+ 	int rc;
+ 	int priority;
+-	cJSON *j_client, *j_clients, *jtmp;
++	cJSON *j_client, *j_clients;
+ 	const char *admin_clientid, *admin_username;
++	char *username;
+ 
+ 	if(json_get_string(cmd->j_command, "groupname", &groupname, false) != MOSQ_ERR_SUCCESS){
+ 		mosquitto_control_command_reply(cmd, "Invalid/missing groupname");
+@@ -982,9 +989,8 @@ int dynsec_groups__process_modify(struct dynsec__data *data, struct mosquitto_co
+ 		/* Iterate over array to check clients are valid before proceeding */
+ 		cJSON_ArrayForEach(j_client, j_clients){
+ 			if(cJSON_IsObject(j_client)){
+-				jtmp = cJSON_GetObjectItem(j_client, "username");
+-				if(jtmp && cJSON_IsString(jtmp)){
+-					client = dynsec_clients__find(data, jtmp->valuestring);
++				if(json_get_string(j_client, "username", &username, false) == MOSQ_ERR_SUCCESS){
++					client = dynsec_clients__find(data, username);
+ 					if(client == NULL){
+ 						mosquitto_control_command_reply(cmd, "'clients' contains an object with a 'username' that does not exist");
+ 						rc = MOSQ_ERR_INVAL;
+@@ -1005,10 +1011,9 @@ int dynsec_groups__process_modify(struct dynsec__data *data, struct mosquitto_co
+ 		/* Now we can add the new clients to the group */
+ 		cJSON_ArrayForEach(j_client, j_clients){
+ 			if(cJSON_IsObject(j_client)){
+-				jtmp = cJSON_GetObjectItem(j_client, "username");
+-				if(jtmp && cJSON_IsString(jtmp)){
++				if(json_get_string(j_client, "username", &username, false) == MOSQ_ERR_SUCCESS){
+ 					json_get_int(j_client, "priority", &priority, true, -1);
+-					dynsec_groups__add_client(data, jtmp->valuestring, groupname, priority, false);
++					dynsec_groups__add_client(data, username, groupname, priority, false);
+ 				}
+ 			}
+ 		}
+diff --git a/plugins/dynamic-security/rolelist.c b/plugins/dynamic-security/rolelist.c
+index 6a5f366475..1965eac42e 100644
+--- a/plugins/dynamic-security/rolelist.c
++++ b/plugins/dynamic-security/rolelist.c
+@@ -171,18 +171,18 @@ int dynsec_rolelist__group_add(struct dynsec__group *group, struct dynsec__role
+ 
+ int dynsec_rolelist__load_from_json(struct dynsec__data *data, cJSON *command, struct dynsec__rolelist **rolelist)
+ {
+-	cJSON *j_roles, *j_role, *j_rolename;
++	cJSON *j_roles, *j_role;
+ 	int priority;
+ 	struct dynsec__role *role;
++	char *rolename;
+ 
+ 	j_roles = cJSON_GetObjectItem(command, "roles");
+ 	if(j_roles){
+ 		if(cJSON_IsArray(j_roles)){
+ 			cJSON_ArrayForEach(j_role, j_roles){
+-				j_rolename = cJSON_GetObjectItem(j_role, "rolename");
+-				if(j_rolename && cJSON_IsString(j_rolename)){
++				if(json_get_string(j_role, "rolename", &rolename, false) == MOSQ_ERR_SUCCESS){
+ 					json_get_int(j_role, "priority", &priority, true, -1);
+-					role = dynsec_roles__find(data, j_rolename->valuestring);
++					role = dynsec_roles__find(data, rolename);
+ 					if(role){
+ 						dynsec_rolelist__add(rolelist, role, priority);
+ 					}else{
+diff --git a/plugins/dynamic-security/roles.c b/plugins/dynamic-security/roles.c
+index 8900bd9ed5..12168ba0e9 100644
+--- a/plugins/dynamic-security/roles.c
++++ b/plugins/dynamic-security/roles.c
+@@ -204,21 +204,24 @@ static int insert_acl_cmp(struct dynsec__acl *a, struct dynsec__acl *b)
+ 
+ static int dynsec_roles__acl_load(cJSON *j_acls, const char *key, struct dynsec__acl **acllist)
+ {
+-	cJSON *j_acl, *j_type, *jtmp;
++	cJSON *j_acl, *jtmp;
+ 	struct dynsec__acl *acl;
+ 	size_t topic_len;
++	char *acltype;
++	char *topic;
+ 
+ 	cJSON_ArrayForEach(j_acl, j_acls){
+-		j_type = cJSON_GetObjectItem(j_acl, "acltype");
+-		if(j_type == NULL || !cJSON_IsString(j_type) || strcasecmp(j_type->valuestring, key) != 0){
++		if(json_get_string(j_acl, "acltype", &acltype, false) != MOSQ_ERR_SUCCESS){
++			continue;
++		}
++		if(strcasecmp(acltype, key) != 0){
+ 			continue;
+ 		}
+-		jtmp = cJSON_GetObjectItem(j_acl, "topic");
+-		if(!jtmp || !cJSON_IsString(jtmp)){
++		if(json_get_string(j_acl, "topic", &topic, false) != MOSQ_ERR_SUCCESS){
+ 			continue;
+ 		}
+ 
+-		topic_len = strlen(jtmp->valuestring);
++		topic_len = strlen(topic);
+ 		if(topic_len == 0){
+ 			continue;
+ 		}
+@@ -227,7 +230,7 @@ static int dynsec_roles__acl_load(cJSON *j_acls, const char *key, struct dynsec_
+ 		if(acl == NULL){
+ 			return 1;
+ 		}
+-		strncpy(acl->topic, jtmp->valuestring, topic_len+1);
++		strncpy(acl->topic, topic, topic_len+1);
+ 
+ 		json_get_int(j_acl, "priority", &acl->priority, true, 0);
+ 		json_get_bool(j_acl, "allow", &acl->allow, true, false);
+@@ -262,25 +265,28 @@ int dynsec_roles__config_load(struct dynsec__data *data, cJSON *tree)
+ 	cJSON_ArrayForEach(j_role, j_roles){
+ 		if(cJSON_IsObject(j_role) == true){
+ 			/* Role name */
+-			jtmp = cJSON_GetObjectItem(j_role, "rolename");
+-			if(jtmp == NULL || !cJSON_IsString(jtmp)){
++			char *rolename;
++			if(json_get_string(j_role, "rolename", &rolename, false) != MOSQ_ERR_SUCCESS){
+ 				continue;
+ 			}
+-			rolename_len = strlen(jtmp->valuestring);
++			rolename_len = strlen(rolename);
+ 			if(rolename_len == 0){
+ 				continue;
+ 			}
++			if(dynsec_roles__find(data, rolename)){
++				continue;
++			}
+ 
+ 			role = mosquitto_calloc(1, sizeof(struct dynsec__role) + rolename_len + 1);
+ 			if(role == NULL){
+ 				return MOSQ_ERR_NOMEM;
+ 			}
+-			strncpy(role->rolename, jtmp->valuestring, rolename_len+1);
++			strncpy(role->rolename, rolename, rolename_len+1);
+ 
+ 			/* Text name */
+-			jtmp = cJSON_GetObjectItem(j_role, "textname");
+-			if(jtmp != NULL){
+-				role->text_name = mosquitto_strdup(jtmp->valuestring);
++			char *textname;
++			if(json_get_string(j_role, "textname", &textname, false) == MOSQ_ERR_SUCCESS){
++				role->text_name = mosquitto_strdup(textname);
+ 				if(role->text_name == NULL){
+ 					mosquitto_free(role);
+ 					continue;
+@@ -288,9 +294,9 @@ int dynsec_roles__config_load(struct dynsec__data *data, cJSON *tree)
+ 			}
+ 
+ 			/* Text description */
+-			jtmp = cJSON_GetObjectItem(j_role, "textdescription");
+-			if(jtmp != NULL){
+-				role->text_description = mosquitto_strdup(jtmp->valuestring);
++			char *textdescription;
++			if(json_get_string(j_role, "textdescription", &textdescription, false) == MOSQ_ERR_SUCCESS){
++				role->text_description = mosquitto_strdup(textdescription);
+ 				if(role->text_description == NULL){
+ 					mosquitto_free(role->text_name);
+ 					mosquitto_free(role);
+@@ -598,11 +604,12 @@ int dynsec_roles__process_add_acl(struct dynsec__data *data, struct mosquitto_co
+ {
+ 	char *rolename;
+ 	struct dynsec__role *role;
+-	cJSON *j_acltype, *j_topic;
+ 	struct dynsec__acl **acllist, *acl;
+ 	int rc;
+ 	const char *admin_clientid, *admin_username;
++	char *topic;
+ 	size_t topic_len;
++	char *acltype;
+ 
+ 	if(json_get_string(cmd->j_command, "rolename", &rolename, false) != MOSQ_ERR_SUCCESS){
+ 		mosquitto_control_command_reply(cmd, "Invalid/missing rolename");
+@@ -619,36 +626,34 @@ int dynsec_roles__process_add_acl(struct dynsec__data *data, struct mosquitto_co
+ 		return MOSQ_ERR_SUCCESS;
+ 	}
+ 
+-	j_acltype = cJSON_GetObjectItem(cmd->j_command, "acltype");
+-	if(j_acltype == NULL || !cJSON_IsString(j_acltype)){
++	if(json_get_string(cmd->j_command, "acltype", &acltype, false) != MOSQ_ERR_SUCCESS){
+ 		mosquitto_control_command_reply(cmd, "Invalid/missing acltype");
+ 		return MOSQ_ERR_SUCCESS;
+ 	}
+-	if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_PUB_C_SEND)){
++	if(!strcasecmp(acltype, ACL_TYPE_PUB_C_SEND)){
+ 		acllist = &role->acls.publish_c_send;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_PUB_C_RECV)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_PUB_C_RECV)){
+ 		acllist = &role->acls.publish_c_recv;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_SUB_LITERAL)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_SUB_LITERAL)){
+ 		acllist = &role->acls.subscribe_literal;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_SUB_PATTERN)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_SUB_PATTERN)){
+ 		acllist = &role->acls.subscribe_pattern;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_UNSUB_LITERAL)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_UNSUB_LITERAL)){
+ 		acllist = &role->acls.unsubscribe_literal;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_UNSUB_PATTERN)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_UNSUB_PATTERN)){
+ 		acllist = &role->acls.unsubscribe_pattern;
+ 	}else{
+ 		mosquitto_control_command_reply(cmd, "Unknown acltype");
+ 		return MOSQ_ERR_SUCCESS;
+ 	}
+ 
+-	j_topic = cJSON_GetObjectItem(cmd->j_command, "topic");
+-	if(j_topic && cJSON_IsString(j_topic)){
+-		topic_len = strlen(j_topic->valuestring);
+-		if(mosquitto_validate_utf8(j_topic->valuestring, (int)topic_len) != MOSQ_ERR_SUCCESS){
++	if(json_get_string(cmd->j_command, "topic", &topic, false) == MOSQ_ERR_SUCCESS){
++		topic_len = strlen(topic);
++		if(mosquitto_validate_utf8(topic, (int)topic_len) != MOSQ_ERR_SUCCESS){
+ 			mosquitto_control_command_reply(cmd, "Topic not valid UTF-8");
+ 			return MOSQ_ERR_INVAL;
+ 		}
+-		rc = mosquitto_sub_topic_check(j_topic->valuestring);
++		rc = mosquitto_sub_topic_check(topic);
+ 		if(rc != MOSQ_ERR_SUCCESS){
+ 			mosquitto_control_command_reply(cmd, "Invalid ACL topic");
+ 			return MOSQ_ERR_INVAL;
+@@ -658,7 +663,7 @@ int dynsec_roles__process_add_acl(struct dynsec__data *data, struct mosquitto_co
+ 		return MOSQ_ERR_SUCCESS;
+ 	}
+ 
+-	HASH_FIND(hh, *acllist, j_topic->valuestring, topic_len, acl);
++	HASH_FIND(hh, *acllist, topic, topic_len, acl);
+ 	if(acl){
+ 		mosquitto_control_command_reply(cmd, "ACL with this topic already exists");
+ 		return MOSQ_ERR_SUCCESS;
+@@ -669,7 +674,7 @@ int dynsec_roles__process_add_acl(struct dynsec__data *data, struct mosquitto_co
+ 		mosquitto_control_command_reply(cmd, "Internal error");
+ 		return MOSQ_ERR_SUCCESS;
+ 	}
+-	strncpy(acl->topic, j_topic->valuestring, topic_len+1);
++	strncpy(acl->topic, topic, topic_len+1);
+ 
+ 	json_get_int(cmd->j_command, "priority", &acl->priority, true, 0);
+ 	json_get_bool(cmd->j_command, "allow", &acl->allow, true, false);
+@@ -683,7 +688,7 @@ int dynsec_roles__process_add_acl(struct dynsec__data *data, struct mosquitto_co
+ 	admin_clientid = mosquitto_client_id(context);
+ 	admin_username = mosquitto_client_username(context);
+ 	mosquitto_log_printf(MOSQ_LOG_INFO, "dynsec: %s/%s | addRoleACL | rolename=%s | acltype=%s | topic=%s | priority=%d | allow=%s",
+-			admin_clientid, admin_username, rolename, j_acltype->valuestring, j_topic->valuestring, acl->priority, acl->allow?"true":"false");
++			admin_clientid, admin_username, rolename, acltype, topic, acl->priority, acl->allow?"true":"false");
+ 
+ 	return MOSQ_ERR_SUCCESS;
+ }
+@@ -695,9 +700,9 @@ int dynsec_roles__process_remove_acl(struct dynsec__data *data, struct mosquitto
+ 	struct dynsec__role *role;
+ 	struct dynsec__acl **acllist, *acl;
+ 	char *topic;
+-	cJSON *j_acltype;
+ 	int rc;
+ 	const char *admin_clientid, *admin_username;
++	char *acltype;
+ 
+ 	if(json_get_string(cmd->j_command, "rolename", &rolename, false) != MOSQ_ERR_SUCCESS){
+ 		mosquitto_control_command_reply(cmd, "Invalid/missing rolename");
+@@ -714,22 +719,21 @@ int dynsec_roles__process_remove_acl(struct dynsec__data *data, struct mosquitto
+ 		return MOSQ_ERR_SUCCESS;
+ 	}
+ 
+-	j_acltype = cJSON_GetObjectItem(cmd->j_command, "acltype");
+-	if(j_acltype == NULL || !cJSON_IsString(j_acltype)){
++	if(json_get_string(cmd->j_command, "acltype", &acltype, false) != MOSQ_ERR_SUCCESS){
+ 		mosquitto_control_command_reply(cmd, "Invalid/missing acltype");
+ 		return MOSQ_ERR_SUCCESS;
+ 	}
+-	if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_PUB_C_SEND)){
++	if(!strcasecmp(acltype, ACL_TYPE_PUB_C_SEND)){
+ 		acllist = &role->acls.publish_c_send;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_PUB_C_RECV)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_PUB_C_RECV)){
+ 		acllist = &role->acls.publish_c_recv;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_SUB_LITERAL)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_SUB_LITERAL)){
+ 		acllist = &role->acls.subscribe_literal;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_SUB_PATTERN)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_SUB_PATTERN)){
+ 		acllist = &role->acls.subscribe_pattern;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_UNSUB_LITERAL)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_UNSUB_LITERAL)){
+ 		acllist = &role->acls.unsubscribe_literal;
+-	}else if(!strcasecmp(j_acltype->valuestring, ACL_TYPE_UNSUB_PATTERN)){
++	}else if(!strcasecmp(acltype, ACL_TYPE_UNSUB_PATTERN)){
+ 		acllist = &role->acls.unsubscribe_pattern;
+ 	}else{
+ 		mosquitto_control_command_reply(cmd, "Unknown acltype");
+@@ -761,7 +765,7 @@ int dynsec_roles__process_remove_acl(struct dynsec__data *data, struct mosquitto
+ 		admin_clientid = mosquitto_client_id(context);
+ 		admin_username = mosquitto_client_username(context);
+ 		mosquitto_log_printf(MOSQ_LOG_INFO, "dynsec: %s/%s | removeRoleACL | rolename=%s | acltype=%s | topic=%s",
+-				admin_clientid, admin_username, rolename, j_acltype->valuestring, topic);
++				admin_clientid, admin_username, rolename, acltype, topic);
+ 
+ 	}else{
+ 		mosquitto_control_command_reply(cmd, "ACL not found");
+diff --git a/plugins/persist-sqlite/restore.c b/plugins/persist-sqlite/restore.c
+index 49ea80f7c8..03f82ec8db 100644
+--- a/plugins/persist-sqlite/restore.c
++++ b/plugins/persist-sqlite/restore.c
+@@ -21,6 +21,7 @@ SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
+ #include <sqlite3.h>
+ #include <cjson/cJSON.h>
+ 
++#include "json_help.h"
+ #include "mosquitto.h"
+ #include "mosquitto_broker.h"
+ #include "mqtt_protocol.h"
+@@ -58,7 +59,7 @@ static uint8_t hex2nibble(char c)
+ static mosquitto_property *json_to_properties(const char *json)
+ {
+ 	mosquitto_property *properties = NULL;
+-	cJSON *array, *obj, *j_id, *j_value, *j_name;
++	cJSON *array, *obj, *j_value;
+ 	int propid, proptype;
+ 	size_t slen;
+ 
+@@ -72,15 +73,16 @@ static mosquitto_property *json_to_properties(const char *json)
+ 	}
+ 
+ 	cJSON_ArrayForEach(obj, array){
+-		j_id = cJSON_GetObjectItem(obj, "identifier");
+-		j_name = cJSON_GetObjectItem(obj, "name");
++		char *identifier;
++
++		json_get_string(obj, "identifier", &identifier, true);
+ 		j_value = cJSON_GetObjectItem(obj, "value");
+ 
+-		if(!j_id || !cJSON_IsString(j_id) || !j_value){
++		if(!identifier || !j_value){
+ 			mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring property whilst restoring, invalid identifier / value");
+ 			continue;
+ 		}
+-		if(mosquitto_string_to_property_info(j_id->valuestring, &propid, &proptype)){
++		if(mosquitto_string_to_property_info(identifier, &propid, &proptype)){
+ 			mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring property whilst restoring, unknown identifier");
+ 			continue;
+ 		}
+@@ -130,15 +132,22 @@ static mosquitto_property *json_to_properties(const char *json)
+ 					mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring %s property whilst restoring, value is incorrect type", "binary");
+ 					continue;
+ 				}
+-				slen = strlen(j_value->valuestring);
+-				if(slen/2 > UINT16_MAX){
+-					mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring %s property whilst restoring, value is too large", "binary");
+-					continue;
+-				}
+-				for(size_t i=0; i<slen; i+=2){
+-					((uint8_t *)j_value->valuestring)[i/2] = (uint8_t)(hex2nibble(j_value->valuestring[i])<<4) + hex2nibble(j_value->valuestring[i+1]);
++				uint8_t *binstr = NULL;
++				uint16_t len = 0;
++
++				if(j_value->valuestring){
++					slen = strlen(j_value->valuestring);
++					if(slen/2 > UINT16_MAX){
++						mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring %s property whilst restoring, value is too large", "binary");
++						continue;
++					}
++					for(size_t i=0; i<slen; i+=2){
++						((uint8_t *)j_value->valuestring)[i/2] = (uint8_t)(hex2nibble(j_value->valuestring[i])<<4) + hex2nibble(j_value->valuestring[i+1]);
++					}
++					binstr = (uint8_t *)j_value->valuestring;
++					len = (uint16_t)slen/2;
+ 				}
+-				if(mosquitto_property_add_binary(&properties, propid, (uint8_t *)j_value->valuestring, (uint16_t)(slen/2))){
++				if(mosquitto_property_add_binary(&properties, propid, binstr, len)){
+ 					mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Out of memory whilst restoring %s property", "binary");
+ 					continue;
+ 				}
+@@ -154,17 +163,21 @@ static mosquitto_property *json_to_properties(const char *json)
+ 				}
+ 				break;
+ 			case MQTT_PROP_TYPE_STRING_PAIR:
+-				if(!cJSON_IsString(j_value)){
+-					mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring %s property whilst restoring, value is incorrect type", "string pair");
+-					continue;
+-				}
+-				if(!j_name || !cJSON_IsString(j_name)){
+-					mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring string pair property whilst restoring, name is missing or incorrect type");
+-					continue;
+-				}
+-				if(mosquitto_property_add_string_pair(&properties, propid, j_name->valuestring, j_value->valuestring)){
+-					mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Out of memory whilst restoring %s property", "string pair");
+-					continue;
++				{
++					char *prop_name;
++
++					if(!cJSON_IsString(j_value)){
++						mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring %s property whilst restoring, value is incorrect type", "string pair");
++						continue;
++					}
++					if(json_get_string(obj, "name", &prop_name, false) != MOSQ_ERR_SUCCESS){
++						mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Ignoring string pair property whilst restoring, name is missing or incorrect type");
++						continue;
++					}
++					if(mosquitto_property_add_string_pair(&properties, propid, prop_name, j_value->valuestring)){
++						mosquitto_log_printf(MOSQ_LOG_WARNING, "Sqlite persistence: Out of memory whilst restoring %s property", "string pair");
++						continue;
++					}
+ 				}
+ 				break;
+ 		}

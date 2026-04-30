@@ -1,0 +1,130 @@
+From 0c5d59f6a9f1fb6935e263603d2e8d45b9559fd5 Mon Sep 17 00:00:00 2001
+From: Fabrice Bellard <fabrice@bellard.org>
+Date: Wed, 16 Apr 2025 15:04:57 +0200
+Subject: [PATCH] optimized and fixed JS_AtomIsNumericIndex1(): 'NaN' is also a
+ number
+
+---
+ TODO               |  2 +-
+ quickjs-atom.h     |  4 +++
+ quickjs.c          | 64 +++++++++++++---------------------------------
+ test262_errors.txt |  1 -
+ 4 files changed, 23 insertions(+), 48 deletions(-)
+
+diff --git a/TODO b/TODO
+index d4de64827..027501bb5 100644
+--- a/TODO
++++ b/TODO
+@@ -62,6 +62,6 @@ Optimization ideas:
+ Test262o:   0/11262 errors, 463 excluded
+ Test262o commit: 7da91bceb9ce7613f87db47ddd1292a2dda58b42 (es5-tests branch)
+ 
+-Result: 10/76964 errors, 3147 excluded, 6912 skipped
++Result: 1/76964 errors, 3147 excluded, 6912 skipped
+ Test262 commit: 56e77d6325067a545ea7e8ff5be5d9284334e33c
+ 
+diff --git a/quickjs-atom.h b/quickjs-atom.h
+index 43f2526ae..73766f23c 100644
+--- a/quickjs-atom.h
++++ b/quickjs-atom.h
+@@ -173,6 +173,10 @@ DEF(status, "status")
+ DEF(reason, "reason")
+ DEF(globalThis, "globalThis")
+ DEF(bigint, "bigint")
++DEF(minus_zero, "-0")
++DEF(Infinity, "Infinity")
++DEF(minus_Infinity, "-Infinity")
++DEF(NaN, "NaN")
+ /* the following 3 atoms are only used with CONFIG_ATOMICS */
+ DEF(not_equal, "not-equal")
+ DEF(timed_out, "timed-out")
+diff --git a/quickjs.c b/quickjs.c
+index fae324cee..e9d2408c1 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3088,7 +3088,7 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
+     JSRuntime *rt = ctx->rt;
+     JSAtomStruct *p1;
+     JSString *p;
+-    int c, len, ret;
++    int c, ret;
+     JSValue num, str;
+ 
+     if (__JS_AtomIsTaggedInt(atom))
+@@ -3097,52 +3097,24 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
+     p1 = rt->atom_array[atom];
+     if (p1->atom_type != JS_ATOM_TYPE_STRING)
+         return JS_UNDEFINED;
+-    p = p1;
+-    len = p->len;
+-    if (p->is_wide_char) {
+-        const uint16_t *r = p->u.str16, *r_end = p->u.str16 + len;
+-        if (r >= r_end)
+-            return JS_UNDEFINED;
+-        c = *r;
+-        if (c == '-') {
+-            if (r >= r_end)
+-                return JS_UNDEFINED;
+-            r++;
+-            c = *r;
+-            /* -0 case is specific */
+-            if (c == '0' && len == 2)
+-                goto minus_zero;
+-        }
+-        /* XXX: should test NaN, but the tests do not check it */
+-        if (!is_num(c)) {
+-            /* XXX: String should be normalized, therefore 8-bit only */
+-            const uint16_t nfinity16[7] = { 'n', 'f', 'i', 'n', 'i', 't', 'y' };
+-            if (!(c =='I' && (r_end - r) == 8 &&
+-                  !memcmp(r + 1, nfinity16, sizeof(nfinity16))))
+-                return JS_UNDEFINED;
+-        }
+-    } else {
+-        const uint8_t *r = p->u.str8, *r_end = p->u.str8 + len;
+-        if (r >= r_end)
+-            return JS_UNDEFINED;
+-        c = *r;
+-        if (c == '-') {
+-            if (r >= r_end)
+-                return JS_UNDEFINED;
+-            r++;
+-            c = *r;
+-            /* -0 case is specific */
+-            if (c == '0' && len == 2) {
+-            minus_zero:
+-                return __JS_NewFloat64(ctx, -0.0);
+-            }
+-        }
+-        if (!is_num(c)) {
+-            if (!(c =='I' && (r_end - r) == 8 &&
+-                  !memcmp(r + 1, "nfinity", 7)))
+-                return JS_UNDEFINED;
+-        }
++    switch(atom) {
++    case JS_ATOM_minus_zero:
++        return __JS_NewFloat64(ctx, -0.0);
++    case JS_ATOM_Infinity:
++        return __JS_NewFloat64(ctx, INFINITY);
++    case JS_ATOM_minus_Infinity:
++        return __JS_NewFloat64(ctx, -INFINITY);
++    case JS_ATOM_NaN:
++        return __JS_NewFloat64(ctx, NAN);
++    default:
++        break;
+     }
++    p = p1;
++    if (p->len == 0)
++        return JS_UNDEFINED;
++    c = string_get(p, 0);
++    if (!is_num(c) && c != '-')
++        return JS_UNDEFINED;
+     /* this is ECMA CanonicalNumericIndexString primitive */
+     num = JS_ToNumber(ctx, JS_MKPTR(JS_TAG_STRING, p));
+     if (JS_IsException(num))
+diff --git a/test262_errors.txt b/test262_errors.txt
+index d81293e06..b42ae134f 100644
+--- a/test262_errors.txt
++++ b/test262_errors.txt
+@@ -1,2 +1 @@
+ test262/test/language/module-code/top-level-await/module-graphs-does-not-hang.js:10: TypeError: $DONE() not called
+-test262/test/language/statements/with/set-mutable-binding-binding-deleted-with-typed-array-in-proto-chain.js:20: Test262Error: Expected SameValue(«[object Object]», «undefined») to be true

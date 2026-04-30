@@ -1,0 +1,344 @@
+From c8444f751f968ebd3b048d6edcc9d90c1c6ac02d Mon Sep 17 00:00:00 2001
+From: Julio Jimenez <julio@clickhouse.com>
+Date: Wed, 26 Oct 2022 14:07:10 -0400
+Subject: [PATCH 1/7] Move SonarCloud Job to nightly
+
+Signed-off-by: Julio Jimenez <julio@clickhouse.com>
+---
+ .github/workflows/nightly.yml | 53 +++++++++++++++++++++++++++++
+ .github/workflows/sonar.yml   | 64 -----------------------------------
+ 2 files changed, 53 insertions(+), 64 deletions(-)
+ delete mode 100644 .github/workflows/sonar.yml
+
+diff --git a/.github/workflows/nightly.yml b/.github/workflows/nightly.yml
+index 801f7eda94ae..834f74822a14 100644
+--- a/.github/workflows/nightly.yml
++++ b/.github/workflows/nightly.yml
+@@ -122,3 +122,56 @@ jobs:
+           docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
++  SonarCloud:
++    name: Sonar Cloud
++    runs-on: [self-hosted, builder]
++    env:
++      SONAR_SCANNER_VERSION: 4.7.0.2747
++      SONAR_SERVER_URL: "https://sonarcloud.io"
++      BUILD_WRAPPER_OUT_DIR: build_wrapper_output_directory # Directory where build-wrapper output will be placed
++    steps:
++      - uses: actions/checkout@v2
++        with:
++          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
++          submodules: true
++      - name: Set up JDK 11
++        uses: actions/setup-java@v1
++        with:
++          java-version: 11
++      - name: Download and set up sonar-scanner
++        env:
++          SONAR_SCANNER_DOWNLOAD_URL: https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux.zip
++        run: |
++          mkdir -p $HOME/.sonar
++          curl -sSLo $HOME/.sonar/sonar-scanner.zip ${{ env.SONAR_SCANNER_DOWNLOAD_URL }}
++          unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
++          echo "$HOME/.sonar/sonar-scanner-${{ env.SONAR_SCANNER_VERSION }}-linux/bin" >> $GITHUB_PATH
++      - name: Download and set up build-wrapper
++        env:
++          BUILD_WRAPPER_DOWNLOAD_URL: ${{ env.SONAR_SERVER_URL }}/static/cpp/build-wrapper-linux-x86.zip
++        run: |
++          curl -sSLo $HOME/.sonar/build-wrapper-linux-x86.zip ${{ env.BUILD_WRAPPER_DOWNLOAD_URL }}
++          unzip -o $HOME/.sonar/build-wrapper-linux-x86.zip -d $HOME/.sonar/
++          echo "$HOME/.sonar/build-wrapper-linux-x86" >> $GITHUB_PATH
++      - name: Set Up Build Tools
++        run: |
++          sudo apt-get update
++          sudo apt-get install -yq git cmake ccache python3 ninja-build
++          sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
++      - name: Run build-wrapper
++        run: |
++          mkdir build
++          cd build
++          cmake ..
++          cd ..
++          build-wrapper-linux-x86-64 --out-dir ${{ env.BUILD_WRAPPER_OUT_DIR }} cmake --build build/
++      - name: Run sonar-scanner
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
++        run: |
++          sonar-scanner \
++            --define sonar.host.url="${{ env.SONAR_SERVER_URL }}" \
++            --define sonar.cfamily.build-wrapper-output="${{ env.BUILD_WRAPPER_OUT_DIR }}" \
++            --define sonar.projectKey="ClickHouse_ClickHouse" \
++            --define sonar.organization="clickhouse-java"
+\ No newline at end of file
+diff --git a/.github/workflows/sonar.yml b/.github/workflows/sonar.yml
+deleted file mode 100644
+index 316f1e90d40a..000000000000
+--- a/.github/workflows/sonar.yml
++++ /dev/null
+@@ -1,64 +0,0 @@
+-name: Sonar Cloud
+-on:
+-  push:
+-    branches:
+-      - master
+-  pull_request:
+-    types: [opened, synchronize, reopened]
+-env:
+-  CC: clang-15
+-  CXX: clang++-15
+-jobs:
+-  sonar_cloud:
+-    name: Sonar Cloud
+-    runs-on: [self-hosted, builder]
+-    env:
+-      SONAR_SCANNER_VERSION: 4.7.0.2747
+-      SONAR_SERVER_URL: "https://sonarcloud.io"
+-      BUILD_WRAPPER_OUT_DIR: build_wrapper_output_directory # Directory where build-wrapper output will be placed
+-    steps:
+-      - uses: actions/checkout@v2
+-        with:
+-          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+-          submodules: true
+-      - name: Set up JDK 11
+-        uses: actions/setup-java@v1
+-        with:
+-          java-version: 11
+-      - name: Download and set up sonar-scanner
+-        env:
+-          SONAR_SCANNER_DOWNLOAD_URL: https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux.zip
+-        run: |
+-          mkdir -p $HOME/.sonar
+-          curl -sSLo $HOME/.sonar/sonar-scanner.zip ${{ env.SONAR_SCANNER_DOWNLOAD_URL }}
+-          unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
+-          echo "$HOME/.sonar/sonar-scanner-${{ env.SONAR_SCANNER_VERSION }}-linux/bin" >> $GITHUB_PATH
+-      - name: Download and set up build-wrapper
+-        env:
+-          BUILD_WRAPPER_DOWNLOAD_URL: ${{ env.SONAR_SERVER_URL }}/static/cpp/build-wrapper-linux-x86.zip
+-        run: |
+-          curl -sSLo $HOME/.sonar/build-wrapper-linux-x86.zip ${{ env.BUILD_WRAPPER_DOWNLOAD_URL }}
+-          unzip -o $HOME/.sonar/build-wrapper-linux-x86.zip -d $HOME/.sonar/
+-          echo "$HOME/.sonar/build-wrapper-linux-x86" >> $GITHUB_PATH
+-      - name: Set Up Build Tools
+-        run: |
+-          sudo apt-get update
+-          sudo apt-get install -yq git cmake ccache python3 ninja-build
+-          sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
+-      - name: Run build-wrapper
+-        run: |
+-          mkdir build
+-          cd build
+-          cmake ..
+-          cd ..
+-          build-wrapper-linux-x86-64 --out-dir ${{ env.BUILD_WRAPPER_OUT_DIR }} cmake --build build/
+-      - name: Run sonar-scanner
+-        env:
+-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+-        run: |
+-          sonar-scanner \
+-            --define sonar.host.url="${{ env.SONAR_SERVER_URL }}" \
+-            --define sonar.cfamily.build-wrapper-output="${{ env.BUILD_WRAPPER_OUT_DIR }}" \
+-            --define sonar.projectKey="clickhouse-java" \
+-            --define sonar.organization="ClickHouse"
+
+From 0872d5c440ada1cb9966f8e69b832b2c8eb1a026 Mon Sep 17 00:00:00 2001
+From: Julio Jimenez <julio@clickhouse.com>
+Date: Fri, 28 Oct 2022 13:33:12 -0400
+Subject: [PATCH 2/7] style
+
+Signed-off-by: Julio Jimenez <julio@clickhouse.com>
+---
+ .github/workflows/nightly.yml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/nightly.yml b/.github/workflows/nightly.yml
+index 834f74822a14..eb6e131886c7 100644
+--- a/.github/workflows/nightly.yml
++++ b/.github/workflows/nightly.yml
+@@ -141,7 +141,7 @@ jobs:
+       - name: Download and set up sonar-scanner
+         env:
+           SONAR_SCANNER_DOWNLOAD_URL: https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux.zip
+-        run: |
++        "run": |
+           mkdir -p $HOME/.sonar
+           curl -sSLo $HOME/.sonar/sonar-scanner.zip ${{ env.SONAR_SCANNER_DOWNLOAD_URL }}
+           unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
+@@ -149,7 +149,7 @@ jobs:
+       - name: Download and set up build-wrapper
+         env:
+           BUILD_WRAPPER_DOWNLOAD_URL: ${{ env.SONAR_SERVER_URL }}/static/cpp/build-wrapper-linux-x86.zip
+-        run: |
++        "run": |
+           curl -sSLo $HOME/.sonar/build-wrapper-linux-x86.zip ${{ env.BUILD_WRAPPER_DOWNLOAD_URL }}
+           unzip -o $HOME/.sonar/build-wrapper-linux-x86.zip -d $HOME/.sonar/
+           echo "$HOME/.sonar/build-wrapper-linux-x86" >> $GITHUB_PATH
+
+From 144648a633e90e5f40b196bb4af668afe74c4e2d Mon Sep 17 00:00:00 2001
+From: Julio Jimenez <julio@clickhouse.com>
+Date: Fri, 28 Oct 2022 13:47:37 -0400
+Subject: [PATCH 3/7] disable sc2086
+
+Signed-off-by: Julio Jimenez <julio@clickhouse.com>
+---
+ .github/workflows/nightly.yml | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/nightly.yml b/.github/workflows/nightly.yml
+index eb6e131886c7..527e3b1f2afe 100644
+--- a/.github/workflows/nightly.yml
++++ b/.github/workflows/nightly.yml
+@@ -141,7 +141,8 @@ jobs:
+       - name: Download and set up sonar-scanner
+         env:
+           SONAR_SCANNER_DOWNLOAD_URL: https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux.zip
+-        "run": |
++        # shellcheck disable=SC2086
++        run: |
+           mkdir -p $HOME/.sonar
+           curl -sSLo $HOME/.sonar/sonar-scanner.zip ${{ env.SONAR_SCANNER_DOWNLOAD_URL }}
+           unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
+@@ -149,7 +150,8 @@ jobs:
+       - name: Download and set up build-wrapper
+         env:
+           BUILD_WRAPPER_DOWNLOAD_URL: ${{ env.SONAR_SERVER_URL }}/static/cpp/build-wrapper-linux-x86.zip
+-        "run": |
++        # shellcheck disable=SC2086
++        run: |
+           curl -sSLo $HOME/.sonar/build-wrapper-linux-x86.zip ${{ env.BUILD_WRAPPER_DOWNLOAD_URL }}
+           unzip -o $HOME/.sonar/build-wrapper-linux-x86.zip -d $HOME/.sonar/
+           echo "$HOME/.sonar/build-wrapper-linux-x86" >> $GITHUB_PATH
+
+From 10bee23c584a2effb509e71d4c7aa09b781e853d Mon Sep 17 00:00:00 2001
+From: Julio Jimenez <julio@clickhouse.com>
+Date: Fri, 28 Oct 2022 13:56:12 -0400
+Subject: [PATCH 4/7] no newline at end of file.
+
+Signed-off-by: Julio Jimenez <julio@clickhouse.com>
+---
+ .github/workflows/nightly.yml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/.github/workflows/nightly.yml b/.github/workflows/nightly.yml
+index 527e3b1f2afe..1fa6603c9607 100644
+--- a/.github/workflows/nightly.yml
++++ b/.github/workflows/nightly.yml
+@@ -176,4 +176,4 @@ jobs:
+             --define sonar.host.url="${{ env.SONAR_SERVER_URL }}" \
+             --define sonar.cfamily.build-wrapper-output="${{ env.BUILD_WRAPPER_OUT_DIR }}" \
+             --define sonar.projectKey="ClickHouse_ClickHouse" \
+-            --define sonar.organization="clickhouse-java"
+\ No newline at end of file
++            --define sonar.organization="clickhouse-java"
+
+From dc10c7a446d2d18823fe3e1c07d8996aaeb99787 Mon Sep 17 00:00:00 2001
+From: Julio Jimenez <julio@clickhouse.com>
+Date: Fri, 28 Oct 2022 13:57:47 -0400
+Subject: [PATCH 5/7] no newline at end of file.
+
+Signed-off-by: Julio Jimenez <julio@clickhouse.com>
+---
+ .github/workflows/nightly.yml | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/.github/workflows/nightly.yml b/.github/workflows/nightly.yml
+index 1fa6603c9607..0bada9eb9135 100644
+--- a/.github/workflows/nightly.yml
++++ b/.github/workflows/nightly.yml
+@@ -123,7 +123,6 @@ jobs:
+           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
+   SonarCloud:
+-    name: Sonar Cloud
+     runs-on: [self-hosted, builder]
+     env:
+       SONAR_SCANNER_VERSION: 4.7.0.2747
+@@ -141,7 +140,6 @@ jobs:
+       - name: Download and set up sonar-scanner
+         env:
+           SONAR_SCANNER_DOWNLOAD_URL: https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux.zip
+-        # shellcheck disable=SC2086
+         run: |
+           mkdir -p $HOME/.sonar
+           curl -sSLo $HOME/.sonar/sonar-scanner.zip ${{ env.SONAR_SCANNER_DOWNLOAD_URL }}
+@@ -150,7 +148,6 @@ jobs:
+       - name: Download and set up build-wrapper
+         env:
+           BUILD_WRAPPER_DOWNLOAD_URL: ${{ env.SONAR_SERVER_URL }}/static/cpp/build-wrapper-linux-x86.zip
+-        # shellcheck disable=SC2086
+         run: |
+           curl -sSLo $HOME/.sonar/build-wrapper-linux-x86.zip ${{ env.BUILD_WRAPPER_DOWNLOAD_URL }}
+           unzip -o $HOME/.sonar/build-wrapper-linux-x86.zip -d $HOME/.sonar/
+
+From 51f2d6046c1b40edc6d07d3b63abe2d5d4e1697f Mon Sep 17 00:00:00 2001
+From: Julio Jimenez <julio@clickhouse.com>
+Date: Fri, 28 Oct 2022 14:10:23 -0400
+Subject: [PATCH 6/7] sc2086
+
+Signed-off-by: Julio Jimenez <julio@clickhouse.com>
+---
+ .github/workflows/nightly.yml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/nightly.yml b/.github/workflows/nightly.yml
+index 0bada9eb9135..81878ccd16f1 100644
+--- a/.github/workflows/nightly.yml
++++ b/.github/workflows/nightly.yml
+@@ -142,14 +142,14 @@ jobs:
+           SONAR_SCANNER_DOWNLOAD_URL: https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux.zip
+         run: |
+           mkdir -p $HOME/.sonar
+-          curl -sSLo $HOME/.sonar/sonar-scanner.zip ${{ env.SONAR_SCANNER_DOWNLOAD_URL }}
++          curl -sSLo $HOME/.sonar/sonar-scanner.zip "${{ env.SONAR_SCANNER_DOWNLOAD_URL }}"
+           unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
+           echo "$HOME/.sonar/sonar-scanner-${{ env.SONAR_SCANNER_VERSION }}-linux/bin" >> $GITHUB_PATH
+       - name: Download and set up build-wrapper
+         env:
+           BUILD_WRAPPER_DOWNLOAD_URL: ${{ env.SONAR_SERVER_URL }}/static/cpp/build-wrapper-linux-x86.zip
+         run: |
+-          curl -sSLo $HOME/.sonar/build-wrapper-linux-x86.zip ${{ env.BUILD_WRAPPER_DOWNLOAD_URL }}
++          curl -sSLo "$HOME/.sonar/build-wrapper-linux-x86.zip ${{ env.BUILD_WRAPPER_DOWNLOAD_URL }}"
+           unzip -o $HOME/.sonar/build-wrapper-linux-x86.zip -d $HOME/.sonar/
+           echo "$HOME/.sonar/build-wrapper-linux-x86" >> $GITHUB_PATH
+       - name: Set Up Build Tools
+
+From 53acc23856f83727b53eda5c39e979038f80c52e Mon Sep 17 00:00:00 2001
+From: Julio Jimenez <julio@clickhouse.com>
+Date: Fri, 28 Oct 2022 14:17:29 -0400
+Subject: [PATCH 7/7] sc2086
+
+Signed-off-by: Julio Jimenez <julio@clickhouse.com>
+---
+ .github/workflows/nightly.yml | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/nightly.yml b/.github/workflows/nightly.yml
+index 81878ccd16f1..e6da4df72004 100644
+--- a/.github/workflows/nightly.yml
++++ b/.github/workflows/nightly.yml
+@@ -141,17 +141,17 @@ jobs:
+         env:
+           SONAR_SCANNER_DOWNLOAD_URL: https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux.zip
+         run: |
+-          mkdir -p $HOME/.sonar
+-          curl -sSLo $HOME/.sonar/sonar-scanner.zip "${{ env.SONAR_SCANNER_DOWNLOAD_URL }}"
+-          unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
+-          echo "$HOME/.sonar/sonar-scanner-${{ env.SONAR_SCANNER_VERSION }}-linux/bin" >> $GITHUB_PATH
++          mkdir -p "$HOME/.sonar"
++          curl -sSLo "$HOME/.sonar/sonar-scanner.zip" "${{ env.SONAR_SCANNER_DOWNLOAD_URL }}"
++          unzip -o "$HOME/.sonar/sonar-scanner.zip" -d "$HOME/.sonar/"
++          echo "$HOME/.sonar/sonar-scanner-${{ env.SONAR_SCANNER_VERSION }}-linux/bin" >> "$GITHUB_PATH"
+       - name: Download and set up build-wrapper
+         env:
+           BUILD_WRAPPER_DOWNLOAD_URL: ${{ env.SONAR_SERVER_URL }}/static/cpp/build-wrapper-linux-x86.zip
+         run: |
+           curl -sSLo "$HOME/.sonar/build-wrapper-linux-x86.zip ${{ env.BUILD_WRAPPER_DOWNLOAD_URL }}"
+-          unzip -o $HOME/.sonar/build-wrapper-linux-x86.zip -d $HOME/.sonar/
+-          echo "$HOME/.sonar/build-wrapper-linux-x86" >> $GITHUB_PATH
++          unzip -o "$HOME/.sonar/build-wrapper-linux-x86.zip" -d "$HOME/.sonar/"
++          echo "$HOME/.sonar/build-wrapper-linux-x86" >> "$GITHUB_PATH"
+       - name: Set Up Build Tools
+         run: |
+           sudo apt-get update

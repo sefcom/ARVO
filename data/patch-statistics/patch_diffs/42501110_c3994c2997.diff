@@ -1,0 +1,98 @@
+From 362b34afc2584237175a2a592b4741df7104faec Mon Sep 17 00:00:00 2001
+From: Eric Blankenhorn <eric@wolfssl.com>
+Date: Wed, 20 Oct 2021 12:59:30 -0500
+Subject: [PATCH] Fix fuzzing test issues
+
+---
+ src/mqtt_client.c |  1 +
+ src/mqtt_packet.c | 33 +++++++++++++++++++++++----------
+ 2 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/src/mqtt_client.c b/src/mqtt_client.c
+index 4b4ab2435..3da38ac40 100644
+--- a/src/mqtt_client.c
++++ b/src/mqtt_client.c
+@@ -296,6 +296,7 @@ static int Handle_Props(MqttClient* client, MqttProp* props, byte use_cb)
+         }
+     #else
+         (void)client;
++        (void)use_cb;
+     #endif
+         /* Free the properties */
+         MqttProps_Free(props);
+diff --git a/src/mqtt_packet.c b/src/mqtt_packet.c
+index 4802bc8bc..b10a6c819 100755
+--- a/src/mqtt_packet.c
++++ b/src/mqtt_packet.c
+@@ -368,7 +368,7 @@ int MqttEncode_Props(MqttPacketType packet, MqttProp* props, byte* buf)
+     // TODO: Validate property type is allowed for packet type
+ 
+     /* loop through the list properties */
+-    while (cur_prop != NULL)
++    while ((cur_prop != NULL) && (rc >= 0))
+     {
+         /* TODO: validate packet type */
+         (void)packet;
+@@ -459,7 +459,8 @@ int MqttEncode_Props(MqttPacketType packet, MqttProp* props, byte* buf)
+             case MQTT_DATA_TYPE_NONE:
+             default:
+             {
+-                /* Do nothing */
++                /* Invalid property data type */
++                rc = MQTT_CODE_ERROR_PROPERTY;
+                 break;
+             }
+         }
+@@ -596,17 +597,25 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
+                 tmp = MqttDecode_String(buf,
+                         (const char**)&cur_prop->data_str.str,
+                         &cur_prop->data_str.len);
+-                buf += tmp;
+-                rc += (int)tmp;
+-                prop_len -= tmp;
++                if (cur_prop->data_str.len <=
++                    (buf_len - (buf + tmp - pbuf))) {
++                    buf += tmp;
++                    rc += (int)tmp;
++                    prop_len -= tmp;
+ 
+-                if (cur_prop->data_str.len <= (buf_len - (buf - pbuf))) {
+                     tmp = MqttDecode_String(buf,
+                             (const char**)&cur_prop->data_str2.str,
+                             &cur_prop->data_str2.len);
+-                    buf += tmp;
+-                    rc += (int)tmp;
+-                    prop_len -= tmp;
++                    if (cur_prop->data_str2.len <=
++                        (buf_len - (buf + tmp - pbuf))) {
++                        buf += tmp;
++                        rc += (int)tmp;
++                        prop_len -= tmp;
++                    }
++                    else {
++                        /* Invalid length */
++                        rc = MQTT_CODE_ERROR_PROPERTY;
++                    }
+                 }
+                 else {
+                     /* Invalid length */
+@@ -617,7 +626,8 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
+             case MQTT_DATA_TYPE_NONE:
+             default:
+             {
+-                /* Do nothing */
++                /* Invalid property data type */
++                rc = MQTT_CODE_ERROR_PROPERTY;
+                 break;
+             }
+         }
+@@ -1722,6 +1732,9 @@ int MqttDecode_Auth(byte *rx_buf, int rx_buf_len, MqttAuth *auth)
+ 
+         if (props_len <= (word32)(rx_buf_len - (rx_payload - rx_buf))) {
+             rx_payload += tmp;
++            if ((rx_payload - rx_buf) > rx_buf_len) {
++                return MQTT_CODE_ERROR_OUT_OF_BUFFER;
++            }
+             if (props_len > 0) {
+                 /* Decode the Properties */
+                 tmp = MqttDecode_Props(MQTT_PACKET_TYPE_AUTH,

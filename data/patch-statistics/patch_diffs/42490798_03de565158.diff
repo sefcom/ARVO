@@ -1,0 +1,307 @@
+From debf23eead5a67b82bae668929c798196a42adc3 Mon Sep 17 00:00:00 2001
+From: Daniel Stenberg <daniel@haxx.se>
+Date: Thu, 17 Dec 2020 13:34:38 +0100
+Subject: [PATCH] mqtt: handle POST/PUBLISH without a set POSTFIELDSIZE
+
+Detected by OSS-Fuzz
+Bug: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=28735
+
+Added test 1916 and 1917 to verify.
+
+Closes #6338
+---
+ lib/mqtt.c                 | 10 ++++++-
+ tests/data/Makefile.inc    |  1 +
+ tests/data/test1198        |  2 +-
+ tests/data/test1199        |  2 +-
+ tests/data/test1916        | 57 +++++++++++++++++++++++++++++++++++
+ tests/data/test1917        | 61 ++++++++++++++++++++++++++++++++++++++
+ tests/libtest/Makefile.inc |  8 ++++-
+ tests/libtest/lib1916.c    | 54 +++++++++++++++++++++++++++++++++
+ 8 files changed, 191 insertions(+), 4 deletions(-)
+ create mode 100644 tests/data/test1916
+ create mode 100644 tests/data/test1917
+ create mode 100644 tests/libtest/lib1916.c
+
+diff --git a/lib/mqtt.c b/lib/mqtt.c
+index a56c7d5eb270..71a00cfc2f5f 100644
+--- a/lib/mqtt.c
++++ b/lib/mqtt.c
+@@ -319,7 +319,7 @@ static CURLcode mqtt_publish(struct connectdata *conn)
+ {
+   CURLcode result;
+   char *payload = conn->data->set.postfields;
+-  size_t payloadlen = (size_t)conn->data->set.postfieldsize;
++  size_t payloadlen;
+   char *topic = NULL;
+   size_t topiclen;
+   unsigned char *pkt = NULL;
+@@ -327,6 +327,14 @@ static CURLcode mqtt_publish(struct connectdata *conn)
+   size_t remaininglength;
+   size_t encodelen;
+   char encodedbytes[4];
++  curl_off_t postfieldsize = conn->data->set.postfieldsize;
++
++  if(!payload)
++    return CURLE_BAD_FUNCTION_ARGUMENT;
++  if(postfieldsize < 0)
++    payloadlen = strlen(payload);
++  else
++    payloadlen = (size_t)postfieldsize;
+ 
+   result = mqtt_get_topic(conn, &topic, &topiclen);
+   if(result)
+diff --git a/tests/data/Makefile.inc b/tests/data/Makefile.inc
+index 7e9663d48949..c80f7abb036e 100644
+--- a/tests/data/Makefile.inc
++++ b/tests/data/Makefile.inc
+@@ -205,6 +205,7 @@ test1800 test1801 \
+ \
+                                     test1904 test1905 test1906 test1907 \
+ test1908 test1909 test1910 test1911 test1912 test1913 test1914 test1915 \
++test1916 test1917 \
+ \
+ test2000 test2001 test2002 test2003 test2004 test2005 test2006 test2007 \
+ test2008 test2009 test2010 test2011 test2012 test2013 test2014 test2015 \
+diff --git a/tests/data/test1198 b/tests/data/test1198
+index deb22906b1b7..a81e4bb81507 100644
+--- a/tests/data/test1198
++++ b/tests/data/test1198
+@@ -30,7 +30,7 @@ mqtt
+ MQTT PUBLISH empty payload, single space topic
+ </name>
+ <command option="binary-trace">
+-"mqtt:/%HOSTIP:%MQTTPORT/ " -d ""
++mqtt://%HOSTIP:%MQTTPORT/%20 -d ""
+ </command>
+ </client>
+ 
+diff --git a/tests/data/test1199 b/tests/data/test1199
+index 6887c576bb41..d710e701351e 100644
+--- a/tests/data/test1199
++++ b/tests/data/test1199
+@@ -30,7 +30,7 @@ mqtt
+ MQTT PUBLISH empty payload, no topic
+ </name>
+ <command option="binary-trace">
+-"mqtt:/%HOSTIP:%MQTTPORT/" -d ""
++mqtt://%HOSTIP:%MQTTPORT -d ""
+ </command>
+ </client>
+ 
+diff --git a/tests/data/test1916 b/tests/data/test1916
+new file mode 100644
+index 000000000000..e3b87bcd4217
+--- /dev/null
++++ b/tests/data/test1916
+@@ -0,0 +1,57 @@
++<testcase>
++<info>
++<keywords>
++MQTT
++MQTT PUBLISH
++</keywords>
++</info>
++
++#
++# Server-side
++<reply>
++<data nocheck="yes">
++hello
++</data>
++<datacheck hex="yes">
++00 04 31 31 39 30   68 65 6c 6c 6f 5b 4c 46 5d 0a
++</datacheck>
++</reply>
++
++#
++# Client-side
++<client>
++<features>
++mqtt
++</features>
++<server>
++mqtt
++</server>
++<name>
++MQTT PUBLISH with no POSTFIELDSIZE set
++</name>
++<tool>
++lib1916
++</tool>
++<command option="binary-trace">
++"mqtt://%HOSTIP:%MQTTPORT/ "
++</command>
++</client>
++
++#
++# Verify data after the test has been "shot"
++<verify>
++# These are hexadecimal protocol dumps from the client
++#
++# Strip out the random part of the client id from the CONNECT message
++# before comparison
++<strippart>
++s/^(.* 00044d5154540402003c000c6375726c).*/$1/
++</strippart>
++<protocol>
++client CONNECT 18 00044d5154540402003c000c6375726c
++server CONNACK 2 20020000
++client PUBLISH 3 000120
++client DISCONNECT 0 e000
++</protocol>
++</verify>
++</testcase>
+diff --git a/tests/data/test1917 b/tests/data/test1917
+new file mode 100644
+index 000000000000..f125c46db972
+--- /dev/null
++++ b/tests/data/test1917
+@@ -0,0 +1,61 @@
++<testcase>
++<info>
++<keywords>
++MQTT
++MQTT PUBLISH
++</keywords>
++</info>
++
++#
++# Server-side
++<reply>
++<data nocheck="yes">
++hello
++</data>
++<datacheck hex="yes">
++00 04 31 31 39 30   68 65 6c 6c 6f 5b 4c 46 5d 0a
++</datacheck>
++</reply>
++
++#
++# Client-side
++<client>
++
++# require HTTP too as otherwise CURLOPT_POST doesn't exist
++<features>
++mqtt
++http
++</features>
++<server>
++mqtt
++</server>
++<name>
++MQTT PUBLISH with CURLOPT_POST set (no payload)
++</name>
++<tool>
++lib1917
++</tool>
++<command option="binary-trace">
++"mqtt://%HOSTIP:%MQTTPORT/ "
++</command>
++</client>
++
++#
++# Verify data after the test has been "shot"
++<verify>
++# These are hexadecimal protocol dumps from the client
++#
++# Strip out the random part of the client id from the CONNECT message
++# before comparison
++<strippart>
++s/^(.* 00044d5154540402003c000c6375726c).*/$1/
++</strippart>
++<protocol>
++client CONNECT 18 00044d5154540402003c000c6375726c
++server CONNACK 2 20020000
++</protocol>
++<errorcode>
++43
++</errorcode>
++</verify>
++</testcase>
+diff --git a/tests/libtest/Makefile.inc b/tests/libtest/Makefile.inc
+index c23bc5b1a0ff..d4b527d66ff4 100644
+--- a/tests/libtest/Makefile.inc
++++ b/tests/libtest/Makefile.inc
+@@ -59,7 +59,7 @@ noinst_PROGRAMS = chkhostname libauthretry libntlmconnect                \
+  lib1558 lib1559 lib1560 lib1564 lib1565 lib1567 \
+  lib1591 lib1592 lib1593 lib1594 lib1596 \
+          lib1905 lib1906 lib1907 lib1908 lib1910 lib1911 lib1912 lib1913 \
+-         lib1915 \
++         lib1915 lib1916 lib1917 \
+          lib3010
+ 
+ chkdecimalpoint_SOURCES = chkdecimalpoint.c ../../lib/mprintf.c \
+@@ -655,6 +655,12 @@ lib1915_SOURCES = lib1915.c $(SUPPORTFILES) $(TESTUTIL) $(WARNLESS)
+ lib1915_LDADD = $(TESTUTIL_LIBS)
+ lib1915_CPPFLAGS = $(AM_CPPFLAGS)
+ 
++lib1916_SOURCES = lib1916.c $(SUPPORTFILES) $(WARNLESS)
++lib1916_CPPFLAGS = $(AM_CPPFLAGS)
++
++lib1917_SOURCES = lib1916.c $(SUPPORTFILES) $(WARNLESS)
++lib1917_CPPFLAGS = $(AM_CPPFLAGS) -DLIB1917
++
+ lib3010_SOURCES = lib3010.c $(SUPPORTFILES) $(TESTUTIL) $(WARNLESS)
+ lib3010_LDADD = $(TESTUTIL_LIBS)
+ lib3010_CPPFLAGS = $(AM_CPPFLAGS)
+diff --git a/tests/libtest/lib1916.c b/tests/libtest/lib1916.c
+new file mode 100644
+index 000000000000..0d5fa78c8cf5
+--- /dev/null
++++ b/tests/libtest/lib1916.c
+@@ -0,0 +1,54 @@
++/***************************************************************************
++ *                                  _   _ ____  _
++ *  Project                     ___| | | |  _ \| |
++ *                             / __| | | | |_) | |
++ *                            | (__| |_| |  _ <| |___
++ *                             \___|\___/|_| \_\_____|
++ *
++ * Copyright (C) 2020, Daniel Stenberg, <daniel@haxx.se>, et al.
++ *
++ * This software is licensed as described in the file COPYING, which
++ * you should have received as part of this distribution. The terms
++ * are also available at https://curl.se/docs/copyright.html.
++ *
++ * You may opt to use, copy, modify, merge, publish, distribute and/or sell
++ * copies of the Software, and permit persons to whom the Software is
++ * furnished to do so, under the terms of the COPYING file.
++ *
++ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
++ * KIND, either express or implied.
++ *
++ ***************************************************************************/
++#include "test.h"
++
++#include "warnless.h"
++#include "memdebug.h"
++
++int test(char *URL)
++{
++  CURL *curl;
++  CURLcode res = CURLE_OK;
++
++  if(curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
++    fprintf(stderr, "curl_global_init() failed\n");
++    return TEST_ERR_MAJOR_BAD;
++  }
++
++  curl = curl_easy_init();
++  if(curl) {
++    curl_easy_setopt(curl, CURLOPT_URL, URL);
++#ifdef LIB1917
++    /* without any postfields set! */
++    curl_easy_setopt(curl, CURLOPT_POST, 1L);
++#else
++    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
++#endif
++    res = curl_easy_perform(curl);
++    if(res) {
++      printf("res: %d\n", res);
++    }
++    curl_easy_cleanup(curl);
++  }
++  curl_global_cleanup();
++  return (int)res;
++}

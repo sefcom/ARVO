@@ -1,0 +1,89 @@
+From cb76165ac5b091545c32d26483b0c0d7a2c47e4f Mon Sep 17 00:00:00 2001
+From: Martin Matuska <martin@matuska.org>
+Date: Sat, 15 Jun 2019 22:32:35 +0200
+Subject: [PATCH] RAR reader: extend fix user after free
+
+If read_data_compressed() returns ARCHIVE_FAILED, the caller is allowed
+to continue with next archive headers. In addition to
+rar->start_new_table=1 we need to set rar->ppmd_valid=0.
+
+Reported by: OSS-Fuzz issue 15120
+---
+ Makefile.am                                   |  1 +
+ libarchive/archive_read_support_format_rar.c  |  1 +
+ libarchive/test/test_read_format_rar.c        | 23 +++++++++++++++++++
+ ...ead_format_rar_ppmd_use_after_free2.rar.uu | 10 ++++++++
+ 4 files changed, 35 insertions(+)
+ create mode 100644 libarchive/test/test_read_format_rar_ppmd_use_after_free2.rar.uu
+
+diff --git a/Makefile.am b/Makefile.am
+index da78b24ac..1ac3218ae 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -826,6 +826,7 @@ libarchive_test_EXTRA_DIST=\
+ 	libarchive/test/test_read_format_rar_noeof.rar.uu \
+ 	libarchive/test/test_read_format_rar_ppmd_lzss_conversion.rar.uu \
+ 	libarchive/test/test_read_format_rar_ppmd_use_after_free.rar.uu \
++	libarchive/test/test_read_format_rar_ppmd_use_after_free2.rar.uu \
+ 	libarchive/test/test_read_format_rar_sfx.exe.uu \
+ 	libarchive/test/test_read_format_rar_subblock.rar.uu \
+ 	libarchive/test/test_read_format_rar_unicode.rar.uu \
+diff --git a/libarchive/archive_read_support_format_rar.c b/libarchive/archive_read_support_format_rar.c
+index 49360876c..41e5a3cad 100644
+--- a/libarchive/archive_read_support_format_rar.c
++++ b/libarchive/archive_read_support_format_rar.c
+@@ -1027,6 +1027,7 @@ archive_read_format_rar_read_data(struct archive_read *a, const void **buff,
+     if (ret != ARCHIVE_OK && ret != ARCHIVE_WARN) {
+       __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
+       rar->start_new_table = 1;
++      rar->ppmd_valid = 0;
+     }
+     break;
+ 
+diff --git a/libarchive/test/test_read_format_rar.c b/libarchive/test/test_read_format_rar.c
+index f08b06bc6..57dece389 100644
+--- a/libarchive/test/test_read_format_rar.c
++++ b/libarchive/test/test_read_format_rar.c
+@@ -3779,3 +3779,26 @@ DEFINE_TEST(test_read_format_rar_ppmd_use_after_free)
+   assertEqualIntA(a, ARCHIVE_OK, archive_read_close(a));
+   assertEqualInt(ARCHIVE_OK, archive_read_free(a));
+ }
++
++DEFINE_TEST(test_read_format_rar_ppmd_use_after_free2)
++{
++  uint8_t buf[16];
++  const char* reffile = "test_read_format_rar_ppmd_use_after_free2.rar";
++
++  struct archive_entry *ae;
++  struct archive *a;
++
++  extract_reference_file(reffile);
++  assert((a = archive_read_new()) != NULL);
++  assertA(0 == archive_read_support_filter_all(a));
++  assertA(0 == archive_read_support_format_all(a));
++  assertA(0 == archive_read_open_filename(a, reffile, 10240));
++
++  assertA(ARCHIVE_OK == archive_read_next_header(a, &ae));
++  assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++  assertA(ARCHIVE_OK == archive_read_next_header(a, &ae));
++  assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++
++  assertEqualIntA(a, ARCHIVE_OK, archive_read_close(a));
++  assertEqualInt(ARCHIVE_OK, archive_read_free(a));
++}
+diff --git a/libarchive/test/test_read_format_rar_ppmd_use_after_free2.rar.uu b/libarchive/test/test_read_format_rar_ppmd_use_after_free2.rar.uu
+new file mode 100644
+index 000000000..03c2eadfa
+--- /dev/null
++++ b/libarchive/test/test_read_format_rar_ppmd_use_after_free2.rar.uu
+@@ -0,0 +1,10 @@
++begin 664 test_read_format_rar_ppmd_use_after_free2.rar
++M4F%R(1H'``1G=$Q24`!W````>U!+`P0Q`'#_J7\`+@TU'`#]`0`7__]"0D)"
++M+W5N)B8F)F=I9`UD#1T+``!"`````````&%R(1H'``3_________`F@`H2``
++M``"`P\/#2\/#P\/#P\/#P\-3PP"`P\/#PYZ>AYZ>GI[#4\,`@,/#`L,@(""=
++M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@(/______
++M__\@("`@("`@("`@("`@("`@("`@("`@("`$9W1,4E``=P```'M02P,$,0!P
++M_ZE_`"X--1P`_0$`%___0D)"0B]U;B8F)B9G:60-9`T="P``0@````````!A
++0<B$:!P`$_________P)H````
++`
++end

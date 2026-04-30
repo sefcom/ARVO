@@ -1,0 +1,72 @@
+From f9d165add1342ecae6cdde1b95e9ce63320768dd Mon Sep 17 00:00:00 2001
+From: Philip Withnall <withnall@endlessm.com>
+Date: Wed, 1 Jul 2020 11:54:05 +0100
+Subject: [PATCH] guri: Fix buffer overrun when decoding %-encoded URI
+ components
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There is a limited (1 or 2 byte) read off the end of the buffer if its
+final or penultimate byte is `%` and it’s not nul-terminated after that.
+If the buffer *is* nul-terminated then the first `g_ascii_isxdigit()`
+call safely returns `FALSE` and the code moves on.
+
+Fix it by adding an additional check, and some unit tests to catch the
+behaviour.
+
+This bug is present in libsoup, which `GUri` is based on, but not
+exploitable due to how the external API only exposes nul-terminated
+strings. See https://gitlab.gnome.org/GNOME/libsoup/-/merge_requests/126
+for the fix there.
+
+oss-fuzz#23815
+oss-fuzz#23818
+
+Signed-off-by: Philip Withnall <withnall@endlessm.com>
+---
+ glib/guri.c      | 5 +++--
+ glib/tests/uri.c | 2 ++
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/glib/guri.c b/glib/guri.c
+index de9f438758..4c55b5bb4e 100644
+--- a/glib/guri.c
++++ b/glib/guri.c
+@@ -253,10 +253,11 @@ uri_decoder (gchar       **out,
+     {
+       if (*s == '%')
+         {
+-          if (!g_ascii_isxdigit (s[1]) ||
++          if (s + 2 >= end ||
++              !g_ascii_isxdigit (s[1]) ||
+               !g_ascii_isxdigit (s[2]))
+             {
+-              /* % followed by non-hex; this is an error */
++              /* % followed by non-hex or the end of the string; this is an error */
+               if (flags & G_URI_FLAGS_PARSE_STRICT)
+                 {
+                   g_set_error_literal (error, G_URI_ERROR, parse_error,
+diff --git a/glib/tests/uri.c b/glib/tests/uri.c
+index 71bfad2890..4e0f07366e 100644
+--- a/glib/tests/uri.c
++++ b/glib/tests/uri.c
+@@ -378,6 +378,7 @@ test_uri_unescape_bytes (gconstpointer test_data)
+     {
+       { "%00%00", 2, (const guint8 *) "\x00\x00" },
+       { "%%", -1, NULL },
++      { "%", -1, NULL },
+     };
+   gsize i;
+ 
+@@ -1284,6 +1285,7 @@ test_uri_parse_params (gconstpointer test_data)
+       { "%00=foo", '&', FALSE, -1, { NULL, }},
+       { "p1=%00", '&', FALSE, -1, { NULL, }},
+       { "p1=foo&P1=bar", '&', TRUE, 1, { "p1", "bar", NULL, }},
++      { "=%", '&', FALSE, 1, { "", "%", NULL, }},
+     };
+   gsize i;
+ 
+-- 
+GitLab
+

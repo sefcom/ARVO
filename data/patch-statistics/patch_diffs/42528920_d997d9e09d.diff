@@ -1,0 +1,62 @@
+From 7dfcea03c37d17ca0d05d7a54f9245a8fde735cc Mon Sep 17 00:00:00 2001
+From: Nick Wellnhofer <wellnhofer@aevum.de>
+Date: Wed, 11 Oct 2023 14:19:04 +0200
+Subject: [PATCH] dict: Fix integer overflow in xmlDictAddString
+
+Short-lived regression.
+
+Older versions didn't check for integer overflow, but limited name
+length to INT_MAX / 2. Reintroduce this limit.
+
+Found by OSS-Fuzz.
+---
+ dict.c | 22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/dict.c b/dict.c
+index a6a3c9bf0..d4ce38356 100644
+--- a/dict.c
++++ b/dict.c
+@@ -153,10 +153,20 @@ xmlDictAddString(xmlDictPtr dict, const xmlChar *name, unsigned int namelen) {
+             return(NULL);
+         }
+ 
+-        if (size == 0) size = 1000;
+-	else size *= 4; /* exponential growth */
+-        if (size < 4 * namelen)
+-	    size = 4 * namelen; /* just in case ! */
++        if (size == 0) {
++            size = 1000;
++        } else {
++            if (size < (SIZE_MAX - sizeof(xmlDictStrings)) / 4)
++                size *= 4; /* exponential growth */
++            else
++                size = SIZE_MAX - sizeof(xmlDictStrings);
++        }
++        if (size / 4 < namelen) {
++            if ((size_t) namelen + 0 < (SIZE_MAX - sizeof(xmlDictStrings)) / 4)
++                size = 4 * (size_t) namelen; /* just in case ! */
++            else
++                return(NULL);
++        }
+ 	pool = (xmlDictStringsPtr) xmlMalloc(sizeof(xmlDictStrings) + size);
+ 	if (pool == NULL)
+ 	    return(NULL);
+@@ -659,12 +669,12 @@ xmlDictLookupInternal(xmlDictPtr dict, const xmlChar *prefix,
+ 
+     if (prefix == NULL) {
+         hashValue = xmlDictHashName(dict->seed, name, maxLen, &len);
+-        if (len > INT_MAX)
++        if (len > INT_MAX / 2)
+             return(NULL);
+         klen = len;
+     } else {
+         hashValue = xmlDictHashQName(dict->seed, prefix, name, &plen, &len);
+-        if ((len > INT_MAX) || (plen >= INT_MAX - len))
++        if ((len > INT_MAX / 2) || (plen >= INT_MAX / 2 - len))
+             return(NULL);
+         klen = plen + 1 + len;
+     }
+-- 
+GitLab
+

@@ -1,0 +1,151 @@
+From ed65992ff095e40193a311e8192a17b2e9e6cd6b Mon Sep 17 00:00:00 2001
+From: Akshay Ragir <akshay.ragir@ittiam.com>
+Date: Fri, 15 Mar 2024 11:15:57 +0530
+Subject: [PATCH] Fix for the Heap-buffer-overflow READ 1 in ixheaace_process
+
+These changes handle the heap buffer overflow runtime error
+by reducing the maximum number of loudnessInfo blocks supported.
+
+Bug: ossFuzz: 67273
+Test: poc in bug
+---
+ encoder/drc_src/impd_drc_common_enc.h |   4 +-
+ fuzzer/xaac_enc_fuzzer.cpp            | 105 ++------------------------
+ 2 files changed, 10 insertions(+), 99 deletions(-)
+
+diff --git a/encoder/drc_src/impd_drc_common_enc.h b/encoder/drc_src/impd_drc_common_enc.h
+index eec3ae5b..8ff57b84 100644
+--- a/encoder/drc_src/impd_drc_common_enc.h
++++ b/encoder/drc_src/impd_drc_common_enc.h
+@@ -25,11 +25,11 @@
+ #define MAX_CHANNEL_COUNT (8)
+ #define MAX_BAND_COUNT (8)
+ #define MAX_SEQUENCE_COUNT (8)
+-#define MAX_MEASUREMENT_COUNT (16)
++#define MAX_MEASUREMENT_COUNT (8)
+ #define MAX_DOWNMIX_INSTRUCTION_COUNT (16)
+ #define MAX_DRC_COEFF_COUNT (8)
+ #define MAX_DRC_INSTRUCTIONS_COUNT (MAX_DOWNMIX_INSTRUCTION_COUNT + 16)
+-#define MAX_LOUDNESS_INFO_COUNT (MAX_DOWNMIX_INSTRUCTION_COUNT + 16)
++#define MAX_LOUDNESS_INFO_COUNT (7)
+ #define MAX_AUDIO_CODEC_FRAME_SIZE (2048)
+ #define MAX_DRC_CODEC_FRAME_SIZE (MAX_AUDIO_CODEC_FRAME_SIZE / 8)
+ #define MAX_NODE_COUNT (MAX_DRC_CODEC_FRAME_SIZE)
+diff --git a/fuzzer/xaac_enc_fuzzer.cpp b/fuzzer/xaac_enc_fuzzer.cpp
+index 3058b5f5..7cd9c9f6 100644
+--- a/fuzzer/xaac_enc_fuzzer.cpp
++++ b/fuzzer/xaac_enc_fuzzer.cpp
+@@ -203,105 +203,16 @@ static VOID ixheaace_read_drc_config_params(
+     }
+   }
+ 
+-  pstr_enc_loudness_info_set->loudness_info_count =
+-      fuzzed_data->ConsumeIntegralInRange<WORD8>(0, MAX_LOUDNESS_INFO_COUNT);
+-  for (n = 0; n < pstr_enc_loudness_info_set->loudness_info_count; n++) {
+-    pstr_enc_loudness_info_set->str_loudness_info[n].drc_set_id =
+-        fuzzed_data->ConsumeIntegral<WORD8>();
+-    pstr_enc_loudness_info_set->str_loudness_info[n].downmix_id =
+-        fuzzed_data->ConsumeIntegral<WORD8>();
+-    pstr_enc_loudness_info_set->str_loudness_info[n].sample_peak_level_present =
+-        fuzzed_data->ConsumeBool();
+-    if (1 == pstr_enc_loudness_info_set->str_loudness_info[n].sample_peak_level_present) {
+-      pstr_enc_loudness_info_set->str_loudness_info[n].sample_peak_level =
+-          fuzzed_data->ConsumeFloatingPoint<FLOAT32>();
+-    }
+-    pstr_enc_loudness_info_set->str_loudness_info[n].true_peak_level_present =
+-        fuzzed_data->ConsumeBool();
+-    if (1 == pstr_enc_loudness_info_set->str_loudness_info[n].true_peak_level_present) {
+-      pstr_enc_loudness_info_set->str_loudness_info[n].true_peak_level =
+-          fuzzed_data->ConsumeFloatingPoint<FLOAT32>();
+-      pstr_enc_loudness_info_set->str_loudness_info[n].true_peak_level_measurement_system =
+-          fuzzed_data->ConsumeIntegral<WORD8>();
+-      pstr_enc_loudness_info_set->str_loudness_info[n].true_peak_level_reliability =
+-          fuzzed_data->ConsumeIntegral<WORD8>();
+-    }
++  pstr_uni_drc_config->str_channel_layout.layout_signaling_present = 0;
++  pstr_uni_drc_config->str_channel_layout.defined_layout = 0;
++  pstr_uni_drc_config->str_channel_layout.speaker_position[0] = 0;
+ 
+-    pstr_enc_loudness_info_set->str_loudness_info[n].measurement_count =
+-        fuzzed_data->ConsumeIntegralInRange<WORD8>(0, MAX_MEASUREMENT_COUNT);
+-    for (m = 0; m < pstr_enc_loudness_info_set->str_loudness_info[n].measurement_count; m++) {
+-      pstr_enc_loudness_info_set->str_loudness_info[n].str_loudness_measure[m].method_definition =
+-          fuzzed_data->ConsumeIntegral<WORD8>();
+-      pstr_enc_loudness_info_set->str_loudness_info[n].str_loudness_measure[m].method_value =
+-          fuzzed_data->ConsumeFloatingPoint<FLOAT32>();
+-      pstr_enc_loudness_info_set->str_loudness_info[n]
+-          .str_loudness_measure[m]
+-          .measurement_system = fuzzed_data->ConsumeIntegral<WORD8>();
+-      pstr_enc_loudness_info_set->str_loudness_info[n].str_loudness_measure[m].reliability =
+-          fuzzed_data->ConsumeIntegral<WORD8>();
+-    }
+-  }
+-
+-  pstr_enc_loudness_info_set->loudness_info_album_count =
+-      fuzzed_data->ConsumeIntegralInRange<WORD8>(0, MAX_LOUDNESS_INFO_COUNT);
+-  for (n = 0; n < pstr_enc_loudness_info_set->loudness_info_album_count; n++) {
+-    pstr_enc_loudness_info_set->str_loudness_info_album[n].drc_set_id =
+-        fuzzed_data->ConsumeIntegral<WORD8>();
+-    pstr_enc_loudness_info_set->str_loudness_info_album[n].downmix_id =
+-        fuzzed_data->ConsumeIntegral<WORD8>();
+-    pstr_enc_loudness_info_set->str_loudness_info_album[n].sample_peak_level_present =
+-        fuzzed_data->ConsumeBool();
+-    if (1 == pstr_enc_loudness_info_set->str_loudness_info_album[n].sample_peak_level_present) {
+-      pstr_enc_loudness_info_set->str_loudness_info_album[n].sample_peak_level =
+-          fuzzed_data->ConsumeFloatingPoint<FLOAT32>();
+-    }
+-    pstr_enc_loudness_info_set->str_loudness_info_album[n].true_peak_level_present =
+-        fuzzed_data->ConsumeBool();
+-    if (1 == pstr_enc_loudness_info_set->str_loudness_info_album[n].true_peak_level_present) {
+-      pstr_enc_loudness_info_set->str_loudness_info_album[n].true_peak_level =
+-          fuzzed_data->ConsumeFloatingPoint<FLOAT32>();
+-      pstr_enc_loudness_info_set->str_loudness_info_album[n].true_peak_level_measurement_system =
+-          fuzzed_data->ConsumeIntegral<WORD8>();
+-      pstr_enc_loudness_info_set->str_loudness_info_album[n].true_peak_level_reliability =
+-          fuzzed_data->ConsumeIntegral<WORD8>();
+-    }
+-
+-    pstr_enc_loudness_info_set->str_loudness_info_album[n].measurement_count =
+-        fuzzed_data->ConsumeIntegralInRange<WORD8>(0, MAX_MEASUREMENT_COUNT);
+-    for (m = 0; m < pstr_enc_loudness_info_set->str_loudness_info_album[n].measurement_count;
+-         m++) {
+-      pstr_enc_loudness_info_set->str_loudness_info_album[n]
+-          .str_loudness_measure[m]
+-          .method_definition = fuzzed_data->ConsumeIntegral<WORD8>();
+-      pstr_enc_loudness_info_set->str_loudness_info_album[n]
+-          .str_loudness_measure[m]
+-          .method_value = fuzzed_data->ConsumeFloatingPoint<FLOAT32>();
+-      pstr_enc_loudness_info_set->str_loudness_info_album[n]
+-          .str_loudness_measure[m]
+-          .measurement_system = fuzzed_data->ConsumeIntegral<WORD8>();
+-      pstr_enc_loudness_info_set->str_loudness_info_album[n].str_loudness_measure[m].reliability =
+-          fuzzed_data->ConsumeIntegral<WORD8>();
+-    }
+-  }
+-
+-  pstr_uni_drc_config->str_channel_layout.layout_signaling_present = fuzzed_data->ConsumeBool();
+-  pstr_uni_drc_config->str_channel_layout.defined_layout = fuzzed_data->ConsumeIntegral<WORD8>();
+-  pstr_uni_drc_config->str_channel_layout.speaker_position[0] =
+-      fuzzed_data->ConsumeIntegral<WORD8>();
+-
+-  pstr_uni_drc_config->downmix_instructions_count =
+-      fuzzed_data->ConsumeIntegralInRange<WORD8>(0, MAX_DOWNMIX_INSTRUCTION_COUNT);
+-  for (n = 0; n < pstr_uni_drc_config->downmix_instructions_count; n++) {
+-    pstr_uni_drc_config->str_downmix_instructions[n].target_layout =
+-        fuzzed_data->ConsumeIntegral<WORD8>();
+-    pstr_uni_drc_config->str_downmix_instructions[n].downmix_coefficients_present =
+-        fuzzed_data->ConsumeBool();
+-  }
++  pstr_uni_drc_config->downmix_instructions_count = 0;
+ 
+-  pstr_uni_drc_config->drc_description_basic_present = fuzzed_data->ConsumeBool();
+-  pstr_uni_drc_config->uni_drc_config_ext_present = fuzzed_data->ConsumeBool();
+-  pstr_enc_loudness_info_set->loudness_info_set_ext_present = fuzzed_data->ConsumeBool();
+-  pstr_enc_gain_extension->uni_drc_gain_ext_present = fuzzed_data->ConsumeBool();
++  pstr_uni_drc_config->drc_description_basic_present = 0;
++  pstr_uni_drc_config->uni_drc_config_ext_present = 0;
++  pstr_enc_loudness_info_set->loudness_info_set_ext_present = 0;
++  pstr_enc_gain_extension->uni_drc_gain_ext_present = 0;
+ }
+ 
+ static VOID ixheaace_fuzzer_flag(ixheaace_input_config *pstr_in_cfg,

@@ -1,0 +1,1699 @@
+From 418ff172c11c5f99fc15af376fb6cd5c9ac14946 Mon Sep 17 00:00:00 2001
+From: Abtin Keshavarzian <abtink@google.com>
+Date: Mon, 21 Aug 2017 13:19:18 -0700
+Subject: [PATCH] Managing off-mesh-routes and their mapping to interface
+ routes
+
+This commit adds support for managing off-mesh-routes from Thread
+network. All off-mesh routes (aka external routes) from NCP or user-
+added (e.g, using `add_external_route()`) are stored in a
+`std::multimap` list `mOffMeshRoutes`. Property "Thread:OffMeshRoutes"
+can be used to get the full list which contains information about the
+origin of each entry along with preference level.
+
+This commit also adds logic to manage the routes on wpan network
+interface corresponding to the off-mesh routes from the network: A
+route is added on wpan network interface if there is an off-mesh route
+on at least one other device within network AND either the same route
+is not added by the device itself, or if it is added, it has a lower
+preference level.
+
+The change in this commit ensures that user-added off-mesh routes are
+restored on NCP in case of an NCP reset.
+---
+ src/ncp-dummy/DummyNCPInstance.cpp            |  14 +
+ src/ncp-dummy/DummyNCPInstance.h              |   5 +
+ src/ncp-spinel/SpinelNCPControlInterface.cpp  | 144 ++----
+ src/ncp-spinel/SpinelNCPControlInterface.h    |   7 +-
+ .../SpinelNCPInstance-Protothreads.cpp        |   2 +-
+ src/ncp-spinel/SpinelNCPInstance.cpp          | 289 ++++++++----
+ src/ncp-spinel/SpinelNCPInstance.h            |  22 +-
+ src/util/TunnelIPv6Interface.cpp              |  12 +-
+ src/util/TunnelIPv6Interface.h                |   4 +-
+ src/util/netif-mgmt.c                         |   8 +-
+ src/util/netif-mgmt.h                         |   4 +-
+ src/wpantund/NCPControlInterface.cpp          |   2 +-
+ src/wpantund/NCPInstanceBase-Addresses.cpp    | 414 +++++++++++++++++-
+ src/wpantund/NCPInstanceBase-AsyncIO.cpp      |   6 +-
+ src/wpantund/NCPInstanceBase-NetInterface.cpp |   6 +-
+ src/wpantund/NCPInstanceBase.cpp              |  19 +
+ src/wpantund/NCPInstanceBase.h                | 113 ++++-
+ src/wpantund/wpan-properties.h                |   1 +
+ 18 files changed, 814 insertions(+), 258 deletions(-)
+
+diff --git a/src/ncp-dummy/DummyNCPInstance.cpp b/src/ncp-dummy/DummyNCPInstance.cpp
+index 5522fea3..031450d1 100644
+--- a/src/ncp-dummy/DummyNCPInstance.cpp
++++ b/src/ncp-dummy/DummyNCPInstance.cpp
+@@ -128,3 +128,17 @@ DummyNCPInstance::remove_on_mesh_prefix_on_ncp(const struct in6_addr &addr, uint
+ {
+ 	return;
+ }
++
++void
++DummyNCPInstance::add_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++	bool stable, CallbackWithStatus cb)
++{
++	return;
++}
++
++void
++DummyNCPInstance::remove_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++	bool stable, CallbackWithStatus cb)
++{
++	return;
++}
+diff --git a/src/ncp-dummy/DummyNCPInstance.h b/src/ncp-dummy/DummyNCPInstance.h
+index f9d4cc76..e3c311d0 100644
+--- a/src/ncp-dummy/DummyNCPInstance.h
++++ b/src/ncp-dummy/DummyNCPInstance.h
+@@ -66,6 +66,11 @@ class DummyNCPInstance : public NCPInstanceBase {
+ 	virtual void remove_on_mesh_prefix_on_ncp(const struct in6_addr &addr, uint8_t prefix_len, uint8_t flags, bool stable,
+ 					CallbackWithStatus cb);
+ 
++	virtual void add_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++					bool stable, CallbackWithStatus cb);
++	virtual void remove_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++					bool stable, CallbackWithStatus cb);
++
+ public:
+ 	static bool setup_property_supported_by_class(const std::string& prop_name);
+ 
+diff --git a/src/ncp-spinel/SpinelNCPControlInterface.cpp b/src/ncp-spinel/SpinelNCPControlInterface.cpp
+index b3915af6..24b9c3c3 100644
+--- a/src/ncp-spinel/SpinelNCPControlInterface.cpp
++++ b/src/ncp-spinel/SpinelNCPControlInterface.cpp
+@@ -249,34 +249,52 @@ SpinelNCPControlInterface::remove_on_mesh_prefix(
+ 
+ void
+ SpinelNCPControlInterface::add_external_route(
+-	const struct in6_addr *prefix,
+-	int prefix_len_in_bits,
++	const struct in6_addr *route,
++	int prefix_len,
+ 	int domain_id,
+ 	ExternalRoutePriority priority,
+ 	CallbackWithStatus cb
+ ) {
+-	require_action(prefix != NULL, bail, cb(kWPANTUNDStatus_InvalidArgument));
+-	require_action(prefix_len_in_bits >= 0, bail, cb(kWPANTUNDStatus_InvalidArgument));
+-	require_action(prefix_len_in_bits <= IPV6_MAX_PREFIX_LENGTH, bail, cb(kWPANTUNDStatus_InvalidArgument));
++	require_action(route != NULL, bail, cb(kWPANTUNDStatus_InvalidArgument));
++	require_action(prefix_len >= 0, bail, cb(kWPANTUNDStatus_InvalidArgument));
++	require_action(prefix_len <= IPV6_MAX_PREFIX_LENGTH, bail, cb(kWPANTUNDStatus_InvalidArgument));
+ 	require_action(mNCPInstance->mEnabled, bail, cb(kWPANTUNDStatus_InvalidWhenDisabled));
+ 
+-	mNCPInstance->start_new_task(SpinelNCPTaskSendCommand::Factory(mNCPInstance)
+-		.set_callback(cb)
+-		.add_command(SpinelPackData(
+-			SPINEL_FRAME_PACK_CMD_PROP_VALUE_INSERT(
+-				SPINEL_DATATYPE_IPv6ADDR_S
+-				SPINEL_DATATYPE_UINT8_S
+-				SPINEL_DATATYPE_BOOL_S
+-				SPINEL_DATATYPE_UINT8_S
+-			),
+-			SPINEL_PROP_THREAD_OFF_MESH_ROUTES,
+-			prefix,
+-			prefix_len_in_bits,
+-			true,
+-			convert_external_route_priority_to_flags(priority)
+-		))
+-		.set_lock_property(SPINEL_PROP_THREAD_ALLOW_LOCAL_NET_DATA_CHANGE)
+-		.finish()
++	mNCPInstance->route_was_added(
++		SpinelNCPInstance::kOriginUser,
++		*route,
++		prefix_len,
++		priority,
++		true,     // stable
++		0,        // rlco16 (ignored for user added routes)
++		true,     // next_hop_is_host
++		cb
++	);
++
++bail:
++	return;
++}
++
++void
++SpinelNCPControlInterface::remove_external_route(
++	const struct in6_addr *route,
++	int prefix_len,
++	int domain_id,
++	CallbackWithStatus cb
++) {
++	require_action(route != NULL, bail, cb(kWPANTUNDStatus_InvalidArgument));
++	require_action(prefix_len >= 0, bail, cb(kWPANTUNDStatus_InvalidArgument));
++	require_action(prefix_len <= IPV6_MAX_PREFIX_LENGTH, bail, cb(kWPANTUNDStatus_InvalidArgument));
++	require_action(mNCPInstance->mEnabled, bail, cb(kWPANTUNDStatus_InvalidWhenDisabled));
++
++	mNCPInstance->route_was_removed(
++		SpinelNCPInstance::kOriginUser,
++		*route,
++		prefix_len,
++		NCPControlInterface::ROUTE_MEDIUM_PREFERENCE, // (value is ignored when removing user-added routes)
++		true,                                         // stable
++		0,                                            // rlco16 (value is ignored for user-added routes)
++		cb
+ 	);
+ 
+ bail:
+@@ -333,41 +351,6 @@ SpinelNCPControlInterface::joiner_add(
+ 	return;
+ }
+ 
+-void
+-SpinelNCPControlInterface::remove_external_route(
+-	const struct in6_addr *prefix,
+-	int prefix_len_in_bits,
+-	int domain_id,
+-	CallbackWithStatus cb
+-) {
+-	require_action(prefix != NULL, bail, cb(kWPANTUNDStatus_InvalidArgument));
+-	require_action(prefix_len_in_bits >= 0, bail, cb(kWPANTUNDStatus_InvalidArgument));
+-	require_action(prefix_len_in_bits <= IPV6_MAX_PREFIX_LENGTH, bail, cb(kWPANTUNDStatus_InvalidArgument));
+-	require_action(mNCPInstance->mEnabled, bail, cb(kWPANTUNDStatus_InvalidWhenDisabled));
+-
+-	mNCPInstance->start_new_task(SpinelNCPTaskSendCommand::Factory(mNCPInstance)
+-		.set_callback(cb)
+-		.add_command(SpinelPackData(
+-			SPINEL_FRAME_PACK_CMD_PROP_VALUE_REMOVE(
+-				SPINEL_DATATYPE_IPv6ADDR_S
+-				SPINEL_DATATYPE_UINT8_S
+-				SPINEL_DATATYPE_BOOL_S
+-				SPINEL_DATATYPE_UINT8_S
+-			),
+-			SPINEL_PROP_THREAD_OFF_MESH_ROUTES,
+-			prefix,
+-			prefix_len_in_bits,
+-			true,
+-			0
+-		))
+-		.set_lock_property(SPINEL_PROP_THREAD_ALLOW_LOCAL_NET_DATA_CHANGE)
+-		.finish()
+-	);
+-
+-bail:
+-	return;
+-}
+-
+ void
+ SpinelNCPControlInterface::handle_permit_join_timeout(Timer *timer, int seconds)
+ {
+@@ -665,53 +648,6 @@ SpinelNCPControlInterface::property_remove_value(
+ // ----------------------------------------------------------------------------
+ // MARK: -
+ 
+-SpinelNCPControlInterface::ExternalRoutePriority
+-SpinelNCPControlInterface::convert_flags_to_external_route_priority(uint8_t flags)
+-{
+-	ExternalRoutePriority priority = ROUTE_MEDIUM_PREFERENCE;
+-
+-	switch ((flags & SPINEL_NET_FLAG_PREFERENCE_MASK) >> SPINEL_NET_FLAG_PREFERENCE_OFFSET) {
+-		case 1:
+-			priority = ROUTE_HIGH_PREFERENCE;
+-			break;
+-
+-		case 3:
+-			priority = ROUTE_LOW_PREFRENCE;
+-			break;
+-
+-		case 0:
+-			priority = ROUTE_MEDIUM_PREFERENCE;
+-			break;
+-	}
+-
+-	return priority;
+-}
+-
+-uint8_t
+-SpinelNCPControlInterface::convert_external_route_priority_to_flags(ExternalRoutePriority priority)
+-{
+-	uint8_t flags;
+-
+-	switch (priority) {
+-	case ROUTE_HIGH_PREFERENCE:
+-		flags = (1 << SPINEL_NET_FLAG_PREFERENCE_OFFSET);
+-		break;
+-
+-	case ROUTE_MEDIUM_PREFERENCE:
+-		flags = (0 << SPINEL_NET_FLAG_PREFERENCE_OFFSET);
+-		break;
+-
+-	case ROUTE_LOW_PREFRENCE:
+-		flags = (3 << SPINEL_NET_FLAG_PREFERENCE_OFFSET);
+-		break;
+-	}
+-
+-	return flags;
+-}
+-
+-// ----------------------------------------------------------------------------
+-// MARK: -
+-
+ void
+ SpinelNCPControlInterface::peek(uint32_t address, uint16_t count, CallbackWithStatusArg1 cb)
+ {
+diff --git a/src/ncp-spinel/SpinelNCPControlInterface.h b/src/ncp-spinel/SpinelNCPControlInterface.h
+index 9cbe45cb..6105a8cc 100644
+--- a/src/ncp-spinel/SpinelNCPControlInterface.h
++++ b/src/ncp-spinel/SpinelNCPControlInterface.h
+@@ -149,7 +149,7 @@ class SpinelNCPControlInterface : public NCPControlInterface, public NCPMfgInter
+ 
+ 	virtual void add_external_route(
+ 		const struct in6_addr *prefix,
+-		int prefix_len_in_bits,
++		int prefix_len,
+ 		int domain_id,
+ 		ExternalRoutePriority priority,
+ 		CallbackWithStatus cb = NilReturn()
+@@ -157,7 +157,7 @@ class SpinelNCPControlInterface : public NCPControlInterface, public NCPMfgInter
+ 
+ 	virtual void remove_external_route(
+ 		const struct in6_addr *prefix,
+-		int prefix_len_in_bits,
++		int prefix_len,
+ 		int domain_id,
+ 		CallbackWithStatus cb = NilReturn()
+ 	);
+@@ -198,9 +198,6 @@ class SpinelNCPControlInterface : public NCPControlInterface, public NCPMfgInter
+ 		CallbackWithStatusArg1 cb = NilReturn()
+ 	);
+ 
+-	static ExternalRoutePriority convert_flags_to_external_route_priority(uint8_t flags);
+-	static uint8_t convert_external_route_priority_to_flags(ExternalRoutePriority priority);
+-
+ private:
+ 	void handle_permit_join_timeout(Timer *timer, int seconds);
+ 
+diff --git a/src/ncp-spinel/SpinelNCPInstance-Protothreads.cpp b/src/ncp-spinel/SpinelNCPInstance-Protothreads.cpp
+index 6aaab989..41ee0299 100644
+--- a/src/ncp-spinel/SpinelNCPInstance-Protothreads.cpp
++++ b/src/ncp-spinel/SpinelNCPInstance-Protothreads.cpp
+@@ -333,7 +333,7 @@ SpinelNCPInstance::vprocess_init(int event, va_list args)
+ 
+ 	set_ncp_power(true);
+ 
+-	remove_ncp_originated_addresses();
++	remove_ncp_originated_address_prefix_route_entries();
+ 
+ 	mNCPVersionString = "";
+ 
+diff --git a/src/ncp-spinel/SpinelNCPInstance.cpp b/src/ncp-spinel/SpinelNCPInstance.cpp
+index c5dab960..2105dad6 100644
+--- a/src/ncp-spinel/SpinelNCPInstance.cpp
++++ b/src/ncp-spinel/SpinelNCPInstance.cpp
+@@ -574,77 +574,6 @@ unpack_jam_detect_history_bitmap(const uint8_t *data_in, spinel_size_t data_len,
+ 	return ret;
+ }
+ 
+-static int
+-unpack_thread_off_mesh_routes(const uint8_t *data_in, spinel_size_t data_len, boost::any& value)
+-{
+-
+-	int ret = kWPANTUNDStatus_Ok;
+-	std::list<std::string> result;
+-
+-	while (data_len > 0)
+-	{
+-		spinel_ssize_t len;
+-		struct in6_addr *route_prefix = NULL;
+-		uint8_t prefix_len;
+-		bool is_stable;
+-		uint8_t flags;
+-		bool is_local;
+-		bool next_hop_is_this_device;
+-
+-
+-		len = spinel_datatype_unpack(
+-			data_in,
+-			data_len,
+-			SPINEL_DATATYPE_STRUCT_S(
+-				SPINEL_DATATYPE_IPv6ADDR_S      // Route Prefix
+-				SPINEL_DATATYPE_UINT8_S         // Prefix Length (in bits)
+-				SPINEL_DATATYPE_BOOL_S          // isStable
+-				SPINEL_DATATYPE_UINT8_S         // Flags
+-				SPINEL_DATATYPE_BOOL_S          // IsLocal
+-				SPINEL_DATATYPE_BOOL_S          // NextHopIsThisDevice
+-			),
+-			&route_prefix,
+-			&prefix_len,
+-			&is_stable,
+-			&flags,
+-			&is_local,
+-			&next_hop_is_this_device
+-		);
+-
+-		if (len <= 0) {
+-			ret = kWPANTUNDStatus_Failure;
+-			break;
+-		} else {
+-			char c_string[200];
+-			NCPControlInterface::ExternalRoutePriority priority;
+-
+-			priority = SpinelNCPControlInterface::convert_flags_to_external_route_priority(flags);
+-
+-			snprintf(c_string, sizeof(c_string),
+-				"%s/%d, stable:%s, local:%s, next_hop:%s, priority:%s (flags:0x%02x)",
+-				in6_addr_to_string(*route_prefix).c_str(),
+-				prefix_len,
+-				is_stable ? "yes" : "no",
+-				is_local ? "yes" : "no",
+-				next_hop_is_this_device ? "this_device" : "off-mesh",
+-				SpinelNCPControlInterface::external_route_priority_to_string(priority).c_str(),
+-				flags
+-			);
+-
+-			result.push_back(c_string);
+-		}
+-
+-		data_in += len;
+-		data_len -= len;
+-	}
+-
+-	if (ret == kWPANTUNDStatus_Ok) {
+-		value = result;
+-	}
+-
+-	return ret;
+-}
+-
+ void
+ SpinelNCPInstance::update_node_type(NodeType new_node_type)
+ {
+@@ -811,16 +740,6 @@ SpinelNCPInstance::property_get_value(
+ 	} else if (strcaseequal(key.c_str(), kWPANTUNDProperty_ThreadStableNetworkDataVersion)) {
+ 		SIMPLE_SPINEL_GET(SPINEL_PROP_THREAD_STABLE_NETWORK_DATA_VERSION, SPINEL_DATATYPE_UINT8_S);
+ 
+-	} else if (strcaseequal(key.c_str(), kWPANTUNDProperty_ThreadOffMeshRoutes)) {
+-		start_new_task(SpinelNCPTaskSendCommand::Factory(this)
+-			.set_callback(cb)
+-			.add_command(
+-				SpinelPackData(SPINEL_FRAME_PACK_CMD_PROP_VALUE_GET, SPINEL_PROP_THREAD_OFF_MESH_ROUTES)
+-			)
+-			.set_reply_unpacker(unpack_thread_off_mesh_routes)
+-			.finish()
+-		);
+-
+ 	} else if (strcaseequal(key.c_str(), kWPANTUNDProperty_ThreadCommissionerEnabled)) {
+ 		SIMPLE_SPINEL_GET(SPINEL_PROP_THREAD_COMMISSIONER_ENABLED, SPINEL_DATATYPE_BOOL_S);
+ 
+@@ -1805,6 +1724,98 @@ SpinelNCPInstance::reset_tasks(wpantund_status_t status)
+ 	}
+ }
+ 
++void
++SpinelNCPInstance::handle_ncp_spinel_value_is_OFF_MESH_ROUTE(const uint8_t* value_data_ptr, spinel_size_t value_data_len)
++{
++	std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator iter;
++	std::multimap<IPv6Prefix, OffMeshRouteEntry> off_mesh_routes(mOffMeshRoutes);
++	int num_routes = 0;
++
++	while (value_data_len > 0) {
++		spinel_ssize_t len;
++		struct in6_addr *route_prefix = NULL;
++		uint8_t prefix_len;
++		bool is_stable;
++		uint8_t flags;
++		bool is_local;
++		bool next_hop_is_this_device;
++		uint16_t rloc16;
++		RoutePreference preference;
++
++		len = spinel_datatype_unpack(
++			value_data_ptr,
++			value_data_len,
++			SPINEL_DATATYPE_STRUCT_S(
++				SPINEL_DATATYPE_IPv6ADDR_S      // Route Prefix
++				SPINEL_DATATYPE_UINT8_S         // Prefix Length (in bits)
++				SPINEL_DATATYPE_BOOL_S          // isStable
++				SPINEL_DATATYPE_UINT8_S         // Flags
++				SPINEL_DATATYPE_BOOL_S          // IsLocal
++				SPINEL_DATATYPE_BOOL_S          // NextHopIsThisDevice
++				SPINEL_DATATYPE_UINT16_S        // RLOC16
++			),
++			&route_prefix,
++			&prefix_len,
++			&is_stable,
++			&flags,
++			&is_local,
++			&next_hop_is_this_device,
++			&rloc16
++		);
++
++		if (len <= 0) {
++			break;
++		}
++
++		preference = convert_flags_to_route_preference(flags);
++
++		syslog(LOG_INFO, "[-NCP-]: Off-mesh route [%d] \"%s/%d\" stable:%s local:%s preference:%s, next_hop_is_this_device:%s, rloc16:0x%0x",
++			num_routes, in6_addr_to_string(*route_prefix).c_str(), prefix_len, is_stable ? "yes" : "no",
++			is_local ? "yes" : "no", NCPControlInterface::external_route_priority_to_string(preference).c_str(),
++			next_hop_is_this_device ? "yes" : "no", rloc16);
++
++		num_routes++;
++
++		if (!is_local) {
++
++			// Go through the `off_mesh_routes` list (which is the copy of mOffMeshRoutes)
++			// and check if this entry is already on the list, if so remove it.
++
++			IPv6Prefix route(*route_prefix, prefix_len);
++			OffMeshRouteEntry entry(kOriginThreadNCP, preference, is_stable, rloc16, next_hop_is_this_device);
++			iter = off_mesh_routes.lower_bound(route);
++
++			if (iter != off_mesh_routes.end()) {
++				std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator upper_iter = off_mesh_routes.upper_bound(route);
++
++				for (; iter != upper_iter; ++iter) {
++					if (iter->second == entry) {
++						off_mesh_routes.erase(iter);
++						break;
++					}
++				}
++			}
++
++			route_was_added(kOriginThreadNCP, *route_prefix, prefix_len, preference, is_stable, rloc16,
++				next_hop_is_this_device);
++		}
++
++		value_data_ptr += len;
++		value_data_len -= len;
++	}
++
++	// Since this was the whole list, we need to remove any routes
++	// which originated from NCP that that weren't in the new list.
++
++	for (iter = off_mesh_routes.begin(); iter != off_mesh_routes.end(); ++iter) {
++		if (iter->second.is_from_ncp()) {
++			route_was_removed(kOriginThreadNCP, iter->first.get_prefix(), iter->first.get_length(),
++				iter->second.get_preference(), iter->second.is_stable(), iter->second.get_rloc());
++		}
++	}
++}
++
++
+ void
+ SpinelNCPInstance::handle_ncp_spinel_value_is(spinel_prop_key_t key, const uint8_t* value_data_ptr, spinel_size_t value_data_len)
+ {
+@@ -2213,9 +2224,9 @@ SpinelNCPInstance::handle_ncp_spinel_value_is(spinel_prop_key_t key, const uint8
+ 				is_local ? "yes" : "no", on_mesh_prefix_flags_to_string(flags).c_str());
+ 
+ 			num_prefix++;
+-			on_mesh_prefixes.erase(*prefix);
+ 
+ 			if (!is_local) {
++				on_mesh_prefixes.erase(*prefix);
+ 				on_mesh_prefix_was_added(kOriginThreadNCP, *prefix, prefix_len, flags, stable);
+ 			}
+ 
+@@ -2231,6 +2242,9 @@ SpinelNCPInstance::handle_ncp_spinel_value_is(spinel_prop_key_t key, const uint8
+ 			}
+ 		}
+ 
++	} else if (key == SPINEL_PROP_THREAD_OFF_MESH_ROUTES) {
++		handle_ncp_spinel_value_is_OFF_MESH_ROUTE(value_data_ptr, value_data_len);
++
+ 	} else if (key == SPINEL_PROP_THREAD_ASSISTING_PORTS) {
+ 		bool is_assisting = (value_data_len != 0);
+ 		uint16_t assisting_port(0);
+@@ -2759,7 +2773,7 @@ SpinelNCPInstance::add_multicast_address_on_ncp(const struct in6_addr &addr, Cal
+ {
+ 	SpinelNCPTaskSendCommand::Factory factory(this);
+ 
+-	syslog(LOG_NOTICE, "Adding multicast address \"%s\" on NCP", in6_addr_to_string(addr).c_str());
++	syslog(LOG_NOTICE, "Adding multicast address \"%s\" to NCP", in6_addr_to_string(addr).c_str());
+ 
+ 	factory.set_lock_property(SPINEL_PROP_THREAD_ALLOW_LOCAL_NET_DATA_CHANGE);
+ 	factory.set_callback(cb);
+@@ -2834,7 +2848,7 @@ SpinelNCPInstance::remove_on_mesh_prefix_on_ncp(const struct in6_addr &prefix, u
+ {
+ 	SpinelNCPTaskSendCommand::Factory factory(this);
+ 
+-	syslog(LOG_NOTICE, "Removing on-mesh prefix \"%s/%d\" to NCP", in6_addr_to_string(prefix).c_str(), prefix_len);
++	syslog(LOG_NOTICE, "Removing on-mesh prefix \"%s/%d\" from NCP", in6_addr_to_string(prefix).c_str(), prefix_len);
+ 
+ 	factory.set_lock_property(SPINEL_PROP_THREAD_ALLOW_LOCAL_NET_DATA_CHANGE);
+ 	factory.set_callback(cb);
+@@ -2856,6 +2870,112 @@ SpinelNCPInstance::remove_on_mesh_prefix_on_ncp(const struct in6_addr &prefix, u
+ 	start_new_task(factory.finish());
+ }
+ 
++void
++SpinelNCPInstance::add_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++	bool stable, CallbackWithStatus cb)
++{
++	SpinelNCPTaskSendCommand::Factory factory(this);
++
++	syslog(LOG_NOTICE, "Adding off-mesh route \"%s/%d\" with preference %s to NCP", in6_addr_to_string(route).c_str(),
++		prefix_len, NCPControlInterface::external_route_priority_to_string(preference).c_str());
++
++	factory.set_lock_property(SPINEL_PROP_THREAD_ALLOW_LOCAL_NET_DATA_CHANGE);
++	factory.set_callback(cb);
++
++	factory.add_command(SpinelPackData(
++		SPINEL_FRAME_PACK_CMD_PROP_VALUE_INSERT(
++			SPINEL_DATATYPE_IPv6ADDR_S
++			SPINEL_DATATYPE_UINT8_S
++			SPINEL_DATATYPE_BOOL_S
++			SPINEL_DATATYPE_UINT8_S
++		),
++		SPINEL_PROP_THREAD_OFF_MESH_ROUTES,
++		&route,
++		prefix_len,
++		stable,
++		convert_route_preference_to_flags(preference)
++	));
++
++	start_new_task(factory.finish());
++}
++
++void
++SpinelNCPInstance::remove_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++	bool stable, CallbackWithStatus cb)
++{
++	SpinelNCPTaskSendCommand::Factory factory(this);
++
++	syslog(LOG_NOTICE, "Removing off-mesh route \"%s/%d\" with preference %s from NCP", in6_addr_to_string(route).c_str(),
++		prefix_len, NCPControlInterface::external_route_priority_to_string(preference).c_str());
++
++	factory.set_lock_property(SPINEL_PROP_THREAD_ALLOW_LOCAL_NET_DATA_CHANGE);
++	factory.set_callback(cb);
++
++	factory.add_command(SpinelPackData(
++		SPINEL_FRAME_PACK_CMD_PROP_VALUE_REMOVE(
++			SPINEL_DATATYPE_IPv6ADDR_S
++			SPINEL_DATATYPE_UINT8_S
++			SPINEL_DATATYPE_BOOL_S
++			SPINEL_DATATYPE_UINT8_S
++		),
++		SPINEL_PROP_THREAD_OFF_MESH_ROUTES,
++		&route,
++		prefix_len,
++		stable,
++		convert_route_preference_to_flags(preference)
++	));
++
++	start_new_task(factory.finish());
++}
++
++SpinelNCPInstance::RoutePreference
++SpinelNCPInstance::convert_flags_to_route_preference(uint8_t flags)
++{
++	RoutePreference preference = NCPControlInterface::ROUTE_MEDIUM_PREFERENCE;
++
++	switch (flags & SPINEL_NET_FLAG_PREFERENCE_MASK) {
++	case SPINEL_ROUTE_PREFERENCE_HIGH:
++		preference = NCPControlInterface::ROUTE_HIGH_PREFERENCE;
++		break;
++
++	case SPINEL_ROUTE_PREFERENCE_MEDIUM:
++		preference = NCPControlInterface::ROUTE_MEDIUM_PREFERENCE;
++		break;
++
++	case SPINEL_ROUTE_PREFERENCE_LOW:
++		preference = NCPControlInterface::ROUTE_LOW_PREFRENCE;
++		break;
++
++	default:
++		syslog(LOG_WARNING, "Invalid RoutePreference flag 0x%02x (using MEDIUM instead)", flags);
++		break;
++	}
++
++	return preference;
++}
++
++uint8_t
++SpinelNCPInstance::convert_route_preference_to_flags(RoutePreference preference)
++{
++	uint8_t flags = SPINEL_ROUTE_PREFERENCE_MEDIUM;
++
++	switch (preference) {
++	case NCPControlInterface::ROUTE_HIGH_PREFERENCE:
++		flags = SPINEL_ROUTE_PREFERENCE_HIGH;
++		break;
++
++	case NCPControlInterface::ROUTE_MEDIUM_PREFERENCE:
++		flags = SPINEL_ROUTE_PREFERENCE_MEDIUM;
++		break;
++
++	case NCPControlInterface::ROUTE_LOW_PREFRENCE:
++		flags = SPINEL_ROUTE_PREFERENCE_LOW;
++		break;
++	}
++
++	return flags;
++}
++
+ bool
+ SpinelNCPInstance::is_busy(void)
+ {
+@@ -2863,7 +2983,6 @@ SpinelNCPInstance::is_busy(void)
+ 		|| !mTaskQueue.empty();
+ }
+ 
+-
+ void
+ SpinelNCPInstance::process(void)
+ {
+diff --git a/src/ncp-spinel/SpinelNCPInstance.h b/src/ncp-spinel/SpinelNCPInstance.h
+index 9de91eaa..0061d52f 100644
+--- a/src/ncp-spinel/SpinelNCPInstance.h
++++ b/src/ncp-spinel/SpinelNCPInstance.h
+@@ -140,21 +140,31 @@ class SpinelNCPInstance : public NCPInstanceBase {
+ 	void handle_ncp_spinel_value_removed(spinel_prop_key_t key, const uint8_t* value_data_ptr, spinel_size_t value_data_len);
+ 	void handle_ncp_state_change(NCPState new_ncp_state, NCPState old_ncp_state);
+ 
++	void handle_ncp_spinel_value_is_OFF_MESH_ROUTE(const uint8_t* value_data_ptr, spinel_size_t value_data_len);
++
+ 	bool should_filter_address(const struct in6_addr &address, uint8_t prefix_len);
+ 	void filter_addresses(void);
+ 
+ 	virtual void add_unicast_address_on_ncp(const struct in6_addr &addr, uint8_t prefix_len,
+-					CallbackWithStatus cb = NilReturn());
++					CallbackWithStatus cb);
+ 	virtual void remove_unicast_address_on_ncp(const struct in6_addr& addr, uint8_t prefix_len,
+-					CallbackWithStatus cb = NilReturn());
++					CallbackWithStatus cb);
+ 
+-	virtual void add_multicast_address_on_ncp(const struct in6_addr &addr, CallbackWithStatus cb = NilReturn());
+-	virtual void remove_multicast_address_on_ncp(const struct in6_addr &addr, CallbackWithStatus cb = NilReturn());
++	virtual void add_multicast_address_on_ncp(const struct in6_addr &addr, CallbackWithStatus cb);
++	virtual void remove_multicast_address_on_ncp(const struct in6_addr &addr, CallbackWithStatus cb);
+ 
+ 	virtual void add_on_mesh_prefix_on_ncp(const struct in6_addr &addr, uint8_t prefix_len, uint8_t flags, bool stable,
+-					CallbackWithStatus cb = NilReturn());
++					CallbackWithStatus cb);
+ 	virtual void remove_on_mesh_prefix_on_ncp(const struct in6_addr &addr, uint8_t prefix_len, uint8_t flags,
+-					bool stable, CallbackWithStatus cb = NilReturn());
++					bool stable, CallbackWithStatus cb);
++
++	virtual void add_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++					bool stable, CallbackWithStatus cb);
++	virtual void remove_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++					bool stable, CallbackWithStatus cb);
++
++	static RoutePreference convert_flags_to_route_preference(uint8_t flags);
++	static uint8_t convert_route_preference_to_flags(RoutePreference priority);
+ 
+ 	uint32_t get_default_channel_mask(void);
+ 
+diff --git a/src/util/TunnelIPv6Interface.cpp b/src/util/TunnelIPv6Interface.cpp
+index d8016acf..4601e82a 100644
+--- a/src/util/TunnelIPv6Interface.cpp
++++ b/src/util/TunnelIPv6Interface.cpp
+@@ -518,15 +518,15 @@ TunnelIPv6Interface::leave_multicast_address(const struct in6_addr *addr)
+ 
+ 
+ bool
+-TunnelIPv6Interface::add_route(const struct in6_addr *route, int prefixlen)
++TunnelIPv6Interface::add_route(const struct in6_addr *route, int prefixlen, uint32_t metric)
+ {
+ 	bool ret = false;
+ 
+-	if (netif_mgmt_add_ipv6_route(mNetifMgmtFD, mInterfaceName.c_str(), route->s6_addr, prefixlen) != 0) {
++	if (netif_mgmt_add_ipv6_route(mNetifMgmtFD, mInterfaceName.c_str(), route->s6_addr, prefixlen, metric) != 0) {
+ 		mLastError = errno;
+ 		goto bail;
+ 	}
+-	syslog(LOG_INFO, "Adding route prefix \"%s/%d\" -> \"%s\".",
++	syslog(LOG_INFO, "Adding route prefix \"%s/%d\" on interface \"%s\".",
+ 	       in6_addr_to_string(*route).c_str(), prefixlen, mInterfaceName.c_str());
+ 
+ 	ret = true;
+@@ -536,16 +536,16 @@ TunnelIPv6Interface::add_route(const struct in6_addr *route, int prefixlen)
+ }
+ 
+ bool
+-TunnelIPv6Interface::remove_route(const struct in6_addr *route, int prefixlen)
++TunnelIPv6Interface::remove_route(const struct in6_addr *route, int prefixlen, uint32_t metric)
+ {
+ 	bool ret = false;
+ 
+-	if (netif_mgmt_remove_ipv6_route(mNetifMgmtFD, mInterfaceName.c_str(), route->s6_addr, prefixlen) != 0) {
++	if (netif_mgmt_remove_ipv6_route(mNetifMgmtFD, mInterfaceName.c_str(), route->s6_addr, prefixlen, metric) != 0) {
+ 		mLastError = errno;
+ 		goto bail;
+ 	}
+ 
+-	syslog(LOG_INFO, "Removing route prefix \"%s/%d\" -> \"%s\".",
++	syslog(LOG_INFO, "Removing route prefix \"%s/%d\" on interface \"%s\".",
+ 	       in6_addr_to_string(*route).c_str(), prefixlen, mInterfaceName.c_str());
+ 
+ 	ret = true;
+diff --git a/src/util/TunnelIPv6Interface.h b/src/util/TunnelIPv6Interface.h
+index 4a425db6..346ff4ab 100644
+--- a/src/util/TunnelIPv6Interface.h
++++ b/src/util/TunnelIPv6Interface.h
+@@ -64,8 +64,8 @@ class TunnelIPv6Interface : public nl::UnixSocket
+ 	bool add_address(const struct in6_addr *addr, int prefixlen = 64);
+ 	bool remove_address(const struct in6_addr *addr, int prefixlen = 64);
+ 
+-	bool add_route(const struct in6_addr *route, int prefixlen = 64);
+-	bool remove_route(const struct in6_addr *route, int prefixlen = 64);
++	bool add_route(const struct in6_addr *route, int prefixlen, uint32_t metric);
++	bool remove_route(const struct in6_addr *route, int prefixlen, uint32_t metric);
+ 
+ 	bool join_multicast_address(const struct in6_addr *addr);
+ 	bool leave_multicast_address(const struct in6_addr *addr);
+diff --git a/src/util/netif-mgmt.c b/src/util/netif-mgmt.c
+index 9f550667..cb5baeba 100644
+--- a/src/util/netif-mgmt.c
++++ b/src/util/netif-mgmt.c
+@@ -364,7 +364,7 @@ netif_mgmt_remove_ipv6_address(int reqfd, const char* if_name, const uint8_t add
+ }
+ 
+ int
+-netif_mgmt_add_ipv6_route(int reqfd, const char* if_name, const uint8_t route[16], int prefixlen)
++netif_mgmt_add_ipv6_route(int reqfd, const char* if_name, const uint8_t route[16], int prefixlen, uint32_t metric)
+ {
+ 	int ret = -1;
+ 
+@@ -390,7 +390,7 @@ netif_mgmt_add_ipv6_route(int reqfd, const char* if_name, const uint8_t route[16
+ 	if (prefixlen == 128) {
+ 		rt.rtmsg_flags |= RTF_HOST;
+ 	}
+-	rt.rtmsg_metric = 512;
++	rt.rtmsg_metric = metric;
+ 
+ 	ret = ioctl(reqfd, SIOGIFINDEX, &ifr);
+ 
+@@ -410,7 +410,7 @@ netif_mgmt_add_ipv6_route(int reqfd, const char* if_name, const uint8_t route[16
+ }
+ 
+ int
+-netif_mgmt_remove_ipv6_route(int reqfd, const char* if_name, const uint8_t route[16], int prefixlen)
++netif_mgmt_remove_ipv6_route(int reqfd, const char* if_name, const uint8_t route[16], int prefixlen, uint32_t metric)
+ {
+ 	int ret = -1;
+ 
+@@ -430,7 +430,7 @@ netif_mgmt_remove_ipv6_route(int reqfd, const char* if_name, const uint8_t route
+ 
+ 	rt.rtmsg_dst_len = prefixlen;
+ 	rt.rtmsg_flags = RTF_UP;
+-	rt.rtmsg_metric = 512;
++	rt.rtmsg_metric = metric;
+ 
+ 	if (prefixlen == 128) {
+ 		rt.rtmsg_flags |= RTF_HOST;
+diff --git a/src/util/netif-mgmt.h b/src/util/netif-mgmt.h
+index 5d2d16b3..cdb28904 100644
+--- a/src/util/netif-mgmt.h
++++ b/src/util/netif-mgmt.h
+@@ -47,8 +47,8 @@ extern int netif_mgmt_set_running(int fd, const char* if_name, bool value);
+ extern int netif_mgmt_add_ipv6_address(int fd, const char* if_name, const uint8_t addr[16], int prefixlen);
+ extern int netif_mgmt_remove_ipv6_address(int fd, const char* if_name, const uint8_t addr[16]);
+ 
+-extern int netif_mgmt_add_ipv6_route(int fd, const char* if_name, const uint8_t route[16], int prefixlen);
+-extern int netif_mgmt_remove_ipv6_route(int fd, const char* if_name, const uint8_t route[16], int prefixlen);
++extern int netif_mgmt_add_ipv6_route(int fd, const char* if_name, const uint8_t route[16], int prefixlen, uint32_t metric);
++extern int netif_mgmt_remove_ipv6_route(int fd, const char* if_name, const uint8_t route[16], int prefixlen, uint32_t metric);
+ 
+ extern int netif_mgmt_join_ipv6_multicast_address(int reqfd, const char* if_name, const uint8_t addr[16]);
+ extern int netif_mgmt_leave_ipv6_multicast_address(int reqfd, const char* if_name, const uint8_t addr[16]);
+diff --git a/src/wpantund/NCPControlInterface.cpp b/src/wpantund/NCPControlInterface.cpp
+index 7db82165..59a95b10 100644
+--- a/src/wpantund/NCPControlInterface.cpp
++++ b/src/wpantund/NCPControlInterface.cpp
+@@ -54,7 +54,7 @@ NCPControlInterface::external_route_priority_to_string(ExternalRoutePriority rou
+ 			break;
+ 
+ 		case ROUTE_MEDIUM_PREFERENCE:
+-			ret = "medium(normal)";
++			ret = "medium";
+ 			break;
+ 
+ 		case ROUTE_HIGH_PREFERENCE:
+diff --git a/src/wpantund/NCPInstanceBase-Addresses.cpp b/src/wpantund/NCPInstanceBase-Addresses.cpp
+index c6f690e5..48d08641 100644
+--- a/src/wpantund/NCPInstanceBase-Addresses.cpp
++++ b/src/wpantund/NCPInstanceBase-Addresses.cpp
+@@ -21,6 +21,7 @@
+ #include <config.h>
+ #endif
+ 
++#include <utility>
+ #include "assert-macros.h"
+ #include "NCPInstanceBase.h"
+ #include "tunnel.h"
+@@ -35,6 +36,40 @@
+ using namespace nl;
+ using namespace wpantund;
+ 
++NCPInstanceBase::IPv6Prefix::IPv6Prefix(const in6_addr &prefix, uint8_t len):
++	mPrefix(prefix), mLength(len)
++{
++	in6_addr_apply_mask(mPrefix, mLength);
++}
++
++bool
++NCPInstanceBase::IPv6Prefix::operator==(const IPv6Prefix &another_prefix) const
++{
++	return (mPrefix == another_prefix.mPrefix) && (mLength == another_prefix.mLength);
++}
++
++bool
++NCPInstanceBase::IPv6Prefix::operator<(const IPv6Prefix &another_prefix) const
++{
++	bool is_less = false;
++
++	if (mLength < another_prefix.mLength) {
++		is_less = true;
++	} else if (mLength == another_prefix.mLength) {
++		is_less = (memcmp(&mPrefix, &another_prefix.mPrefix, sizeof(mPrefix)) < 0);
++	}
++
++	return is_less;
++}
++
++std::string
++NCPInstanceBase::IPv6Prefix::to_string(void) const
++{
++	char c_string[100];
++	snprintf(c_string, sizeof(c_string), "%s/%d", in6_addr_to_string(mPrefix).c_str(), mLength);
++	return std::string(c_string);
++}
++
+ std::string
+ NCPInstanceBase::EntryBase::get_origin_as_string(void) const
+ {
+@@ -168,7 +203,7 @@ NCPInstanceBase::OnMeshPrefixEntry::get_description(const struct in6_addr &addre
+ 			is_stable() ? "yes" : "no ", on_mesh_prefix_flags_to_string(get_flags(), true).c_str());
+ 
+ 	} else {
+-		snprintf(c_string, sizeof(c_string), "\"%s/%d\", origin:%s, stable:%s, flags:%s, ",
++		snprintf(c_string, sizeof(c_string), "\"%s/%d\", origin:%s, stable:%s, flags:%s",
+ 			in6_addr_to_string(address).c_str(), get_prefix_len(), get_origin_as_string().c_str(),
+ 			is_stable() ? "yes" : "no", on_mesh_prefix_flags_to_string(get_flags()).c_str());
+ 	}
+@@ -176,22 +211,87 @@ NCPInstanceBase::OnMeshPrefixEntry::get_description(const struct in6_addr &addre
+ 	return std::string(c_string);
+ }
+ 
++bool
++NCPInstanceBase::OffMeshRouteEntry::operator==(const OffMeshRouteEntry &entry)
++{
++	bool retval = true;
++
++	// Check the originator first.
++	if (get_origin() != entry.get_origin()) {
++		retval = false;
++		goto bail;
++	}
++
++	// If the entry is from NCP then ensure other fields also match.
++	if (is_from_ncp()) {
++
++		// Note that we intentionally don't check `mNextHopIsHost` as the RLOC16 value
++		// assigned to the node can be changed (e.g., after a re-attach) causing the
++		// `mNextHopIsHost` value to also change.
++
++		if ((mPreference != entry.mPreference) || (mStable != entry.mStable) || (mRloc != entry.mRloc)) {
++			retval = false;
++			goto bail;
++		}
++	}
++
++bail:
++	return retval;
++}
++
++std::string
++NCPInstanceBase::OffMeshRouteEntry::get_description(const IPv6Prefix &route, bool align) const
++{
++	char c_string[300];
++
++	if (align) {
++		snprintf(c_string, sizeof(c_string), "%-26s origin:%-8s stable:%s preference:%-7s rloc:0x%04x next_hop_is_host:%s",
++			route.to_string().c_str(), get_origin_as_string().c_str(), is_stable() ? "yes" : "no ",
++			NCPControlInterface::external_route_priority_to_string(get_preference()).c_str(), get_rloc(),
++			is_next_hop_host() ? "yes" : "no ");
++
++	} else {
++		snprintf(c_string, sizeof(c_string), "\"%s\", origin:%s, stable:%s, preference:%s, rloc:0x%04x, next_hop_is_host:%s",
++			route.to_string().c_str(), get_origin_as_string().c_str(), is_stable() ? "yes" : "no",
++			NCPControlInterface::external_route_priority_to_string(get_preference()).c_str(), get_rloc(),
++			is_next_hop_host() ? "yes" : "no");
++	}
++
++	return std::string(c_string);
++}
++
++std::string
++NCPInstanceBase::InterfaceRouteEntry::get_description(const IPv6Prefix &route, bool align) const
++{
++	char c_string[300];
++
++	if (align) {
++		snprintf(c_string, sizeof(c_string), "%-26s metric:%-6d", route.to_string().c_str(), mMetric);
++	} else {
++		snprintf(c_string, sizeof(c_string), "\"%s\", metric:%d", route.to_string().c_str(), mMetric);
++	}
++
++	return std::string(c_string);
++}
++
+ // ========================================================================
+ // MARK: Global Entries Management
+ 
+ void
+-NCPInstanceBase::refresh_address_entries(void)
++NCPInstanceBase::refresh_address_route_prefix_entries(void)
+ {
+-	// Here is where we would do any periodic global address bookkeeping,
+-	// which doesn't appear to be necessary yet but may become necessary
+-	// in the future.
++	if (mRequestRouteRefresh) {
++		mRequestRouteRefresh = false;
++		refresh_routes_on_interface();
++	}
+ }
+ 
+ void
+-NCPInstanceBase::remove_all_address_prefix_entries(void)
++NCPInstanceBase::remove_all_address_prefix_route_entries(void)
+ {
+-	syslog(LOG_INFO, "Removing all address/prefix entries");
++	syslog(LOG_INFO, "Removing all address/prefix/route entries");
+ 
++	// Unicast addresses
+ 	for (
+ 		std::map<struct in6_addr, UnicastAddressEntry>::iterator iter = mUnicastAddresses.begin();
+ 		iter != mUnicastAddresses.end();
+@@ -200,6 +300,7 @@ NCPInstanceBase::remove_all_address_prefix_entries(void)
+ 		mPrimaryInterface->remove_address(&iter->first, iter->second.get_prefix_len());
+ 	}
+ 
++	// Multicast addresses
+ 	for (
+ 		std::map<struct in6_addr, MulticastAddressEntry>::iterator iter = mMulticastAddresses.begin();
+ 		iter != mMulticastAddresses.end();
+@@ -208,21 +309,31 @@ NCPInstanceBase::remove_all_address_prefix_entries(void)
+ 		mPrimaryInterface->leave_multicast_address(&iter->first);
+ 	}
+ 
++	// Routes
++	for (
++		std::map<IPv6Prefix, InterfaceRouteEntry>::iterator iter = mInterfaceRoutes.begin();
++		iter != mInterfaceRoutes.end();
++		++iter
++	) {
++		mPrimaryInterface->remove_route(&iter->first.get_prefix(), iter->first.get_length(), iter->second.get_metric());
++	}
++
+ 	memset(&mNCPLinkLocalAddress, 0, sizeof(mNCPLinkLocalAddress));
+ 	memset(&mNCPMeshLocalAddress, 0, sizeof(mNCPMeshLocalAddress));
+ 
+ 	mUnicastAddresses.clear();
+ 	mMulticastAddresses.clear();
+ 	mOnMeshPrefixes.clear();
++	mOffMeshRoutes.clear();
++	mInterfaceRoutes.clear();
+ }
+ 
+ void
+-NCPInstanceBase::remove_ncp_originated_addresses(void)
++NCPInstanceBase::remove_ncp_originated_address_prefix_route_entries(void)
+ {
+ 	bool did_remove = false;
+ 
+-	// We remove all of the addresses/prefixes that originated
+-	// from the NCP.
++	// We remove all of the addresses/prefixes/routes that originated from the NCP.
+ 
+ 	syslog(LOG_INFO, "Removing all NCP originated addresses");
+ 
+@@ -282,13 +393,33 @@ NCPInstanceBase::remove_ncp_originated_addresses(void)
+ 			break;
+ 		}
+ 	} while (did_remove);
++
++	// Off-Mesh Routes
++	do {
++		std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator iter;
++
++		did_remove = false;
++
++		for (iter = mOffMeshRoutes.begin(); iter != mOffMeshRoutes.end(); iter++) {
++			if (!iter->second.is_from_ncp()) {
++				continue;
++			}
++
++			syslog(LOG_INFO, "OffMeshRoutes: Removing %s", iter->second.get_description(iter->first).c_str());
++			mOffMeshRoutes.erase(iter);
++			did_remove = true;
++			mRequestRouteRefresh = true;
++			break;
++		}
++	} while (did_remove);
+ }
+ 
+ void
+-NCPInstanceBase::restore_address_prefix_entries_on_ncp(void)
++NCPInstanceBase::restore_address_prefix_route_entries_on_ncp(void)
+ {
+-	syslog(LOG_INFO, "Restoring interface/user originated address/prefix entries on NCP");
++	syslog(LOG_INFO, "Restoring interface/user originated address/prefix/route entries on NCP");
+ 
++	// Unicast addresses
+ 	for (
+ 		std::map<struct in6_addr, UnicastAddressEntry>::iterator iter = mUnicastAddresses.begin();
+ 		iter != mUnicastAddresses.end();
+@@ -299,23 +430,39 @@ NCPInstanceBase::restore_address_prefix_entries_on_ncp(void)
+ 		}
+ 	}
+ 
++	// Multicast addresses
+ 	for (
+ 		std::map<struct in6_addr, MulticastAddressEntry>::iterator iter = mMulticastAddresses.begin();
+ 		iter != mMulticastAddresses.end();
+ 		++iter
+ 	) {
+ 		if (iter->second.is_from_interface() || iter->second.is_from_user()) {
+-			add_multicast_address_on_ncp(iter->first);
++			add_multicast_address_on_ncp(iter->first,
++				boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "restoring multicast address", NilReturn()));
+ 		}
+ 	}
+ 
++	// On-mesh prefixes
+ 	for (
+ 		std::map<struct in6_addr, OnMeshPrefixEntry>::iterator iter = mOnMeshPrefixes.begin();
+ 		iter != mOnMeshPrefixes.end();
+ 		++iter
+ 	) {
+ 		if (iter->second.is_from_interface() || iter->second.is_from_user()) {
+-			add_on_mesh_prefix_on_ncp(iter->first, iter->second.get_prefix_len(), iter->second.get_flags(), iter->second.is_stable());
++			add_on_mesh_prefix_on_ncp(iter->first, iter->second.get_prefix_len(), iter->second.get_flags(), iter->second.is_stable(),
++				boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "restoring on-mesh prefix", NilReturn()));
++		}
++	}
++
++	// Off-mesh-routes
++	for (
++		std::map<IPv6Prefix, OffMeshRouteEntry>::iterator iter = mOffMeshRoutes.begin();
++		iter != mOffMeshRoutes.end();
++		++iter
++	) {
++		if (iter->second.is_from_interface() || iter->second.is_from_user()) {
++			add_route_on_ncp(iter->first.get_prefix(), iter->first.get_length(), iter->second.get_preference(), iter->second.is_stable(),
++				boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "restoring off-mesh route", NilReturn()));
+ 		}
+ 	}
+ }
+@@ -323,9 +470,11 @@ NCPInstanceBase::restore_address_prefix_entries_on_ncp(void)
+ void
+ NCPInstanceBase::check_ncp_entry_update_status(int status, std::string operation, CallbackWithStatus cb)
+ {
+-	if (status == kWPANTUNDStatus_Timeout)
++	if (status != kWPANTUNDStatus_Ok)
+ 	{
+-		syslog(LOG_ERR, "Timed out while performing \"%s\" on NCP - Resetting NCP.", operation.c_str());
++		syslog(LOG_ERR, "Error %s (%d) while performing \"%s\" on NCP - Resetting NCP.", wpantund_status_to_cstr(status),
++			status, operation.c_str());
++
+ 		ncp_is_misbehaving();
+ 	}
+ 
+@@ -415,7 +564,8 @@ NCPInstanceBase::add_address_on_ncp_and_update_prefixes(const in6_addr &address,
+ void
+ NCPInstanceBase::remove_address_on_ncp_and_update_prefixes(const in6_addr &address, const UnicastAddressEntry &entry)
+ {
+-	remove_unicast_address_on_ncp(address, entry.get_prefix_len());
++	remove_unicast_address_on_ncp(address, entry.get_prefix_len(),
++		boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "removing unicast address", NilReturn()));
+ 
+ 	if (!entry.is_from_ncp()
+ 	   && !IN6_IS_ADDR_LINKLOCAL(&address)
+@@ -443,7 +593,8 @@ NCPInstanceBase::multicast_address_was_joined(Origin origin, const struct in6_ad
+ 		}
+ 
+ 		if ((origin == kOriginPrimaryInterface) || (origin == kOriginUser)) {
+-			add_multicast_address_on_ncp(address);
++			add_multicast_address_on_ncp(address,
++				boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "adding multicast address", NilReturn()));
+ 		}
+ 	}
+ }
+@@ -466,7 +617,8 @@ NCPInstanceBase::multicast_address_was_left(Origin origin, const struct in6_addr
+ 			}
+ 
+ 			if ((origin == kOriginPrimaryInterface) || (origin == kOriginUser)) {
+-				remove_multicast_address_on_ncp(address);
++				remove_multicast_address_on_ncp(address,
++					boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "removing multicast address", NilReturn()));
+ 			}
+ 		}
+ 	}
+@@ -520,7 +672,7 @@ NCPInstanceBase::on_mesh_prefix_was_added(Origin origin, const struct in6_addr &
+ 		}
+ 	} else {
+ 		entry = mOnMeshPrefixes[prefix];
+-		cb(kWPANTUNDStatus_Already);
++		cb(kWPANTUNDStatus_Ok);
+ 	}
+ 
+ 	if (entry.is_on_mesh() && entry.is_slaac()
+@@ -556,7 +708,8 @@ NCPInstanceBase::on_mesh_prefix_was_removed(Origin origin, const struct in6_addr
+ 			mOnMeshPrefixes.erase(prefix);
+ 
+ 			if ((origin == kOriginPrimaryInterface) || (origin == kOriginUser)) {
+-				remove_on_mesh_prefix_on_ncp(prefix, entry.get_prefix_len(), entry.get_flags(), entry.is_stable(), cb);
++				remove_on_mesh_prefix_on_ncp(prefix, entry.get_prefix_len(), entry.get_flags(), entry.is_stable(),
++					boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "removing on-mesh prefix", cb));
+ 			} else {
+ 				cb(kWPANTUNDStatus_Ok);
+ 			}
+@@ -565,12 +718,227 @@ NCPInstanceBase::on_mesh_prefix_was_removed(Origin origin, const struct in6_addr
+ 				&& entry.is_slaac() && entry.is_on_mesh()
+ 			) {
+ 				syslog(LOG_NOTICE, "Removing SLAAC address %s/%d from NCP", in6_addr_to_string(address).c_str(), prefix_len);
+-				remove_unicast_address_on_ncp(address, prefix_len);
++				remove_unicast_address_on_ncp(address, prefix_len,
++					boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "removing SLAAC address", NilReturn()));
+ 			}
+ 		} else {
+ 			cb(kWPANTUNDStatus_InvalidForCurrentState);
+ 		}
+ 	} else {
+-		cb(kWPANTUNDStatus_Already);
++		cb(kWPANTUNDStatus_Ok);
++	}
++}
++
++// ========================================================================
++// MARK: Route Management
++
++// Searches for a given route entry in the `mOffMeshRoutes` multimap.
++std::multimap<NCPInstanceBase::IPv6Prefix, NCPInstanceBase::OffMeshRouteEntry>::iterator
++NCPInstanceBase::find_route_entry(const IPv6Prefix &route, const OffMeshRouteEntry &entry)
++{
++	std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator iter;
++
++	iter = mOffMeshRoutes.lower_bound(route);
++
++	if (iter != mOffMeshRoutes.end()) {
++		std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator upper_iter = mOffMeshRoutes.upper_bound(route);
++
++		for (; iter != upper_iter; iter++) {
++			if (iter->second == entry) {
++				break;
++			}
++		}
++
++		if (iter == upper_iter) {
++			iter = mOffMeshRoutes.end();
++		}
++	}
++
++	return iter;
++}
++
++void
++NCPInstanceBase::route_was_added(Origin origin, const struct in6_addr &route_prefix, uint8_t prefix_len, RoutePreference preference,
++	bool stable, uint16_t rloc16, bool next_hop_is_host, CallbackWithStatus cb)
++{
++	OffMeshRouteEntry entry(origin, preference, stable, rloc16, next_hop_is_host);
++	IPv6Prefix route(route_prefix, prefix_len);
++	std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator iter;
++
++	iter = find_route_entry(route, entry);
++
++	if (iter == mOffMeshRoutes.end()) {
++		mOffMeshRoutes.insert(std::make_pair(route, entry));
++		mRequestRouteRefresh = true;
++		syslog(LOG_INFO, "OffMeshRoutes: Adding %s", entry.get_description(route).c_str());
++
++		if (origin != kOriginThreadNCP) {
++			add_route_on_ncp(route.get_prefix(), prefix_len, preference, stable,
++				boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "adding off-mesh route", cb));
++
++		} else {
++			cb(kWPANTUNDStatus_Ok);
++		}
++	} else {
++		cb(kWPANTUNDStatus_Ok);
++	}
++}
++
++void
++NCPInstanceBase::route_was_removed(Origin origin, const struct in6_addr &route_prefix, uint8_t prefix_len,
++	RoutePreference preference, bool stable, uint16_t rloc16, CallbackWithStatus cb)
++{
++	OffMeshRouteEntry entry(origin, preference, stable, rloc16);
++	std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator iter;
++	IPv6Prefix route(route_prefix, prefix_len);
++
++	iter = find_route_entry(route, entry);
++
++	if (iter != mOffMeshRoutes.end()) {
++		syslog(LOG_INFO, "OffMeshRoutes: Removing %s", iter->second.get_description(route).c_str());
++		mOffMeshRoutes.erase(iter);
++		mRequestRouteRefresh = true;
++
++		if (origin != kOriginThreadNCP) {
++			remove_route_on_ncp(route.get_prefix(), prefix_len, preference, stable,
++				boost::bind(&NCPInstanceBase::check_ncp_entry_update_status, this, _1, "removing off-mesh route", cb));
++
++		} else {
++			cb(kWPANTUNDStatus_Ok);
++		}
++	} else {
++		cb(kWPANTUNDStatus_Ok);
++	}
++}
++
++// Decides if the given route should be added on the primary interface, if we need to add the route `metric` is also
++// updated.
++bool
++NCPInstanceBase::should_add_route_on_interface(const IPv6Prefix &route, uint32_t &metric)
++{
++	bool should_add = false;
++	bool route_added_by_device = false;
++	bool route_added_by_others = false;
++	RoutePreference preference_device = NCPControlInterface::ROUTE_LOW_PREFRENCE;
++	RoutePreference preference_others = NCPControlInterface::ROUTE_LOW_PREFRENCE;
++
++	std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator iter, sub_iter, upper_iter;
++
++	for (iter = mOffMeshRoutes.begin(); iter != mOffMeshRoutes.end(); iter = upper_iter) {
++
++		// Get the iterator pointing to the first element that is greater than current key/route.
++		upper_iter = mOffMeshRoutes.upper_bound(iter->first);
++
++		// Skip all elements for which the multimap key does not match the route.
++		if (iter->first != route) {
++			continue;
++		}
++
++		// Iterate through all multimap elements with same key (i.e., same route).
++		for (sub_iter = iter; sub_iter != upper_iter; ++sub_iter) {
++
++			if ((sub_iter->second.get_origin() != kOriginThreadNCP) || sub_iter->second.is_next_hop_host()) {
++				route_added_by_device = true;
++				if (preference_device < sub_iter->second.get_preference()) {
++					preference_device = sub_iter->second.get_preference();
++				}
++			} else {
++				route_added_by_others = true;
++				if (preference_others < sub_iter->second.get_preference()) {
++					preference_others = sub_iter->second.get_preference();
++				}
++			}
++		}
++	}
++
++	// The route should be added on host primary interface, if it
++	// is added by at least one other device within the network and,
++	// either it is not added by host/this-device or added but with
++	// a lower preference level.
++
++	if (route_added_by_others) {
++		if (!route_added_by_device || (preference_others > preference_device)) {
++			should_add = true;
++		}
++	}
++
++	// If the route should be added, map the preference level to route metric.
++
++	if (should_add) {
++		switch (preference_others) {
++		case NCPControlInterface::ROUTE_LOW_PREFRENCE:
++			metric = InterfaceRouteEntry::kRouteMetricLow;
++			break;
++
++		case NCPControlInterface::ROUTE_MEDIUM_PREFERENCE:
++			metric = InterfaceRouteEntry::kRouteMetricMedium;
++			break;
++
++		case NCPControlInterface::ROUTE_HIGH_PREFERENCE:
++			metric = InterfaceRouteEntry::kRouteMetricHigh;
++			break;
++		}
++	}
++
++	return should_add;
++}
++
++void
++NCPInstanceBase::refresh_routes_on_interface(void)
++{
++	bool did_remove = false;
++	uint32_t metric;
++
++	syslog(LOG_INFO, "Refreshing routes on primary interface");
++
++	// First, check all currently added routes on primary interface and remove any one that is no longer valid.
++
++	do {
++		std::map<IPv6Prefix, InterfaceRouteEntry>::iterator iter;
++
++		did_remove = false;
++
++		for (iter = mInterfaceRoutes.begin(); iter != mInterfaceRoutes.end(); iter++) {
++
++			// If the route should not be added on interface or it has been added with
++			// incorrect metric value, remove it from the `mInterfaceRoute` list (note
++			// that it will be re-added if route metric is changed).
++
++			if (!should_add_route_on_interface(iter->first, metric)
++				|| (metric != iter->second.get_metric())
++			) {
++				syslog(LOG_INFO, "InterfaceRoutes: Removing %s", iter->second.get_description(iter->first).c_str());
++				mPrimaryInterface->remove_route(&iter->first.get_prefix(), iter->first.get_length(),
++					iter->second.get_metric());
++				mInterfaceRoutes.erase(iter);
++
++				// We removed an element from `mInterfaceRoutes` while iterating over it,
++				// so we break from the `for` loop and start the iteration over again on the
++				// new updated `mInterfaceRoutes` list.
++
++				did_remove = true;
++				break;
++			}
++		}
++	} while (did_remove);
++
++	// Iterate through all off-mesh route entries to check if there is a new route that should be added on interface.
++
++	{
++		std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator iter, upper_iter;
++
++		for (iter = mOffMeshRoutes.begin(); iter != mOffMeshRoutes.end(); iter = upper_iter) {
++
++			// Get the iterator pointing to the first element that is greater than current key/route.
++			upper_iter = mOffMeshRoutes.upper_bound(iter->first);
++
++			if (should_add_route_on_interface(iter->first, metric)
++				&& (mInterfaceRoutes.count(iter->first) == 0)
++			) {
++				syslog(LOG_INFO, "InterfaceRoutes: Adding %s", iter->second.get_description(iter->first).c_str());
++				mPrimaryInterface->add_route(&iter->first.get_prefix(), iter->first.get_length(), metric);
++				mInterfaceRoutes[iter->first] = InterfaceRouteEntry(metric);
++			}
++		}
+ 	}
+ }
+diff --git a/src/wpantund/NCPInstanceBase-AsyncIO.cpp b/src/wpantund/NCPInstanceBase-AsyncIO.cpp
+index 3bba3048..0513035d 100644
+--- a/src/wpantund/NCPInstanceBase-AsyncIO.cpp
++++ b/src/wpantund/NCPInstanceBase-AsyncIO.cpp
+@@ -153,6 +153,10 @@ NCPInstanceBase::get_ms_to_next_event(void)
+ 		}
+ 	}
+ 
++	if (mRequestRouteRefresh) {
++		ret = 0;
++	}
++
+ 	if (ret < 0) {
+ 		ret = 0;
+ 	}
+@@ -209,7 +213,7 @@ NCPInstanceBase::process(void)
+ 	mPcapManager.process();
+ 
+ 	if (get_upgrade_status() != EINPROGRESS) {
+-		refresh_address_entries();
++		refresh_address_route_prefix_entries();
+ 
+ 		require_noerr(ret = mPrimaryInterface->process(), socket_failure);
+ 
+diff --git a/src/wpantund/NCPInstanceBase-NetInterface.cpp b/src/wpantund/NCPInstanceBase-NetInterface.cpp
+index fe9d948f..1718e058 100644
+--- a/src/wpantund/NCPInstanceBase-NetInterface.cpp
++++ b/src/wpantund/NCPInstanceBase-NetInterface.cpp
+@@ -77,7 +77,7 @@ NCPInstanceBase::set_online(bool is_online)
+ 		ret = mPrimaryInterface->set_online(is_online);
+ 
+ 		if (is_online) {
+-			restore_address_prefix_entries_on_ncp();
++			restore_address_prefix_route_entries_on_ncp();
+ 		}
+ 
+ 		if ((ret == 0) && static_cast<bool>(mLegacyInterface)) {
+@@ -155,8 +155,8 @@ NCPInstanceBase::reset_interface(void)
+ 
+ 	mPrimaryInterface->reset();
+ 
+-	// The global entries table (addresses, prefixes) must be cleared upon reset
+-	remove_all_address_prefix_entries();
++	// All IPv6 address (unicast/multicast), on-mesh-prefixes, routes (off-mesh/interface) must be cleared upon reset.
++	remove_all_address_prefix_route_entries();
+ 
+ 	if (static_cast<bool>(mLegacyInterface)) {
+ 		mLegacyInterface->reset();
+diff --git a/src/wpantund/NCPInstanceBase.cpp b/src/wpantund/NCPInstanceBase.cpp
+index 8be7b741..f55fc974 100644
+--- a/src/wpantund/NCPInstanceBase.cpp
++++ b/src/wpantund/NCPInstanceBase.cpp
+@@ -72,6 +72,7 @@ NCPInstanceBase::NCPInstanceBase(const Settings& settings):
+ 	mLastChangedBusy = 0;
+ 	mLegacyInterfaceEnabled = false;
+ 	mNCPState = UNINITIALIZED;
++	mRequestRouteRefresh = false;
+ 	mNodeType = UNKNOWN;
+ 	mNodeTypeSupportsLegacy = false;
+ 	mSetDefaultRouteForAutoAddedPrefix = false;
+@@ -272,8 +273,10 @@ NCPInstanceBase::get_supported_property_keys(void) const
+ 	properties.insert(kWPANTUNDProperty_IPv6AllAddresses);
+ 	properties.insert(kWPANTUNDProperty_IPv6MulticastAddresses);
+ 	properties.insert(kWPANTUNDProperty_IPv6SetSLAACForAutoAddedPrefix);
++	properties.insert(kWPANTUNDProperty_IPv6InterfaceRoutes);
+ 
+ 	properties.insert(kWPANTUNDProperty_ThreadOnMeshPrefixes);
++	properties.insert(kWPANTUNDProperty_ThreadOffMeshRoutes);
+ 
+ 	properties.insert(kWPANTUNDProperty_DaemonAutoAssociateAfterReset);
+ 	properties.insert(kWPANTUNDProperty_DaemonAutoDeepSleep);
+@@ -461,6 +464,14 @@ NCPInstanceBase::property_get_value(
+ 		}
+ 		cb(0, boost::any(result));
+ 
++	} else if (strcaseequal(key.c_str(), kWPANTUNDProperty_ThreadOffMeshRoutes)) {
++		std::list<std::string> result;
++		std::multimap<IPv6Prefix, OffMeshRouteEntry>::const_iterator iter;
++		for (iter = mOffMeshRoutes.begin(); iter != mOffMeshRoutes.end(); iter++ ) {
++			result.push_back(iter->second.get_description(iter->first, true));
++		}
++		cb(0, boost::any(result));
++
+ 	} else if (strcaseequal(key.c_str(), kWPANTUNDProperty_IPv6AllAddresses)
+ 		|| strcaseequal(key.c_str(), kWPANTUNDProperty_DebugIPv6GlobalIPAddressList)
+ 	) {
+@@ -479,6 +490,14 @@ NCPInstanceBase::property_get_value(
+ 		}
+ 		cb(0, boost::any(result));
+ 
++	} else if (strcaseequal(key.c_str(), kWPANTUNDProperty_IPv6InterfaceRoutes)) {
++		std::list<std::string> result;
++		std::map<IPv6Prefix, InterfaceRouteEntry>::const_iterator iter;
++		for (iter = mInterfaceRoutes.begin(); iter != mInterfaceRoutes.end(); iter++ ) {
++			result.push_back(iter->second.get_description(iter->first, true));
++		}
++		cb(0, boost::any(result));
++
+ 	} else if (strcaseequal(key.c_str(), kWPANTUNDProperty_DaemonSyslogMask)) {
+ 		std::string mask_string;
+ 		int logmask;
+diff --git a/src/wpantund/NCPInstanceBase.h b/src/wpantund/NCPInstanceBase.h
+index 791d8324..500c04e7 100644
+--- a/src/wpantund/NCPInstanceBase.h
++++ b/src/wpantund/NCPInstanceBase.h
+@@ -144,6 +144,8 @@ class NCPInstanceBase : public NCPInstance, public EventHandler {
+ 		kOriginUser,
+ 	};
+ 
++	typedef NCPControlInterface::ExternalRoutePriority  RoutePreference;
++
+ 	void unicast_address_was_added(Origin origin, const struct in6_addr &address,
+ 			uint8_t prefix_len = 64, uint32_t valid_lifetime = UINT32_MAX, uint32_t preferred_lifetime = UINT32_MAX);
+ 
+@@ -161,38 +163,51 @@ class NCPInstanceBase : public NCPInstance, public EventHandler {
+ 	void on_mesh_prefix_was_removed(Origin origin, const struct in6_addr &prefix, uint8_t prefix_len = 64,
+ 			CallbackWithStatus cb = NilReturn());
+ 
++	void route_was_added(Origin origin, const struct in6_addr &route, uint8_t prefix_len = 64,
++			RoutePreference preference = NCPControlInterface::ROUTE_MEDIUM_PREFERENCE,  bool stable = true,
++			uint16_t rloc16 = 0, bool next_hop_is_host = true, CallbackWithStatus cb = NilReturn());
++
++	void route_was_removed(Origin origin, const struct in6_addr &route, uint8_t prefix_len = 64,
++			RoutePreference preference = NCPControlInterface::ROUTE_MEDIUM_PREFERENCE,  bool stable = true,
++			uint16_t rloc16 = 0, CallbackWithStatus cb = NilReturn());
++
+ 	bool lookup_address_for_prefix(struct in6_addr *address, const struct in6_addr &prefix, int prefix_len = 64);
+ 
+ 	static std::string on_mesh_prefix_flags_to_string(uint8_t flags, bool detailed = false);
+ 
+ protected:
+-	void refresh_address_entries(void);
++	void refresh_address_route_prefix_entries(void);
+ 
+-	void remove_all_address_prefix_entries(void);
++	void remove_all_address_prefix_route_entries(void);
+ 
+-	void remove_ncp_originated_addresses(void);
++	void remove_ncp_originated_address_prefix_route_entries(void);
+ 
+-	void restore_address_prefix_entries_on_ncp(void);
++	void restore_address_prefix_route_entries_on_ncp(void);
+ 
+ protected:
+ 	// ========================================================================
+-	// MARK: Subclass hooks related to address/prefix
++	// MARK: Subclass hooks related to address/prefix/route management
+ 
+-	virtual void add_unicast_address_on_ncp(const struct in6_addr &addr, uint8_t prefix_len,
+-					CallbackWithStatus cb = NilReturn()) = 0;
++	virtual void add_unicast_address_on_ncp(const struct in6_addr &addr, uint8_t prefix_len, CallbackWithStatus cb) = 0;
+ 
+ 	virtual void remove_unicast_address_on_ncp(const struct in6_addr &addr, uint8_t prefix_len,
+-					CallbackWithStatus cb = NilReturn()) = 0;
++					CallbackWithStatus cb) = 0;
+ 
+-	virtual void add_multicast_address_on_ncp(const struct in6_addr &addr, CallbackWithStatus cb = NilReturn()) = 0;
++	virtual void add_multicast_address_on_ncp(const struct in6_addr &addr, CallbackWithStatus cb) = 0;
+ 
+-	virtual void remove_multicast_address_on_ncp(const struct in6_addr &addr, CallbackWithStatus cb = NilReturn()) = 0;
++	virtual void remove_multicast_address_on_ncp(const struct in6_addr &addr, CallbackWithStatus cb) = 0;
+ 
+ 	virtual void add_on_mesh_prefix_on_ncp(const struct in6_addr &addr, uint8_t prefix_len, uint8_t flags, bool stable,
+-					CallbackWithStatus cb = NilReturn()) = 0;
++					CallbackWithStatus cb) = 0;
+ 
+ 	virtual void remove_on_mesh_prefix_on_ncp(const struct in6_addr &addr, uint8_t prefix_len, uint8_t flags,
+-					bool stable, CallbackWithStatus cb = NilReturn()) = 0;
++					bool stable, CallbackWithStatus cb) = 0;
++
++	virtual void add_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++					bool stable, CallbackWithStatus cb) = 0;
++
++	virtual void remove_route_on_ncp(const struct in6_addr &route, uint8_t prefix_len, RoutePreference preference,
++					bool stable, CallbackWithStatus cb) = 0;
+ 
+ protected:
+ 	//========================================================================
+@@ -275,7 +290,25 @@ class NCPInstanceBase : public NCPInstance, public EventHandler {
+ protected:
+ 	//==========================================================================
+ 	// MARK: Global entries: Unicast IPv6 addresses, multicast IPv6 addresses,
+-	// on-mesh prefixes.
++	// on-mesh prefixes, routes.
++
++	class IPv6Prefix {
++	public:
++		IPv6Prefix(const in6_addr &prefix, uint8_t prefix_len);
++
++		const struct in6_addr &get_prefix(void) const { return mPrefix; }
++		uint8_t get_length(void) const { return mLength; }
++
++		bool operator==(const IPv6Prefix &another_prefix) const;
++		bool operator!=(const IPv6Prefix &another_prefix) const { return !(*this == another_prefix); }
++		bool operator<(const IPv6Prefix &another_prefix) const;
++
++		std::string to_string(void) const;
++
++	private:
++		struct in6_addr mPrefix;
++		uint8_t mLength;
++	};
+ 
+ 	class EntryBase {
+ 	public:
+@@ -361,10 +394,56 @@ class NCPInstanceBase : public NCPInstance, public EventHandler {
+ 		bool mStable;
+ 	};
+ 
++	class OffMeshRouteEntry : public EntryBase {
++	public:
++		OffMeshRouteEntry(Origin origin, RoutePreference preference = NCPControlInterface::ROUTE_MEDIUM_PREFERENCE,
++			bool stable = true, uint16_t rloc16 = 0, bool next_hop_is_host = false)
++			: EntryBase(origin), mPreference(preference), mStable(stable), mRloc(rloc16)
++			, mNextHopIsHost(next_hop_is_host) { }
++
++		uint8_t is_stable(void) const { return mStable; }
++		RoutePreference get_preference(void) const { return mPreference; }
++		uint16_t get_rloc(void) const { return mRloc; }
++		bool is_next_hop_host(void) const { return mNextHopIsHost; }
++
++		bool operator==(const OffMeshRouteEntry &entry);
++
++		std::string get_description(const IPv6Prefix &route, bool align = false) const;
++
++	private:
++		RoutePreference mPreference;
++		bool mStable;
++		uint16_t mRloc;
++		bool mNextHopIsHost;
++	};
++
++	class InterfaceRouteEntry
++	{
++	public:
++		// Mapping the 3 route preference values to Linux route metric (note that larger metric means lower priority)
++		enum {
++			kRouteMetricHigh     = 1,
++			kRouteMetricMedium   = 256,
++			kRouteMetricLow      = 512,
++		};
++
++		InterfaceRouteEntry(uint32_t metric = 512)
++			: mMetric(metric) { }
++
++		uint32_t get_metric(void) const { return mMetric; }
++
++		std::string get_description(const IPv6Prefix &route, bool align = false) const;
++
++	private:
++		uint32_t mMetric;
++	};
++
+ private:
+ 	void add_address_on_ncp_and_update_prefixes(const in6_addr &address, const UnicastAddressEntry &entry);
+ 	void remove_address_on_ncp_and_update_prefixes(const in6_addr &address, const UnicastAddressEntry &entry);
+-
++	std::multimap<IPv6Prefix, OffMeshRouteEntry>::iterator find_route_entry(const IPv6Prefix &route, const OffMeshRouteEntry &entry);
++	void refresh_routes_on_interface(void);
++	bool should_add_route_on_interface(const IPv6Prefix &route, uint32_t &metric);
+ 	void check_ncp_entry_update_status(int status, std::string operation, CallbackWithStatus cb);
+ 
+ protected:
+@@ -373,6 +452,9 @@ class NCPInstanceBase : public NCPInstance, public EventHandler {
+ 	std::map<struct in6_addr, MulticastAddressEntry> mMulticastAddresses;
+ 	std::map<struct in6_addr, OnMeshPrefixEntry> mOnMeshPrefixes;
+ 
++	std::multimap<IPv6Prefix, OffMeshRouteEntry> mOffMeshRoutes;
++	std::map<IPv6Prefix, InterfaceRouteEntry> mInterfaceRoutes;
++
+ protected:
+ 
+ 	IPv6PacketMatcherRule mCommissioningRule;
+@@ -392,7 +474,7 @@ class NCPInstanceBase : public NCPInstance, public EventHandler {
+ 	uint16_t mCommissionerPort;
+ 
+ 	// When an unicast address is added on interface, the related on-mesh prefix
+-	//  is updated on NCP if `mDefaultRouteForAutoAddedPrefix` is true the prefix
++	// is updated on NCP if `mDefaultRouteForAutoAddedPrefix` is true the prefix
+ 	// is added with flag "DefaultRoute" set.
+ 	bool mSetDefaultRouteForAutoAddedPrefix;
+ 	bool mSetSLAACForAutoAddedPrefix;
+@@ -401,6 +483,7 @@ class NCPInstanceBase : public NCPInstance, public EventHandler {
+ 	NCPState mNCPState;
+ 	bool mIsInitializingNCP;
+ 	bool mIsInterfaceOnline;
++	bool mRequestRouteRefresh;
+ 
+ protected:
+ 	//! This is set to the currently used MAC address (EUI64).
+diff --git a/src/wpantund/wpan-properties.h b/src/wpantund/wpan-properties.h
+index a023b95e..3895a612 100644
+--- a/src/wpantund/wpan-properties.h
++++ b/src/wpantund/wpan-properties.h
+@@ -82,6 +82,7 @@
+ #define kWPANTUNDProperty_IPv6MeshLocalPrefix                   "IPv6:MeshLocalPrefix"
+ #define kWPANTUNDProperty_IPv6AllAddresses                      "IPv6:AllAddresses"
+ #define kWPANTUNDProperty_IPv6MulticastAddresses                "IPv6:MulticastAddresses"
++#define kWPANTUNDProperty_IPv6InterfaceRoutes                   "IPv6:Routes"
+ #define kWPANTUNDProperty_IPv6SetSLAACForAutoAddedPrefix        "IPv6:SetSLAACForAutoAddedPrefix"
+ 
+ #define kWPANTUNDProperty_ThreadRLOC16                          "Thread:RLOC16"

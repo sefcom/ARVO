@@ -1,0 +1,102 @@
+From a9d18eb4229893fabd9c40ebdb00d7466d9ab401 Mon Sep 17 00:00:00 2001
+From: pancake <pancake@nowsecure.com>
+Date: Sat, 7 Oct 2023 12:50:33 +0200
+Subject: [PATCH] Improve the situation in the non-null terminated string
+ handling in mach0land ##crash
+
+---
+ libr/bin/format/mach0/mach0.c |  9 ++++----
+ libr/include/r_util/r_str.h   | 40 ++++++++++++++++++++++++++---------
+ 2 files changed, 35 insertions(+), 14 deletions(-)
+
+diff --git a/libr/bin/format/mach0/mach0.c b/libr/bin/format/mach0/mach0.c
+index c3d54bad23364..9aa630084fa65 100644
+--- a/libr/bin/format/mach0/mach0.c
++++ b/libr/bin/format/mach0/mach0.c
+@@ -426,15 +426,15 @@ static bool parse_segments(struct MACH0_(obj_t) *mo, ut64 off) {
+ 			ut64 offset = off + sizeof (struct MACH0_(segment_command)) + j * sizeof (struct MACH0_(section));
+ 			len = r_buf_read_at (mo->b, offset, sec, sizeof (struct MACH0_(section)));
+ 			if (len != sizeof (struct MACH0_(section))) {
+-				R_LOG_ERROR ("read (sects)");
++				R_LOG_ERROR ("read sects");
+ 				mo->nsects = sect;
+ 				return false;
+ 			}
+ 
+ 			i = 0;
+-			memcpy (&mo->sects[k].sectname, &sec[i], 16);
++			memcpy (&mo->sects[k].sectname, &sec[i], 16); // INFO: this string is not null terminated!
+ 			i += 16;
+-			memcpy (&mo->sects[k].segname, &sec[i], 16);
++			memcpy (&mo->sects[k].segname, &sec[i], 16); // INFO: Remember: it's not null terminated!
+ 			i += 16;
+ 			snprintf (section_flagname, sizeof (section_flagname), "mach0_section_%.16s_%.16s.offset",
+ 						mo->sects[k].segname, mo->sects[k].sectname);
+@@ -2614,7 +2614,8 @@ const RVector *MACH0_(load_sections)(struct MACH0_(obj_t) *mo) {
+ 		section->flags = mo->sects[i].flags;
+ 		r_str_ncpy (sectname, mo->sects[i].sectname, 17);
+ 		r_str_filter (sectname, -1);
+-		r_str_ncpy (raw_segname, mo->sects[i].segname, 16);
++		r_str_ncpy (raw_segname, mo->sects[i].segname, 17);
++		r_str_filter (raw_segname, -1);
+ 		for (j = 0; j < mo->nsegs; j++) {
+ 			if (section->vaddr >= mo->segs[j].vmaddr &&
+ 				section->vaddr < (mo->segs[j].vmaddr + mo->segs[j].vmsize)) {
+diff --git a/libr/include/r_util/r_str.h b/libr/include/r_util/r_str.h
+index a2a295a97cd32..556b5eded7fa9 100644
+--- a/libr/include/r_util/r_str.h
++++ b/libr/include/r_util/r_str.h
+@@ -107,16 +107,6 @@ R_API void r_str_filter_zeroline(char *str, int len);
+ R_API size_t r_str_utf8_codepoint(const char *s, size_t left);
+ R_API bool r_str_char_fullwidth(const char *s, size_t left);
+ R_API int r_str_write(int fd, const char *b);
+-static inline size_t r_str_ncpy(char *x, const char *y, int z) {
+-	if (z > 0) {
+-		size_t ylen = strlen (y) + 1;
+-		size_t flen = R_MIN (ylen, z);
+-		memcpy (x, y, flen);
+-		x[flen - 1] = 0;
+-		return ylen;
+-	}
+-	return 0;
+-}
+ R_API void r_str_sanitize(char *c);
+ R_API char *r_str_sanitize_sdb_key(const char *s);
+ R_API const char *r_str_casestr(const char *a, const char *b);
+@@ -278,6 +268,36 @@ R_API bool r_str_glob(const char *str, const char *glob);
+ R_API int r_str_binstr2bin(const char *str, ut8 *out, int outlen);
+ R_API char *r_str_between(const char *str, const char *prefix, const char *suffix);
+ #undef r_str_startswith
++#if 1
++static inline size_t r_str_ncpy(char *dst, const char *src, size_t n) {
++	size_t i;
++
++	// do not do anything if n is 0
++	if (n == 0) {
++		return 0;
++	}
++
++	n--;
++	for (i = 0; src[i] && n > 0; i++, n--) {
++		dst[i] = src[i];
++	}
++	dst[i] = 0;
++	return i;
++}
++#else
++static inline size_t r_str_ncpy(char *x, const char *y, int z) {
++	if (z > 0) {
++		// size_t ylen = strnlen (y, z) + 1;
++		size_t ylen = r_str_nlen (y, z) + 1;
++		// size_t ylen = strlen (y) + 1;
++		// size_t flen = R_MIN (ylen, z);
++		memcpy (x, y, ylen);
++		x[ylen - 1] = 0;
++		return ylen;
++	}
++	return 0;
++}
++#endif
+ R_API bool r_str_startswith(const char *str, const char *needle);
+ R_UNUSED static bool r_str_startswith_inline(const char *str, const char *needle) {
+ 	if (!str || !needle) {

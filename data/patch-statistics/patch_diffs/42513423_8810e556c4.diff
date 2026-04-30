@@ -1,0 +1,92 @@
+From dd9e9bb80e500ad5e1213e7b4a5f7075ef09b547 Mon Sep 17 00:00:00 2001
+From: Dirk Lemstra <dirk@lemstra.org>
+Date: Thu, 14 Jul 2022 20:35:25 +0200
+Subject: [PATCH] Added extra checks to make sure we don't go out of bounds
+ when checking spaces.
+
+---
+ MagickCore/magic.c | 51 +++++++++++++++++++++++++---------------------
+ 1 file changed, 28 insertions(+), 23 deletions(-)
+
+diff --git a/MagickCore/magic.c b/MagickCore/magic.c
+index eb8170d01d5..605f20e539c 100644
+--- a/MagickCore/magic.c
++++ b/MagickCore/magic.c
+@@ -274,15 +274,38 @@ static MagickBooleanType IsMagicCacheInstantiated()
+   return(magic_cache != (LinkedListInfo *) NULL ? MagickTrue : MagickFalse);
+ }
+ 
++static inline MagickBooleanType MatchesMagic(const unsigned char *magic,
++  const size_t length,const MagicInfo *magic_info)
++{
++  const unsigned char
++    *q;
++
++  MagickOffsetType
++    remaining;
++
++  assert(magic_info->offset >= 0);
++  q=magic+magic_info->offset;
++  remaining=(MagickOffsetType) length-magic_info->offset;
++  if (magic_info->skip_spaces != MagickFalse)
++    {
++      while ((remaining > 0) && (isspace(*q) != 0))
++        {
++          q++;
++          remaining--;
++        }
++    }
++  if ((remaining >= magic_info->length) &&
++      (memcmp(q,magic_info->magic,magic_info->length) == 0))
++    return(MagickTrue);
++  return(MagickFalse);
++}
++
+ MagickExport const MagicInfo *GetMagicInfo(const unsigned char *magic,
+   const size_t length,ExceptionInfo *exception)
+ {
+   const MagicInfo
+     *p;
+ 
+-  MagickOffsetType
+-    offset;
+-
+   assert(exception != (ExceptionInfo *) NULL);
+   if (IsMagicListInstantiated(exception) == MagickFalse)
+     return((const MagicInfo *) NULL);
+@@ -298,16 +321,7 @@ MagickExport const MagicInfo *GetMagicInfo(const unsigned char *magic,
+       p=(const MagicInfo *) GetNextValueInLinkedList(magic_cache);
+       while (p != (const MagicInfo *) NULL)
+       {
+-        const unsigned char
+-          *q;
+-
+-        q=magic;
+-        if (p->skip_spaces != MagickFalse)
+-          while (isspace(*q) != 0) q++;
+-        assert(p->offset >= 0);
+-        offset=p->offset+(MagickOffsetType) p->length;
+-        if ((offset <= (MagickOffsetType) length) &&
+-            (memcmp(q+p->offset,p->magic,p->length) == 0))
++        if (MatchesMagic(magic,length,p) != MagickFalse)
+           break;
+         p=(const MagicInfo *) GetNextValueInLinkedList(magic_cache);
+       }
+@@ -328,16 +342,7 @@ MagickExport const MagicInfo *GetMagicInfo(const unsigned char *magic,
+     }
+   while (p != (const MagicInfo *) NULL)
+   {
+-    const unsigned char
+-      *q;
+-
+-    q=magic;
+-    if (p->skip_spaces != MagickFalse)
+-      while (isspace(*q) != 0) q++;
+-    assert(p->offset >= 0);
+-    offset=p->offset+(MagickOffsetType) p->length;
+-    if ((offset <= (MagickOffsetType) length) &&
+-        (memcmp(q+p->offset,p->magic,p->length) == 0))
++    if (MatchesMagic(magic,length,p) != MagickFalse)
+       break;
+     p=(const MagicInfo *) GetNextValueInLinkedList(magic_list);
+   }

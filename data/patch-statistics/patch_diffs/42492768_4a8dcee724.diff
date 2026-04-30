@@ -1,0 +1,39 @@
+From ce5fe2a6e807b819866b4f429ca6f7a2d74445b7 Mon Sep 17 00:00:00 2001
+From: Luke <luke.wilde@live.co.uk>
+Date: Fri, 26 Feb 2021 22:31:07 +0000
+Subject: [PATCH] LibGfx: Fix read buffer overflow in interlaced GIF decode
+
+Unfortunately 10420dee7e48c818a7b1c5386b8fcebc587825f0 didn't quite fix it,
+as the buffer overflow was actually happening here:
+https://github.com/SerenityOS/serenity/blob/af2220448834fb0bff5132bf68104719819862ce/Userland/Libraries/LibGfx/GIFLoader.cpp#L402
+
+Found by oss-fuzz: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=30507
+---
+ Userland/Libraries/LibGfx/GIFLoader.cpp | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/Userland/Libraries/LibGfx/GIFLoader.cpp b/Userland/Libraries/LibGfx/GIFLoader.cpp
+index 3bec3d1ce91700..fb7b9eb26b301e 100644
+--- a/Userland/Libraries/LibGfx/GIFLoader.cpp
++++ b/Userland/Libraries/LibGfx/GIFLoader.cpp
+@@ -399,13 +399,14 @@ static bool decode_frame(GIFLoadingContext& context, size_t frame_index)
+                 ++pixel_index;
+                 if (pixel_index % image.width == 0) {
+                     if (image.interlaced) {
+-                        if (row + INTERLACE_ROW_STRIDES[interlace_pass] >= image.height) {
+-                            ++interlace_pass;
+-                            if (interlace_pass < 4)
+-                                row = INTERLACE_ROW_OFFSETS[interlace_pass];
+-                        } else {
+-                            if (interlace_pass < 4)
++                        if (interlace_pass < 4) {
++                            if (row + INTERLACE_ROW_STRIDES[interlace_pass] >= image.height) {
++                                ++interlace_pass;
++                                if (interlace_pass < 4)
++                                    row = INTERLACE_ROW_OFFSETS[interlace_pass];
++                            } else {
+                                 row += INTERLACE_ROW_STRIDES[interlace_pass];
++                            }
+                         }
+                     } else {
+                         ++row;

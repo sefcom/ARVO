@@ -1,0 +1,91 @@
+From 7fe586b892c9e0cbf3b21d57cfd8135e2311e45c Mon Sep 17 00:00:00 2001
+From: Philip Hazel <Philip.Hazel@gmail.com>
+Date: Mon, 20 Nov 2023 15:41:06 +0000
+Subject: [PATCH] Fix incorrect patch in c1306126
+
+---
+ src/pcre2_compile.c  | 20 ++++++++++++++------
+ testdata/testinput2  |  2 ++
+ testdata/testoutput2 |  2 ++
+ 3 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/src/pcre2_compile.c b/src/pcre2_compile.c
+index fdaf2adff..9e4558037 100644
+--- a/src/pcre2_compile.c
++++ b/src/pcre2_compile.c
+@@ -2782,6 +2782,7 @@ uint32_t *previous_callout = NULL;
+ uint32_t *parsed_pattern = cb->parsed_pattern;
+ uint32_t *parsed_pattern_end = cb->parsed_pattern_end;
+ uint32_t *this_parsed_item = NULL;
++uint32_t *prev_parsed_item = NULL;
+ uint32_t meta_quantifier = 0;
+ uint32_t add_after_mark = 0;
+ uint32_t xoptions = cb->cx->extra_options;
+@@ -2867,11 +2868,10 @@ while (ptr < ptrend)
+   uint32_t xset, xunset, *xoptset;
+   uint32_t terminator;
+   uint32_t prev_meta_quantifier;
+-  uint32_t *prev_parsed_item = this_parsed_item; 
+   BOOL prev_okquantifier;
+   PCRE2_SPTR tempptr;
+   PCRE2_SIZE offset;
+-  
++
+   if (parsed_pattern >= parsed_pattern_end)
+     {
+     errorcode = ERR63;  /* Internal error (parsed pattern overflow) */
+@@ -2883,10 +2883,17 @@ while (ptr < ptrend)
+     errorcode = ERR19;
+     goto FAILED;        /* Parentheses too deeply nested */
+     }
+-    
+-  /* Remember where this item started */
+ 
+-  this_parsed_item = parsed_pattern;
++  /* If the last time round this loop something was added, parsed_pattern will
++  no longer be equal to this_parsed_item. Remember where the previous item
++  started and reset for the next item. Note that sometimes round the loop,
++  nothing gets added (e.g. for ignored white space). */
++
++  if (this_parsed_item != parsed_pattern)
++    {
++    prev_parsed_item = this_parsed_item;
++    this_parsed_item = parsed_pattern;
++    }
+ 
+   /* Get next input character, save its position for callout handling. */
+ 
+@@ -3440,7 +3447,8 @@ while (ptr < ptrend)
+ 
+     /* ---- Quantifier post-processing ---- */
+ 
+-    /* Check that a quantifier is allowed after the previous item. */
++    /* Check that a quantifier is allowed after the previous item. This
++    guarantees that there is a previous item. */
+ 
+     CHECK_QUANTIFIER:
+     if (!prev_okquantifier)
+diff --git a/testdata/testinput2 b/testdata/testinput2
+index ba292d890..da845c10c 100644
+--- a/testdata/testinput2
++++ b/testdata/testinput2
+@@ -6051,4 +6051,6 @@ a)"xI
+ # /|a(?0)/endanchored
+ #    aaaa
+ 
++/A +/extended
++
+ # End of testinput2
+diff --git a/testdata/testoutput2 b/testdata/testoutput2
+index 888f06a6c..85de4aee6 100644
+--- a/testdata/testoutput2
++++ b/testdata/testoutput2
+@@ -17932,6 +17932,8 @@ No match
+ # /|a(?0)/endanchored
+ #    aaaa
+ 
++/A +/extended
++
+ # End of testinput2
+ Error -70: PCRE2_ERROR_BADDATA (unknown error number)
+ Error -62: bad serialized data

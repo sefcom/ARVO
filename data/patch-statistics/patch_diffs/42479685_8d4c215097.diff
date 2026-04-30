@@ -1,0 +1,158 @@
+From fc82cdfa4ac11e34725319620cdc549cb1b700d0 Mon Sep 17 00:00:00 2001
+From: Luca Deri <deri@ntop.org>
+Date: Thu, 21 Nov 2019 19:36:01 +0100
+Subject: [PATCH] Implemented telnet password export
+
+---
+ example/ndpiReader.c        |  1 +
+ example/reader_util.c       |  1 +
+ example/reader_util.h       |  5 ++---
+ src/include/ndpi_typedefs.h |  8 +++++---
+ src/lib/ndpi_main.c         |  2 +-
+ src/lib/protocols/telnet.c  | 33 +++++++++++++++++++++++++++++++--
+ 6 files changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/example/ndpiReader.c b/example/ndpiReader.c
+index b26b146c86d..ae79bc5266e 100644
+--- a/example/ndpiReader.c
++++ b/example/ndpiReader.c
+@@ -1089,6 +1089,7 @@ static void printFlow(u_int16_t id, struct ndpi_flow_info *flow, u_int16_t threa
+     fprintf(out, "[< 1 sec]");
+ 
+   if(flow->telnet.username[0] != '\0')  fprintf(out, "[Username: %s]", flow->telnet.username);
++  if(flow->telnet.password[0] != '\0')  fprintf(out, "[Password: %s]", flow->telnet.password);
+   if(flow->host_server_name[0] != '\0') fprintf(out, "[Host: %s]", flow->host_server_name);
+ 
+   if(flow->info[0] != '\0') fprintf(out, "[%s]", flow->info);
+diff --git a/example/reader_util.c b/example/reader_util.c
+index d91c0ed5f6e..88d64126ee6 100644
+--- a/example/reader_util.c
++++ b/example/reader_util.c
+@@ -997,6 +997,7 @@ void process_ndpi_collected_info(struct ndpi_workflow * workflow, struct ndpi_fl
+     }
+   } else if(is_ndpi_proto(flow, NDPI_PROTOCOL_TELNET)) {
+     snprintf(flow->telnet.username, sizeof(flow->telnet.username), "%s", flow->ndpi_flow->protos.telnet.username);
++    snprintf(flow->telnet.password, sizeof(flow->telnet.password), "%s", flow->ndpi_flow->protos.telnet.password);
+   } else if(is_ndpi_proto(flow, NDPI_PROTOCOL_SSH)) {
+     snprintf(flow->ssh_tls.client_info, sizeof(flow->ssh_tls.client_info), "%s",
+ 	     flow->ndpi_flow->protos.ssh.client_signature);
+diff --git a/example/reader_util.h b/example/reader_util.h
+index 775e519c113..99f8c5ada7a 100644
+--- a/example/reader_util.h
++++ b/example/reader_util.h
+@@ -201,14 +201,13 @@ typedef struct ndpi_flow_info {
+   } http;
+   
+   struct {
+-    char username[32];
++    char username[32], password[32];
+   } telnet;
+   
+   void *src_id, *dst_id;
+ 
+   struct ndpi_entropy entropy;
+-  struct ndpi_entropy last_entropy;
+-  
++  struct ndpi_entropy last_entropy;  
+ } ndpi_flow_info_t;
+ 
+ 
+diff --git a/src/include/ndpi_typedefs.h b/src/include/ndpi_typedefs.h
+index 3325e9cd985..d773cd01316 100644
+--- a/src/include/ndpi_typedefs.h
++++ b/src/include/ndpi_typedefs.h
+@@ -1234,9 +1234,11 @@ struct ndpi_flow_struct {
+     } imo;
+     
+     struct {
+-      u_int8_t username_detected:1, username_found:1, skip_next:1, _pad:5;
++      u_int8_t username_detected:1, username_found:1,
++	password_detected:1, password_found:1,
++	skip_next:1, _pad:3;
+       u_int8_t character_id;
+-      char username[32];
++      char username[32], password[32];
+     } telnet;
+     
+     struct {
+@@ -1255,7 +1257,7 @@ struct ndpi_flow_struct {
+     } http;
+ 
+     struct {
+-      u_int8_t auth_found;
++      u_int8_t auth_found:1;
+       char username[16], password[16];
+     } ftp_imap_pop_smtp;
+   
+diff --git a/src/lib/ndpi_main.c b/src/lib/ndpi_main.c
+index 572c2a73672..fbcf6f111b4 100644
+--- a/src/lib/ndpi_main.c
++++ b/src/lib/ndpi_main.c
+@@ -6580,7 +6580,7 @@ u_int8_t ndpi_extra_dissection_possible(struct ndpi_detection_module_struct *ndp
+     break;
+ 
+   case NDPI_PROTOCOL_TELNET:
+-    if(!flow->protos.telnet.username_detected)
++    if(!flow->protos.telnet.password_detected)
+       return(1);
+     break;
+   }
+diff --git a/src/lib/protocols/telnet.c b/src/lib/protocols/telnet.c
+index 0fd00e6d49c..35693bf62a7 100644
+--- a/src/lib/protocols/telnet.c
++++ b/src/lib/protocols/telnet.c
+@@ -1,8 +1,8 @@
+ /*
+  * telnet.c
+  *
+- * Copyright (C) 2009-2011 by ipoque GmbH
+  * Copyright (C) 2011-19 - ntop.org
++ * Copyright (C) 2009-2011 by ipoque GmbH
+  *
+  * This file is part of nDPI, an open source deep packet inspection
+  * library based on the OpenDPI and PACE technology by ipoque GmbH
+@@ -47,6 +47,34 @@ static int search_telnet_again(struct ndpi_detection_module_struct *ndpi_struct,
+   if(packet->payload_packet_len > 0) {
+     int i;
+ 
++    if(flow->protos.telnet.username_detected) {
++      if((!flow->protos.telnet.password_found)
++	 && (packet->payload_packet_len > 6)) {
++	
++	if(strncasecmp((char*)packet->payload, "password:", 9) == 0) {
++	  flow->protos.telnet.password_found = 1;
++	}
++	
++	return(1);
++      }
++      
++      if(packet->payload[0] == '\r') {
++	if(!flow->protos.telnet.password_found)
++	  return(1);
++	
++	flow->protos.telnet.password_detected = 1;
++	flow->protos.telnet.password[flow->protos.telnet.character_id] = '\0';
++	return(0);
++      }
++
++      for(i=0; i<packet->payload_packet_len; i++) {
++	if(flow->protos.telnet.character_id < (sizeof(flow->protos.telnet.password)-1))
++	  flow->protos.telnet.password[flow->protos.telnet.character_id++] = packet->payload[i];
++      }
++
++      return(1);
++    }
++    
+     if((!flow->protos.telnet.username_found)
+        && (packet->payload_packet_len > 6)) {
+ 
+@@ -60,7 +88,8 @@ static int search_telnet_again(struct ndpi_detection_module_struct *ndpi_struct,
+     if(packet->payload[0] == '\r') {
+       flow->protos.telnet.username_detected = 1;
+       flow->protos.telnet.username[flow->protos.telnet.character_id] = '\0';
+-      return(0);
++      flow->protos.telnet.character_id = 0;
++      return(1);
+     }
+ 
+     for(i=0; i<packet->payload_packet_len; i++) {

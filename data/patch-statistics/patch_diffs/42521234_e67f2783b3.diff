@@ -1,0 +1,45 @@
+From c38af025abf0040f6693d15f4ce2e878a728cfee Mon Sep 17 00:00:00 2001
+From: Ashwin Natesan <ashwin.natesan@ittiam.com>
+Date: Mon, 20 Feb 2023 16:52:56 +0530
+Subject: [PATCH] svcenc: fixed incorrect streamBuf accesses
+
+If 'u4_strm_buf_offset == 0' when 'isvce_cabac_flush' is called,
+then 'carry' is implicitly 0.
+
+'u4_strm_buf_offset == 0' implies stream buffer is empty.
+
+Invocation of 'isvce_cabac_flush' implies all MB's in a slice
+have been encoded.
+
+BUG = ossfuzz:56137
+Test: svc_enc_fuzzer
+---
+ encoder/svc/isvce_cabac.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/encoder/svc/isvce_cabac.c b/encoder/svc/isvce_cabac.c
+index e36025e8..3d3194df 100644
+--- a/encoder/svc/isvce_cabac.c
++++ b/encoder/svc/isvce_cabac.c
+@@ -252,6 +252,9 @@ void isvce_cabac_flush(isvce_cabac_ctxt_t *ps_cabac_ctxt)
+         WORD32 bits_left;
+         WORD32 rem_bits;
+ 
++        /* carry exists only if pu1_strm_buf has at least 1 byte of data */
++        carry = carry && (u4_strm_buf_offset > 0);
++
+         if(carry)
+         {
+             /* CORNER CASE: if the previous data is 0x000003, then EPB will be
+@@ -283,7 +286,10 @@ void isvce_cabac_flush(isvce_cabac_ctxt_t *ps_cabac_ctxt)
+         }
+ 
+         /*  clear the carry in low */
+-        u4_low &= ((1 << (u4_bits_gen + CABAC_BITS)) - 1);
++        if(carry)
++        {
++            u4_low &= ((1 << (u4_bits_gen + CABAC_BITS)) - 1);
++        }
+ 
+         /* extract the remaining bits;                                   */
+         /* includes additional msb bit of low as per Figure 9-12      */

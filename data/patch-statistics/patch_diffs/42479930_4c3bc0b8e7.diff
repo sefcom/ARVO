@@ -1,0 +1,79 @@
+From f7b91535da39550693214dbe7ae2c16d83d70a4f Mon Sep 17 00:00:00 2001
+From: Leandro Pereira <leandro@hardinfo.org>
+Date: Sat, 16 Nov 2019 09:48:57 -0800
+Subject: [PATCH] Fix heap overflow while parsing templates
+
+Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=18952
+
+Thanks to OSS-Fuzz.
+---
+ src/lib/lwan-array.h    |  9 +++++++--
+ src/lib/lwan-template.c | 12 +++++++++++-
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/src/lib/lwan-array.h b/src/lib/lwan-array.h
+index 1ebe964c2..fdf04b3f2 100644
+--- a/src/lib/lwan-array.h
++++ b/src/lib/lwan-array.h
+@@ -116,12 +116,17 @@ struct lwan_array *coro_lwan_array_new(struct coro *coro, bool inline_first);
+         lwan_array_sort(&array->base, sizeof(element_type_), cmp);             \
+     }                                                                          \
+     __attribute__((unused)) static inline size_t array_type_##_get_elem_index( \
+-        struct array_type_ *array, element_type_ *elem)                        \
++        const struct array_type_ *array, element_type_ *elem)                  \
+     {                                                                          \
+         return (size_t)(elem - (element_type_ *)array->base.base);             \
+     }                                                                          \
+     __attribute__((unused)) static inline element_type_                        \
+-        *array_type_##_get_elem(struct array_type_ *array, size_t index)       \
++        *array_type_##_get_elem(const struct array_type_ *array, size_t index) \
+     {                                                                          \
+         return &((element_type_ *)array->base.base)[index];                    \
++    }                                                                          \
++    __attribute__((unused)) static inline size_t array_type_##_len(            \
++        const struct array_type_ *array)                                       \
++    {                                                                          \
++        return array->base.elements;                                           \
+     }
+diff --git a/src/lib/lwan-template.c b/src/lib/lwan-template.c
+index 684c1c5bf..3d68360c2 100644
+--- a/src/lib/lwan-template.c
++++ b/src/lib/lwan-template.c
+@@ -996,12 +996,16 @@ void lwan_tpl_free(struct lwan_tpl *tpl)
+ 
+ static bool post_process_template(struct parser *parser)
+ {
++    struct chunk *last_chunk =
++        chunk_array_get_elem(&parser->chunks, chunk_array_len(&parser->chunks));
+     struct chunk *prev_chunk;
+     struct chunk *chunk;
+ 
+-    LWAN_ARRAY_FOREACH(&parser->chunks, chunk) {
++    LWAN_ARRAY_FOREACH (&parser->chunks, chunk) {
+         if (chunk->action == ACTION_IF_VARIABLE_NOT_EMPTY) {
+             for (prev_chunk = chunk;; chunk++) {
++                if (chunk > last_chunk)
++                    goto error;
+                 if (chunk->action == ACTION_LAST) {
+                     lwan_status_error("Internal error: Could not find the end "
+                                       "var not empty chunk");
+@@ -1026,6 +1030,8 @@ static bool post_process_template(struct parser *parser)
+             enum flags flags = chunk->flags;
+ 
+             for (prev_chunk = chunk;; chunk++) {
++                if (chunk > last_chunk)
++                    goto error;
+                 if (chunk->action == ACTION_LAST) {
+                     lwan_status_error(
+                         "Internal error: Could not find the end iter chunk");
+@@ -1084,6 +1090,10 @@ static bool post_process_template(struct parser *parser)
+     parser->tpl->chunks = parser->chunks;
+ 
+     return true;
++
++error:
++    lwan_status_error("Unknown error while parsing template; bug?");
++    return false;
+ }
+ 
+ static bool parser_init(struct parser *parser,

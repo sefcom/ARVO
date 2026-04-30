@@ -1,0 +1,1864 @@
+From 765b47d02aac894da80b74284263d1b487415aa0 Mon Sep 17 00:00:00 2001
+From: Keith Winstein <208955+keithw@users.noreply.github.com>
+Date: Fri, 8 Nov 2024 07:45:07 -0800
+Subject: [PATCH] Add support for the custom-page-sizes proposal (#2502)
+
+This adds support in the binary/text parsers and writers,
+the validator and interpreter, and objdump (but not wasm2c).
+---
+ README.md                                     |   2 +
+ include/wabt/binary-reader-logging.h          |   7 +-
+ include/wabt/binary-reader-nop.h              |   7 +-
+ include/wabt/binary-reader.h                  |   7 +-
+ include/wabt/binary.h                         |   7 +-
+ include/wabt/common.h                         |  20 +--
+ include/wabt/feature.def                      |   1 +
+ include/wabt/interp/interp-inl.h              |   7 +-
+ include/wabt/interp/interp.h                  |   3 +-
+ include/wabt/ir.h                             |   1 +
+ include/wabt/shared-validator.h               |   2 +-
+ include/wabt/token.def                        |   1 +
+ include/wabt/wast-parser.h                    |   1 +
+ src/binary-reader-ir.cc                       |  16 ++-
+ src/binary-reader-logging.cc                  |  11 +-
+ src/binary-reader-objdump.cc                  |  20 ++-
+ src/binary-reader.cc                          |  33 +++--
+ src/binary-writer.cc                          |  23 ++-
+ src/interp/binary-reader-interp.cc            |  22 +--
+ src/interp/interp-wasm-c-api.cc               |   5 +-
+ src/interp/interp.cc                          |  10 +-
+ src/lexer-keywords.txt                        |   1 +
+ src/prebuilt/lexer-keywords.cc                | 122 ++++++++--------
+ src/shared-validator.cc                       |  18 ++-
+ src/test-interp.cc                            |   5 +-
+ src/tools/spectest-interp.cc                  |   3 +-
+ src/validator.cc                              |   6 +-
+ src/wast-parser.cc                            |  53 ++++++-
+ src/wat-writer.cc                             |   5 +
+ test/binary/bad-memory-limits-flag.txt        |   6 +-
+ test/help/spectest-interp.txt                 |   1 +
+ test/help/wasm-interp.txt                     |   1 +
+ test/help/wasm-stats.txt                      |   1 +
+ test/help/wasm-validate.txt                   |   1 +
+ test/help/wasm2wat.txt                        |   1 +
+ test/help/wast2json.txt                       |   1 +
+ test/help/wat-desugar.txt                     |   1 +
+ test/help/wat2wasm.txt                        |   1 +
+ test/interp/custom-page-sizes.txt             | 131 ++++++++++++++++++
+ test/roundtrip/custom-page-sizes.txt          |  91 ++++++++++++
+ test/run-roundtrip.py                         |   3 +
+ .../custom-page-sizes-invalid.txt             |  63 +++++++++
+ .../custom-page-sizes/custom-page-sizes.txt   |   9 ++
+ test/spec/memory64/binary.txt                 |   4 +-
+ 44 files changed, 602 insertions(+), 132 deletions(-)
+ create mode 100644 test/interp/custom-page-sizes.txt
+ create mode 100644 test/roundtrip/custom-page-sizes.txt
+ create mode 100644 test/spec/custom-page-sizes/custom-page-sizes-invalid.txt
+ create mode 100644 test/spec/custom-page-sizes/custom-page-sizes.txt
+
+diff --git a/README.md b/README.md
+index a6122ee42e..d0ae81a304 100644
+--- a/README.md
++++ b/README.md
+@@ -62,6 +62,7 @@ Wabt has been compiled to JavaScript via emscripten. Some of the functionality i
+ | [multi-memory][]      | `--enable-multi-memory`     |   | ✓ | ✓ | ✓ | ✓ | ✓ |
+ | [extended-const][]    | `--enable-extended-const`   |   | ✓ | ✓ | ✓ | ✓ | ✓ |
+ | [relaxed-simd][]      | `--enable-relaxed-simd`     |   | ✓ | ✓ | ✓ | ✓ |   |
++| [custom-page-sizes][] | `--enable-custom-page-sizes`|   | ✓ | ✓ | ✓ | ✓ |   |
+ 
+ [exception handling]: https://github.com/WebAssembly/exception-handling
+ [mutable globals]: https://github.com/WebAssembly/mutable-global
+@@ -78,6 +79,7 @@ Wabt has been compiled to JavaScript via emscripten. Some of the functionality i
+ [multi-memory]: https://github.com/WebAssembly/multi-memory
+ [extended-const]: https://github.com/WebAssembly/extended-const
+ [relaxed-simd]: https://github.com/WebAssembly/relaxed-simd
++[custom-page-sizes]: https://github.com/WebAssembly/custom-page-sizes
+ 
+ ## Cloning
+ 
+diff --git a/include/wabt/binary-reader-logging.h b/include/wabt/binary-reader-logging.h
+index fee211f96e..fd166011ad 100644
+--- a/include/wabt/binary-reader-logging.h
++++ b/include/wabt/binary-reader-logging.h
+@@ -74,7 +74,8 @@ class BinaryReaderLogging : public BinaryReaderDelegate {
+                         std::string_view module_name,
+                         std::string_view field_name,
+                         Index memory_index,
+-                        const Limits* page_limits) override;
++                        const Limits* page_limits,
++                        uint32_t page_size) override;
+   Result OnImportGlobal(Index import_index,
+                         std::string_view module_name,
+                         std::string_view field_name,
+@@ -102,7 +103,9 @@ class BinaryReaderLogging : public BinaryReaderDelegate {
+ 
+   Result BeginMemorySection(Offset size) override;
+   Result OnMemoryCount(Index count) override;
+-  Result OnMemory(Index index, const Limits* limits) override;
++  Result OnMemory(Index index,
++                  const Limits* limits,
++                  uint32_t page_size) override;
+   Result EndMemorySection() override;
+ 
+   Result BeginGlobalSection(Offset size) override;
+diff --git a/include/wabt/binary-reader-nop.h b/include/wabt/binary-reader-nop.h
+index c7ec78b11d..8590606241 100644
+--- a/include/wabt/binary-reader-nop.h
++++ b/include/wabt/binary-reader-nop.h
+@@ -89,7 +89,8 @@ class BinaryReaderNop : public BinaryReaderDelegate {
+                         std::string_view module_name,
+                         std::string_view field_name,
+                         Index memory_index,
+-                        const Limits* page_limits) override {
++                        const Limits* page_limits,
++                        uint32_t page_size) override {
+     return Result::Ok;
+   }
+   Result OnImportGlobal(Index import_index,
+@@ -130,7 +131,9 @@ class BinaryReaderNop : public BinaryReaderDelegate {
+   /* Memory section */
+   Result BeginMemorySection(Offset size) override { return Result::Ok; }
+   Result OnMemoryCount(Index count) override { return Result::Ok; }
+-  Result OnMemory(Index index, const Limits* limits) override {
++  Result OnMemory(Index index,
++                  const Limits* limits,
++                  uint32_t page_size) override {
+     return Result::Ok;
+   }
+   Result EndMemorySection() override { return Result::Ok; }
+diff --git a/include/wabt/binary-reader.h b/include/wabt/binary-reader.h
+index 3d48f57470..90161264b1 100644
+--- a/include/wabt/binary-reader.h
++++ b/include/wabt/binary-reader.h
+@@ -125,7 +125,8 @@ class BinaryReaderDelegate {
+                                 std::string_view module_name,
+                                 std::string_view field_name,
+                                 Index memory_index,
+-                                const Limits* page_limits) = 0;
++                                const Limits* page_limits,
++                                uint32_t page_size) = 0;
+   virtual Result OnImportGlobal(Index import_index,
+                                 std::string_view module_name,
+                                 std::string_view field_name,
+@@ -156,7 +157,9 @@ class BinaryReaderDelegate {
+   /* Memory section */
+   virtual Result BeginMemorySection(Offset size) = 0;
+   virtual Result OnMemoryCount(Index count) = 0;
+-  virtual Result OnMemory(Index index, const Limits* limits) = 0;
++  virtual Result OnMemory(Index index,
++                          const Limits* limits,
++                          uint32_t page_size) = 0;
+   virtual Result EndMemorySection() = 0;
+ 
+   /* Global section */
+diff --git a/include/wabt/binary.h b/include/wabt/binary.h
+index ecf11a79d5..98575f962b 100644
+--- a/include/wabt/binary.h
++++ b/include/wabt/binary.h
+@@ -24,7 +24,12 @@
+ #define WABT_BINARY_LIMITS_HAS_MAX_FLAG 0x1
+ #define WABT_BINARY_LIMITS_IS_SHARED_FLAG 0x2
+ #define WABT_BINARY_LIMITS_IS_64_FLAG 0x4
+-#define WABT_BINARY_LIMITS_ALL_FLAGS                                     \
++#define WABT_BINARY_LIMITS_HAS_CUSTOM_PAGE_SIZE_FLAG 0x8
++#define WABT_BINARY_LIMITS_ALL_MEMORY_FLAGS                              \
++  (WABT_BINARY_LIMITS_HAS_MAX_FLAG | WABT_BINARY_LIMITS_IS_SHARED_FLAG | \
++   WABT_BINARY_LIMITS_IS_64_FLAG |                                       \
++   WABT_BINARY_LIMITS_HAS_CUSTOM_PAGE_SIZE_FLAG)
++#define WABT_BINARY_LIMITS_ALL_TABLE_FLAGS                               \
+   (WABT_BINARY_LIMITS_HAS_MAX_FLAG | WABT_BINARY_LIMITS_IS_SHARED_FLAG | \
+    WABT_BINARY_LIMITS_IS_64_FLAG)
+ 
+diff --git a/include/wabt/common.h b/include/wabt/common.h
+index 12b2eb09d2..6962f06d26 100644
+--- a/include/wabt/common.h
++++ b/include/wabt/common.h
+@@ -44,14 +44,18 @@
+ #define WABT_USE(x) static_cast<void>(x)
+ 
+ // 64k
+-#define WABT_PAGE_SIZE 0x10000
+-// # of pages that fit in 32-bit address space
+-#define WABT_MAX_PAGES32 0x10000
+-// # of pages that fit in 64-bit address space
+-#define WABT_MAX_PAGES64 0x1000000000000
+-#define WABT_BYTES_TO_PAGES(x) ((x) >> 16)
+-#define WABT_ALIGN_UP_TO_PAGE(x) \
+-  (((x) + WABT_PAGE_SIZE - 1) & ~(WABT_PAGE_SIZE - 1))
++#define WABT_DEFAULT_PAGE_SIZE 0x10000
++
++inline uint64_t WABT_BYTES_TO_MIN_PAGES(uint64_t num_bytes,
++                                        uint32_t page_size) {
++  if ((page_size == 0) ||
++      (page_size & (page_size - 1))) {  // malformed page sizes
++    WABT_UNREACHABLE;
++    return 0;
++  }
++  uint64_t num_pages = num_bytes / page_size;
++  return (page_size * num_pages == num_bytes) ? num_pages : num_pages + 1;
++}
+ 
+ #define WABT_ENUM_COUNT(name) \
+   (static_cast<int>(name::Last) - static_cast<int>(name::First) + 1)
+diff --git a/include/wabt/feature.def b/include/wabt/feature.def
+index 00a4e7f238..ac96377b43 100644
+--- a/include/wabt/feature.def
++++ b/include/wabt/feature.def
+@@ -40,3 +40,4 @@ WABT_FEATURE(memory64,            "memory64",                false,   "64-bit me
+ WABT_FEATURE(multi_memory,        "multi-memory",            false,   "Multi-memory")
+ WABT_FEATURE(extended_const,      "extended-const",          false,   "Extended constant expressions")
+ WABT_FEATURE(relaxed_simd,        "relaxed-simd",            false,   "Relaxed SIMD")
++WABT_FEATURE(custom_page_sizes,   "custom-page-sizes",       false,   "Custom page sizes")
+diff --git a/include/wabt/interp/interp-inl.h b/include/wabt/interp/interp-inl.h
+index 1f3402c6c4..a9ac4a3488 100644
+--- a/include/wabt/interp/interp-inl.h
++++ b/include/wabt/interp/interp-inl.h
+@@ -64,11 +64,12 @@ inline bool MemoryType::classof(const ExternType* type) {
+   return type->kind == skind;
+ }
+ 
+-inline MemoryType::MemoryType(Limits limits)
+-    : ExternType(ExternKind::Memory), limits(limits) {
++inline MemoryType::MemoryType(Limits limits, uint32_t page_size)
++    : ExternType(ExternKind::Memory), limits(limits), page_size(page_size) {
+   // Always set max.
+   if (!limits.has_max) {
+-    this->limits.max = limits.is_64 ? WABT_MAX_PAGES64 : WABT_MAX_PAGES32;
++    this->limits.max = WABT_BYTES_TO_MIN_PAGES(
++        (limits.is_64 ? UINT64_MAX : UINT32_MAX), page_size);
+   }
+ }
+ 
+diff --git a/include/wabt/interp/interp.h b/include/wabt/interp/interp.h
+index 069bedaa6b..821a53911b 100644
+--- a/include/wabt/interp/interp.h
++++ b/include/wabt/interp/interp.h
+@@ -206,7 +206,7 @@ struct MemoryType : ExternType {
+   static const ExternKind skind = ExternKind::Memory;
+   static bool classof(const ExternType* type);
+ 
+-  explicit MemoryType(Limits);
++  explicit MemoryType(Limits, uint32_t);
+ 
+   std::unique_ptr<ExternType> Clone() const override;
+ 
+@@ -215,6 +215,7 @@ struct MemoryType : ExternType {
+                       std::string* out_msg);
+ 
+   Limits limits;
++  uint32_t page_size;
+ };
+ 
+ struct GlobalType : ExternType {
+diff --git a/include/wabt/ir.h b/include/wabt/ir.h
+index 80e1c2a8bc..e300b66c90 100644
+--- a/include/wabt/ir.h
++++ b/include/wabt/ir.h
+@@ -947,6 +947,7 @@ struct Memory {
+ 
+   std::string name;
+   Limits page_limits;
++  uint32_t page_size;
+ };
+ 
+ struct DataSegment {
+diff --git a/include/wabt/shared-validator.h b/include/wabt/shared-validator.h
+index 32add01220..df02b59407 100644
+--- a/include/wabt/shared-validator.h
++++ b/include/wabt/shared-validator.h
+@@ -75,7 +75,7 @@ class SharedValidator {
+ 
+   Result OnFunction(const Location&, Var sig_var);
+   Result OnTable(const Location&, Type elem_type, const Limits&);
+-  Result OnMemory(const Location&, const Limits&);
++  Result OnMemory(const Location&, const Limits&, uint32_t page_size);
+   Result OnGlobalImport(const Location&, Type type, bool mutable_);
+   Result OnGlobal(const Location&, Type type, bool mutable_);
+   Result OnTag(const Location&, Var sig_var);
+diff --git a/include/wabt/token.def b/include/wabt/token.def
+index 1fd3d0e5d2..53d1fabba1 100644
+--- a/include/wabt/token.def
++++ b/include/wabt/token.def
+@@ -57,6 +57,7 @@ WABT_TOKEN(NanArithmetic, "nan:arithmetic")
+ WABT_TOKEN(NanCanonical, "nan:canonical")
+ WABT_TOKEN(Offset, "offset")
+ WABT_TOKEN(Output, "output")
++WABT_TOKEN(PageSize, "pagesize")
+ WABT_TOKEN(Param, "param")
+ WABT_TOKEN(Ref, "ref")
+ WABT_TOKEN(Quote, "quote")
+diff --git a/include/wabt/wast-parser.h b/include/wabt/wast-parser.h
+index 36447c5867..8ba71e4777 100644
+--- a/include/wabt/wast-parser.h
++++ b/include/wabt/wast-parser.h
+@@ -147,6 +147,7 @@ class WastParser {
+   Result ParseMemidx(Location loc, Var* memidx);
+   Result ParseLimitsIndex(Limits*);
+   Result ParseLimits(Limits*);
++  Result ParsePageSize(uint32_t*);
+   Result ParseNat(uint64_t*, bool is_64);
+ 
+   Result ParseModuleFieldList(Module*);
+diff --git a/src/binary-reader-ir.cc b/src/binary-reader-ir.cc
+index 2ab3b0982b..04b2e90ba9 100644
+--- a/src/binary-reader-ir.cc
++++ b/src/binary-reader-ir.cc
+@@ -126,7 +126,8 @@ class BinaryReaderIR : public BinaryReaderNop {
+                         std::string_view module_name,
+                         std::string_view field_name,
+                         Index memory_index,
+-                        const Limits* page_limits) override;
++                        const Limits* page_limits,
++                        uint32_t page_size) override;
+   Result OnImportGlobal(Index import_index,
+                         std::string_view module_name,
+                         std::string_view field_name,
+@@ -148,7 +149,9 @@ class BinaryReaderIR : public BinaryReaderNop {
+                  const Limits* elem_limits) override;
+ 
+   Result OnMemoryCount(Index count) override;
+-  Result OnMemory(Index index, const Limits* limits) override;
++  Result OnMemory(Index index,
++                  const Limits* limits,
++                  uint32_t page_size) override;
+ 
+   Result OnGlobalCount(Index count) override;
+   Result BeginGlobal(Index index, Type type, bool mutable_) override;
+@@ -620,11 +623,13 @@ Result BinaryReaderIR::OnImportMemory(Index import_index,
+                                       std::string_view module_name,
+                                       std::string_view field_name,
+                                       Index memory_index,
+-                                      const Limits* page_limits) {
++                                      const Limits* page_limits,
++                                      uint32_t page_size) {
+   auto import = std::make_unique<MemoryImport>();
+   import->module_name = module_name;
+   import->field_name = field_name;
+   import->memory.page_limits = *page_limits;
++  import->memory.page_size = page_size;
+   if (import->memory.page_limits.is_shared) {
+     module_->features_used.threads = true;
+   }
+@@ -707,10 +712,13 @@ Result BinaryReaderIR::OnMemoryCount(Index count) {
+   return Result::Ok;
+ }
+ 
+-Result BinaryReaderIR::OnMemory(Index index, const Limits* page_limits) {
++Result BinaryReaderIR::OnMemory(Index index,
++                                const Limits* page_limits,
++                                uint32_t page_size) {
+   auto field = std::make_unique<MemoryModuleField>(GetLocation());
+   Memory& memory = field->memory;
+   memory.page_limits = *page_limits;
++  memory.page_size = page_size;
+   if (memory.page_limits.is_shared) {
+     module_->features_used.threads = true;
+   }
+diff --git a/src/binary-reader-logging.cc b/src/binary-reader-logging.cc
+index ea42739190..0c3fcda697 100644
+--- a/src/binary-reader-logging.cc
++++ b/src/binary-reader-logging.cc
+@@ -217,14 +217,15 @@ Result BinaryReaderLogging::OnImportMemory(Index import_index,
+                                            std::string_view module_name,
+                                            std::string_view field_name,
+                                            Index memory_index,
+-                                           const Limits* page_limits) {
++                                           const Limits* page_limits,
++                                           uint32_t page_size) {
+   char buf[100];
+   SPrintLimits(buf, sizeof(buf), page_limits);
+   LOGF("OnImportMemory(import_index: %" PRIindex ", memory_index: %" PRIindex
+        ", %s)\n",
+        import_index, memory_index, buf);
+   return reader_->OnImportMemory(import_index, module_name, field_name,
+-                                 memory_index, page_limits);
++                                 memory_index, page_limits, page_size);
+ }
+ 
+ Result BinaryReaderLogging::OnImportGlobal(Index import_index,
+@@ -264,11 +265,13 @@ Result BinaryReaderLogging::OnTable(Index index,
+   return reader_->OnTable(index, elem_type, elem_limits);
+ }
+ 
+-Result BinaryReaderLogging::OnMemory(Index index, const Limits* page_limits) {
++Result BinaryReaderLogging::OnMemory(Index index,
++                                     const Limits* page_limits,
++                                     uint32_t page_size) {
+   char buf[100];
+   SPrintLimits(buf, sizeof(buf), page_limits);
+   LOGF("OnMemory(index: %" PRIindex ", %s)\n", index, buf);
+-  return reader_->OnMemory(index, page_limits);
++  return reader_->OnMemory(index, page_limits, page_size);
+ }
+ 
+ Result BinaryReaderLogging::BeginGlobal(Index index, Type type, bool mutable_) {
+diff --git a/src/binary-reader-objdump.cc b/src/binary-reader-objdump.cc
+index ff9afbc651..52e6d27ace 100644
+--- a/src/binary-reader-objdump.cc
++++ b/src/binary-reader-objdump.cc
+@@ -1059,7 +1059,8 @@ class BinaryReaderObjdump : public BinaryReaderObjdumpBase {
+                         std::string_view module_name,
+                         std::string_view field_name,
+                         Index memory_index,
+-                        const Limits* page_limits) override;
++                        const Limits* page_limits,
++                        uint32_t page_size) override;
+   Result OnImportGlobal(Index import_index,
+                         std::string_view module_name,
+                         std::string_view field_name,
+@@ -1081,7 +1082,9 @@ class BinaryReaderObjdump : public BinaryReaderObjdumpBase {
+                  const Limits* elem_limits) override;
+ 
+   Result OnMemoryCount(Index count) override;
+-  Result OnMemory(Index index, const Limits* limits) override;
++  Result OnMemory(Index index,
++                  const Limits* limits,
++                  uint32_t page_size) override;
+ 
+   Result OnGlobalCount(Index count) override;
+   Result BeginGlobal(Index index, Type type, bool mutable_) override;
+@@ -1563,7 +1566,8 @@ Result BinaryReaderObjdump::OnImportMemory(Index import_index,
+                                            std::string_view module_name,
+                                            std::string_view field_name,
+                                            Index memory_index,
+-                                           const Limits* page_limits) {
++                                           const Limits* page_limits,
++                                           uint32_t page_size) {
+   PrintDetails(" - memory[%" PRIindex "] pages: initial=%" PRId64, memory_index,
+                page_limits->initial);
+   if (page_limits->has_max) {
+@@ -1575,6 +1579,9 @@ Result BinaryReaderObjdump::OnImportMemory(Index import_index,
+   if (page_limits->is_64) {
+     PrintDetails(" i64");
+   }
++  if (page_size != WABT_DEFAULT_PAGE_SIZE) {
++    PrintDetails(" (pagesize %u)", page_size);
++  }
+   PrintDetails(" <- " PRIstringview "." PRIstringview "\n",
+                WABT_PRINTF_STRING_VIEW_ARG(module_name),
+                WABT_PRINTF_STRING_VIEW_ARG(field_name));
+@@ -1615,7 +1622,9 @@ Result BinaryReaderObjdump::OnMemoryCount(Index count) {
+   return OnCount(count);
+ }
+ 
+-Result BinaryReaderObjdump::OnMemory(Index index, const Limits* page_limits) {
++Result BinaryReaderObjdump::OnMemory(Index index,
++                                     const Limits* page_limits,
++                                     uint32_t page_size) {
+   PrintDetails(" - memory[%" PRIindex "] pages: initial=%" PRId64, index,
+                page_limits->initial);
+   if (page_limits->has_max) {
+@@ -1627,6 +1636,9 @@ Result BinaryReaderObjdump::OnMemory(Index index, const Limits* page_limits) {
+   if (page_limits->is_64) {
+     PrintDetails(" i64");
+   }
++  if (page_size != WABT_DEFAULT_PAGE_SIZE) {
++    PrintDetails(" (pagesize %u)", page_size);
++  }
+   PrintDetails("\n");
+   return Result::Ok;
+ }
+diff --git a/src/binary-reader.cc b/src/binary-reader.cc
+index 33801a7d5e..18b57e05f4 100644
+--- a/src/binary-reader.cc
++++ b/src/binary-reader.cc
+@@ -146,7 +146,8 @@ class BinaryReader {
+ 
+   [[nodiscard]] Result ReadInitExpr(Index index);
+   [[nodiscard]] Result ReadTable(Type* out_elem_type, Limits* out_elem_limits);
+-  [[nodiscard]] Result ReadMemory(Limits* out_page_limits);
++  [[nodiscard]] Result ReadMemory(Limits* out_page_limits,
++                                  uint32_t* out_page_size);
+   [[nodiscard]] Result ReadGlobalHeader(Type* out_type, bool* out_mutable);
+   [[nodiscard]] Result ReadTagType(Index* out_sig_index);
+   [[nodiscard]] Result ReadAddress(Address* out_value,
+@@ -600,7 +601,7 @@ Result BinaryReader::ReadTable(Type* out_elem_type, Limits* out_elem_limits) {
+   bool has_max = flags & WABT_BINARY_LIMITS_HAS_MAX_FLAG;
+   bool is_shared = flags & WABT_BINARY_LIMITS_IS_SHARED_FLAG;
+   bool is_64 = flags & WABT_BINARY_LIMITS_IS_64_FLAG;
+-  const uint8_t unknown_flags = flags & ~WABT_BINARY_LIMITS_ALL_FLAGS;
++  const uint8_t unknown_flags = flags & ~WABT_BINARY_LIMITS_ALL_TABLE_FLAGS;
+   ERROR_IF(is_shared, "tables may not be shared");
+   ERROR_IF(is_64 && !options_.features.memory64_enabled(),
+            "memory64 not allowed");
+@@ -617,7 +618,8 @@ Result BinaryReader::ReadTable(Type* out_elem_type, Limits* out_elem_limits) {
+   return Result::Ok;
+ }
+ 
+-Result BinaryReader::ReadMemory(Limits* out_page_limits) {
++Result BinaryReader::ReadMemory(Limits* out_page_limits,
++                                uint32_t* out_page_size) {
+   uint8_t flags;
+   uint64_t initial;
+   uint64_t max = 0;
+@@ -625,12 +627,17 @@ Result BinaryReader::ReadMemory(Limits* out_page_limits) {
+   bool has_max = flags & WABT_BINARY_LIMITS_HAS_MAX_FLAG;
+   bool is_shared = flags & WABT_BINARY_LIMITS_IS_SHARED_FLAG;
+   bool is_64 = flags & WABT_BINARY_LIMITS_IS_64_FLAG;
+-  const uint8_t unknown_flags = flags & ~WABT_BINARY_LIMITS_ALL_FLAGS;
++  bool has_custom_page_size =
++      flags & WABT_BINARY_LIMITS_HAS_CUSTOM_PAGE_SIZE_FLAG;
++  const uint8_t unknown_flags = flags & ~WABT_BINARY_LIMITS_ALL_MEMORY_FLAGS;
+   ERROR_UNLESS(unknown_flags == 0, "malformed memory limits flag: %d", flags);
+   ERROR_IF(is_shared && !options_.features.threads_enabled(),
+            "memory may not be shared: threads not allowed");
+   ERROR_IF(is_64 && !options_.features.memory64_enabled(),
+            "memory64 not allowed");
++  ERROR_IF(
++      has_custom_page_size && !options_.features.custom_page_sizes_enabled(),
++      "custom page sizes not allowed");
+   if (options_.features.memory64_enabled()) {
+     CHECK_RESULT(ReadU64Leb128(&initial, "memory initial page count"));
+     if (has_max) {
+@@ -646,6 +653,14 @@ Result BinaryReader::ReadMemory(Limits* out_page_limits) {
+       max = max32;
+     }
+   }
++  if (has_custom_page_size) {
++    uint32_t page_size_log2;
++    CHECK_RESULT(ReadU32Leb128(&page_size_log2, "memory page size"));
++    ERROR_IF(page_size_log2 > 16, "malformed memory page size");
++    *out_page_size = 1 << page_size_log2;
++  } else {
++    *out_page_size = WABT_DEFAULT_PAGE_SIZE;
++  }
+ 
+   out_page_limits->has_max = has_max;
+   out_page_limits->is_shared = is_shared;
+@@ -2586,9 +2601,10 @@ Result BinaryReader::ReadImportSection(Offset section_size) {
+ 
+       case ExternalKind::Memory: {
+         Limits page_limits;
+-        CHECK_RESULT(ReadMemory(&page_limits));
++        uint32_t page_size;
++        CHECK_RESULT(ReadMemory(&page_limits, &page_size));
+         CALLBACK(OnImportMemory, i, module_name, field_name,
+-                 num_memory_imports_, &page_limits);
++                 num_memory_imports_, &page_limits, page_size);
+         num_memory_imports_++;
+         break;
+       }
+@@ -2663,8 +2679,9 @@ Result BinaryReader::ReadMemorySection(Offset section_size) {
+   for (Index i = 0; i < num_memories; ++i) {
+     Index memory_index = num_memory_imports_ + i;
+     Limits page_limits;
+-    CHECK_RESULT(ReadMemory(&page_limits));
+-    CALLBACK(OnMemory, memory_index, &page_limits);
++    uint32_t page_size;
++    CHECK_RESULT(ReadMemory(&page_limits, &page_size));
++    CALLBACK(OnMemory, memory_index, &page_limits, page_size);
+   }
+   CALLBACK0(EndMemorySection);
+   return Result::Ok;
+diff --git a/src/binary-writer.cc b/src/binary-writer.cc
+index a94eb1476f..60863d62e6 100644
+--- a/src/binary-writer.cc
++++ b/src/binary-writer.cc
+@@ -64,11 +64,18 @@ void WriteType(Stream* stream, Type type, const char* desc) {
+   }
+ }
+ 
+-void WriteLimits(Stream* stream, const Limits* limits) {
++void WriteLimitsFlags(Stream* stream, uint32_t flags) {
++  WriteU32Leb128(stream, flags, "limits: flags");
++}
++
++uint32_t ComputeLimitsFlags(const Limits* limits) {
+   uint32_t flags = limits->has_max ? WABT_BINARY_LIMITS_HAS_MAX_FLAG : 0;
+   flags |= limits->is_shared ? WABT_BINARY_LIMITS_IS_SHARED_FLAG : 0;
+   flags |= limits->is_64 ? WABT_BINARY_LIMITS_IS_64_FLAG : 0;
+-  WriteU32Leb128(stream, flags, "limits: flags");
++  return flags;
++}
++
++void WriteLimitsData(Stream* stream, const Limits* limits) {
+   if (limits->is_64) {
+     WriteU64Leb128(stream, limits->initial, "limits: initial");
+     if (limits->has_max) {
+@@ -1157,11 +1164,19 @@ void BinaryWriter::WriteFunc(const Func* func) {
+ 
+ void BinaryWriter::WriteTable(const Table* table) {
+   WriteType(stream_, table->elem_type);
+-  WriteLimits(stream_, &table->elem_limits);
++  WriteLimitsFlags(stream_, ComputeLimitsFlags(&table->elem_limits));
++  WriteLimitsData(stream_, &table->elem_limits);
+ }
+ 
+ void BinaryWriter::WriteMemory(const Memory* memory) {
+-  WriteLimits(stream_, &memory->page_limits);
++  uint32_t flags = ComputeLimitsFlags(&memory->page_limits);
++  const bool custom_page_size = memory->page_size != WABT_DEFAULT_PAGE_SIZE;
++  flags |= custom_page_size ? WABT_BINARY_LIMITS_HAS_CUSTOM_PAGE_SIZE_FLAG : 0;
++  WriteLimitsFlags(stream_, flags);
++  WriteLimitsData(stream_, &memory->page_limits);
++  if (custom_page_size) {
++    WriteU32Leb128(stream_, log2_u32(memory->page_size), "memory page size");
++  }
+ }
+ 
+ void BinaryWriter::WriteGlobalHeader(const Global* global) {
+diff --git a/src/interp/binary-reader-interp.cc b/src/interp/binary-reader-interp.cc
+index dc7ec41037..1d3daf8ed3 100644
+--- a/src/interp/binary-reader-interp.cc
++++ b/src/interp/binary-reader-interp.cc
+@@ -105,7 +105,8 @@ class BinaryReaderInterp : public BinaryReaderNop {
+                         std::string_view module_name,
+                         std::string_view field_name,
+                         Index memory_index,
+-                        const Limits* page_limits) override;
++                        const Limits* page_limits,
++                        uint32_t page_size) override;
+   Result OnImportGlobal(Index import_index,
+                         std::string_view module_name,
+                         std::string_view field_name,
+@@ -127,7 +128,9 @@ class BinaryReaderInterp : public BinaryReaderNop {
+                  const Limits* elem_limits) override;
+ 
+   Result OnMemoryCount(Index count) override;
+-  Result OnMemory(Index index, const Limits* limits) override;
++  Result OnMemory(Index index,
++                  const Limits* limits,
++                  uint32_t page_size) override;
+ 
+   Result OnGlobalCount(Index count) override;
+   Result BeginGlobal(Index index, Type type, bool mutable_) override;
+@@ -537,9 +540,10 @@ Result BinaryReaderInterp::OnImportMemory(Index import_index,
+                                           std::string_view module_name,
+                                           std::string_view field_name,
+                                           Index memory_index,
+-                                          const Limits* page_limits) {
+-  CHECK_RESULT(validator_.OnMemory(GetLocation(), *page_limits));
+-  MemoryType memory_type{*page_limits};
++                                          const Limits* page_limits,
++                                          uint32_t page_size) {
++  CHECK_RESULT(validator_.OnMemory(GetLocation(), *page_limits, page_size));
++  MemoryType memory_type{*page_limits, page_size};
+   module_.imports.push_back(ImportDesc{ImportType(
+       std::string(module_name), std::string(field_name), memory_type.Clone())});
+   memory_types_.push_back(memory_type);
+@@ -608,9 +612,11 @@ Result BinaryReaderInterp::OnMemoryCount(Index count) {
+   return Result::Ok;
+ }
+ 
+-Result BinaryReaderInterp::OnMemory(Index index, const Limits* limits) {
+-  CHECK_RESULT(validator_.OnMemory(GetLocation(), *limits));
+-  MemoryType memory_type{*limits};
++Result BinaryReaderInterp::OnMemory(Index index,
++                                    const Limits* limits,
++                                    uint32_t page_size) {
++  CHECK_RESULT(validator_.OnMemory(GetLocation(), *limits, page_size));
++  MemoryType memory_type{*limits, page_size};
+   module_.memories.push_back(MemoryDesc{memory_type});
+   memory_types_.push_back(memory_type);
+   return Result::Ok;
+diff --git a/src/interp/interp-wasm-c-api.cc b/src/interp/interp-wasm-c-api.cc
+index cfa8a89707..bb4598a472 100644
+--- a/src/interp/interp-wasm-c-api.cc
++++ b/src/interp/interp-wasm-c-api.cc
+@@ -160,7 +160,10 @@ struct wasm_tabletype_t : wasm_externtype_t {
+ 
+ struct wasm_memorytype_t : wasm_externtype_t {
+   wasm_memorytype_t(const wasm_limits_t* limits)
+-      : wasm_externtype_t{std::make_unique<MemoryType>(ToWabtLimits(*limits))},
++      : wasm_externtype_t{std::make_unique<MemoryType>(
++            ToWabtLimits(*limits),
++            WABT_DEFAULT_PAGE_SIZE)},  // wasm-c-api doesn't support
++                                       // custom-page-sizes yet
+         limits{*limits} {}
+ 
+   wasm_memorytype_t(MemoryType mt)
+diff --git a/src/interp/interp.cc b/src/interp/interp.cc
+index a3dd9b4a15..f93fa5a687 100644
+--- a/src/interp/interp.cc
++++ b/src/interp/interp.cc
+@@ -136,6 +136,12 @@ std::unique_ptr<ExternType> MemoryType::Clone() const {
+ Result Match(const MemoryType& expected,
+              const MemoryType& actual,
+              std::string* out_msg) {
++  if (expected.page_size != actual.page_size) {
++    *out_msg = StringPrintf(
++        "page_size mismatch in imported memory, expected %u but got %u.",
++        expected.page_size, actual.page_size);
++    return Result::Error;
++  }
+   return Match(expected.limits, actual.limits, out_msg);
+ }
+ 
+@@ -576,7 +582,7 @@ Result Table::Copy(Store& store,
+ //// Memory ////
+ Memory::Memory(class Store&, MemoryType type)
+     : Extern(skind), type_(type), pages_(type.limits.initial) {
+-  data_.resize(pages_ * WABT_PAGE_SIZE);
++  data_.resize(pages_ * type_.page_size);
+ }
+ 
+ void Memory::Mark(class Store&) {}
+@@ -597,7 +603,7 @@ Result Memory::Grow(u64 count) {
+     auto old_size = data_.size();
+ #endif
+     pages_ = new_pages;
+-    data_.resize(new_pages * WABT_PAGE_SIZE);
++    data_.resize(new_pages * type_.page_size);
+ #if WABT_BIG_ENDIAN
+     std::move_backward(data_.begin(), data_.begin() + old_size, data_.end());
+     std::fill(data_.begin(), data_.end() - old_size, 0);
+diff --git a/src/lexer-keywords.txt b/src/lexer-keywords.txt
+index e4fd37d38e..1c72983b91 100644
+--- a/src/lexer-keywords.txt
++++ b/src/lexer-keywords.txt
+@@ -556,6 +556,7 @@ nan:canonical, TokenType::NanCanonical
+ nop, TokenType::Nop, Opcode::Nop
+ offset, TokenType::Offset
+ output, TokenType::Output
++pagesize, TokenType::PageSize
+ param, TokenType::Param
+ ref, TokenType::Ref
+ quote, TokenType::Quote
+diff --git a/src/prebuilt/lexer-keywords.cc b/src/prebuilt/lexer-keywords.cc
+index 32b6951abe..f04fc53734 100644
+--- a/src/prebuilt/lexer-keywords.cc
++++ b/src/prebuilt/lexer-keywords.cc
+@@ -158,7 +158,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ {
+   enum
+     {
+-      TOTAL_KEYWORDS = 596,
++      TOTAL_KEYWORDS = 597,
+       MIN_WORD_LENGTH = 2,
+       MAX_WORD_LENGTH = 35,
+       MIN_HASH_VALUE = 15,
+@@ -224,7 +224,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {"f32x4.lt", TokenType::Compare, Opcode::F32X4Lt},
+ #line 340 "src/lexer-keywords.txt"
+       {"i32x4.lt_u", TokenType::Compare, Opcode::I32X4LtU},
+-#line 567 "src/lexer-keywords.txt"
++#line 568 "src/lexer-keywords.txt"
+       {"result", TokenType::Result},
+ #line 329 "src/lexer-keywords.txt"
+       {"i32x4.gt_s", TokenType::Compare, Opcode::I32X4GtS},
+@@ -258,10 +258,10 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {""},
+ #line 107 "src/lexer-keywords.txt"
+       {"f32x4.ne", TokenType::Compare, Opcode::F32X4Ne},
+-#line 565 "src/lexer-keywords.txt"
++#line 566 "src/lexer-keywords.txt"
+       {"ref.null", TokenType::RefNull, Opcode::RefNull},
+       {""},
+-#line 583 "src/lexer-keywords.txt"
++#line 584 "src/lexer-keywords.txt"
+       {"table", TokenType::Table},
+ #line 347 "src/lexer-keywords.txt"
+       {"i32x4.neg", TokenType::Unary, Opcode::I32X4Neg},
+@@ -281,15 +281,15 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {""}, {""}, {""}, {""},
+ #line 105 "src/lexer-keywords.txt"
+       {"f32x4.nearest", TokenType::Unary, Opcode::F32X4Nearest},
+-#line 571 "src/lexer-keywords.txt"
++#line 572 "src/lexer-keywords.txt"
+       {"return", TokenType::Return, Opcode::Return},
+ #line 91 "src/lexer-keywords.txt"
+       {"f32x4.ceil", TokenType::Unary, Opcode::F32X4Ceil},
+       {""}, {""}, {""},
+-#line 578 "src/lexer-keywords.txt"
++#line 579 "src/lexer-keywords.txt"
+       {"table.get", TokenType::TableGet, Opcode::TableGet},
+       {""},
+-#line 581 "src/lexer-keywords.txt"
++#line 582 "src/lexer-keywords.txt"
+       {"table.set", TokenType::TableSet, Opcode::TableSet},
+       {""},
+ #line 141 "src/lexer-keywords.txt"
+@@ -297,7 +297,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 80 "src/lexer-keywords.txt"
+       {"f32.nearest", TokenType::Unary, Opcode::F32Nearest},
+       {""},
+-#line 575 "src/lexer-keywords.txt"
++#line 576 "src/lexer-keywords.txt"
+       {"struct", Type::Struct, TokenType::Struct},
+ #line 147 "src/lexer-keywords.txt"
+       {"f64.store", TokenType::Store, Opcode::F64Store},
+@@ -348,7 +348,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 346 "src/lexer-keywords.txt"
+       {"i32x4.mul", TokenType::Binary, Opcode::I32X4Mul},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+-#line 562 "src/lexer-keywords.txt"
++#line 563 "src/lexer-keywords.txt"
+       {"ref.extern", TokenType::RefExtern},
+       {""}, {""},
+ #line 451 "src/lexer-keywords.txt"
+@@ -410,7 +410,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 349 "src/lexer-keywords.txt"
+       {"i32x4.relaxed_laneselect", TokenType::Ternary, Opcode::I32X4RelaxedLaneSelect},
+       {""}, {""}, {""}, {""},
+-#line 572 "src/lexer-keywords.txt"
++#line 573 "src/lexer-keywords.txt"
+       {"select", TokenType::Select, Opcode::Select},
+       {""},
+ #line 373 "src/lexer-keywords.txt"
+@@ -519,7 +519,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {"i64.trunc_f32_s", TokenType::Convert, Opcode::I64TruncF32S},
+ #line 310 "src/lexer-keywords.txt"
+       {"i32.trunc_f32_s", TokenType::Convert, Opcode::I32TruncF32S},
+-#line 566 "src/lexer-keywords.txt"
++#line 567 "src/lexer-keywords.txt"
+       {"register", TokenType::Register},
+       {""},
+ #line 429 "src/lexer-keywords.txt"
+@@ -536,7 +536,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 61 "src/lexer-keywords.txt"
+       {"f32.ceil", TokenType::Unary, Opcode::F32Ceil},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+-#line 582 "src/lexer-keywords.txt"
++#line 583 "src/lexer-keywords.txt"
+       {"table.size", TokenType::TableSize, Opcode::TableSize},
+ #line 409 "src/lexer-keywords.txt"
+       {"i64.atomic.store", TokenType::AtomicStore, Opcode::I64AtomicStore},
+@@ -547,7 +547,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 265 "src/lexer-keywords.txt"
+       {"i32.atomic.rmw.or", TokenType::AtomicRmw, Opcode::I32AtomicRmwOr},
+       {""}, {""}, {""}, {""}, {""},
+-#line 570 "src/lexer-keywords.txt"
++#line 571 "src/lexer-keywords.txt"
+       {"return_call", TokenType::ReturnCall, Opcode::ReturnCall},
+       {""}, {""}, {""}, {""}, {""}, {""},
+ #line 389 "src/lexer-keywords.txt"
+@@ -583,9 +583,9 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 88 "src/lexer-keywords.txt"
+       {"f32", Type::F32},
+       {""},
+-#line 580 "src/lexer-keywords.txt"
++#line 581 "src/lexer-keywords.txt"
+       {"table.init", TokenType::TableInit, Opcode::TableInit},
+-#line 586 "src/lexer-keywords.txt"
++#line 587 "src/lexer-keywords.txt"
+       {"try", TokenType::Try, Opcode::Try},
+       {""}, {""},
+ #line 318 "src/lexer-keywords.txt"
+@@ -730,7 +730,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {""}, {""},
+ #line 353 "src/lexer-keywords.txt"
+       {"i32x4.shr_u", TokenType::Binary, Opcode::I32X4ShrU},
+-#line 564 "src/lexer-keywords.txt"
++#line 565 "src/lexer-keywords.txt"
+       {"ref.is_null", TokenType::RefIsNull, Opcode::RefIsNull},
+ #line 352 "src/lexer-keywords.txt"
+       {"i32x4.shr_s", TokenType::Binary, Opcode::I32X4ShrS},
+@@ -756,10 +756,10 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 467 "src/lexer-keywords.txt"
+       {"i64x2.mul", TokenType::Binary, Opcode::I64X2Mul},
+       {""}, {""}, {""}, {""}, {""}, {""},
+-#line 561 "src/lexer-keywords.txt"
++#line 562 "src/lexer-keywords.txt"
+       {"quote", TokenType::Quote},
+       {""}, {""}, {""}, {""},
+-#line 600 "src/lexer-keywords.txt"
++#line 601 "src/lexer-keywords.txt"
+       {"v128", Type::V128},
+       {""},
+ #line 536 "src/lexer-keywords.txt"
+@@ -832,7 +832,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {"i32x4.relaxed_trunc_f32x4_s", TokenType::Unary, Opcode::I32X4RelaxedTruncF32X4S},
+ #line 420 "src/lexer-keywords.txt"
+       {"i64.extend_i32_s", TokenType::Convert, Opcode::I64ExtendI32S},
+-#line 595 "src/lexer-keywords.txt"
++#line 596 "src/lexer-keywords.txt"
+       {"v128.or", TokenType::Binary, Opcode::V128Or},
+       {""},
+ #line 555 "src/lexer-keywords.txt"
+@@ -855,7 +855,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {""},
+ #line 171 "src/lexer-keywords.txt"
+       {"f64x2.relaxed_max", TokenType::Binary, Opcode::F64X2RelaxedMax},
+-#line 599 "src/lexer-keywords.txt"
++#line 600 "src/lexer-keywords.txt"
+       {"v128.store", TokenType::Store, Opcode::V128Store},
+       {""},
+ #line 395 "src/lexer-keywords.txt"
+@@ -867,7 +867,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {""},
+ #line 203 "src/lexer-keywords.txt"
+       {"i16x8.ge_u", TokenType::Compare, Opcode::I16X8GeU},
+-#line 601 "src/lexer-keywords.txt"
++#line 602 "src/lexer-keywords.txt"
+       {"v128.xor", TokenType::Binary, Opcode::V128Xor},
+ #line 207 "src/lexer-keywords.txt"
+       {"i16x8.le_u", TokenType::Compare, Opcode::I16X8LeU},
+@@ -895,24 +895,24 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 523 "src/lexer-keywords.txt"
+       {"i8x16.relaxed_laneselect", TokenType::Ternary, Opcode::I8X16RelaxedLaneSelect},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+-#line 587 "src/lexer-keywords.txt"
++#line 588 "src/lexer-keywords.txt"
+       {"type", TokenType::Type},
+ #line 404 "src/lexer-keywords.txt"
+       {"i64.atomic.rmw.xchg", TokenType::AtomicRmw, Opcode::I64AtomicRmwXchg},
+ #line 267 "src/lexer-keywords.txt"
+       {"i32.atomic.rmw.xchg", TokenType::AtomicRmw, Opcode::I32AtomicRmwXchg},
+       {""},
+-#line 594 "src/lexer-keywords.txt"
++#line 595 "src/lexer-keywords.txt"
+       {"v128.not", TokenType::Unary, Opcode::V128Not},
+       {""}, {""},
+-#line 613 "src/lexer-keywords.txt"
++#line 614 "src/lexer-keywords.txt"
+       {"v128.store64_lane", TokenType::SimdStoreLane, Opcode::V128Store64Lane},
+ #line 219 "src/lexer-keywords.txt"
+       {"i16x8.neg", TokenType::Unary, Opcode::I16X8Neg},
+       {""},
+ #line 221 "src/lexer-keywords.txt"
+       {"i16x8.ne", TokenType::Compare, Opcode::I16X8Ne},
+-#line 606 "src/lexer-keywords.txt"
++#line 607 "src/lexer-keywords.txt"
+       {"v128.load8_lane", TokenType::SimdLoadLane, Opcode::V128Load8Lane},
+ #line 466 "src/lexer-keywords.txt"
+       {"v128.load32x2_u", TokenType::Load, Opcode::V128Load32X2U},
+@@ -934,9 +934,9 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 535 "src/lexer-keywords.txt"
+       {"input", TokenType::Input},
+       {""}, {""},
+-#line 593 "src/lexer-keywords.txt"
++#line 594 "src/lexer-keywords.txt"
+       {"v128.load", TokenType::Load, Opcode::V128Load},
+-#line 605 "src/lexer-keywords.txt"
++#line 606 "src/lexer-keywords.txt"
+       {"v128.load8_splat", TokenType::Load, Opcode::V128Load8Splat},
+       {""},
+ #line 534 "src/lexer-keywords.txt"
+@@ -956,7 +956,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {""}, {""},
+ #line 116 "src/lexer-keywords.txt"
+       {"f32x4.sqrt", TokenType::Unary, Opcode::F32X4Sqrt},
+-#line 569 "src/lexer-keywords.txt"
++#line 570 "src/lexer-keywords.txt"
+       {"return_call_indirect", TokenType::ReturnCallIndirect, Opcode::ReturnCallIndirect},
+       {""}, {""}, {""}, {""}, {""}, {""},
+ #line 397 "src/lexer-keywords.txt"
+@@ -972,7 +972,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 108 "src/lexer-keywords.txt"
+       {"f32x4.pmax", TokenType::Binary, Opcode::F32X4PMax},
+       {""}, {""}, {""}, {""},
+-#line 592 "src/lexer-keywords.txt"
++#line 593 "src/lexer-keywords.txt"
+       {"v128.const", TokenType::Const, Opcode::V128Const},
+ #line 173 "src/lexer-keywords.txt"
+       {"f64x2.relaxed_nmadd", TokenType::Ternary, Opcode::F64X2RelaxedNmadd},
+@@ -980,11 +980,11 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 525 "src/lexer-keywords.txt"
+       {"i8x16.shl", TokenType::Binary, Opcode::I8X16Shl},
+       {""},
+-#line 590 "src/lexer-keywords.txt"
++#line 591 "src/lexer-keywords.txt"
+       {"v128.and", TokenType::Binary, Opcode::V128And},
+ #line 533 "src/lexer-keywords.txt"
+       {"if", TokenType::If, Opcode::If},
+-#line 560 "src/lexer-keywords.txt"
++#line 561 "src/lexer-keywords.txt"
+       {"ref", TokenType::Ref},
+       {""}, {""}, {""},
+ #line 551 "src/lexer-keywords.txt"
+@@ -995,7 +995,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 216 "src/lexer-keywords.txt"
+       {"i16x8.mul", TokenType::Binary, Opcode::I16X8Mul},
+       {""}, {""}, {""}, {""},
+-#line 589 "src/lexer-keywords.txt"
++#line 590 "src/lexer-keywords.txt"
+       {"v128.andnot", TokenType::Binary, Opcode::V128Andnot},
+ #line 51 "src/lexer-keywords.txt"
+       {"else", TokenType::Else, Opcode::Else},
+@@ -1013,10 +1013,10 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 224 "src/lexer-keywords.txt"
+       {"i16x8.replace_lane", TokenType::SimdLaneOp, Opcode::I16X8ReplaceLane},
+       {""}, {""}, {""}, {""}, {""}, {""},
+-#line 584 "src/lexer-keywords.txt"
++#line 585 "src/lexer-keywords.txt"
+       {"then", TokenType::Then},
+       {""},
+-#line 611 "src/lexer-keywords.txt"
++#line 612 "src/lexer-keywords.txt"
+       {"v128.store16_lane", TokenType::SimdStoreLane, Opcode::V128Store16Lane},
+       {""}, {""}, {""}, {""},
+ #line 163 "src/lexer-keywords.txt"
+@@ -1087,7 +1087,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 230 "src/lexer-keywords.txt"
+       {"i16x8.sub_sat_u", TokenType::Binary, Opcode::I16X8SubSatU},
+       {""},
+-#line 576 "src/lexer-keywords.txt"
++#line 577 "src/lexer-keywords.txt"
+       {"table.copy", TokenType::TableCopy, Opcode::TableCopy},
+       {""},
+ #line 229 "src/lexer-keywords.txt"
+@@ -1096,7 +1096,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 522 "src/lexer-keywords.txt"
+       {"i8x16.relaxed_swizzle", TokenType::Binary, Opcode::I8X16RelaxedSwizzle},
+       {""}, {""},
+-#line 603 "src/lexer-keywords.txt"
++#line 604 "src/lexer-keywords.txt"
+       {"v128.load32_splat", TokenType::Load, Opcode::V128Load32Splat},
+       {""}, {""}, {""}, {""}, {""},
+ #line 486 "src/lexer-keywords.txt"
+@@ -1104,13 +1104,13 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {""},
+ #line 485 "src/lexer-keywords.txt"
+       {"i64x2.shr_s", TokenType::Binary, Opcode::I64X2ShrS},
+-#line 610 "src/lexer-keywords.txt"
++#line 611 "src/lexer-keywords.txt"
+       {"v128.store8_lane", TokenType::SimdStoreLane, Opcode::V128Store8Lane},
+       {""},
+ #line 183 "src/lexer-keywords.txt"
+       {"field", TokenType::Field},
+       {""},
+-#line 608 "src/lexer-keywords.txt"
++#line 609 "src/lexer-keywords.txt"
+       {"v128.load32_lane", TokenType::SimdLoadLane, Opcode::V128Load32Lane},
+       {""}, {""},
+ #line 21 "src/lexer-keywords.txt"
+@@ -1122,7 +1122,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {"f64.floor", TokenType::Unary, Opcode::F64Floor},
+ #line 71 "src/lexer-keywords.txt"
+       {"f32.floor", TokenType::Unary, Opcode::F32Floor},
+-#line 559 "src/lexer-keywords.txt"
++#line 560 "src/lexer-keywords.txt"
+       {"param", TokenType::Param},
+       {""},
+ #line 549 "src/lexer-keywords.txt"
+@@ -1131,19 +1131,19 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 117 "src/lexer-keywords.txt"
+       {"f32x4.sub", TokenType::Binary, Opcode::F32X4Sub},
+       {""}, {""}, {""}, {""},
+-#line 597 "src/lexer-keywords.txt"
++#line 598 "src/lexer-keywords.txt"
+       {"v128.load32_zero", TokenType::Load, Opcode::V128Load32Zero},
+ #line 355 "src/lexer-keywords.txt"
+       {"i32x4.sub", TokenType::Binary, Opcode::I32X4Sub},
+       {""}, {""}, {""},
+-#line 563 "src/lexer-keywords.txt"
++#line 564 "src/lexer-keywords.txt"
+       {"ref.func", TokenType::RefFunc, Opcode::RefFunc},
+       {""},
+ #line 121 "src/lexer-keywords.txt"
+       {"f64.abs", TokenType::Unary, Opcode::F64Abs},
+ #line 59 "src/lexer-keywords.txt"
+       {"f32.abs", TokenType::Unary, Opcode::F32Abs},
+-#line 574 "src/lexer-keywords.txt"
++#line 575 "src/lexer-keywords.txt"
+       {"start", TokenType::Start},
+ #line 449 "src/lexer-keywords.txt"
+       {"i64.store16", TokenType::Store, Opcode::I64Store16},
+@@ -1161,7 +1161,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 526 "src/lexer-keywords.txt"
+       {"i8x16.shr_s", TokenType::Binary, Opcode::I8X16ShrS},
+       {""}, {""}, {""},
+-#line 596 "src/lexer-keywords.txt"
++#line 597 "src/lexer-keywords.txt"
+       {"v128.any_true", TokenType::Unary, Opcode::V128AnyTrue},
+       {""}, {""}, {""}, {""}, {""}, {""},
+ #line 193 "src/lexer-keywords.txt"
+@@ -1182,7 +1182,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+       {"i16x8.max_s", TokenType::Binary, Opcode::I16X8MaxS},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+       {""}, {""}, {""}, {""},
+-#line 604 "src/lexer-keywords.txt"
++#line 605 "src/lexer-keywords.txt"
+       {"v128.load64_splat", TokenType::Load, Opcode::V128Load64Splat},
+       {""}, {""}, {""},
+ #line 375 "src/lexer-keywords.txt"
+@@ -1190,7 +1190,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 34 "src/lexer-keywords.txt"
+       {"br_table", TokenType::BrTable, Opcode::BrTable},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""},
+-#line 609 "src/lexer-keywords.txt"
++#line 610 "src/lexer-keywords.txt"
+       {"v128.load64_lane", TokenType::SimdLoadLane, Opcode::V128Load64Lane},
+ #line 94 "src/lexer-keywords.txt"
+       {"f32x4.div", TokenType::Binary, Opcode::F32X4Div},
+@@ -1217,10 +1217,10 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 528 "src/lexer-keywords.txt"
+       {"i8x16.splat", TokenType::Unary, Opcode::I8X16Splat},
+       {""}, {""},
+-#line 598 "src/lexer-keywords.txt"
++#line 599 "src/lexer-keywords.txt"
+       {"v128.load64_zero", TokenType::Load, Opcode::V128Load64Zero},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+-#line 585 "src/lexer-keywords.txt"
++#line 586 "src/lexer-keywords.txt"
+       {"throw", TokenType::Throw, Opcode::Throw},
+       {""},
+ #line 68 "src/lexer-keywords.txt"
+@@ -1234,15 +1234,15 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 47 "src/lexer-keywords.txt"
+       {"drop", TokenType::Drop, Opcode::Drop},
+       {""}, {""}, {""},
+-#line 612 "src/lexer-keywords.txt"
++#line 613 "src/lexer-keywords.txt"
+       {"v128.store32_lane", TokenType::SimdStoreLane, Opcode::V128Store32Lane},
+       {""}, {""}, {""}, {""}, {""},
+-#line 573 "src/lexer-keywords.txt"
++#line 574 "src/lexer-keywords.txt"
+       {"shared", TokenType::Shared},
+-#line 615 "src/lexer-keywords.txt"
++#line 616 "src/lexer-keywords.txt"
+       {"i8x16.swizzle", TokenType::Binary, Opcode::I8X16Swizzle},
+       {""}, {""}, {""}, {""},
+-#line 577 "src/lexer-keywords.txt"
++#line 578 "src/lexer-keywords.txt"
+       {"table.fill", TokenType::TableFill, Opcode::TableFill},
+       {""}, {""}, {""}, {""}, {""}, {""},
+ #line 394 "src/lexer-keywords.txt"
+@@ -1252,7 +1252,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 119 "src/lexer-keywords.txt"
+       {"f32x4.demote_f64x2_zero", TokenType::Unary, Opcode::F32X4DemoteF64X2Zero},
+       {""}, {""}, {""},
+-#line 588 "src/lexer-keywords.txt"
++#line 589 "src/lexer-keywords.txt"
+       {"unreachable", TokenType::Unreachable, Opcode::Unreachable},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+       {""}, {""}, {""}, {""}, {""},
+@@ -1286,10 +1286,10 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 251 "src/lexer-keywords.txt"
+       {"i32.atomic.rmw16.or_u", TokenType::AtomicRmw, Opcode::I32AtomicRmw16OrU},
+       {""}, {""}, {""}, {""}, {""}, {""},
+-#line 568 "src/lexer-keywords.txt"
++#line 569 "src/lexer-keywords.txt"
+       {"rethrow", TokenType::Rethrow, Opcode::Rethrow},
+       {""}, {""}, {""},
+-#line 579 "src/lexer-keywords.txt"
++#line 580 "src/lexer-keywords.txt"
+       {"table.grow", TokenType::TableGrow, Opcode::TableGrow},
+ #line 345 "src/lexer-keywords.txt"
+       {"i32x4.dot_i16x8_s", TokenType::Binary, Opcode::I32X4DotI16X8S},
+@@ -1375,8 +1375,10 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 297 "src/lexer-keywords.txt"
+       {"i32.popcnt", TokenType::Unary, Opcode::I32Popcnt},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+-      {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+-      {""}, {""},
++      {""}, {""}, {""}, {""},
++#line 559 "src/lexer-keywords.txt"
++      {"pagesize", TokenType::PageSize},
++      {""}, {""}, {""}, {""}, {""}, {""},
+ #line 556 "src/lexer-keywords.txt"
+       {"nop", TokenType::Nop, Opcode::Nop},
+       {""}, {""},
+@@ -1520,7 +1522,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 479 "src/lexer-keywords.txt"
+       {"i64x2.extend_high_i32x4_s", TokenType::Unary, Opcode::I64X2ExtendHighI32X4S},
+       {""},
+-#line 614 "src/lexer-keywords.txt"
++#line 615 "src/lexer-keywords.txt"
+       {"i8x16.shuffle", TokenType::SimdShuffleOp, Opcode::I8X16Shuffle},
+ #line 380 "src/lexer-keywords.txt"
+       {"i64.atomic.rmw16.cmpxchg_u", TokenType::AtomicRmwCmpxchg, Opcode::I64AtomicRmw16CmpxchgU},
+@@ -1567,7 +1569,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 184 "src/lexer-keywords.txt"
+       {"funcref", Type::FuncRef},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+-#line 602 "src/lexer-keywords.txt"
++#line 603 "src/lexer-keywords.txt"
+       {"v128.load16_splat", TokenType::Load, Opcode::V128Load16Splat},
+       {""}, {""}, {""}, {""}, {""},
+ #line 368 "src/lexer-keywords.txt"
+@@ -1576,7 +1578,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 367 "src/lexer-keywords.txt"
+       {"i32x4.extend_low_i16x8_s", TokenType::Unary, Opcode::I32X4ExtendLowI16X8S},
+       {""}, {""}, {""}, {""},
+-#line 607 "src/lexer-keywords.txt"
++#line 608 "src/lexer-keywords.txt"
+       {"v128.load16_lane", TokenType::SimdLoadLane, Opcode::V128Load16Lane},
+       {""}, {""}, {""}, {""}, {""}, {""},
+ #line 50 "src/lexer-keywords.txt"
+@@ -1617,7 +1619,7 @@ Perfect_Hash::InWordSet (const char *str, size_t len)
+ #line 27 "src/lexer-keywords.txt"
+       {"assert_trap", TokenType::AssertTrap},
+       {""}, {""}, {""}, {""},
+-#line 591 "src/lexer-keywords.txt"
++#line 592 "src/lexer-keywords.txt"
+       {"v128.bitselect", TokenType::Ternary, Opcode::V128BitSelect},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+       {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""}, {""},
+diff --git a/src/shared-validator.cc b/src/shared-validator.cc
+index 914b534643..6492cbebda 100644
+--- a/src/shared-validator.cc
++++ b/src/shared-validator.cc
+@@ -134,13 +134,25 @@ Result SharedValidator::OnTable(const Location& loc,
+   return result;
+ }
+ 
+-Result SharedValidator::OnMemory(const Location& loc, const Limits& limits) {
++Result SharedValidator::OnMemory(const Location& loc,
++                                 const Limits& limits,
++                                 uint32_t page_size) {
+   Result result = Result::Ok;
+   if (memories_.size() > 0 && !options_.features.multi_memory_enabled()) {
+     result |= PrintError(loc, "only one memory block allowed");
+   }
+-  result |= CheckLimits(
+-      loc, limits, limits.is_64 ? WABT_MAX_PAGES64 : WABT_MAX_PAGES32, "pages");
++
++  if (page_size != WABT_DEFAULT_PAGE_SIZE) {
++    if (!options_.features.custom_page_sizes_enabled()) {
++      result |= PrintError(loc, "only default page size (64 KiB) is allowed");
++    } else if (page_size != 1) {
++      result |= PrintError(loc, "only page sizes of 1 B or 64 KiB are allowed");
++    }
++  }
++
++  uint64_t absolute_max = WABT_BYTES_TO_MIN_PAGES(
++      (limits.is_64 ? UINT64_MAX : UINT32_MAX), page_size);
++  result |= CheckLimits(loc, limits, absolute_max, "pages");
+ 
+   if (limits.is_shared) {
+     if (!options_.features.threads_enabled()) {
+diff --git a/src/test-interp.cc b/src/test-interp.cc
+index 614eed3362..9346b7b166 100644
+--- a/src/test-interp.cc
++++ b/src/test-interp.cc
+@@ -491,7 +491,8 @@ TEST_F(InterpTest, Rot13) {
+ 
+   std::string string_data = "Hello, WebAssembly!";
+ 
+-  auto memory = Memory::New(store_, MemoryType{Limits{1}});
++  auto memory =
++      Memory::New(store_, MemoryType{Limits{1}, WABT_DEFAULT_PAGE_SIZE});
+ 
+   auto fill_buf = [&](Thread& thread, const Values& params, Values& results,
+                       Trap::Ptr* out_trap) -> Result {
+@@ -659,7 +660,7 @@ TEST_F(InterpGCTest, Collect_InstanceImport) {
+                          [](Thread& thread, const Values&, Values&,
+                             Trap::Ptr*) -> Result { return Result::Ok; });
+   auto t = Table::New(store_, TableType{ValueType::FuncRef, Limits{0}});
+-  auto m = Memory::New(store_, MemoryType{Limits{0}});
++  auto m = Memory::New(store_, MemoryType{Limits{0}, WABT_DEFAULT_PAGE_SIZE});
+   auto g = Global::New(store_, GlobalType{ValueType::I32, Mutability::Const},
+                        Value::Make(5));
+ 
+diff --git a/src/tools/spectest-interp.cc b/src/tools/spectest-interp.cc
+index 2dd4202baf..d859f14823 100644
+--- a/src/tools/spectest-interp.cc
++++ b/src/tools/spectest-interp.cc
+@@ -1313,7 +1313,8 @@ CommandRunner::CommandRunner() : store_(s_features) {
+   spectest["table64"] = interp::Table::New(
+       store_, TableType{ValueType::FuncRef, Limits{10, 20, false, true}});
+ 
+-  spectest["memory"] = interp::Memory::New(store_, MemoryType{Limits{1, 2}});
++  spectest["memory"] = interp::Memory::New(
++      store_, MemoryType{Limits{1, 2}, WABT_DEFAULT_PAGE_SIZE});
+ 
+   spectest["global_i32"] =
+       interp::Global::New(store_, GlobalType{ValueType::I32, Mutability::Const},
+diff --git a/src/validator.cc b/src/validator.cc
+index 980618c848..71c784117a 100644
+--- a/src/validator.cc
++++ b/src/validator.cc
+@@ -732,7 +732,8 @@ Result Validator::CheckModule() {
+ 
+         case ExternalKind::Memory: {
+           auto&& memory = cast<MemoryImport>(f->import.get())->memory;
+-          result_ |= validator_.OnMemory(field.loc, memory.page_limits);
++          result_ |= validator_.OnMemory(field.loc, memory.page_limits,
++                                         memory.page_size);
+           break;
+         }
+ 
+@@ -772,7 +773,8 @@ Result Validator::CheckModule() {
+   // Memory section.
+   for (const ModuleField& field : module->fields) {
+     if (auto* f = dyn_cast<MemoryModuleField>(&field)) {
+-      result_ |= validator_.OnMemory(field.loc, f->memory.page_limits);
++      result_ |= validator_.OnMemory(field.loc, f->memory.page_limits,
++                                     f->memory.page_size);
+     }
+   }
+ 
+diff --git a/src/wast-parser.cc b/src/wast-parser.cc
+index eb67dcebae..e3606b7c7a 100644
+--- a/src/wast-parser.cc
++++ b/src/wast-parser.cc
+@@ -1146,6 +1146,37 @@ Result WastParser::ParseLimits(Limits* out_limits) {
+   return Result::Ok;
+ }
+ 
++Result WastParser::ParsePageSize(uint32_t* out_page_size) {
++  WABT_TRACE(ParsePageSize);
++
++  Result result = Result::Ok;
++
++  if (PeekMatchLpar(TokenType::PageSize)) {
++    if (!options_->features.custom_page_sizes_enabled()) {
++      Error(GetLocation(), "Specifying memory page size is not allowed");
++      return Result::Error;
++    }
++    EXPECT(Lpar);
++    EXPECT(PageSize);
++    auto token = GetToken();
++    if (!token.HasLiteral()) {
++      Error(GetLocation(), "malformed custom page size");
++      return Result::Error;
++    }
++    auto sv = token.literal().text;
++    result |= ParseInt32(sv, out_page_size, ParseIntType::UnsignedOnly);
++    if (*out_page_size > UINT32_MAX || *out_page_size <= 0 ||
++        (*out_page_size & (*out_page_size - 1))) {
++      Error(GetLocation(), "malformed custom page size");
++      return Result::Error;
++    }
++    Consume();
++    EXPECT(Rpar);
++  }
++
++  return result;
++}
++
+ Result WastParser::ParseNat(uint64_t* out_nat, bool is_64) {
+   WABT_TRACE(ParseNat);
+   if (!PeekMatch(TokenType::Nat)) {
+@@ -1674,8 +1705,10 @@ Result WastParser::ParseImportModuleField(Module* module) {
+       Consume();
+       ParseBindVarOpt(&name);
+       auto import = std::make_unique<MemoryImport>(name);
++      import->memory.page_size = WABT_DEFAULT_PAGE_SIZE;
+       CHECK_RESULT(ParseLimitsIndex(&import->memory.page_limits));
+       CHECK_RESULT(ParseLimits(&import->memory.page_limits));
++      CHECK_RESULT(ParsePageSize(&import->memory.page_size));
+       EXPECT(Rpar);
+       field = std::make_unique<ImportModuleField>(std::move(import), loc);
+       break;
+@@ -1728,15 +1761,26 @@ Result WastParser::ParseMemoryModuleField(Module* module) {
+   if (PeekMatchLpar(TokenType::Import)) {
+     CheckImportOrdering(module);
+     auto import = std::make_unique<MemoryImport>(name);
++    import->memory.page_size = WABT_DEFAULT_PAGE_SIZE;
+     CHECK_RESULT(ParseInlineImport(import.get()));
+     CHECK_RESULT(ParseLimitsIndex(&import->memory.page_limits));
+     CHECK_RESULT(ParseLimits(&import->memory.page_limits));
++    CHECK_RESULT(ParsePageSize(&import->memory.page_size));
+     auto field =
+         std::make_unique<ImportModuleField>(std::move(import), GetLocation());
+     module->AppendField(std::move(field));
+   } else {
+     auto field = std::make_unique<MemoryModuleField>(loc, name);
++    field->memory.page_size = WABT_DEFAULT_PAGE_SIZE;
+     CHECK_RESULT(ParseLimitsIndex(&field->memory.page_limits));
++    if (PeekMatchLpar(TokenType::PageSize)) {
++      // this is the data abbreviation (no limits)
++      CHECK_RESULT(ParsePageSize(&field->memory.page_size));
++      if (!PeekMatchLpar(TokenType::Data)) {
++        ConsumeIfLpar();
++        return ErrorExpected({"inline data segment"});
++      }
++    }
+     if (MatchLpar(TokenType::Data)) {
+       auto data_segment_field = std::make_unique<DataSegmentModuleField>(loc);
+       DataSegment& data_segment = data_segment_field->data_segment;
+@@ -1747,16 +1791,17 @@ Result WastParser::ParseMemoryModuleField(Module* module) {
+       ParseTextListOpt(&data_segment.data);
+       EXPECT(Rpar);
+ 
+-      uint32_t byte_size = WABT_ALIGN_UP_TO_PAGE(data_segment.data.size());
+-      uint32_t page_size = WABT_BYTES_TO_PAGES(byte_size);
+-      field->memory.page_limits.initial = page_size;
+-      field->memory.page_limits.max = page_size;
++      uint32_t num_pages = WABT_BYTES_TO_MIN_PAGES(data_segment.data.size(),
++                                                   field->memory.page_size);
++      field->memory.page_limits.initial = num_pages;
++      field->memory.page_limits.max = num_pages;
+       field->memory.page_limits.has_max = true;
+ 
+       module->AppendField(std::move(field));
+       module->AppendField(std::move(data_segment_field));
+     } else {
+       CHECK_RESULT(ParseLimits(&field->memory.page_limits));
++      CHECK_RESULT(ParsePageSize(&field->memory.page_size));
+       module->AppendField(std::move(field));
+     }
+   }
+diff --git a/src/wat-writer.cc b/src/wat-writer.cc
+index b458eca1a2..a013717ac5 100644
+--- a/src/wat-writer.cc
++++ b/src/wat-writer.cc
+@@ -1496,6 +1496,11 @@ void WatWriter::WriteMemory(const Memory& memory) {
+   WriteInlineExports(ExternalKind::Memory, memory_index_);
+   WriteInlineImport(ExternalKind::Memory, memory_index_);
+   WriteLimits(memory.page_limits);
++  if (memory.page_size != WABT_DEFAULT_PAGE_SIZE) {
++    WriteOpenSpace("pagesize");
++    Writef("%u", memory.page_size);
++    WriteCloseSpace();
++  }
+   WriteCloseNewline();
+   memory_index_++;
+ }
+diff --git a/test/binary/bad-memory-limits-flag.txt b/test/binary/bad-memory-limits-flag.txt
+index 3e8922b8b5..7c413f599a 100644
+--- a/test/binary/bad-memory-limits-flag.txt
++++ b/test/binary/bad-memory-limits-flag.txt
+@@ -3,9 +3,9 @@ magic
+ version
+ section(MEMORY) {
+   count[1]
+-  flags[8]
++  flags[16]
+ }
+ (;; STDERR ;;;
+-000000c: error: malformed memory limits flag: 8
+-000000c: error: malformed memory limits flag: 8
++000000c: error: malformed memory limits flag: 16
++000000c: error: malformed memory limits flag: 16
+ ;;; STDERR ;;)
+diff --git a/test/help/spectest-interp.txt b/test/help/spectest-interp.txt
+index 0bbeb97bd3..3fc0e6d7c5 100644
+--- a/test/help/spectest-interp.txt
++++ b/test/help/spectest-interp.txt
+@@ -31,6 +31,7 @@ options:
+       --enable-multi-memory                    Enable Multi-memory
+       --enable-extended-const                  Enable Extended constant expressions
+       --enable-relaxed-simd                    Enable Relaxed SIMD
++      --enable-custom-page-sizes               Enable Custom page sizes
+       --enable-all                             Enable all features
+   -V, --value-stack-size=SIZE                  Size in elements of the value stack
+   -C, --call-stack-size=SIZE                   Size in elements of the call stack
+diff --git a/test/help/wasm-interp.txt b/test/help/wasm-interp.txt
+index f0199d0a3f..800532e660 100644
+--- a/test/help/wasm-interp.txt
++++ b/test/help/wasm-interp.txt
+@@ -45,6 +45,7 @@ options:
+       --enable-multi-memory                    Enable Multi-memory
+       --enable-extended-const                  Enable Extended constant expressions
+       --enable-relaxed-simd                    Enable Relaxed SIMD
++      --enable-custom-page-sizes               Enable Custom page sizes
+       --enable-all                             Enable all features
+   -V, --value-stack-size=SIZE                  Size in elements of the value stack
+   -C, --call-stack-size=SIZE                   Size in elements of the call stack
+diff --git a/test/help/wasm-stats.txt b/test/help/wasm-stats.txt
+index fb3b758342..5e83b1e32f 100644
+--- a/test/help/wasm-stats.txt
++++ b/test/help/wasm-stats.txt
+@@ -31,6 +31,7 @@ options:
+       --enable-multi-memory                    Enable Multi-memory
+       --enable-extended-const                  Enable Extended constant expressions
+       --enable-relaxed-simd                    Enable Relaxed SIMD
++      --enable-custom-page-sizes               Enable Custom page sizes
+       --enable-all                             Enable all features
+   -o, --output=FILENAME                        Output file for the stats, by default use stdout
+   -c, --cutoff=N                               Cutoff for reporting counts less than N
+diff --git a/test/help/wasm-validate.txt b/test/help/wasm-validate.txt
+index 8e3de11bc1..1b4b424b39 100644
+--- a/test/help/wasm-validate.txt
++++ b/test/help/wasm-validate.txt
+@@ -31,6 +31,7 @@ options:
+       --enable-multi-memory                    Enable Multi-memory
+       --enable-extended-const                  Enable Extended constant expressions
+       --enable-relaxed-simd                    Enable Relaxed SIMD
++      --enable-custom-page-sizes               Enable Custom page sizes
+       --enable-all                             Enable all features
+       --no-debug-names                         Ignore debug names in the binary file
+       --ignore-custom-section-errors           Ignore errors in custom sections
+diff --git a/test/help/wasm2wat.txt b/test/help/wasm2wat.txt
+index 39f7ae35fe..f2b2f5c88f 100644
+--- a/test/help/wasm2wat.txt
++++ b/test/help/wasm2wat.txt
+@@ -37,6 +37,7 @@ options:
+       --enable-multi-memory                    Enable Multi-memory
+       --enable-extended-const                  Enable Extended constant expressions
+       --enable-relaxed-simd                    Enable Relaxed SIMD
++      --enable-custom-page-sizes               Enable Custom page sizes
+       --enable-all                             Enable all features
+       --inline-exports                         Write all exports inline
+       --inline-imports                         Write all imports inline
+diff --git a/test/help/wast2json.txt b/test/help/wast2json.txt
+index d6888fc245..1dbb9c54d6 100644
+--- a/test/help/wast2json.txt
++++ b/test/help/wast2json.txt
+@@ -34,6 +34,7 @@ options:
+       --enable-multi-memory                    Enable Multi-memory
+       --enable-extended-const                  Enable Extended constant expressions
+       --enable-relaxed-simd                    Enable Relaxed SIMD
++      --enable-custom-page-sizes               Enable Custom page sizes
+       --enable-all                             Enable all features
+   -o, --output=FILE                            output JSON file
+   -r, --relocatable                            Create a relocatable wasm binary (suitable for linking with e.g. lld)
+diff --git a/test/help/wat-desugar.txt b/test/help/wat-desugar.txt
+index 5d84034f9e..2560ed7585 100644
+--- a/test/help/wat-desugar.txt
++++ b/test/help/wat-desugar.txt
+@@ -41,6 +41,7 @@ options:
+       --enable-multi-memory                    Enable Multi-memory
+       --enable-extended-const                  Enable Extended constant expressions
+       --enable-relaxed-simd                    Enable Relaxed SIMD
++      --enable-custom-page-sizes               Enable Custom page sizes
+       --enable-all                             Enable all features
+       --generate-names                         Give auto-generated names to non-named functions, types, etc.
+ ;;; STDOUT ;;)
+diff --git a/test/help/wat2wasm.txt b/test/help/wat2wasm.txt
+index 31ca9714a4..19b3d5d15e 100644
+--- a/test/help/wat2wasm.txt
++++ b/test/help/wat2wasm.txt
+@@ -41,6 +41,7 @@ options:
+       --enable-multi-memory                    Enable Multi-memory
+       --enable-extended-const                  Enable Extended constant expressions
+       --enable-relaxed-simd                    Enable Relaxed SIMD
++      --enable-custom-page-sizes               Enable Custom page sizes
+       --enable-all                             Enable all features
+   -o, --output=FILE                            Output wasm binary file. Use "-" to write to stdout.
+   -r, --relocatable                            Create a relocatable wasm binary (suitable for linking with e.g. lld)
+diff --git a/test/interp/custom-page-sizes.txt b/test/interp/custom-page-sizes.txt
+new file mode 100644
+index 0000000000..2f1692cae9
+--- /dev/null
++++ b/test/interp/custom-page-sizes.txt
+@@ -0,0 +1,131 @@
++;;; TOOL: run-interp-spec
++;;; ARGS*: --enable-custom-page-sizes --enable-memory64
++
++;; Page size of zero is malformed
++(assert_malformed
++  (module quote "(memory 0 (pagesize 0))")
++  "invalid custom page size")
++
++;; Maximum memory sizes with pagesize 1 and 65536
++;; These are valid but would instantiate a huge memory,
++;; so test with `assert_unlinkable`.
++
++;; i32 (pagesize 1)
++(assert_unlinkable
++  (module
++    (import "test" "unknown" (func))
++    (memory 0xFFFF_FFFF (pagesize 1)))
++  "unknown import")
++
++;; i64 (pagesize 1)
++(assert_unlinkable
++  (module
++    (import "test" "import" (func))
++    (memory i64 0xFFFF_FFFF_FFFF_FFFF (pagesize 1)))
++  "unknown import")
++
++;; i32 (default pagesize)
++(assert_unlinkable
++  (module
++    (import "test" "unknown" (func))
++    (memory 65536 (pagesize 65536)))
++  "unknown import")
++
++;; i64 (default pagesize)
++(assert_unlinkable
++  (module
++    (import "test" "unknown" (func))
++    (memory i64 0x1_0000_0000_0000 (pagesize 65536)))
++  "unknown import")
++
++;; Memory size just over the maximum.
++;;
++;; These are malformed (for pagesize 1)
++;; or invalid (for other pagesizes).
++
++;; i32 (pagesize 1)
++(assert_malformed
++  (module quote "(memory 0x1_0000_0000 (pagesize 1))")
++  "constant out of range")
++
++;; i64 (pagesize 1)
++(assert_malformed
++  (module quote "(memory i64 0x1_0000_0000_0000_0000 (pagesize 1))")
++  "constant out of range")
++
++;; i32 (default pagesize)
++(assert_invalid
++  (module
++    (memory 65537 (pagesize 65536)))
++  "memory size must be at most")
++
++;; i64 (default pagesize)
++(assert_invalid
++  (module
++    (memory i64 0x1_0000_0000_0001 (pagesize 65536)))
++  "memory size must be at most")
++
++;; Test data abbreviation syntax
++
++(assert_malformed (module quote "(memory (pagesize 0) (data))") "invalid custom page size")
++
++(module
++  (memory (pagesize 1) (data "xyz"))
++  (func (export "size") (result i32)
++    memory.size)
++  (func (export "grow") (param i32) (result i32)
++    (memory.grow (local.get 0)))
++  (func (export "load") (param i32) (result i32)
++    (i32.load8_u (local.get 0))))
++
++(assert_return (invoke "size") (i32.const 3))
++(assert_return (invoke "load" (i32.const 0)) (i32.const 120))
++(assert_return (invoke "load" (i32.const 1)) (i32.const 121))
++(assert_return (invoke "load" (i32.const 2)) (i32.const 122))
++(assert_trap (invoke "load" (i32.const 3)) "out of bounds")
++(assert_return (invoke "grow" (i32.const 1)) (i32.const -1))
++
++(module
++  (memory (pagesize 65536) (data "xyz"))
++  (func (export "size") (result i32)
++        memory.size))
++
++(assert_return (invoke "size") (i32.const 1))
++
++(;; STDOUT ;;;
++out/test/interp/custom-page-sizes.txt:6: assert_malformed passed:
++  out/test/interp/custom-page-sizes/custom-page-sizes.0.wat:1:21: error: malformed custom page size
++  (memory 0 (pagesize 0))
++                      ^
++out/test/interp/custom-page-sizes.txt:15: assert_unlinkable passed:
++  error: invalid import "test.unknown"
++out/test/interp/custom-page-sizes.txt:22: assert_unlinkable passed:
++  error: invalid import "test.import"
++out/test/interp/custom-page-sizes.txt:29: assert_unlinkable passed:
++  error: invalid import "test.unknown"
++out/test/interp/custom-page-sizes.txt:36: assert_unlinkable passed:
++  error: invalid import "test.unknown"
++out/test/interp/custom-page-sizes.txt:48: assert_malformed passed:
++  out/test/interp/custom-page-sizes/custom-page-sizes.5.wat:1:9: error: invalid int "0x1_0000_0000"
++  (memory 0x1_0000_0000 (pagesize 1))
++          ^^^^^^^^^^^^^
++out/test/interp/custom-page-sizes.txt:53: assert_malformed passed:
++  out/test/interp/custom-page-sizes/custom-page-sizes.6.wat:1:13: error: invalid int "0x1_0000_0000_0000_0000"
++  (memory i64 0x1_0000_0000_0000_0000 (pagesize 1))
++              ^^^^^^^^^^^^^^^^^^^^^^^
++out/test/interp/custom-page-sizes.txt:58: assert_invalid passed:
++  out/test/interp/custom-page-sizes/custom-page-sizes.7.wasm:000000f: error: initial pages (65537) must be <= (65536)
++  000000f: error: OnMemory callback failed
++out/test/interp/custom-page-sizes.txt:64: assert_invalid passed:
++  out/test/interp/custom-page-sizes/custom-page-sizes.8.wasm:0000013: error: initial pages (281474976710657) must be <= (281474976710656)
++  0000013: error: OnMemory callback failed
++out/test/interp/custom-page-sizes.txt:70: assert_malformed passed:
++  out/test/interp/custom-page-sizes/custom-page-sizes.9.wat:1:19: error: malformed custom page size
++  (memory (pagesize 0) (data))
++                    ^
++  out/test/interp/custom-page-sizes/custom-page-sizes.9.wat:1:28: error: unexpected token ), expected EOF.
++  (memory (pagesize 0) (data))
++                             ^
++out/test/interp/custom-page-sizes.txt:85: assert_trap passed: out of bounds memory access: access at 3+1 >= max value 3
++19/19 tests passed.
++;;; STDOUT ;;)
+diff --git a/test/roundtrip/custom-page-sizes.txt b/test/roundtrip/custom-page-sizes.txt
+new file mode 100644
+index 0000000000..8aef13165d
+--- /dev/null
++++ b/test/roundtrip/custom-page-sizes.txt
+@@ -0,0 +1,91 @@
++;;; TOOL: run-roundtrip
++;;; ARGS*: --stdout --enable-custom-page-sizes --enable-multi-memory --enable-memory64 --debug-names
++(module
++  (import "n" "mem2" (memory 23 (pagesize 1)))
++  (import "o" "mem3" (memory 24 25 (pagesize 1)))
++  (import "n" "mem2" (memory 23 (pagesize 65536)))
++  (import "o" "mem3" (memory 24 25 (pagesize 65536)))
++  (import "n" "mem2" (memory $g i64 23 (pagesize 1)))
++  (import "o" "mem3" (memory $h i64 24 25 (pagesize 1)))
++  (import "n" "mem2" (memory i64 23 (pagesize 65536)))
++  (import "o" "mem3" (memory i64 24 25 (pagesize 65536)))
++
++  (memory (import "m" "mem1") 107 (pagesize 1))
++  (memory (import "m" "mem1") 107 (pagesize 65536))
++  (memory $c (import "m" "mem1") i64 107 (pagesize 1))
++  (memory (import "m" "mem1") i64 107 (pagesize 65536))
++
++  (memory 57 (pagesize 1))
++  (memory 73 92 (pagesize 1))
++  (memory (pagesize 1) (data))
++  (memory (pagesize 1) (data "xyz"))
++  (memory 57 (pagesize 65536))
++  (memory 73 92 (pagesize 65536))
++  (memory (pagesize 65536) (data))
++  (memory (pagesize 65536) (data "xyz"))
++  (memory $a i64 57 (pagesize 1))
++  (memory $b i64 73 92 (pagesize 1))
++  (memory $d i64 (pagesize 1) (data))
++  (memory $e i64 (pagesize 1) (data "xyz"))
++  (memory $k i64 (data))
++  (memory $i i64 (pagesize 65536) (data))
++  (memory $j i64 (pagesize 65536) (data "xyz"))
++  (memory i64 57 (pagesize 65536))
++  (memory i64 73 92 (pagesize 65536))
++  (memory i64 (pagesize 65536) (data))
++  (memory i64 (pagesize 65536) (data "xyz"))
++
++  (memory 0xFFFF_FFFF (pagesize 1))
++  (memory i64 0xFFFF_FFFF_FFFF_FFFF (pagesize 1))
++  (memory 0x10000 (pagesize 0x10000))
++  (memory i64 0x1_0000_0000_0000 (pagesize 0x10000))
++)
++(;; STDOUT ;;;
++(module
++  (import "n" "mem2" (memory (;0;) 23 (pagesize 1)))
++  (import "o" "mem3" (memory (;1;) 24 25 (pagesize 1)))
++  (import "n" "mem2" (memory (;2;) 23))
++  (import "o" "mem3" (memory (;3;) 24 25))
++  (import "n" "mem2" (memory $g i64 23 (pagesize 1)))
++  (import "o" "mem3" (memory $h i64 24 25 (pagesize 1)))
++  (import "n" "mem2" (memory (;6;) i64 23))
++  (import "o" "mem3" (memory (;7;) i64 24 25))
++  (import "m" "mem1" (memory (;8;) 107 (pagesize 1)))
++  (import "m" "mem1" (memory (;9;) 107))
++  (import "m" "mem1" (memory $c i64 107 (pagesize 1)))
++  (import "m" "mem1" (memory (;11;) i64 107))
++  (memory (;12;) 57 (pagesize 1))
++  (memory (;13;) 73 92 (pagesize 1))
++  (memory (;14;) 0 0 (pagesize 1))
++  (memory (;15;) 3 3 (pagesize 1))
++  (memory (;16;) 57)
++  (memory (;17;) 73 92)
++  (memory (;18;) 0 0)
++  (memory (;19;) 1 1)
++  (memory $a i64 57 (pagesize 1))
++  (memory $b i64 73 92 (pagesize 1))
++  (memory $d i64 0 0 (pagesize 1))
++  (memory $e i64 3 3 (pagesize 1))
++  (memory $k i64 0 0)
++  (memory $i i64 0 0)
++  (memory $j i64 1 1)
++  (memory (;27;) i64 57)
++  (memory (;28;) i64 73 92)
++  (memory (;29;) i64 0 0)
++  (memory (;30;) i64 1 1)
++  (memory (;31;) 4294967295 (pagesize 1))
++  (memory (;32;) i64 18446744073709551615 (pagesize 1))
++  (memory (;33;) 65536)
++  (memory (;34;) i64 281474976710656)
++  (data (;0;) (memory 14) (i32.const 0) "")
++  (data (;1;) (memory 15) (i32.const 0) "xyz")
++  (data (;2;) (memory 18) (i32.const 0) "")
++  (data (;3;) (memory 19) (i32.const 0) "xyz")
++  (data (;4;) (memory $d) (i64.const 0) "")
++  (data (;5;) (memory $e) (i64.const 0) "xyz")
++  (data (;6;) (memory $k) (i64.const 0) "")
++  (data (;7;) (memory $i) (i64.const 0) "")
++  (data (;8;) (memory $j) (i64.const 0) "xyz")
++  (data (;9;) (memory 29) (i64.const 0) "")
++  (data (;10;) (memory 30) (i64.const 0) "xyz"))
++;;; STDOUT ;;)
+diff --git a/test/run-roundtrip.py b/test/run-roundtrip.py
+index 5260ec3efe..69c4596f01 100755
+--- a/test/run-roundtrip.py
++++ b/test/run-roundtrip.py
+@@ -114,6 +114,7 @@ def main(args):
+     parser.add_argument('--enable-multi-memory', action='store_true')
+     parser.add_argument('--enable-annotations', action='store_true')
+     parser.add_argument('--enable-code-metadata', action='store_true')
++    parser.add_argument('--enable-custom-page-sizes', action='store_true')
+     parser.add_argument('--inline-exports', action='store_true')
+     parser.add_argument('--inline-imports', action='store_true')
+     parser.add_argument('--reloc', action='store_true')
+@@ -138,6 +139,7 @@ def main(args):
+         '--enable-multi-memory': options.enable_multi_memory,
+         '--enable-annotations': options.enable_annotations,
+         '--enable-code-metadata': options.enable_code_metadata,
++        '--enable-custom-page-sizes': options.enable_custom_page_sizes,
+         '--reloc': options.reloc,
+         '--no-check': options.no_check,
+     })
+@@ -160,6 +162,7 @@ def main(args):
+         '--enable-multi-memory': options.enable_multi_memory,
+         '--enable-annotations': options.enable_annotations,
+         '--enable-code-metadata': options.enable_code_metadata,
++        '--enable-custom-page-sizes': options.enable_custom_page_sizes,
+         '--inline-exports': options.inline_exports,
+         '--inline-imports': options.inline_imports,
+         '--no-debug-names': not options.debug_names,
+diff --git a/test/spec/custom-page-sizes/custom-page-sizes-invalid.txt b/test/spec/custom-page-sizes/custom-page-sizes-invalid.txt
+new file mode 100644
+index 0000000000..3ae9fa7432
+--- /dev/null
++++ b/test/spec/custom-page-sizes/custom-page-sizes-invalid.txt
+@@ -0,0 +1,63 @@
++;;; TOOL: run-interp-spec
++;;; ARGS*: --enable-custom-page-sizes --enable-multi-memory
++;;; STDIN_FILE: third_party/testsuite/proposals/custom-page-sizes/custom-page-sizes-invalid.wast
++(;; STDOUT ;;;
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:3: assert_malformed passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.0.wat:1:21: error: malformed custom page size
++  (memory 0 (pagesize 3))
++                      ^
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:9: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.1.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:13: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.2.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:17: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.3.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:21: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.4.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:25: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.5.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:29: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.6.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:33: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.7.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:37: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.8.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:41: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.9.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:45: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.10.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:49: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.11.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:53: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.12.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:57: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.13.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:61: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.14.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:65: assert_invalid passed:
++  out/test/spec/custom-page-sizes/custom-page-sizes-invalid/custom-page-sizes-invalid.15.wasm:000000e: error: only page sizes of 1 B or 64 KiB are allowed
++  000000e: error: OnMemory callback failed
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:71: assert_invalid passed:
++  000000e: error: malformed memory page size
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:78: assert_malformed passed:
++  000000e: error: malformed memory page size
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:99: assert_unlinkable passed:
++  error: page_size mismatch in imported memory, expected 65536 but got 1.
++out/test/spec/custom-page-sizes/custom-page-sizes-invalid.wast:106: assert_unlinkable passed:
++  error: page_size mismatch in imported memory, expected 1 but got 65536.
++21/21 tests passed.
++;;; STDOUT ;;)
+diff --git a/test/spec/custom-page-sizes/custom-page-sizes.txt b/test/spec/custom-page-sizes/custom-page-sizes.txt
+new file mode 100644
+index 0000000000..7e11e71070
+--- /dev/null
++++ b/test/spec/custom-page-sizes/custom-page-sizes.txt
+@@ -0,0 +1,9 @@
++;;; TOOL: run-interp-spec
++;;; ARGS*: --enable-custom-page-sizes --enable-multi-memory
++;;; STDIN_FILE: third_party/testsuite/proposals/custom-page-sizes/custom-page-sizes.wast
++(;; STDOUT ;;;
++out/test/spec/custom-page-sizes/custom-page-sizes.wast:27: assert_trap passed: out of bounds memory access: access at 0+1 >= max value 0
++out/test/spec/custom-page-sizes/custom-page-sizes.wast:34: assert_trap passed: out of bounds memory access: access at 65536+1 >= max value 65536
++out/test/spec/custom-page-sizes/custom-page-sizes.wast:41: assert_trap passed: out of bounds memory access: access at 131072+1 >= max value 131072
++34/34 tests passed.
++;;; STDOUT ;;)
+diff --git a/test/spec/memory64/binary.txt b/test/spec/memory64/binary.txt
+index 2844199341..e34a5f79df 100644
+--- a/test/spec/memory64/binary.txt
++++ b/test/spec/memory64/binary.txt
+@@ -137,9 +137,9 @@ out/test/spec/memory64/binary.wast:633: assert_malformed passed:
+ out/test/spec/memory64/binary.wast:651: assert_malformed passed:
+   000000b: error: invalid memory count 1, only 0 bytes left in section
+ out/test/spec/memory64/binary.wast:661: assert_malformed passed:
+-  000000c: error: malformed memory limits flag: 8
++  000000c: error: custom page sizes not allowed
+ out/test/spec/memory64/binary.wast:669: assert_malformed passed:
+-  000000c: error: malformed memory limits flag: 8
++  000000c: error: custom page sizes not allowed
+ out/test/spec/memory64/binary.wast:678: assert_malformed passed:
+   000000c: error: malformed memory limits flag: 129
+ out/test/spec/memory64/binary.wast:687: assert_malformed passed:

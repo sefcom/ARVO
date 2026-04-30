@@ -1,0 +1,85 @@
+From c3fd0514a45fb79096105c64205ae98cd607755e Mon Sep 17 00:00:00 2001
+From: David Bryant <david@wavpack.com>
+Date: Wed, 12 Feb 2025 15:58:40 -0800
+Subject: [PATCH] src/unpack_utils.c: fix for multiple oss-fuzz issues
+
+- issue 395207094, Heap-use-after-free in unpack_dsd_samples
+- issue 394980079, Use-of-uninitialized-value in get_words_lossless
+- issue 395669934, Null-dereference READ in unpack_dsd_samples
+- all issues were manifestations of the same multithreading bug
+  (attempting to decode more samples from an exhausted block)
+- no stack or writes involved, so not serious vulnerabilities
+- the NULL-dereference causes an exception, but could only cause
+  a DoS if running as a web service (which I've never heard of)
+- trigger files added to regression test
+---
+ fuzzing/regression/394980079.wv | Bin 0 -> 1433 bytes
+ fuzzing/regression/395207094.wv | Bin 0 -> 76 bytes
+ fuzzing/regression/395669934.wv | Bin 0 -> 184 bytes
+ src/unpack_utils.c              |  11 ++++++-----
+ 4 files changed, 6 insertions(+), 5 deletions(-)
+ create mode 100644 fuzzing/regression/394980079.wv
+ create mode 100644 fuzzing/regression/395207094.wv
+ create mode 100644 fuzzing/regression/395669934.wv
+
+diff --git a/fuzzing/regression/394980079.wv b/fuzzing/regression/394980079.wv
+new file mode 100644
+index 0000000000000000000000000000000000000000..9cc020f3a4a2ab7ddba7f3c69b47f1e5705bdb77
+GIT binary patch
+literal 1433
+zcmah{%T)t03^Yj|XG(A(bU-P&aDpCak6ySM&5Xv<Cgh>F&(>%@cCtHX)^fw0$Rh*c
+zj;wHoxkJ_t-2NNez54Owv9&R4%|L5@e!O3Qp2m2&3?;sfF$05Toz}drd0t_Ny1>Tn
+z8SY)D=++!x-{IU9JS5u!B63hS8Yy#aK*AQFYs-BIK{V2fLJQ2X=ea}0-$C9a<UR|t
+zgb?qd7C*qzV9>KLjvgU+xD;R@#`*&&pv{XX%m|=|Y#ygnP3qXhJ0`?+4@}_>EAqGo
+z8f%QfaZb?lNNv*6*}oC^-`Y1q7vBDy=X76)0OA{I)xHtlhm=lD70y)aTT0VJl9V3;
+z(FcoCOc|9}6B|2!^!Q}&p{(|{6Rv5CjbWQt%S$&{Z8QJZBIIu)r=lzfsoVS9%_vgu
+gwaJ2~L^`bMDA};sv|8jHK3%y@QtPdl-Ki<~3)pUouK)l5
+
+literal 0
+HcmV?d00001
+
+diff --git a/fuzzing/regression/395207094.wv b/fuzzing/regression/395207094.wv
+new file mode 100644
+index 0000000000000000000000000000000000000000..e21d2f3f5a5073f7cc32e50e8da34afc20288c9a
+GIT binary patch
+literal 76
+zcmXRfE6A2(U|`^5DN+D}{|pRFs!Tw>!hePTK%l_K#L1wbP>!aG5v~fP2&4+ALjeHd
+CgcM`|
+
+literal 0
+HcmV?d00001
+
+diff --git a/fuzzing/regression/395669934.wv b/fuzzing/regression/395669934.wv
+new file mode 100644
+index 0000000000000000000000000000000000000000..510917703ddadfd628bdab69e45bc30e4302e5e2
+GIT binary patch
+literal 184
+zcmXRfE68?WU|<knVNieo1|S2375;<xe8L>e3L-EbNCZ152byC5G=~pnPCL*HCLjiz
+W0@TAzoWB1EeGvP(r6KmCX$JsEI~<b$
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/unpack_utils.c b/src/unpack_utils.c
+index 610faf0b..cb1e9411 100644
+--- a/src/unpack_utils.c
++++ b/src/unpack_utils.c
+@@ -404,12 +404,13 @@ uint32_t WavpackUnpackSamples (WavpackContext *wpc, int32_t *buffer, uint32_t sa
+         }
+ #ifdef ENABLE_THREADS
+         // This is where temporal multithreaded decoding occurs. If there's a worker thread available, and no errors
+-        // have been encountered, and there are samples beyond this block to be decoded during this same call to
+-        // WavpackUnpackSamples(), then we give this block to a worker thread to decode to completion. Because we
+-        // are going to continue decoding the next block in this stream before this one completes, we must make a
+-        // copy of the stream that can decode in isolation, and we instruct the worker thread to free everything
+-        // associated with the stream context when it's done.
++        // have been encountered, and we are going to finish this block, and there are samples beyond this block to
++        // be decoded during this same call to WavpackUnpackSamples(), then we give this block to a worker thread to
++        // decode to completion. Because we are going to continue decoding the next block in this stream before this
++        // one completes, we must make a copy of the stream that can decode in isolation, and we instruct the worker
++        // thread to free everything associated with the stream context when it's done.
+         else if (worker_available (wpc) && !wps->mute_error &&
++            wps->sample_index + samples_to_unpack == GET_BLOCK_INDEX (wps->wphdr) + wps->wphdr.block_samples &&
+             wps->sample_index + samples > GET_BLOCK_INDEX (wps->wphdr) + wps->wphdr.block_samples) {
+                 WavpackStream *wps_copy = malloc (sizeof (WavpackStream));
+ 

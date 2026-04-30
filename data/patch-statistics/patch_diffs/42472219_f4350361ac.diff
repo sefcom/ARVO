@@ -1,0 +1,187 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1549741573 21600
+#      Sat Feb 09 13:46:13 2019 -0600
+# Node ID 5e16e05e1d9dbc60921bd7660d1c5dfc5dfb2f72
+# Parent  d4c58d8df6b1c54d7cd97ed0b9dd9f1022ce4aab
+ReadMIFFImage(): Improve pixel buffer calculations to defend against overflow.  Assure that zlib and bzlib decode the expected number of bytes for a pixel row. (Credit to OSS-Fuzz)
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,12 @@
++2019-02-09  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
++
++	* coders/miff.c (ReadMIFFImage): Improve pixel buffer calculations
++	to defend against overflow.  Assure that zlib and bzlib decode the
++	expected number of bytes for a pixel row.  Fixes oss-fuzz issue
++	12448 "graphicsmagick/coder_MIFF_fuzzer:
++	Use-of-uninitialized-value in RGBTransformPackets". (Credit to
++	OSS-Fuzz)
++
+ 2019-02-08  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
+ 	* coders/png.c (ReadMNGImage): Quit processing and report error
+diff --git a/VisualMagick/installer/inc/version.isx b/VisualMagick/installer/inc/version.isx
+--- a/VisualMagick/installer/inc/version.isx
++++ b/VisualMagick/installer/inc/version.isx
+@@ -10,5 +10,5 @@
+ 
+ #define public MagickPackageName "GraphicsMagick"
+ #define public MagickPackageVersion "1.4"
+-#define public MagickPackageVersionAddendum ".020190208"
+-#define public MagickPackageReleaseDate "snapshot-20190208"
++#define public MagickPackageVersionAddendum ".020190209"
++#define public MagickPackageReleaseDate "snapshot-20190209"
+diff --git a/coders/miff.c b/coders/miff.c
+--- a/coders/miff.c
++++ b/coders/miff.c
+@@ -755,8 +755,9 @@
+     c;
+ 
+   size_t
++    compressed_length,
+     length,
+-    compressed_length;
++    pixels_size;
+ 
+   long
+     y;
+@@ -1370,7 +1371,8 @@
+         (image->compression == UndefinedCompression) ||
+         (image->colorspace == UndefinedColorspace) ||
+         (image->columns == 0) ||
+-        (image->rows == 0))
++        (image->rows == 0) ||
++        (image->depth == 0) || (image->depth > 32))
+       {
+         if (image->previous)
+           {
+@@ -1600,12 +1602,19 @@
+       packet_size+=quantum_size/8;
+     if (image->compression == RLECompression)
+       packet_size++;
+-    pixels=MagickAllocateArray(unsigned char *,packet_size,image->columns);
++    pixels_size=MagickArraySize(packet_size,image->columns);
++    if (pixels_size == 0)
++      ThrowMIFFReaderException(CoderError,ArithmeticOverflow,image);
++    pixels=MagickAllocateMemory(unsigned char *,pixels_size);
+     if (pixels == (unsigned char *) NULL)
+       ThrowMIFFReaderException(ResourceLimitError,MemoryAllocationFailed,image);
+-    length=(size_t) (1.01*MagickArraySize(packet_size,image->columns));
+-    if (length)
++    length=(size_t) (1.01*pixels_size);
++    if (length < pixels_size)
++      ThrowMIFFReaderException(CoderError,ArithmeticOverflow,image);
++    if (~((size_t) 0) - length > 600)
+       length += 600;
++    else
++      ThrowMIFFReaderException(CoderError,ArithmeticOverflow,image);
+     compressed_length = length;
+     compress_pixels=MagickAllocateMemory(unsigned char *,compressed_length);
+     if (compress_pixels == (unsigned char *) NULL)
+@@ -1648,7 +1657,10 @@
+                       zip_info.next_in=compress_pixels;
+                       if (version == 0)
+                         {
+-                          length=(int) (1.01*packet_size*image->columns+12);
++                          length=(int) (1.01*pixels_size+12);
++                          if (image->logging)
++                            (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                                                  "length = %zu", length);
+                           zip_info.avail_in=(uInt) ReadBlob(image,length,zip_info.next_in);
+                         }
+                       else
+@@ -1679,7 +1691,12 @@
+                     }
+                   zip_status=inflate(&zip_info,Z_NO_FLUSH);
+                   if (zip_status == Z_STREAM_END)
++                    {
++                      if (image->logging)
++                        (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                                              "zip_status == Z_STREAM_END");
+                     break;
++                    }
+                   else if (zip_status != Z_OK)
+                     {
+                       (void) inflateEnd(&zip_info);
+@@ -1695,6 +1712,12 @@
+                   code=inflateEnd(&zip_info);
+                   status|=code >= 0;
+                 }
++              if ((size_t) (zip_info.next_out-pixels) < pixels_size)
++                {
++                  (void) inflateEnd(&zip_info);
++                  ThrowMIFFReaderException(CorruptImageError,UnexpectedEndOfFile,
++                                           image);
++                }
+               if (!ImportImagePixelArea(image,quantum_type,quantum_size,pixels,0,0))
+                 break;
+               if (!SyncImagePixels(image))
+@@ -1730,7 +1753,7 @@
+                   bzip_info.avail_in=0;
+                 }
+               bzip_info.next_out=(char *) pixels;
+-              bzip_info.avail_out=(unsigned int) (packet_size*image->columns);
++              bzip_info.avail_out=(unsigned int) (pixels_size);
+               do
+                 {
+                   int
+@@ -1741,7 +1764,7 @@
+                       bzip_info.next_in=(char *) compress_pixels;
+                       if (version == 0)
+                         {
+-                          length=(int) (1.01*packet_size*image->columns+600);
++                          length=(int) (1.01*pixels_size+600);
+                           bzip_info.avail_in=(unsigned int) ReadBlob(image,length,bzip_info.next_in);
+                         }
+                       else
+@@ -1773,6 +1796,13 @@
+                   code=BZ2_bzDecompressEnd(&bzip_info);
+                   status|=code >= 0;
+                 }
++              if ((size_t) (((magick_uint64_t) bzip_info.total_out_hi32 << 32) |
++                            bzip_info.total_out_lo32) < pixels_size)
++                {
++                  (void) BZ2_bzDecompressEnd(&bzip_info);
++                  ThrowMIFFReaderException(CorruptImageError,UnexpectedEndOfFile,
++                                           image);
++                }
+               if (!ImportImagePixelArea(image,quantum_type,quantum_size,pixels,0,0))
+                 break;
+               if (!SyncImagePixels(image))
+diff --git a/magick/version.h b/magick/version.h
+--- a/magick/version.h
++++ b/magick/version.h
+@@ -38,8 +38,8 @@
+ #define MagickLibVersion  0x221900
+ #define MagickLibVersionText  "1.4"
+ #define MagickLibVersionNumber 22,19,0
+-#define MagickChangeDate   "20190208"
+-#define MagickReleaseDate  "snapshot-20190208"
++#define MagickChangeDate   "20190209"
++#define MagickReleaseDate  "snapshot-20190209"
+ 
+ /*
+   The MagickLibInterfaceNewest and MagickLibInterfaceOldest defines
+diff --git a/www/Changelog.html b/www/Changelog.html
+--- a/www/Changelog.html
++++ b/www/Changelog.html
+@@ -35,6 +35,17 @@
+ <div class="document">
+ 
+ 
++<p>2019-02-09  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
++<blockquote>
++<ul class="simple">
++<li>coders/miff.c (ReadMIFFImage): Improve pixel buffer calculations
++to defend against overflow.  Assure that zlib and bzlib decode the
++expected number of bytes for a pixel row.  Fixes oss-fuzz issue
++12448 &quot;graphicsmagick/coder_MIFF_fuzzer:
++Use-of-uninitialized-value in RGBTransformPackets&quot;. (Credit to
++OSS-Fuzz)</li>
++</ul>
++</blockquote>
+ <p>2019-02-08  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
+ <blockquote>
+ <ul class="simple">

@@ -1,0 +1,47 @@
+From ab959c2235ab69359cdc75372c5cdf7bcc324726 Mon Sep 17 00:00:00 2001
+From: Roman Lebedev <lebedev.ri@gmail.com>
+Date: Wed, 20 Jun 2018 20:32:11 +0300
+Subject: [PATCH] ArwDecoder::GetWB(): slightly less broken handling of IFD
+ decryption.
+
+1. We should only alloc off+len bytes for the new buffer,
+   not the entire size of original IFD buffer
+   Because we only decode [off, len).
+   Otherwise we'd end up with uninitialized garbage at the end.
+2. We do not decode [0, off), thus that contains uninitialized garbage.
+   Thus we should not allow IFD to point into that.
+---
+ src/librawspeed/decoders/ArwDecoder.cpp | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/src/librawspeed/decoders/ArwDecoder.cpp b/src/librawspeed/decoders/ArwDecoder.cpp
+index 8b671f772..ff9736053 100644
+--- a/src/librawspeed/decoders/ArwDecoder.cpp
++++ b/src/librawspeed/decoders/ArwDecoder.cpp
+@@ -425,15 +425,21 @@ void ArwDecoder::GetWB() {
+ 
+     // "Decrypt" IFD
+     const auto& ifd_crypt = priv->getRootIfdData();
+-    auto ifd_size = ifd_crypt.getSize();
+-    auto ifd_decoded = Buffer::Create(ifd_size);
++    const auto EncryptedBuffer = ifd_crypt.getSubView(off, len);
++    // We do have to prepend 'off' padding, because TIFF uses absolute offsets.
++    const auto DecryptedBufferSize = off + EncryptedBuffer.getSize();
++    auto DecryptedBuffer = Buffer::Create(DecryptedBufferSize);
+ 
+-    SonyDecrypt(reinterpret_cast<const uint32*>(ifd_crypt.getData(off, len)),
+-                reinterpret_cast<uint32*>(ifd_decoded.get() + off), len / 4,
++    SonyDecrypt(reinterpret_cast<const uint32*>(EncryptedBuffer.begin()),
++                reinterpret_cast<uint32*>(DecryptedBuffer.get() + off), len / 4,
+                 key);
+ 
+     NORangesSet<Buffer> ifds_decoded;
+-    Buffer decIFD(move(ifd_decoded), ifd_size);
++    Buffer decIFD(std::move(DecryptedBuffer), DecryptedBufferSize);
++    const Buffer Padding(decIFD.getSubView(0, off));
++    // The Decrypted Root Ifd can not point to preceding padding buffer.
++    ifds_decoded.emplace(Padding);
++
+     DataBuffer dbIDD(decIFD, priv->getRootIfdData().getByteOrder());
+     TiffRootIFD encryptedIFD(nullptr, &ifds_decoded, dbIDD, off);
+ 

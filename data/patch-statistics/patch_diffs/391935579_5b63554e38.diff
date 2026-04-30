@@ -1,0 +1,49 @@
+From 05d7666f57f07dbbb073250a97548c53ce863c6d Mon Sep 17 00:00:00 2001
+From: Sebastian Rasmussen <sebras@gmail.com>
+Date: Thu, 20 Feb 2025 11:06:20 +0100
+Subject: [PATCH] Ensure that cfb archive entry names are null-terminated.
+
+Previously open_cfb_archive_with_stream() depended on that input data
+from the file contained a null-terminator for the UTF-8 decoded string
+in its internal archive state to be null-terminated.
+
+The parser should always null-terminate its own strings, and not depend
+on input data to be well-formed.
+
+This fixes oss-fuzz issue 391935579.
+---
+ source/fitz/uncfb.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/source/fitz/uncfb.c b/source/fitz/uncfb.c
+index b5e7914d21..d730c18e9f 100644
+--- a/source/fitz/uncfb.c
++++ b/source/fitz/uncfb.c
+@@ -760,23 +760,24 @@ fz_open_cfb_archive_with_stream(fz_context *ctx, fz_stream *file)
+ 				for (i = 0; i < 64; i += 2)
+ 				{
+ 					int ucs = get16(buffer+off+i);
+-					count += fz_runelen(ucs);
+ 					if (ucs == 0)
+ 						break;
++					count += fz_runelen(ucs);
+ 				}
+ 				if (i+2 != namelen || i == 64)
+ 					fz_throw(ctx, FZ_ERROR_FORMAT, "Malformed name in CFB directory");
+ 
+ 				/* Copy the name. */
+-				cfb->entries[cfb->count++].name = fz_malloc(ctx, count);
++				cfb->entries[cfb->count++].name = fz_malloc(ctx, count + 1);
+ 				count = 0;
+ 				for (i = 0; i < 64; i += 2)
+ 				{
+ 					int ucs = buffer[off+i] + (buffer[off+i+1]<<8);
+-					count += fz_runetochar(&cfb->entries[cfb->count-1].name[count], ucs);
+ 					if (ucs == 0)
+ 						break;
++					count += fz_runetochar(&cfb->entries[cfb->count-1].name[count], ucs);
+ 				}
++				cfb->entries[cfb->count-1].name[count] = 0;
+ 
+ 				cfb->entries[cfb->count-1].sector = get32(buffer+off+128-12);
+ 				cfb->entries[cfb->count-1].size = get_len(ctx, cfb, buffer+off+128-8);

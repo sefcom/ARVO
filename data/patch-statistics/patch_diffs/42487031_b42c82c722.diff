@@ -1,0 +1,545 @@
+From ad61e141dd60087f566c4e9ccb0f529988526608 Mon Sep 17 00:00:00 2001
+From: Bob Weinand <bobwei9@hotmail.com>
+Date: Mon, 14 Sep 2020 00:04:45 +0200
+Subject: [PATCH] Fix crashes with unproper cleaning of repeated yield from
+
+Closes GH-6130
+---
+ NEWS                                          |   3 +-
+ ...ted_yield_from_with_immediate_release.phpt |  19 +
+ .../yield_from_multi_tree_single_nodes.phpt   | 328 ++++++++++++++++++
+ Zend/zend_generators.c                        | 102 +++++-
+ 4 files changed, 440 insertions(+), 12 deletions(-)
+ create mode 100644 Zend/tests/generators/repeated_yield_from_with_immediate_release.phpt
+ create mode 100644 Zend/tests/generators/yield_from_multi_tree_single_nodes.phpt
+
+diff --git a/NEWS b/NEWS
+index 87f9550353c4e..7bdadfa86b970 100644
+--- a/NEWS
++++ b/NEWS
+@@ -1,6 +1,6 @@
+ PHP                                                                        NEWS
+ |||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+-?? ??? ????, PHP 8.0.0rc1
++?? ??? ????, PHP 8.0.0beta4
+ 
+ - Core:
+   . Implement #[Attr] Attribute syntax as per final vote in RFC
+@@ -9,6 +9,7 @@ PHP                                                                        NEWS
+     __call). (Nikita)
+   . Fixed bug #80096 (Segmentation fault with named arguments in nested call).
+     (Nikita)
++  . Fixed faulty generator cleanup with yield from. (Bob)
+ 
+ - Date:
+   . Fixed bug #80057 (DateTimeImmutable::createFromFormat() does not populate
+diff --git a/Zend/tests/generators/repeated_yield_from_with_immediate_release.phpt b/Zend/tests/generators/repeated_yield_from_with_immediate_release.phpt
+new file mode 100644
+index 0000000000000..48813704b68fa
+--- /dev/null
++++ b/Zend/tests/generators/repeated_yield_from_with_immediate_release.phpt
+@@ -0,0 +1,19 @@
++--TEST--
++A generator can be yielded from multiple times, testing immediate release of the yield from'ing generator
++--FILE--
++<?php
++
++function gen() {
++	yield 42;
++}
++function yield_from($gen) {
++	yield from $gen;
++}
++$gen = gen();
++var_dump(yield_from($gen)->current());
++var_dump(yield_from($gen)->current());
++
++?>
++--EXPECT--
++int(42)
++int(42)
+diff --git a/Zend/tests/generators/yield_from_multi_tree_single_nodes.phpt b/Zend/tests/generators/yield_from_multi_tree_single_nodes.phpt
+new file mode 100644
+index 0000000000000..2d78ffdc68d6c
+--- /dev/null
++++ b/Zend/tests/generators/yield_from_multi_tree_single_nodes.phpt
+@@ -0,0 +1,328 @@
++--TEST--
++yield from on multiple trees needing merge, with intermediary nodes having only one child
++--FILE--
++<?php
++
++function from($levels) {
++    foreach (range(0, 2 << $levels) as $v) {
++        yield $v;
++    }
++}
++
++function gen($gen, $level) {
++    yield from (function() use ($gen) { yield from $gen; })();
++}
++
++foreach (range(0, 6) as $levels) {
++    print "$levels level".($levels == 1 ? "" : "s")."\n\n";
++
++    $all = array();
++    $all[] = $gens[0][0] = from($levels);
++
++    for ($level = 1; $level < $levels; $level++) {
++        for ($i = 0; $i < (1 << $level); $i++) {
++            $all[] = $gens[$level][$i] = gen($gens[$level-1][$i >> 1], $level);
++        }
++    }
++
++    while (1) {
++        foreach ($all as $gen) {
++            var_dump($gen->current());
++            $gen->next();
++            if (!$gen->valid()) {
++                break 2;
++            }
++        }
++    }
++
++    print "\n\n";
++}
++?>
++--EXPECT--
++0 levels
++
++int(0)
++int(1)
++int(2)
++
++
++1 level
++
++int(0)
++int(1)
++int(2)
++int(3)
++int(4)
++
++
++2 levels
++
++int(0)
++int(1)
++int(2)
++int(3)
++int(4)
++int(5)
++int(6)
++int(7)
++int(8)
++
++
++3 levels
++
++int(0)
++int(1)
++int(2)
++int(3)
++int(4)
++int(5)
++int(6)
++int(7)
++int(8)
++int(9)
++int(10)
++int(11)
++int(12)
++int(13)
++int(14)
++int(15)
++int(16)
++
++
++4 levels
++
++int(0)
++int(1)
++int(2)
++int(3)
++int(4)
++int(5)
++int(6)
++int(7)
++int(8)
++int(9)
++int(10)
++int(11)
++int(12)
++int(13)
++int(14)
++int(15)
++int(16)
++int(17)
++int(18)
++int(19)
++int(20)
++int(21)
++int(22)
++int(23)
++int(24)
++int(25)
++int(26)
++int(27)
++int(28)
++int(29)
++int(30)
++int(31)
++int(32)
++
++
++5 levels
++
++int(0)
++int(1)
++int(2)
++int(3)
++int(4)
++int(5)
++int(6)
++int(7)
++int(8)
++int(9)
++int(10)
++int(11)
++int(12)
++int(13)
++int(14)
++int(15)
++int(16)
++int(17)
++int(18)
++int(19)
++int(20)
++int(21)
++int(22)
++int(23)
++int(24)
++int(25)
++int(26)
++int(27)
++int(28)
++int(29)
++int(30)
++int(31)
++int(32)
++int(33)
++int(34)
++int(35)
++int(36)
++int(37)
++int(38)
++int(39)
++int(40)
++int(41)
++int(42)
++int(43)
++int(44)
++int(45)
++int(46)
++int(47)
++int(48)
++int(49)
++int(50)
++int(51)
++int(52)
++int(53)
++int(54)
++int(55)
++int(56)
++int(57)
++int(58)
++int(59)
++int(60)
++int(61)
++int(62)
++int(63)
++int(64)
++
++
++6 levels
++
++int(0)
++int(1)
++int(2)
++int(3)
++int(4)
++int(5)
++int(6)
++int(7)
++int(8)
++int(9)
++int(10)
++int(11)
++int(12)
++int(13)
++int(14)
++int(15)
++int(16)
++int(17)
++int(18)
++int(19)
++int(20)
++int(21)
++int(22)
++int(23)
++int(24)
++int(25)
++int(26)
++int(27)
++int(28)
++int(29)
++int(30)
++int(31)
++int(32)
++int(33)
++int(34)
++int(35)
++int(36)
++int(37)
++int(38)
++int(39)
++int(40)
++int(41)
++int(42)
++int(43)
++int(44)
++int(45)
++int(46)
++int(47)
++int(48)
++int(49)
++int(50)
++int(51)
++int(52)
++int(53)
++int(54)
++int(55)
++int(56)
++int(57)
++int(58)
++int(59)
++int(60)
++int(61)
++int(62)
++int(63)
++int(64)
++int(65)
++int(66)
++int(67)
++int(68)
++int(69)
++int(70)
++int(71)
++int(72)
++int(73)
++int(74)
++int(75)
++int(76)
++int(77)
++int(78)
++int(79)
++int(80)
++int(81)
++int(82)
++int(83)
++int(84)
++int(85)
++int(86)
++int(87)
++int(88)
++int(89)
++int(90)
++int(91)
++int(92)
++int(93)
++int(94)
++int(95)
++int(96)
++int(97)
++int(98)
++int(99)
++int(100)
++int(101)
++int(102)
++int(103)
++int(104)
++int(105)
++int(106)
++int(107)
++int(108)
++int(109)
++int(110)
++int(111)
++int(112)
++int(113)
++int(114)
++int(115)
++int(116)
++int(117)
++int(118)
++int(119)
++int(120)
++int(121)
++int(122)
++int(123)
++int(124)
++int(125)
++int(126)
++int(127)
++int(128)
+diff --git a/Zend/zend_generators.c b/Zend/zend_generators.c
+index cbb0a10d06e62..cbefd531b36c6 100644
+--- a/Zend/zend_generators.c
++++ b/Zend/zend_generators.c
+@@ -163,6 +163,52 @@ ZEND_API void zend_generator_close(zend_generator *generator, zend_bool finished
+ 
+ static zend_generator *zend_generator_get_child(zend_generator_node *node, zend_generator *leaf);
+ 
++static void zend_generator_update_leaf_of_child(zend_generator_node *node, zend_generator *from_leaf, zend_generator *to_leaf)
++{
++	ZEND_ASSERT(node->children >= 1);
++	if (node->ptr.leaf == from_leaf) {
++		node->ptr.leaf = to_leaf;
++	}
++	if (node->children == 1) {
++		node->child.single.leaf = to_leaf;
++	} else {
++		HashTable *ht = node->child.ht;
++		zend_generator *child = zend_hash_index_find_ptr(ht, (zend_ulong) from_leaf);
++		ZEND_ASSERT(child != NULL);
++		zend_hash_index_del(ht, (zend_ulong) from_leaf);
++		zend_hash_index_add_ptr(ht, (zend_ulong) to_leaf, child);
++	}
++}
++
++static void zend_generator_remove_leaf_child(zend_generator_node *node, zend_generator *leaf, zend_generator *replace_leaf) {
++	if (node->children > 1) {
++		HashTable *ht = node->child.ht;
++		zend_ulong child_leaf;
++		zend_generator *child_generator;
++		zend_hash_index_del(ht, (zend_ulong) leaf);
++		if (--node->children == 1) {
++			ZEND_HASH_FOREACH_NUM_KEY_PTR(ht, child_leaf, child_generator) {
++				node->child.single.leaf = (zend_generator *) child_leaf;
++				node->child.single.child = child_generator;
++				if (node->ptr.leaf == leaf) {
++					node->ptr.leaf = (zend_generator *) child_leaf;
++				}
++				break;
++			} ZEND_HASH_FOREACH_END();
++			zend_hash_destroy(ht);
++			efree(ht);
++		} else if (node->ptr.leaf == leaf) {
++			ZEND_HASH_FOREACH_NUM_KEY_PTR(ht, child_leaf, child_generator) {
++				node->ptr.leaf = (zend_generator *) child_leaf;
++				break;
++			} ZEND_HASH_FOREACH_END();
++		}
++	} else if (node->ptr.leaf == leaf) {
++		ZEND_ASSERT(replace_leaf != leaf);
++		node->ptr.leaf = replace_leaf;
++	}
++}
++
+ static void zend_generator_dtor_storage(zend_object *object) /* {{{ */
+ {
+ 	zend_generator *generator = (zend_generator*) object;
+@@ -176,14 +222,45 @@ static void zend_generator_dtor_storage(zend_object *object) /* {{{ */
+ 		ZVAL_UNDEF(&generator->values);
+ 	}
+ 
++	if (UNEXPECTED(generator->node.children != 0) && generator->node.parent) {
++		/* we're called out of order - this must only happen during shutdown sequence: we call our (direct) child nodes destructors first, to clean it from the bottom up */
++		while (generator->node.children != 0) {
++			zend_generator *child;
++			if (generator->node.children == 1) {
++				child = generator->node.child.single.child;
++			} else {
++				child = (zend_generator *) Z_PTR_P(zend_hash_get_current_data(generator->node.child.ht));
++			}
++			GC_ADD_FLAGS(&child->std, IS_OBJ_DESTRUCTOR_CALLED);
++			zend_generator_dtor_storage(&child->std);
++		}
++	}
+ 	if (EXPECTED(generator->node.children == 0)) {
+-		zend_generator *root = generator->node.ptr.root, *next;
+-		while (UNEXPECTED(root != generator)) {
+-			next = zend_generator_get_child(&root->node, generator);
+-			generator->node.ptr.root = next;
+-			next->node.parent = NULL;
+-			OBJ_RELEASE(&root->std);
+-			root = next;
++		zend_generator_update_current(generator, generator); /* ensure we remove it from a *live* root */
++		zend_generator *root = generator->node.ptr.root, *parent = generator->node.parent, *next, *toproot = root;
++		if (parent) {
++			zend_bool parent_becomes_leaf = parent->node.children == 1;
++			if (parent_becomes_leaf) {
++				while (UNEXPECTED(root != generator)) {
++					next = zend_generator_get_child(&root->node, generator);
++					zend_generator_update_leaf_of_child(&root->node, generator, parent);
++					root = next;
++				}
++				parent->node.ptr.root = toproot;
++				parent->node.children = 0;
++			} else {
++				zend_generator_remove_leaf_child(&parent->node, generator, NULL);
++				while (UNEXPECTED(root != parent)) {
++					next = zend_generator_get_child(&root->node, generator);
++					zend_generator_remove_leaf_child(&root->node, generator, parent->node.ptr.leaf);
++					OBJ_RELEASE(&root->std);
++					root = next;
++				}
++			}
++			OBJ_RELEASE(&parent->std);
++			/* Reset for resuming in finally */
++			generator->node.parent = NULL;
++			generator->node.ptr.root = generator; 
+ 		}
+ 	}
+ 
+@@ -465,10 +542,13 @@ static void zend_generator_add_single_child(zend_generator_node *node, zend_gene
+ 			node->child.ht = ht;
+ 		}
+ 
+-		zend_hash_index_add_ptr(node->child.ht, (zend_ulong) leaf, child);
++		if (zend_hash_index_add_ptr(node->child.ht, (zend_ulong) leaf, child) == NULL) {
++			ZEND_ASSERT(node->children > 1);
++			return;
++		}
+ 	}
+ 
+-	node->children++;
++	++node->children;
+ }
+ 
+ static void zend_generator_merge_child_nodes(zend_generator_node *dest, zend_generator_node *src, zend_generator *child)
+@@ -507,7 +587,6 @@ static void zend_generator_add_child(zend_generator *generator, zend_generator *
+ 	} else if (generator->node.children == 1) {
+ 		multi_children_node = zend_generator_search_multi_children_node(&generator->node);
+ 		if (multi_children_node) {
+-			generator->node.children = 0;
+ 			zend_generator_merge_child_nodes(&generator->node, multi_children_node, generator->node.child.single.child);
+ 		}
+ 	}
+@@ -518,6 +597,7 @@ static void zend_generator_add_child(zend_generator *generator, zend_generator *
+ 		multi_children_node = (zend_generator_node *) 0x1;
+ 	}
+ 
++	/* for allowing zend_generator_get_child() to work, we need every multi children node to have ALL its leaf descendents present, linking to their respective child */
+ 	{
+ 		zend_generator *parent = generator->node.parent, *cur = generator;
+ 
+@@ -574,7 +654,7 @@ ZEND_API zend_generator *zend_generator_update_current(zend_generator *generator
+ 
+ 	if (root->node.parent) {
+ 		if (root->node.parent->execute_data == NULL) {
+-			if (EXPECTED(EG(exception) == NULL)) {
++			if (EXPECTED(EG(exception) == NULL) && EXPECTED((OBJ_FLAGS(&generator->std) & IS_OBJ_DESTRUCTOR_CALLED) == 0)) {
+ 				zend_op *yield_from = (zend_op *) root->execute_data->opline - 1;
+ 
+ 				if (yield_from->opcode == ZEND_YIELD_FROM) {

@@ -1,0 +1,562 @@
+From 6704961c8250b44dc622e95821fd7e2b6bed673a Mon Sep 17 00:00:00 2001
+From: Idan Horowitz <idan.horowitz@gmail.com>
+Date: Sat, 11 Sep 2021 02:15:44 +0300
+Subject: [PATCH] AK: Replace the mutable String::replace API with an immutable
+ version
+
+This removes the awkward String::replace API which was the only String
+API which mutated the String and replaces it with a new immutable
+version that returns a new String with the replacements applied. This
+also fixes a couple of UAFs that were caused by the use of this API.
+
+As an optimization an equivalent StringView::replace API was also added
+to remove an unnecessary String allocations in the format of:
+`String { view }.replace(...);`
+---
+ AK/String.cpp                                 | 30 -------------------
+ AK/String.h                                   |  2 +-
+ AK/StringUtils.cpp                            | 28 +++++++++++++++++
+ AK/StringUtils.h                              |  1 +
+ AK/StringView.cpp                             |  5 ++++
+ AK/StringView.h                               |  1 +
+ AK/URLParser.cpp                              |  7 ++---
+ .../LibUnicode/GenerateUnicodeData.cpp        |  2 +-
+ .../LibUnicode/GenerateUnicodeLocale.cpp      |  5 ++--
+ .../LibWeb/WrapperGenerator.cpp               |  5 +---
+ Tests/AK/TestString.cpp                       | 16 ++++------
+ Userland/Applications/Browser/Tab.cpp         |  7 ++---
+ .../Applications/HexEditor/FindDialog.cpp     |  3 +-
+ .../HexEditor/GoToOffsetDialog.cpp            |  3 +-
+ .../Applications/KeyboardSettings/main.cpp    |  3 +-
+ Userland/Applications/Terminal/main.cpp       | 10 ++-----
+ .../DevTools/HackStudio/ProjectTemplate.cpp   |  3 +-
+ Userland/Libraries/LibC/netdb.cpp             | 13 ++------
+ Userland/Libraries/LibC/termcap.cpp           |  4 +--
+ Userland/Libraries/LibIMAP/Objects.cpp        |  4 +--
+ Userland/Libraries/LibJS/Parser.h             |  6 +---
+ .../LibJS/Runtime/RegExpPrototype.cpp         |  7 +----
+ .../LibJS/Runtime/StringPrototype.cpp         |  3 +-
+ Userland/Libraries/LibJS/Token.cpp            |  5 +---
+ Userland/Services/WindowServer/Window.cpp     |  3 +-
+ Userland/Utilities/man.cpp                    | 14 ++++-----
+ 26 files changed, 72 insertions(+), 118 deletions(-)
+
+diff --git a/AK/String.cpp b/AK/String.cpp
+index 1d8a6e844a35f3..df2d0730c6c1ae 100644
+--- a/AK/String.cpp
++++ b/AK/String.cpp
+@@ -352,36 +352,6 @@ bool String::equals_ignoring_case(const StringView& other) const
+     return StringUtils::equals_ignoring_case(view(), other);
+ }
+ 
+-int String::replace(const String& needle, const String& replacement, bool all_occurrences)
+-{
+-    if (is_empty())
+-        return 0;
+-
+-    Vector<size_t> positions;
+-    if (all_occurrences) {
+-        positions = find_all(needle);
+-    } else {
+-        auto pos = find(needle);
+-        if (!pos.has_value())
+-            return 0;
+-        positions.append(pos.value());
+-    }
+-
+-    if (!positions.size())
+-        return 0;
+-
+-    StringBuilder b;
+-    size_t lastpos = 0;
+-    for (auto& pos : positions) {
+-        b.append(substring_view(lastpos, pos - lastpos));
+-        b.append(replacement);
+-        lastpos = pos + needle.length();
+-    }
+-    b.append(substring_view(lastpos, length() - lastpos));
+-    m_impl = StringImpl::create(b.build().characters());
+-    return positions.size();
+-}
+-
+ String String::reverse() const
+ {
+     StringBuilder reversed_string(length());
+diff --git a/AK/String.h b/AK/String.h
+index 623c23fbb48872..d5c47e1dab118a 100644
+--- a/AK/String.h
++++ b/AK/String.h
+@@ -285,7 +285,7 @@ class String {
+         return { characters(), length() };
+     }
+ 
+-    int replace(const String& needle, const String& replacement, bool all_occurrences = false);
++    [[nodiscard]] String replace(const StringView& needle, const StringView& replacement, bool all_occurrences = false) const { return StringUtils::replace(*this, needle, replacement, all_occurrences); }
+     [[nodiscard]] size_t count(StringView const& needle) const { return StringUtils::count(*this, needle); }
+     [[nodiscard]] String reverse() const;
+ 
+diff --git a/AK/StringUtils.cpp b/AK/StringUtils.cpp
+index ee0594e7e91d9e..887620c663768c 100644
+--- a/AK/StringUtils.cpp
++++ b/AK/StringUtils.cpp
+@@ -427,6 +427,34 @@ String to_titlecase(StringView const& str)
+     return builder.to_string();
+ }
+ 
++String replace(StringView const& str, StringView const& needle, StringView const& replacement, bool all_occurrences)
++{
++    if (str.is_empty())
++        return str;
++
++    Vector<size_t> positions;
++    if (all_occurrences) {
++        positions = str.find_all(needle);
++        if (!positions.size())
++            return str;
++    } else {
++        auto pos = str.find(needle);
++        if (!pos.has_value())
++            return str;
++        positions.append(pos.value());
++    }
++
++    StringBuilder replaced_string;
++    size_t last_position = 0;
++    for (auto& position : positions) {
++        replaced_string.append(str.substring_view(last_position, position - last_position));
++        replaced_string.append(replacement);
++        last_position = position + needle.length();
++    }
++    replaced_string.append(str.substring_view(last_position, str.length() - last_position));
++    return replaced_string.build();
++}
++
+ // TODO: Benchmark against KMP (AK/MemMem.h) and switch over if it's faster for short strings too
+ size_t count(StringView const& str, StringView const& needle)
+ {
+diff --git a/AK/StringUtils.h b/AK/StringUtils.h
+index 661ce963dbd626..dabf4a1fefe93c 100644
+--- a/AK/StringUtils.h
++++ b/AK/StringUtils.h
+@@ -71,6 +71,7 @@ Optional<size_t> find_any_of(StringView const& haystack, StringView const& needl
+ String to_snakecase(const StringView&);
+ String to_titlecase(StringView const&);
+ 
++String replace(StringView const&, StringView const& needle, StringView const& replacement, bool all_occurrences = false);
+ size_t count(StringView const&, StringView const& needle);
+ 
+ }
+diff --git a/AK/StringView.cpp b/AK/StringView.cpp
+index 0aeb124676e770..83f90e2d3c2fa4 100644
+--- a/AK/StringView.cpp
++++ b/AK/StringView.cpp
+@@ -245,4 +245,9 @@ bool StringView::operator==(const String& string) const
+ 
+ String StringView::to_string() const { return String { *this }; }
+ 
++String StringView::replace(const StringView& needle, const StringView& replacement, bool all_occurrences) const
++{
++    return StringUtils::replace(*this, needle, replacement, all_occurrences);
++}
++
+ }
+diff --git a/AK/StringView.h b/AK/StringView.h
+index f6868d1b8a9421..fa1905d8858574 100644
+--- a/AK/StringView.h
++++ b/AK/StringView.h
+@@ -220,6 +220,7 @@ class StringView {
+ 
+     [[nodiscard]] bool is_whitespace() const { return StringUtils::is_whitespace(*this); }
+ 
++    [[nodiscard]] String replace(const StringView& needle, const StringView& replacement, bool all_occurrences = false) const;
+     [[nodiscard]] size_t count(StringView const& needle) const { return StringUtils::count(*this, needle); }
+ 
+     template<typename... Ts>
+diff --git a/AK/URLParser.cpp b/AK/URLParser.cpp
+index 7edf6c65c7a1a8..b8db96528f0f5e 100644
+--- a/AK/URLParser.cpp
++++ b/AK/URLParser.cpp
+@@ -203,15 +203,12 @@ URL URLParser::parse(Badge<URL>, StringView const& raw_input, URL const* base_ur
+     if (start_index >= end_index)
+         return {};
+ 
+-    auto processed_input = raw_input.substring_view(start_index, end_index - start_index);
++    String processed_input = raw_input.substring_view(start_index, end_index - start_index);
+ 
+     // NOTE: This replaces all tab and newline characters with nothing.
+     if (processed_input.contains("\t") || processed_input.contains("\n")) {
+         report_validation_error();
+-        String processed_input_string(processed_input);
+-        processed_input_string.replace("\t", "", true);
+-        processed_input_string.replace("\n", "", true);
+-        processed_input = processed_input_string;
++        processed_input = processed_input.replace("\t", "", true).replace("\n", "", true);
+     }
+ 
+     State state = State::SchemeStart;
+diff --git a/Meta/Lagom/Tools/CodeGenerators/LibUnicode/GenerateUnicodeData.cpp b/Meta/Lagom/Tools/CodeGenerators/LibUnicode/GenerateUnicodeData.cpp
+index 93647ea176af08..166da0820e1a4e 100644
+--- a/Meta/Lagom/Tools/CodeGenerators/LibUnicode/GenerateUnicodeData.cpp
++++ b/Meta/Lagom/Tools/CodeGenerators/LibUnicode/GenerateUnicodeData.cpp
+@@ -201,7 +201,7 @@ static void parse_special_casing(Core::File& file, UnicodeData& unicode_data)
+ 
+             if (!casing.locale.is_empty())
+                 casing.locale = String::formatted("{:c}{}", to_ascii_uppercase(casing.locale[0]), casing.locale.substring_view(1));
+-            casing.condition.replace("_", "", true);
++            casing.condition = casing.condition.replace("_", "", true);
+ 
+             if (!casing.condition.is_empty() && !unicode_data.conditions.contains_slow(casing.condition))
+                 unicode_data.conditions.append(casing.condition);
+diff --git a/Meta/Lagom/Tools/CodeGenerators/LibUnicode/GenerateUnicodeLocale.cpp b/Meta/Lagom/Tools/CodeGenerators/LibUnicode/GenerateUnicodeLocale.cpp
+index b5e2fb1c96e684..5ca7d38c81a20f 100644
+--- a/Meta/Lagom/Tools/CodeGenerators/LibUnicode/GenerateUnicodeLocale.cpp
++++ b/Meta/Lagom/Tools/CodeGenerators/LibUnicode/GenerateUnicodeLocale.cpp
+@@ -507,7 +507,7 @@ static void parse_all_locales(String core_path, String locale_names_path, String
+ 
+ static String format_identifier(StringView owner, String identifier)
+ {
+-    identifier.replace("-"sv, "_"sv, true);
++    identifier = identifier.replace("-"sv, "_"sv, true);
+ 
+     if (all_of(identifier, is_ascii_digit))
+         return String::formatted("{}_{}", owner[0], identifier);
+@@ -638,8 +638,7 @@ struct Patterns {
+ )~~~");
+ 
+     auto format_mapping_name = [](StringView format, StringView name) {
+-        auto mapping_name = name.to_lowercase_string();
+-        mapping_name.replace("-"sv, "_"sv, true);
++        auto mapping_name = name.to_lowercase_string().replace("-"sv, "_"sv, true);
+         return String::formatted(format, mapping_name);
+     };
+ 
+diff --git a/Meta/Lagom/Tools/CodeGenerators/LibWeb/WrapperGenerator.cpp b/Meta/Lagom/Tools/CodeGenerators/LibWeb/WrapperGenerator.cpp
+index 2d302aa4a9f149..2e68cf201a1256 100644
+--- a/Meta/Lagom/Tools/CodeGenerators/LibWeb/WrapperGenerator.cpp
++++ b/Meta/Lagom/Tools/CodeGenerators/LibWeb/WrapperGenerator.cpp
+@@ -27,10 +27,7 @@ static String make_input_acceptable_cpp(String const& input)
+         return builder.to_string();
+     }
+ 
+-    String input_without_dashes = input;
+-    input_without_dashes.replace("-", "_");
+-
+-    return input_without_dashes;
++    return input.replace("-", "_");
+ }
+ 
+ static void report_parsing_error(StringView message, StringView filename, StringView input, size_t offset)
+diff --git a/Tests/AK/TestString.cpp b/Tests/AK/TestString.cpp
+index d5e7c970bb9d98..fc55df1a5a409a 100644
+--- a/Tests/AK/TestString.cpp
++++ b/Tests/AK/TestString.cpp
+@@ -146,25 +146,21 @@ TEST_CASE(flystring)
+ TEST_CASE(replace)
+ {
+     String test_string = "Well, hello Friends!";
+-    u32 replacements = test_string.replace("Friends", "Testers");
+-    EXPECT(replacements == 1);
++
++    test_string = test_string.replace("Friends", "Testers");
+     EXPECT(test_string == "Well, hello Testers!");
+ 
+-    replacements = test_string.replace("ell", "e're", true);
+-    EXPECT(replacements == 2);
++    test_string = test_string.replace("ell", "e're", true);
+     EXPECT(test_string == "We're, he'reo Testers!");
+ 
+-    replacements = test_string.replace("!", " :^)");
+-    EXPECT(replacements == 1);
++    test_string = test_string.replace("!", " :^)");
+     EXPECT(test_string == "We're, he'reo Testers :^)");
+ 
+     test_string = String("111._.111._.111");
+-    replacements = test_string.replace("111", "|||", true);
+-    EXPECT(replacements == 3);
++    test_string = test_string.replace("111", "|||", true);
+     EXPECT(test_string == "|||._.|||._.|||");
+ 
+-    replacements = test_string.replace("|||", "111");
+-    EXPECT(replacements == 1);
++    test_string = test_string.replace("|||", "111");
+     EXPECT(test_string == "111._.|||._.|||");
+ }
+ 
+diff --git a/Userland/Applications/Browser/Tab.cpp b/Userland/Applications/Browser/Tab.cpp
+index 0482b3a783da18..f043adb0324c56 100644
+--- a/Userland/Applications/Browser/Tab.cpp
++++ b/Userland/Applications/Browser/Tab.cpp
+@@ -40,11 +40,8 @@ namespace Browser {
+ 
+ URL url_from_user_input(const String& input)
+ {
+-    if (input.starts_with("?") && !g_search_engine.is_null()) {
+-        auto url = g_search_engine;
+-        url.replace("{}", URL::percent_encode(input.substring_view(1)));
+-        return URL(url);
+-    }
++    if (input.starts_with("?") && !g_search_engine.is_null())
++        return URL(g_search_engine.replace("{}", URL::percent_encode(input.substring_view(1))));
+ 
+     auto url = URL(input);
+     if (url.is_valid())
+diff --git a/Userland/Applications/HexEditor/FindDialog.cpp b/Userland/Applications/HexEditor/FindDialog.cpp
+index 46cbcd8e88b137..c1cb3399bf9aeb 100644
+--- a/Userland/Applications/HexEditor/FindDialog.cpp
++++ b/Userland/Applications/HexEditor/FindDialog.cpp
+@@ -76,8 +76,7 @@ Result<ByteBuffer, String> FindDialog::process_input(String text_value, OptionId
+     }
+ 
+     case OPTION_HEX_VALUE: {
+-        text_value.replace(" ", "", true);
+-        auto decoded = decode_hex(text_value.substring_view(0, text_value.length()));
++        auto decoded = decode_hex(text_value.replace(" ", "", true));
+         if (!decoded.has_value())
+             return String("Input contains invalid hex values.");
+ 
+diff --git a/Userland/Applications/HexEditor/GoToOffsetDialog.cpp b/Userland/Applications/HexEditor/GoToOffsetDialog.cpp
+index fb6a5990b53075..9940b191695694 100644
+--- a/Userland/Applications/HexEditor/GoToOffsetDialog.cpp
++++ b/Userland/Applications/HexEditor/GoToOffsetDialog.cpp
+@@ -130,9 +130,8 @@ GoToOffsetDialog::GoToOffsetDialog()
+     m_text_editor->on_change = [this]() {
+         auto text = m_text_editor->text();
+         if (text.starts_with("0x")) {
+-            text.replace("0x", "");
+             m_offset_type_box->set_selected_index(1);
+-            m_text_editor->set_text(text);
++            m_text_editor->set_text(text.replace("0x", ""));
+         }
+         update_statusbar();
+     };
+diff --git a/Userland/Applications/KeyboardSettings/main.cpp b/Userland/Applications/KeyboardSettings/main.cpp
+index 43199b7e5d19d2..858cdfa1cf261e 100644
+--- a/Userland/Applications/KeyboardSettings/main.cpp
++++ b/Userland/Applications/KeyboardSettings/main.cpp
+@@ -83,8 +83,7 @@ int main(int argc, char** argv)
+ 
+     while (iterator.has_next()) {
+         auto name = iterator.next_path();
+-        name.replace(".json", "");
+-        character_map_files.append(name);
++        character_map_files.append(name.replace(".json", ""));
+     }
+     quick_sort(character_map_files);
+ 
+diff --git a/Userland/Applications/Terminal/main.cpp b/Userland/Applications/Terminal/main.cpp
+index e59e3bf4ba1d90..711c2c7999539b 100644
+--- a/Userland/Applications/Terminal/main.cpp
++++ b/Userland/Applications/Terminal/main.cpp
+@@ -162,8 +162,7 @@ static RefPtr<GUI::Window> create_settings_window(VT::TerminalWidget& terminal)
+     Core::DirIterator iterator("/res/terminal-colors", Core::DirIterator::SkipParentAndBaseDir);
+     while (iterator.has_next()) {
+         auto path = iterator.next_path();
+-        path.replace(".ini", "");
+-        color_scheme_names.append(path);
++        color_scheme_names.append(path.replace(".ini", ""));
+     }
+     quick_sort(color_scheme_names);
+     auto& color_scheme_combo = *settings.find_descendant_of_type_named<GUI::ComboBox>("color_scheme_combo");
+@@ -199,11 +198,8 @@ static RefPtr<GUI::Window> create_find_window(VT::TerminalWidget& terminal)
+     auto& find_textbox = find.add<GUI::TextBox>();
+     find_textbox.set_fixed_width(230);
+     find_textbox.set_focus(true);
+-    if (terminal.has_selection()) {
+-        String selected_text = terminal.selected_text();
+-        selected_text.replace("\n", " ", true);
+-        find_textbox.set_text(selected_text);
+-    }
++    if (terminal.has_selection())
++        find_textbox.set_text(terminal.selected_text().replace("\n", " ", true));
+     auto& find_backwards = find.add<GUI::Button>();
+     find_backwards.set_fixed_width(25);
+     find_backwards.set_icon(Gfx::Bitmap::try_load_from_file("/res/icons/16x16/upward-triangle.png"));
+diff --git a/Userland/DevTools/HackStudio/ProjectTemplate.cpp b/Userland/DevTools/HackStudio/ProjectTemplate.cpp
+index 9cb202087e7a80..619d042e5ed65b 100644
+--- a/Userland/DevTools/HackStudio/ProjectTemplate.cpp
++++ b/Userland/DevTools/HackStudio/ProjectTemplate.cpp
+@@ -90,8 +90,7 @@ Result<void, String> ProjectTemplate::create_project(const String& name, const S
+         dbgln("Running post-create script '{}'", postcreate_script_path);
+ 
+         // Generate a namespace-safe project name (replace hyphens with underscores)
+-        String namespace_safe(name.characters());
+-        namespace_safe.replace("-", "_", true);
++        auto namespace_safe = name.replace("-", "_", true);
+ 
+         pid_t child_pid;
+         const char* argv[] = { postcreate_script_path.characters(), name.characters(), path.characters(), namespace_safe.characters(), nullptr };
+diff --git a/Userland/Libraries/LibC/netdb.cpp b/Userland/Libraries/LibC/netdb.cpp
+index 920c99ea4538bf..7c0f973da374d4 100644
+--- a/Userland/Libraries/LibC/netdb.cpp
++++ b/Userland/Libraries/LibC/netdb.cpp
+@@ -425,9 +425,7 @@ void endservent()
+ static bool fill_getserv_buffers(const char* line, ssize_t read)
+ {
+     // Splitting the line by tab delimiter and filling the servent buffers name, port, and protocol members.
+-    String string_line = String(line, read);
+-    string_line.replace(" ", "\t", true);
+-    auto split_line = string_line.split('\t');
++    auto split_line = StringView(line, read).replace(" ", "\t", true).split('\t');
+ 
+     // This indicates an incorrect file format.
+     // Services file entries should always at least contain
+@@ -450,11 +448,7 @@ static bool fill_getserv_buffers(const char* line, ssize_t read)
+     __getserv_port_buffer = number.value();
+ 
+     // Remove any annoying whitespace at the end of the protocol.
+-    port_protocol_split[1].replace(" ", "", true);
+-    port_protocol_split[1].replace("\t", "", true);
+-    port_protocol_split[1].replace("\n", "", true);
+-
+-    __getserv_protocol_buffer = port_protocol_split[1];
++    __getserv_protocol_buffer = port_protocol_split[1].replace(" ", "", true).replace("\t", "", true).replace("\n", "", true);
+     __getserv_alias_list_buffer.clear();
+ 
+     // If there are aliases for the service, we will fill the alias list buffer.
+@@ -610,8 +604,7 @@ void endprotoent()
+ static bool fill_getproto_buffers(const char* line, ssize_t read)
+ {
+     String string_line = String(line, read);
+-    string_line.replace(" ", "\t", true);
+-    auto split_line = string_line.split('\t');
++    auto split_line = string_line.replace(" ", "\t", true).split('\t');
+ 
+     // This indicates an incorrect file format. Protocols file entries should
+     // always have at least a name and a protocol.
+diff --git a/Userland/Libraries/LibC/termcap.cpp b/Userland/Libraries/LibC/termcap.cpp
+index 28a9c195cd187a..54b0216671b6e5 100644
+--- a/Userland/Libraries/LibC/termcap.cpp
++++ b/Userland/Libraries/LibC/termcap.cpp
+@@ -114,9 +114,7 @@ int tgetnum(const char* id)
+ static Vector<char> s_tgoto_buffer;
+ char* tgoto([[maybe_unused]] const char* cap, [[maybe_unused]] int col, [[maybe_unused]] int row)
+ {
+-    auto cap_str = String(cap);
+-    cap_str.replace("%p1%d", String::number(col));
+-    cap_str.replace("%p2%d", String::number(row));
++    auto cap_str = StringView(cap).replace("%p1%d", String::number(col)).replace("%p2%d", String::number(row));
+ 
+     s_tgoto_buffer.clear_with_capacity();
+     s_tgoto_buffer.ensure_capacity(cap_str.length());
+diff --git a/Userland/Libraries/LibIMAP/Objects.cpp b/Userland/Libraries/LibIMAP/Objects.cpp
+index c8f87857e983a8..21a9f6b2225947 100644
+--- a/Userland/Libraries/LibIMAP/Objects.cpp
++++ b/Userland/Libraries/LibIMAP/Objects.cpp
+@@ -128,9 +128,7 @@ String serialize_astring(StringView string)
+     // Try to quote
+     auto can_be_quoted = !(string.contains('\n') || string.contains('\r'));
+     if (can_be_quoted) {
+-        auto escaped_str = string.to_string();
+-        escaped_str.replace("\\", "\\\\");
+-        escaped_str.replace("\"", "\\\"");
++        auto escaped_str = string.replace("\\", "\\\\").replace("\"", "\\\"");
+         return String::formatted("\"{}\"", escaped_str);
+     }
+ 
+diff --git a/Userland/Libraries/LibJS/Parser.h b/Userland/Libraries/LibJS/Parser.h
+index b594b640408e15..b4000ab7748d9c 100644
+--- a/Userland/Libraries/LibJS/Parser.h
++++ b/Userland/Libraries/LibJS/Parser.h
+@@ -117,11 +117,7 @@ class Parser {
+                 return {};
+             // We need to modify the source to match what the lexer considers one line - normalizing
+             // line terminators to \n is easier than splitting using all different LT characters.
+-            String source_string { source };
+-            source_string.replace("\r\n", "\n");
+-            source_string.replace("\r", "\n");
+-            source_string.replace(LINE_SEPARATOR_STRING, "\n");
+-            source_string.replace(PARAGRAPH_SEPARATOR_STRING, "\n");
++            String source_string = source.replace("\r\n", "\n").replace("\r", "\n").replace(LINE_SEPARATOR_STRING, "\n").replace(PARAGRAPH_SEPARATOR_STRING, "\n");
+             StringBuilder builder;
+             builder.append(source_string.split_view('\n', true)[position.value().line - 1]);
+             builder.append('\n');
+diff --git a/Userland/Libraries/LibJS/Runtime/RegExpPrototype.cpp b/Userland/Libraries/LibJS/Runtime/RegExpPrototype.cpp
+index 65c85ad6d5439b..b74abd50527797 100644
+--- a/Userland/Libraries/LibJS/Runtime/RegExpPrototype.cpp
++++ b/Userland/Libraries/LibJS/Runtime/RegExpPrototype.cpp
+@@ -84,12 +84,7 @@ static String escape_regexp_pattern(const RegExpObject& regexp_object)
+     if (pattern.is_empty())
+         return "(?:)";
+     // FIXME: Check u flag and escape accordingly
+-    pattern.replace("\n", "\\n", true);
+-    pattern.replace("\r", "\\r", true);
+-    pattern.replace(LINE_SEPARATOR_STRING, "\\u2028", true);
+-    pattern.replace(PARAGRAPH_SEPARATOR_STRING, "\\u2029", true);
+-    pattern.replace("/", "\\/", true);
+-    return pattern;
++    return pattern.replace("\n", "\\n", true).replace("\r", "\\r", true).replace(LINE_SEPARATOR_STRING, "\\u2028", true).replace(PARAGRAPH_SEPARATOR_STRING, "\\u2029", true).replace("/", "\\/", true);
+ }
+ 
+ // 22.2.5.2.3 AdvanceStringIndex ( S, index, unicode ), https://tc39.es/ecma262/#sec-advancestringindex
+diff --git a/Userland/Libraries/LibJS/Runtime/StringPrototype.cpp b/Userland/Libraries/LibJS/Runtime/StringPrototype.cpp
+index 1df3e4f9731504..a415ffce4ce2e4 100644
+--- a/Userland/Libraries/LibJS/Runtime/StringPrototype.cpp
++++ b/Userland/Libraries/LibJS/Runtime/StringPrototype.cpp
+@@ -1141,11 +1141,10 @@ static Value create_html(GlobalObject& global_object, Value string, const String
+         auto value_string = value.to_string(global_object);
+         if (vm.exception())
+             return {};
+-        value_string.replace("\"", "&quot;", true);
+         builder.append(' ');
+         builder.append(attribute);
+         builder.append("=\"");
+-        builder.append(value_string);
++        builder.append(value_string.replace("\"", "&quot;", true));
+         builder.append('"');
+     }
+     builder.append('>');
+diff --git a/Userland/Libraries/LibJS/Token.cpp b/Userland/Libraries/LibJS/Token.cpp
+index 80c957ffd0e7bd..5a268d2808c485 100644
+--- a/Userland/Libraries/LibJS/Token.cpp
++++ b/Userland/Libraries/LibJS/Token.cpp
+@@ -207,10 +207,7 @@ String Token::string_value(StringValueStatus& status) const
+ // 12.8.6.2 Static Semantics: TRV, https://tc39.es/ecma262/multipage/ecmascript-language-lexical-grammar.html#sec-static-semantics-trv
+ String Token::raw_template_value() const
+ {
+-    String base = value().to_string();
+-    base.replace("\r\n", "\n", true);
+-    base.replace("\r", "\n", true);
+-    return base;
++    return value().replace("\r\n", "\n", true).replace("\r", "\n", true);
+ }
+ 
+ bool Token::bool_value() const
+diff --git a/Userland/Services/WindowServer/Window.cpp b/Userland/Services/WindowServer/Window.cpp
+index aa066301b85362..72462a194aaf74 100644
+--- a/Userland/Services/WindowServer/Window.cpp
++++ b/Userland/Services/WindowServer/Window.cpp
+@@ -1260,8 +1260,7 @@ void Window::set_modified(bool modified)
+ 
+ String Window::computed_title() const
+ {
+-    String title = m_title;
+-    title.replace("[*]", is_modified() ? " (*)" : "");
++    String title = m_title.replace("[*]", is_modified() ? " (*)" : "");
+     if (client() && client()->is_unresponsive())
+         return String::formatted("{} (Not responding)", title);
+     return title;
+diff --git a/Userland/Utilities/man.cpp b/Userland/Utilities/man.cpp
+index 925dfe27e8ce98..2b10142dc17ed8 100644
+--- a/Userland/Utilities/man.cpp
++++ b/Userland/Utilities/man.cpp
+@@ -114,15 +114,11 @@ int main(int argc, char* argv[])
+     auto file = Core::File::construct();
+     file->set_filename(make_path(section));
+ 
+-    String pager_command = pager;
+-    if (!pager) {
+-        String clean_name(name);
+-        String clean_section(section);
+-
+-        clean_name.replace("'", "'\\''");
+-        clean_section.replace("'", "'\\''");
+-        pager_command = String::formatted("less -P 'Manual Page {}({}) line %l?e (END):.'", clean_name, clean_section);
+-    }
++    String pager_command;
++    if (pager)
++        pager_command = pager;
++    else
++        pager_command = String::formatted("less -P 'Manual Page {}({}) line %l?e (END):.'", StringView(name).replace("'", "'\\''"), StringView(section).replace("'", "'\\''"));
+     pid_t pager_pid = pipe_to_pager(pager_command);
+ 
+     if (!file->open(Core::OpenMode::ReadOnly)) {

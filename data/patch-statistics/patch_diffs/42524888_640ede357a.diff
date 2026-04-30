@@ -1,0 +1,53 @@
+From b031cfed70f6a9578326cc6b4a07d173eeb1d30d Mon Sep 17 00:00:00 2001
+From: Reini Urban <rurban@cpan.org>
+Date: Tue, 12 Sep 2023 12:17:38 +0200
+Subject: [PATCH] indxf: fix double-free with INVALIDDWG cases
+
+when the dxfname was allocated and the import error occured later.
+Fixes oss-fuzz 59428
+---
+ src/in_dxf.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/in_dxf.c b/src/in_dxf.c
+index 53b23ebeac..ca00dab641 100644
+--- a/src/in_dxf.c
++++ b/src/in_dxf.c
+@@ -11782,17 +11782,20 @@ dxf_tables_read (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+               Dwg_Object *obj;
+               Dwg_Object *ctrl = &dwg->object[ctrl_id];
+               char *dxfname = strdup (pair->value.s);
++              BITCODE_BL idx = dwg->num_objects;
+               BITCODE_H ref;
+               dxf_free_pair (pair);
+               // until 0 table or 0 ENDTAB
+               pair = new_object (table, dxfname, dat, dwg, ctrl_id,
+                                  (BITCODE_BL *)&i);
++              obj = &dwg->object[idx];
+               if (!pair)
+                 {
+                   free (dxfname);
++                  if (idx != dwg->num_objects)
++                    obj->dxfname = NULL;
+                   return DWG_ERR_INVALIDDWG;
+                 }
+-              obj = &dwg->object[dwg->num_objects - 1];
+               // A minimal DXF will have no handle values
+               if (!obj->handle.value)
+                 {
+@@ -11972,12 +11975,14 @@ dxf_blocks_read (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+                              obj->handle.size, obj->handle.value);
+                 }
+               pair = new_object (name, dxfname, dat, dwg, 0, &i);
++              obj = &dwg->object[idx];
+               if (!pair)
+                 {
+                   free (dxfname);
++                  if (idx != dwg->num_objects)
++                    obj->dxfname = NULL;
+                   return DWG_ERR_INVALIDDWG;
+                 }
+-              obj = &dwg->object[idx];
+               if (obj->type == DWG_TYPE_BLOCK)
+                 {
+                   Dwg_Object_Entity *ent = obj->tio.entity;

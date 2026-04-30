@@ -1,0 +1,751 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index f84dbae..93addb8 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1753,17 +1753,18 @@
+       "tools/debugger",
+     ]
+     sources = [
++      "fuzz/Fuzz.cpp",
+       "fuzz/FuzzCanvas.cpp",
+       "fuzz/FuzzCommon.cpp",
+       "fuzz/FuzzDrawFunctions.cpp",
+       "fuzz/FuzzEncoders.cpp",
+       "fuzz/FuzzGradients.cpp",
++      "fuzz/FuzzMain.cpp",
+       "fuzz/FuzzParsePath.cpp",
+       "fuzz/FuzzPathMeasure.cpp",
+       "fuzz/FuzzPathop.cpp",
+       "fuzz/FuzzPolyUtils.cpp",
+       "fuzz/FuzzRegionOp.cpp",
+-      "fuzz/fuzz.cpp",
+       "fuzz/oss_fuzz/FuzzAnimatedImage.cpp",
+       "fuzz/oss_fuzz/FuzzImage.cpp",
+       "fuzz/oss_fuzz/FuzzImageFilterDeserialize.cpp",
+diff --git a/fuzz/Fuzz.cpp b/fuzz/Fuzz.cpp
+new file mode 100644
+index 0000000..1aad215
+--- /dev/null
++++ b/fuzz/Fuzz.cpp
+@@ -0,0 +1,39 @@
++/*
++ * Copyright 2016 Google Inc.
++ *
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file.
++ */
++
++
++#include "Fuzz.h"
++#include "FuzzCommon.h"
++
++// UBSAN reminds us that bool can only legally hold 0 or 1.
++void Fuzz::next(bool* b) {
++  uint8_t n;
++  this->next(&n);
++  *b = (n & 1) == 1;
++}
++
++void Fuzz::next(SkImageFilter::CropRect* cropRect) {
++    SkRect rect;
++    uint8_t flags;
++    this->next(&rect);
++    this->nextRange(&flags, 0, 0xF);
++    *cropRect = SkImageFilter::CropRect(rect, flags);
++}
++
++void Fuzz::next(SkRegion* region) {
++    // See FuzzCommon.h
++    FuzzNiceRegion(this, region, 10);
++}
++
++void Fuzz::nextRange(float* f, float min, float max) {
++    this->next(f);
++    if (!std::isnormal(*f) && *f != 0.0f) {
++        // Don't deal with infinity or other strange floats.
++        *f = max;
++    }
++    *f = min + std::fmod(std::abs(*f), (max - min + 1));
++}
+diff --git a/fuzz/Fuzz.h b/fuzz/Fuzz.h
+index 32ec990..b27e04d 100644
+--- a/fuzz/Fuzz.h
++++ b/fuzz/Fuzz.h
+@@ -10,7 +10,9 @@
+ 
+ #include "../tools/Registry.h"
+ #include "SkData.h"
++#include "SkImageFilter.h"
+ #include "SkMalloc.h"
++#include "SkRegion.h"
+ #include "SkTypes.h"
+ 
+ #include <limits>
+@@ -48,6 +50,11 @@
+     template <typename T, typename Min, typename Max>
+     void nextRange(T*, Min, Max);
+ 
++    // Explicit version of nextRange for enums.
++    // Again, values are in [min, max].
++    template <typename T, typename Min, typename Max>
++    void nextEnum(T*, Min, Max);
++
+     // nextN loads n * sizeof(T) bytes into ptr
+     template <typename T>
+     void nextN(T* ptr, int n);
+@@ -58,6 +65,13 @@
+         raise(SIGSEGV);
+     }
+ 
++    // Specialized versions for when true random doesn't quite make sense
++    void next(bool* b);
++    void next(SkImageFilter::CropRect* cropRect);
++    void next(SkRegion* region);
++
++    void nextRange(float* f, float min, float max);
++
+ private:
+     template <typename T>
+     T nextT();
+@@ -67,14 +81,6 @@
+     friend void fuzz__MakeEncoderCorpus(Fuzz*);
+ };
+ 
+-// UBSAN reminds us that bool can only legally hold 0 or 1.
+-template <>
+-inline void Fuzz::next(bool* b) {
+-  uint8_t n;
+-  this->next(&n);
+-  *b = (n & 1) == 1;
+-}
+-
+ template <typename T>
+ inline void Fuzz::next(T* n) {
+     if ((fNextByte + sizeof(T)) > fBytes->size()) {
+@@ -93,16 +99,6 @@
+    this->next(rest...);
+ }
+ 
+-template <>
+-inline void Fuzz::nextRange(float* f, float min, float max) {
+-    this->next(f);
+-    if (!std::isnormal(*f) && *f != 0.0f) {
+-        // Don't deal with infinity or other strange floats.
+-        *f = max;
+-    }
+-    *f = min + std::fmod(std::abs(*f), (max - min + 1));
+-}
+-
+ template <typename T, typename Min, typename Max>
+ inline void Fuzz::nextRange(T* n, Min min, Max max) {
+     this->next<T>(n);
+@@ -126,6 +122,12 @@
+     *n = min + (*n % ((size_t)max - min + 1));
+ }
+ 
++template <typename T, typename Min, typename Max>
++inline void Fuzz::nextEnum(T* value, Min rmin, Max rmax) {
++    using U = skstd::underlying_type_t<T>;
++    this->nextRange((U*)value, (U)rmin, (U)rmax);
++}
++
+ template <typename T>
+ inline void Fuzz::nextN(T* ptr, int n) {
+    for (int i = 0; i < n; i++) {
+diff --git a/fuzz/FuzzCanvas.cpp b/fuzz/FuzzCanvas.cpp
+index 9dbf260..df24800 100644
+--- a/fuzz/FuzzCanvas.cpp
++++ b/fuzz/FuzzCanvas.cpp
+@@ -96,74 +96,6 @@
+     return t;
+ }
+ 
+-template <>
+-inline void Fuzz::next(SkShader::TileMode* m) {
+-    fuzz_enum_range(this, m, 0, SkShader::kTileModeCount - 1);
+-}
+-
+-template <>
+-inline void Fuzz::next(SkFilterQuality* q) {
+-    fuzz_enum_range(this, q, SkFilterQuality::kNone_SkFilterQuality,
+-                    SkFilterQuality::kLast_SkFilterQuality);
+-}
+-
+-template <>
+-inline void Fuzz::next(SkMatrix* m) {
+-    constexpr int kArrayLength = 9;
+-    SkScalar buffer[kArrayLength];
+-    int matrixType;
+-    this->nextRange(&matrixType, 0, 4);
+-    switch (matrixType) {
+-        case 0:  // identity
+-            *m = SkMatrix::I();
+-            return;
+-        case 1:  // translate
+-            this->nextRange(&buffer[0], -4000.0f, 4000.0f);
+-            this->nextRange(&buffer[1], -4000.0f, 4000.0f);
+-            *m = SkMatrix::MakeTrans(buffer[0], buffer[1]);
+-            return;
+-        case 2:  // translate + scale
+-            this->nextRange(&buffer[0], -400.0f, 400.0f);
+-            this->nextRange(&buffer[1], -400.0f, 400.0f);
+-            this->nextRange(&buffer[2], -4000.0f, 4000.0f);
+-            this->nextRange(&buffer[3], -4000.0f, 4000.0f);
+-            *m = SkMatrix::MakeScale(buffer[0], buffer[1]);
+-            m->postTranslate(buffer[2], buffer[3]);
+-            return;
+-        case 3:  // affine
+-            this->nextN(buffer, 6);
+-            m->setAffine(buffer);
+-            return;
+-        case 4:  // perspective
+-            this->nextN(buffer, kArrayLength);
+-            m->set9(buffer);
+-            return;
+-        default:
+-            SkASSERT(false);
+-            return;
+-    }
+-}
+-
+-template <>
+-inline void Fuzz::next(SkRRect* rr) {
+-    SkRect r;
+-    SkVector radii[4];
+-    this->next(&r);
+-    r.sort();
+-    for (SkVector& vec : radii) {
+-        this->nextRange(&vec.fX, 0.0f, 1.0f);
+-        vec.fX *= 0.5f * r.width();
+-        this->nextRange(&vec.fY, 0.0f, 1.0f);
+-        vec.fY *= 0.5f * r.height();
+-    }
+-    rr->setRectRadii(r, radii);
+-}
+-
+-template <>
+-inline void Fuzz::next(SkBlendMode* mode) {
+-    fuzz_enum_range(this, mode, 0, SkBlendMode::kLastMode);
+-}
+-
+ static sk_sp<SkImage> make_fuzz_image(Fuzz*);
+ 
+ static SkBitmap make_fuzz_bitmap(Fuzz*);
+@@ -182,7 +114,8 @@
+         case 1: {
+             SkColor color;
+             SkBlendMode mode;
+-            fuzz->next(&color, &mode);
++            fuzz->next(&color);
++            fuzz->nextEnum(&mode, 0, SkBlendMode::kLastMode);
+             return SkColorFilter::MakeModeFilter(color, mode);
+         }
+         case 2: {
+@@ -278,21 +211,25 @@
+             return SkShader::MakeColorShader(color);
+         case 3:
+             img = make_fuzz_image(fuzz);
+-            fuzz->next(&tmX, &tmY, &useMatrix);
++            fuzz->nextEnum(&tmX, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->nextEnum(&tmY, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->next(&useMatrix);
+             if (useMatrix) {
+-                fuzz->next(&matrix);
++                FuzzNiceMatrix(fuzz, &matrix);
+             }
+             return img->makeShader(tmX, tmY, useMatrix ? &matrix : nullptr);
+         case 4:
+             bitmap = make_fuzz_bitmap(fuzz);
+-            fuzz->next(&tmX, &tmY, &useMatrix);
++            fuzz->nextEnum(&tmX, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->nextEnum(&tmY, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->next(&useMatrix);
+             if (useMatrix) {
+-                fuzz->next(&matrix);
++                FuzzNiceMatrix(fuzz, &matrix);
+             }
+             return SkShader::MakeBitmapShader(bitmap, tmX, tmY, useMatrix ? &matrix : nullptr);
+         case 5:
+             shader1 = make_fuzz_shader(fuzz, depth - 1);  // limit recursion.
+-            fuzz->next(&matrix);
++            FuzzNiceMatrix(fuzz, &matrix);
+             return shader1 ? shader1->makeWithLocalMatrix(matrix) : nullptr;
+         case 6:
+             shader1 = make_fuzz_shader(fuzz, depth - 1);  // limit recursion.
+@@ -301,15 +238,17 @@
+         case 7:
+             shader1 = make_fuzz_shader(fuzz, depth - 1);  // limit recursion.
+             shader2 = make_fuzz_shader(fuzz, depth - 1);
+-            fuzz->next(&blendMode);
++            fuzz->nextEnum(&blendMode, 0, SkBlendMode::kLastMode);
+             return SkShader::MakeComposeShader(std::move(shader1), std::move(shader2), blendMode);
+         case 8: {
+             auto pic = make_fuzz_picture(fuzz, depth - 1);
+             bool useTile;
+             SkRect tile;
+-            fuzz->next(&tmX, &tmY, &useMatrix, &useTile);
++            fuzz->nextEnum(&tmX, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->nextEnum(&tmY, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->next(&useMatrix, &useTile);
+             if (useMatrix) {
+-                fuzz->next(&matrix);
++                FuzzNiceMatrix(fuzz, &matrix);
+             }
+             if (useTile) {
+                 fuzz->next(&tile);
+@@ -332,9 +271,10 @@
+             fuzz->nextN(pts, 2);
+             fuzz->nextRange(&colorCount, 2, kMaxColors);
+             fuzz->nextN(colors, colorCount);
+-            fuzz->next(&tmX, &useMatrix, &usePos);
++            fuzz->nextEnum(&tmX, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->next(&useMatrix, &usePos);
+             if (useMatrix) {
+-                fuzz->next(&matrix);
++                FuzzNiceMatrix(fuzz, &matrix);
+             }
+             if (usePos) {
+                 fuzz_gradient_stops(fuzz, pos, colorCount);
+@@ -350,11 +290,12 @@
+             bool usePos;
+             SkColor colors[kMaxColors];
+             SkScalar pos[kMaxColors];
+-            fuzz->next(&tmX, &useMatrix, &usePos, &center, &radius);
++            fuzz->nextEnum(&tmX, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->next(&useMatrix, &usePos, &center, &radius);
+             fuzz->nextRange(&colorCount, 2, kMaxColors);
+             fuzz->nextN(colors, colorCount);
+             if (useMatrix) {
+-                fuzz->next(&matrix);
++                FuzzNiceMatrix(fuzz, &matrix);
+             }
+             if (usePos) {
+                 fuzz_gradient_stops(fuzz, pos, colorCount);
+@@ -370,11 +311,12 @@
+             bool usePos;
+             SkColor colors[kMaxColors];
+             SkScalar pos[kMaxColors];
+-            fuzz->next(&tmX, &useMatrix, &usePos, &startRadius, &endRadius, &start, &end);
++            fuzz->nextEnum(&tmX, 0, SkShader::TileMode::kLast_TileMode);
++            fuzz->next(&useMatrix, &usePos, &startRadius, &endRadius, &start, &end);
+             fuzz->nextRange(&colorCount, 2, kMaxColors);
+             fuzz->nextN(colors, colorCount);
+             if (useMatrix) {
+-                fuzz->next(&matrix);
++                FuzzNiceMatrix(fuzz, &matrix);
+             }
+             if (usePos) {
+                 fuzz_gradient_stops(fuzz, pos, colorCount);
+@@ -394,7 +336,7 @@
+             fuzz->nextRange(&colorCount, 2, kMaxColors);
+             fuzz->nextN(colors, colorCount);
+             if (useMatrix) {
+-                fuzz->next(&matrix);
++                FuzzNiceMatrix(fuzz, &matrix);
+             }
+             if (usePos) {
+                 fuzz_gradient_stops(fuzz, pos, colorCount);
+@@ -455,20 +397,21 @@
+             SkScalar advance, phase;
+             fuzz->next(&advance, &phase);
+             SkPath1DPathEffect::Style style;
+-            fuzz_enum_range(fuzz, &style, 0, SkPath1DPathEffect::kLastEnum_Style);
++            fuzz->nextEnum(&style, 0, SkPath1DPathEffect::kLastEnum_Style);
+             return SkPath1DPathEffect::Make(path, advance, phase, style);
+         }
+         case 4: {
+             SkScalar width;
+             SkMatrix matrix;
+-            fuzz->next(&width, &matrix);
++            fuzz->next(&width);
++            FuzzNiceMatrix(fuzz, &matrix);
+             return SkLine2DPathEffect::Make(width, matrix);
+         }
+         case 5: {
+             SkPath path;
+             FuzzPath(fuzz, &path, 20);
+             SkMatrix matrix;
+-            fuzz->next(&matrix);
++            FuzzNiceMatrix(fuzz, &matrix);
+             return SkPath2DPathEffect::Make(matrix, path);
+         }
+         case 6: {
+@@ -505,7 +448,7 @@
+             return nullptr;
+         case 1: {
+             SkBlurStyle blurStyle;
+-            fuzz_enum_range(fuzz, &blurStyle, 0, kLastEnum_SkBlurStyle);
++            fuzz->nextEnum(&blurStyle, 0, kLastEnum_SkBlurStyle);
+             SkScalar sigma;
+             fuzz->next(&sigma);
+             bool respectCTM;
+@@ -533,15 +476,6 @@
+     return sk_sp<SkTypeface>(family->createTypeface(j));
+ }
+ 
+-template <>
+-inline void Fuzz::next(SkImageFilter::CropRect* cropRect) {
+-    SkRect rect;
+-    uint8_t flags;
+-    this->next(&rect);
+-    this->nextRange(&flags, 0, 0xF);
+-    *cropRect = SkImageFilter::CropRect(rect, flags);
+-}
+-
+ static sk_sp<SkImageFilter> make_fuzz_imageFilter(Fuzz* fuzz, int depth);
+ 
+ static sk_sp<SkImageFilter> make_fuzz_lighting_imagefilter(Fuzz* fuzz, int depth) {
+@@ -629,8 +563,9 @@
+         }
+         case 2: {
+             SkMatrix matrix;
++            FuzzNiceMatrix(fuzz, &matrix);
+             SkFilterQuality quality;
+-            fuzz->next(&matrix, &quality);
++            fuzz->nextEnum(&quality, 0, SkFilterQuality::kLast_SkFilterQuality);
+             sk_sp<SkImageFilter> input = make_fuzz_imageFilter(fuzz, depth - 1);
+             return SkImageFilter::MakeMatrixFilter(matrix, quality, std::move(input));
+         }
+@@ -681,8 +616,8 @@
+         }
+         case 7: {
+             SkDisplacementMapEffect::ChannelSelectorType xChannelSelector, yChannelSelector;
+-            fuzz_enum_range(fuzz, &xChannelSelector, 1, 4);
+-            fuzz_enum_range(fuzz, &yChannelSelector, 1, 4);
++            fuzz->nextEnum(&xChannelSelector, 1, 4);
++            fuzz->nextEnum(&yChannelSelector, 1, 4);
+             SkScalar scale;
+             bool useCropRect;
+             fuzz->next(&scale, &useCropRect);
+@@ -700,7 +635,7 @@
+             SkScalar dx, dy, sigmaX, sigmaY;
+             SkColor color;
+             SkDropShadowImageFilter::ShadowMode shadowMode;
+-            fuzz_enum_range(fuzz, &shadowMode, 0, 1);
++            fuzz->nextEnum(&shadowMode, 0, 1);
+             bool useCropRect;
+             fuzz->next(&dx, &dy, &sigmaX, &sigmaY, &color, &useCropRect);
+             SkImageFilter::CropRect cropRect;
+@@ -718,7 +653,8 @@
+             sk_sp<SkImage> image = make_fuzz_image(fuzz);
+             SkRect srcRect, dstRect;
+             SkFilterQuality filterQuality;
+-            fuzz->next(&srcRect, &dstRect, &filterQuality);
++            fuzz->next(&srcRect, &dstRect);
++            fuzz->nextEnum(&filterQuality, 0, SkFilterQuality::kLast_SkFilterQuality);
+             return SkImageSource::Make(std::move(image), srcRect, dstRect, filterQuality);
+         }
+         case 11:
+@@ -750,7 +686,7 @@
+             bool convolveAlpha, useCropRect;
+             fuzz->next(&gain, &bias, &convolveAlpha, &useCropRect);
+             SkMatrixConvolutionImageFilter::TileMode tileMode;
+-            fuzz_enum_range(fuzz, &tileMode, 0, 2);
++            fuzz->nextEnum(&tileMode, 0, SkMatrixConvolutionImageFilter::TileMode::kLast_TileMode);
+             SkImageFilter::CropRect cropRect;
+             if (useCropRect) {
+                 fuzz->next(&cropRect);
+@@ -857,7 +793,8 @@
+         case 23: {
+             SkBlendMode blendMode;
+             bool useCropRect;
+-            fuzz->next(&useCropRect, &blendMode);
++            fuzz->next(&useCropRect);
++            fuzz->nextEnum(&blendMode, 0, SkBlendMode::kLastMode);
+             SkImageFilter::CropRect cropRect;
+             if (useCropRect) {
+                 fuzz->next(&cropRect);
+@@ -912,7 +849,7 @@
+ template <typename T, typename Min, typename Max>
+ inline T make_fuzz_t_range(Fuzz* fuzz, Min minv, Max maxv) {
+     T value;
+-    fuzz_enum_range(fuzz, &value, minv, maxv);
++    fuzz->nextEnum(&value, minv, maxv);
+     return value;
+ }
+ 
+@@ -1104,7 +1041,6 @@
+             return;
+         }
+         SkPaint paint;
+-        SkMatrix matrix;
+         unsigned drawCommand;
+         fuzz->nextRange(&drawCommand, 0, 53);
+         switch (drawCommand) {
+@@ -1212,13 +1148,13 @@
+             }
+             case 16: {
+                 SkMatrix mat;
+-                fuzz->next(&mat);
++                FuzzNiceMatrix(fuzz, &mat);
+                 canvas->concat(mat);
+                 break;
+             }
+             case 17: {
+                 SkMatrix mat;
+-                fuzz->next(&mat);
++                FuzzNiceMatrix(fuzz, &mat);
+                 canvas->setMatrix(mat);
+                 break;
+             }
+@@ -1239,7 +1175,7 @@
+                 SkRRect rr;
+                 int op;
+                 bool doAntiAlias;
+-                fuzz->next(&rr);
++                FuzzNiceRRect(fuzz, &rr);
+                 fuzz->next(&doAntiAlias);
+                 fuzz->nextRange(&op, 0, 1);
+                 canvas->clipRRect(rr, (SkClipOp)op, doAntiAlias);
+@@ -1270,7 +1206,7 @@
+             case 24: {
+                 fuzz_paint(fuzz, &paint, depth - 1);
+                 SkCanvas::PointMode pointMode;
+-                fuzz_enum_range(fuzz, &pointMode,
++                fuzz->nextEnum(&pointMode,
+                                 SkCanvas::kPoints_PointMode, SkCanvas::kPolygon_PointMode);
+                 size_t count;
+                 constexpr int kMaxCount = 30;
+@@ -1311,15 +1247,15 @@
+             case 29: {
+                 fuzz_paint(fuzz, &paint, depth - 1);
+                 SkRRect rr;
+-                fuzz->next(&rr);
++                FuzzNiceRRect(fuzz, &rr);
+                 canvas->drawRRect(rr, paint);
+                 break;
+             }
+             case 30: {
+                 fuzz_paint(fuzz, &paint, depth - 1);
+                 SkRRect orr, irr;
+-                fuzz->next(&orr);
+-                fuzz->next(&irr);
++                FuzzNiceRRect(fuzz, &orr);
++                FuzzNiceRRect(fuzz, &irr);
+                 if (orr.getBounds().contains(irr.getBounds())) {
+                     canvas->drawDRRect(orr, irr, paint);
+                 }
+@@ -1605,7 +1541,7 @@
+                 SkMatrix matrix;
+                 bool useMatrix = make_fuzz_t<bool>(fuzz);
+                 if (useMatrix) {
+-                    fuzz->next(&matrix);
++                    FuzzNiceMatrix(fuzz, &matrix);
+                 }
+                 fuzz_paint(fuzz, &paint, depth - 1);
+                 fuzz_paint_text(fuzz, &paint);
+@@ -1645,13 +1581,14 @@
+                 break;
+             }
+             case 52: {
++                SkMatrix matrix;
+                 bool usePaint, useMatrix;
+                 fuzz->next(&usePaint, &useMatrix);
+                 if (usePaint) {
+                     fuzz_paint(fuzz, &paint, depth - 1);
+                 }
+                 if (useMatrix) {
+-                    fuzz->next(&matrix);
++                    FuzzNiceMatrix(fuzz, &matrix);
+                 }
+                 auto pic = make_fuzz_picture(fuzz, depth - 1);
+                 canvas->drawPicture(pic, useMatrix ? &matrix : nullptr,
+@@ -1662,8 +1599,8 @@
+                 fuzz_paint(fuzz, &paint, depth - 1);
+                 SkVertices::VertexMode vertexMode;
+                 SkBlendMode blendMode;
+-                fuzz_enum_range(fuzz, &vertexMode, 0, SkVertices::kTriangleFan_VertexMode);
+-                fuzz->next(&blendMode);
++                fuzz->nextEnum(&vertexMode, 0, SkVertices::kTriangleFan_VertexMode);
++                fuzz->nextEnum(&blendMode, 0, SkBlendMode::kLastMode);
+                 constexpr int kMaxCount = 100;
+                 int vertexCount;
+                 SkPoint vertices[kMaxCount];
+diff --git a/fuzz/FuzzCommon.cpp b/fuzz/FuzzCommon.cpp
+index d6aa94e..36ec600 100644
+--- a/fuzz/FuzzCommon.cpp
++++ b/fuzz/FuzzCommon.cpp
+@@ -8,6 +8,21 @@
+ #include "Fuzz.h"
+ #include "FuzzCommon.h"
+ 
++// We don't always want to test NaNs and infinities.
++static void fuzz_nice_float(Fuzz* fuzz, float* f) {
++    float v;
++    fuzz->next(&v);
++    constexpr float kLimit = 1.0e35f;  // FLT_MAX?
++    *f = (v == v && v <= kLimit && v >= -kLimit) ? v : 0.0f;
++}
++
++template <typename... Args>
++static void fuzz_nice_float(Fuzz* fuzz, float* f, Args... rest) {
++    fuzz_nice_float(fuzz, f);
++    fuzz_nice_float(fuzz, rest...);
++}
++
++
+ // allows some float values for path points
+ void FuzzPath(Fuzz* fuzz, SkPath* path, int maxOps) {
+     if (maxOps <= 0) {
+@@ -239,3 +254,72 @@
+     }
+   }
+ }
++
++void FuzzNiceRRect(Fuzz* fuzz, SkRRect* rr) {
++    SkRect r;
++    SkVector radii[4];
++    fuzz->next(&r);
++    r.sort();
++    for (SkVector& vec : radii) {
++        fuzz->nextRange(&vec.fX, 0.0f, 1.0f);
++        vec.fX *= 0.5f * r.width();
++        fuzz->nextRange(&vec.fY, 0.0f, 1.0f);
++        vec.fY *= 0.5f * r.height();
++    }
++    rr->setRectRadii(r, radii);
++}
++
++void FuzzNiceMatrix(Fuzz* fuzz, SkMatrix* m) {
++    constexpr int kArrayLength = 9;
++    SkScalar buffer[kArrayLength];
++    int matrixType;
++    fuzz->nextRange(&matrixType, 0, 4);
++    switch (matrixType) {
++        case 0:  // identity
++            *m = SkMatrix::I();
++            return;
++        case 1:  // translate
++            fuzz->nextRange(&buffer[0], -4000.0f, 4000.0f);
++            fuzz->nextRange(&buffer[1], -4000.0f, 4000.0f);
++            *m = SkMatrix::MakeTrans(buffer[0], buffer[1]);
++            return;
++        case 2:  // translate + scale
++            fuzz->nextRange(&buffer[0], -400.0f, 400.0f);
++            fuzz->nextRange(&buffer[1], -400.0f, 400.0f);
++            fuzz->nextRange(&buffer[2], -4000.0f, 4000.0f);
++            fuzz->nextRange(&buffer[3], -4000.0f, 4000.0f);
++            *m = SkMatrix::MakeScale(buffer[0], buffer[1]);
++            m->postTranslate(buffer[2], buffer[3]);
++            return;
++        case 3:  // affine
++            fuzz->nextN(buffer, 6);
++            m->setAffine(buffer);
++            return;
++        case 4:  // perspective
++            fuzz->nextN(buffer, kArrayLength);
++            m->set9(buffer);
++            return;
++        default:
++            SkASSERT(false);
++            return;
++    }
++}
++
++void FuzzNiceRegion(Fuzz* fuzz, SkRegion* region, int maxN) {
++    uint8_t N;
++    fuzz->nextRange(&N, 0, maxN);
++    for (uint8_t i = 0; i < N; ++i) {
++        SkIRect r;
++        SkRegion::Op op;
++        // Avoid the sentinal value used by Region.
++        fuzz->nextRange(&r.fLeft,   -2147483646, 2147483646);
++        fuzz->nextRange(&r.fTop,    -2147483646, 2147483646);
++        fuzz->nextRange(&r.fRight,  -2147483646, 2147483646);
++        fuzz->nextRange(&r.fBottom, -2147483646, 2147483646);
++        r.sort();
++        fuzz->nextEnum(&op, 0, SkRegion::kLastOp);
++        if (!region->op(r, op)) {
++            return;
++        }
++    }
++}
+diff --git a/fuzz/FuzzCommon.h b/fuzz/FuzzCommon.h
+index 98fab25..11b7317 100644
+--- a/fuzz/FuzzCommon.h
++++ b/fuzz/FuzzCommon.h
+@@ -9,55 +9,21 @@
+ #define FuzzCommon_DEFINED
+ 
+ #include "Fuzz.h"
++#include "SkMatrix.h"
+ #include "SkPath.h"
++#include "SkRRect.h"
+ #include "SkRegion.h"
+ 
+-// We don't always want to test NaNs and infinities.
+-static inline void fuzz_nice_float(Fuzz* fuzz, float* f) {
+-    float v;
+-    fuzz->next(&v);
+-    constexpr float kLimit = 1.0e35f;  // FLT_MAX?
+-    *f = (v == v && v <= kLimit && v >= -kLimit) ? v : 0.0f;
+-}
+-
+-template <typename... Args>
+-inline void fuzz_nice_float(Fuzz* fuzz, float* f, Args... rest) {
+-    fuzz_nice_float(fuzz, f);
+-    fuzz_nice_float(fuzz, rest...);
+-}
+-
+-template <typename T, typename Min, typename Max>
+-inline void fuzz_enum_range(Fuzz* fuzz, T* value, Min rmin, Max rmax) {
+-    using U = skstd::underlying_type_t<T>;
+-    fuzz->nextRange((U*)value, (U)rmin, (U)rmax);
+-}
+-
+-inline void fuzz_region(Fuzz* fuzz, SkRegion* region, int maxN) {
+-    uint8_t N;
+-    fuzz->nextRange(&N, 0, maxN);
+-    for (uint8_t i = 0; i < N; ++i) {
+-        SkIRect r;
+-        SkRegion::Op op;
+-        // Avoid the sentinal value used by Region.
+-        fuzz->nextRange(&r.fLeft,   -2147483646, 2147483646);
+-        fuzz->nextRange(&r.fTop,    -2147483646, 2147483646);
+-        fuzz->nextRange(&r.fRight,  -2147483646, 2147483646);
+-        fuzz->nextRange(&r.fBottom, -2147483646, 2147483646);
+-        r.sort();
+-        fuzz_enum_range(fuzz, &op, (SkRegion::Op)0, SkRegion::kLastOp);
+-        if (!region->op(r, op)) {
+-            return;
+-        }
+-    }
+-}
+-
+-template <>
+-inline void Fuzz::next(SkRegion* region) { fuzz_region(this, region, 10); }
+-
+ // allows some float values for path points
+ void FuzzPath(Fuzz* fuzz, SkPath* path, int maxOps);
+ // allows all float values for path points
+ void BuildPath(Fuzz* fuzz, SkPath* path, int last_verb);
+ 
++void FuzzNiceRRect(Fuzz* fuzz, SkRRect* rr);
++
++void FuzzNiceMatrix(Fuzz* fuzz, SkMatrix* m);
++
++void FuzzNiceRegion(Fuzz* fuzz, SkRegion* region, int maxN);
++
+ #endif
+ 
+diff --git a/fuzz/fuzz.cpp b/fuzz/FuzzMain.cpp
+similarity index 100%
+rename from fuzz/fuzz.cpp
+rename to fuzz/FuzzMain.cpp
+diff --git a/fuzz/FuzzRegionOp.cpp b/fuzz/FuzzRegionOp.cpp
+index 7f8bbbe..ec0194d 100644
+--- a/fuzz/FuzzRegionOp.cpp
++++ b/fuzz/FuzzRegionOp.cpp
+@@ -10,9 +10,9 @@
+ 
+ DEF_FUZZ(RegionOp, fuzz) {  // `fuzz -t api -n RegionOp`
+     SkRegion regionA, regionB, regionC;
+-    fuzz_region(fuzz, &regionA, 2000);
+-    fuzz_region(fuzz, &regionB, 2000);
++    FuzzNiceRegion(fuzz, &regionA, 2000);
++    FuzzNiceRegion(fuzz, &regionB, 2000);
+     SkRegion::Op op;
+-    fuzz_enum_range(fuzz, &op, (SkRegion::Op)0, SkRegion::kLastOp);
++    fuzz->nextEnum(&op, 0, SkRegion::kLastOp);
+     regionC.op(regionA, regionB, op);
+ }

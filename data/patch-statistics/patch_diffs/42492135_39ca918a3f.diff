@@ -1,0 +1,74 @@
+From cc8a207b883e2f953c7e2e19a7d33a0e370bc1ee Mon Sep 17 00:00:00 2001
+From: James Bonfield <jkb@sanger.ac.uk>
+Date: Tue, 26 Jan 2021 09:31:42 +0000
+Subject: [PATCH] Fix more OSS fuzz bugs
+
+Credit to OSS-Fuzz
+
+- Fix overflow in filling out sfb[] array.
+
+  This bug was created in a recent previous commit by making F[j]
+  unsigned.  This evaded the test on F[j]<0 and the x+F[j] > ... test
+  fails also due to overflowing.  Rearranged to fix this.
+
+  Fixes oss-fuzz 29931
+
+- Fix RLE with zero-byte meta-data block.
+  This caused a read beyond buffer by 1 byte, although it was
+  guaranteed to then fail on the next line (and not report the byte it
+  read).
+
+  Fixes oss-fuzz 29939
+
+- Fix rle_decode memory tidyup.
+  It doesn't own "out" so freeing it is wrong.
+
+  Fixes oss-fuzz 29935
+---
+ htscodecs/rANS_static4x16pr.c | 6 ++++--
+ htscodecs/rle.c               | 1 -
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/htscodecs/rANS_static4x16pr.c b/htscodecs/rANS_static4x16pr.c
+index e39672f..7d1361e 100644
+--- a/htscodecs/rANS_static4x16pr.c
++++ b/htscodecs/rANS_static4x16pr.c
+@@ -611,7 +611,7 @@ unsigned char *rans_uncompress_O0_4x16(unsigned char *in, unsigned int in_size,
+     // Build symbols; fixme, do as part of decode, see the _d variant
+     for (j = x = 0; j < 256; j++) {
+ 	if (F[j]) {
+-	    if (x + F[j] > TOTFREQ)
++	    if (F[j] > TOTFREQ - x)
+ 		goto err;
+ 	    for (y = 0; y < F[j]; y++) {
+ 		ssym [y + x] = j;
+@@ -1118,7 +1118,7 @@ unsigned char *rans_uncompress_O1_4x16(unsigned char *in, unsigned int in_size,
+ 	// Build symbols; fixme, do as part of decode, see the _d variant
+ 	for (j = x = 0; j < 256; j++) {
+ 	    if (F[j]) {
+-		if (x + F[j] > (1<<shift))
++		if (F[j] > (1<<shift) - x)
+ 		    goto err;
+ 
+ 		memset(&sfb[i][x], j, F[j]);
+@@ -1777,6 +1777,8 @@ unsigned char *rans_uncompress_to_4x16(unsigned char *in,  unsigned int in_size,
+ 
+     if (do_rle) {
+ 	// Unpack RLE.  tmp1 -> tmp2.
++	if (u_meta_size == 0)
++	    goto err;
+ 	uint64_t unrle_size = *out_size;
+ 	int rle_nsyms = *meta ? *meta : 256;
+ 	if (u_meta_size < 1+rle_nsyms)
+diff --git a/htscodecs/rle.c b/htscodecs/rle.c
+index 58c3672..fd0965a 100644
+--- a/htscodecs/rle.c
++++ b/htscodecs/rle.c
+@@ -183,7 +183,6 @@ uint8_t *rle_decode(uint8_t *lit, uint64_t lit_len,
+     return out;
+ 
+  err:
+-    free(out);
+     return NULL;
+ }
+ 

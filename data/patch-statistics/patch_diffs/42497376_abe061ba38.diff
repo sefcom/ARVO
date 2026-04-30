@@ -1,0 +1,260 @@
+From 4be1e8dbb3f8da8058ed93dfc222ee6dffb02e60 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Tue, 25 May 2021 13:36:20 +0930
+Subject: [PATCH] asan: _bfd_elf_parse_attributes heap buffer overflow
+
+I exposed a problem with the change in commit 574ec1084d to the outer
+loop of _bfd_elf_parse_attributes.  "p_end - p >= 4" is better than
+"p < p_end - 4" as far as pointer UB is concerned if the size of the
+attritbute section is say, 3 bytes.  However you do need to ensure p
+never exceeds p_end, and that length remaining is kept consistent with
+the pointer.
+
+	* elf-attrs.c (elf_attr_strdup): New function.
+	(_bfd_elf_attr_strdup): Use it here.
+	(elf_add_obj_attr_string): New function, extracted from..
+	(bfd_elf_add_obj_attr_string): ..here.
+	(elf_add_obj_attr_int_string): New function, extracted from..
+	(bfd_elf_add_obj_attr_int_string): ..here.
+	(_bfd_elf_parse_attributes): Don't allocate an extra byte for a
+	string terminator.  Instead ensure parsing doesn't go past
+	end of sub-section.  Use size_t variables for lengths.
+---
+ bfd/ChangeLog   |  12 ++++++
+ bfd/elf-attrs.c | 109 ++++++++++++++++++++++++++++++------------------
+ 2 files changed, 81 insertions(+), 40 deletions(-)
+
+diff --git a/bfd/ChangeLog b/bfd/ChangeLog
+index a240941eb00..516b8163585 100644
+--- a/bfd/ChangeLog
++++ b/bfd/ChangeLog
+@@ -1,3 +1,15 @@
++2021-05-25  Alan Modra  <amodra@gmail.com>
++
++	* elf-attrs.c (elf_attr_strdup): New function.
++	(_bfd_elf_attr_strdup): Use it here.
++	(elf_add_obj_attr_string): New function, extracted from..
++	(bfd_elf_add_obj_attr_string): ..here.
++	(elf_add_obj_attr_int_string): New function, extracted from..
++	(bfd_elf_add_obj_attr_int_string): ..here.
++	(_bfd_elf_parse_attributes): Don't allocate an extra byte for a
++	string terminator.  Instead ensure parsing doesn't go past
++	end of sub-section.  Use size_t variables for lengths.
++
+ 2021-05-22  Alan Modra  <amodra@gmail.com>
+ 
+ 	* libbfd.c (_bfd_safe_read_leb128): Remove length_return parameter.
+diff --git a/bfd/elf-attrs.c b/bfd/elf-attrs.c
+index e77b73a2a97..11a81a3ba74 100644
+--- a/bfd/elf-attrs.c
++++ b/bfd/elf-attrs.c
+@@ -303,40 +303,69 @@ bfd_elf_add_obj_attr_int (bfd *abfd, int vendor, unsigned int tag, unsigned int
+ }
+ 
+ /* Duplicate an object attribute string value.  */
+-char *
+-_bfd_elf_attr_strdup (bfd *abfd, const char * s)
++static char *
++elf_attr_strdup (bfd *abfd, const char *s, const char *end)
+ {
+-  char * p;
+-  int len;
++  char *p;
++  size_t len;
++
++  if (end)
++    len = strnlen (s, end - s);
++  else
++    len = strlen (s);
++
++  p = (char *) bfd_alloc (abfd, len + 1);
++  if (p != NULL)
++    {
++      memcpy (p, s, len);
++      p[len] = 0;
++    }
++  return p;
++}
+ 
+-  len = strlen (s) + 1;
+-  p = (char *) bfd_alloc (abfd, len);
+-  return (char *) memcpy (p, s, len);
++char *
++_bfd_elf_attr_strdup (bfd *abfd, const char *s)
++{
++  return elf_attr_strdup (abfd, s, NULL);
+ }
+ 
+ /* Add a string object attribute.  */
+-void
+-bfd_elf_add_obj_attr_string (bfd *abfd, int vendor, unsigned int tag, const char *s)
++static void
++elf_add_obj_attr_string (bfd *abfd, int vendor, unsigned int tag,
++			 const char *s, const char *end)
+ {
+   obj_attribute *attr;
+ 
+   attr = elf_new_obj_attr (abfd, vendor, tag);
+   attr->type = _bfd_elf_obj_attrs_arg_type (abfd, vendor, tag);
+-  attr->s = _bfd_elf_attr_strdup (abfd, s);
++  attr->s = elf_attr_strdup (abfd, s, end);
+ }
+ 
+-/* Add a int+string object attribute.  */
+ void
+-bfd_elf_add_obj_attr_int_string (bfd *abfd, int vendor,
+-				 unsigned int tag,
+-				 unsigned int i, const char *s)
++bfd_elf_add_obj_attr_string (bfd *abfd, int vendor, unsigned int tag,
++			     const char *s)
++{
++  elf_add_obj_attr_string (abfd, vendor, tag, s, NULL);
++}
++
++/* Add a int+string object attribute.  */
++static void
++elf_add_obj_attr_int_string (bfd *abfd, int vendor, unsigned int tag,
++			     unsigned int i, const char *s, const char *end)
+ {
+   obj_attribute *attr;
+ 
+   attr = elf_new_obj_attr (abfd, vendor, tag);
+   attr->type = _bfd_elf_obj_attrs_arg_type (abfd, vendor, tag);
+   attr->i = i;
+-  attr->s = _bfd_elf_attr_strdup (abfd, s);
++  attr->s = elf_attr_strdup (abfd, s, end);
++}
++
++void
++bfd_elf_add_obj_attr_int_string (bfd *abfd, int vendor, unsigned int tag,
++				 unsigned int i, const char *s)
++{
++  elf_add_obj_attr_int_string (abfd, vendor, tag, i, s, NULL);
+ }
+ 
+ /* Copy the object attributes from IBFD to OBFD.  */
+@@ -434,7 +463,6 @@ _bfd_elf_parse_attributes (bfd *abfd, Elf_Internal_Shdr * hdr)
+   bfd_byte *contents;
+   bfd_byte *p;
+   bfd_byte *p_end;
+-  bfd_vma len;
+   const char *std_sec;
+   ufile_ptr filesize;
+ 
+@@ -452,7 +480,7 @@ _bfd_elf_parse_attributes (bfd *abfd, Elf_Internal_Shdr * hdr)
+       return;
+     }
+ 
+-  contents = (bfd_byte *) bfd_malloc (hdr->sh_size + 1);
++  contents = (bfd_byte *) bfd_malloc (hdr->sh_size);
+   if (!contents)
+     return;
+   if (!bfd_get_section_contents (abfd, hdr->bfd_section, contents, 0,
+@@ -461,20 +489,17 @@ _bfd_elf_parse_attributes (bfd *abfd, Elf_Internal_Shdr * hdr)
+       free (contents);
+       return;
+     }
+-  /* Ensure that the buffer is NUL terminated.  */
+-  contents[hdr->sh_size] = 0;
+   p = contents;
+   p_end = p + hdr->sh_size;
+   std_sec = get_elf_backend_data (abfd)->obj_attrs_vendor;
+ 
+-  if (*(p++) == 'A')
++  if (*p++ == 'A')
+     {
+-      len = hdr->sh_size - 1;
+-
+-      while (len > 0 && p_end - p >= 4)
++      while (p_end - p >= 4)
+ 	{
+-	  unsigned namelen;
+-	  bfd_vma section_len;
++	  size_t len = p_end - p;
++	  size_t namelen;
++	  size_t section_len;
+ 	  int vendor;
+ 
+ 	  section_len = bfd_get_32 (abfd, p);
+@@ -483,19 +508,17 @@ _bfd_elf_parse_attributes (bfd *abfd, Elf_Internal_Shdr * hdr)
+ 	    break;
+ 	  if (section_len > len)
+ 	    section_len = len;
+-	  len -= section_len;
+ 	  if (section_len <= 4)
+ 	    {
+ 	      _bfd_error_handler
+-		(_("%pB: error: attribute section length too small: %" PRId64),
+-		 abfd, (int64_t) section_len);
++		(_("%pB: error: attribute section length too small: %ld"),
++		 abfd, (long) section_len);
+ 	      break;
+ 	    }
+ 	  section_len -= 4;
+ 	  namelen = strnlen ((char *) p, section_len) + 1;
+-	  if (namelen == 0 || namelen >= section_len)
++	  if (namelen >= section_len)
+ 	    break;
+-	  section_len -= namelen;
+ 	  if (std_sec && strcmp ((char *) p, std_sec) == 0)
+ 	    vendor = OBJ_ATTR_PROC;
+ 	  else if (strcmp ((char *) p, "gnu") == 0)
+@@ -503,16 +526,17 @@ _bfd_elf_parse_attributes (bfd *abfd, Elf_Internal_Shdr * hdr)
+ 	  else
+ 	    {
+ 	      /* Other vendor section.  Ignore it.  */
+-	      p += namelen + section_len;
++	      p += section_len;
+ 	      continue;
+ 	    }
+ 
+ 	  p += namelen;
+-	  while (section_len > 0 && p < p_end)
++	  section_len -= namelen;
++	  while (section_len > 0)
+ 	    {
+ 	      unsigned int tag;
+ 	      unsigned int val;
+-	      bfd_vma subsection_len;
++	      size_t subsection_len;
+ 	      bfd_byte *end, *orig_p;
+ 
+ 	      orig_p = p;
+@@ -546,14 +570,20 @@ _bfd_elf_parse_attributes (bfd *abfd, Elf_Internal_Shdr * hdr)
+ 			{
+ 			case ATTR_TYPE_FLAG_INT_VAL | ATTR_TYPE_FLAG_STR_VAL:
+ 			  val = _bfd_safe_read_leb128 (abfd, &p, false, end);
+-			  bfd_elf_add_obj_attr_int_string (abfd, vendor, tag,
+-							   val, (char *) p);
+-			  p += strlen ((char *)p) + 1;
++			  elf_add_obj_attr_int_string (abfd, vendor, tag, val,
++						       (char *) p,
++						       (char *) end);
++			  p += strnlen ((char *) p, end - p);
++			  if (p < end)
++			    p++;
+ 			  break;
+ 			case ATTR_TYPE_FLAG_STR_VAL:
+-			  bfd_elf_add_obj_attr_string (abfd, vendor, tag,
+-						       (char *) p);
+-			  p += strlen ((char *)p) + 1;
++			  elf_add_obj_attr_string (abfd, vendor, tag,
++						   (char *) p,
++						   (char *) end);
++			  p += strnlen ((char *) p, end - p);
++			  if (p < end)
++			    p++;
+ 			  break;
+ 			case ATTR_TYPE_FLAG_INT_VAL:
+ 			  val = _bfd_safe_read_leb128 (abfd, &p, false, end);
+@@ -571,7 +601,6 @@ _bfd_elf_parse_attributes (bfd *abfd, Elf_Internal_Shdr * hdr)
+ 		default:
+ 		  /* Ignore things we don't know about.  */
+ 		  p = end;
+-		  subsection_len = 0;
+ 		  break;
+ 		}
+ 	    }
+-- 
+GitLab
+

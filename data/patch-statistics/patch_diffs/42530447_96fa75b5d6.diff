@@ -1,0 +1,107 @@
+From e49a9150a3b1cfc3fb9097ca02dd042e35226129 Mon Sep 17 00:00:00 2001
+From: Mallikarjun Kamble <mallikarjun.kamble@ittiam.com>
+Date: Wed, 6 Dec 2023 19:38:52 +0530
+Subject: [PATCH] Fixes for heap overflow
+
+---
+ decoder/svc/isvcd_api.c             |  3 ++-
+ decoder/svc/isvcd_parse_slice.c     | 24 ++++++++++++++++++++++++
+ decoder/svc/isvcd_process_epslice.c |  2 ++
+ decoder/svc/isvcd_structs.h         |  1 +
+ 4 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/decoder/svc/isvcd_api.c b/decoder/svc/isvcd_api.c
+index f3ac7780..6fd595c6 100644
+--- a/decoder/svc/isvcd_api.c
++++ b/decoder/svc/isvcd_api.c
+@@ -5184,6 +5184,7 @@ WORD32 isvcd_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
+                 ps_svcd_ctxt->u1_cur_layer_id = u1_res_id;
+                 ps_svc_lyr_dec = ps_svcd_ctxt->ps_svc_dec_lyr + u1_res_id;
+                 ps_svc_lyr_dec->u1_res_init_done = 0;
++                ps_svc_lyr_dec->u1_first_mb_addr_check = 1;
+                 ps_dec = &ps_svc_lyr_dec->s_dec;
+ 
+                 ps_dec->i4_decode_header = ps_dec_zero_lyr->i4_decode_header;
+@@ -5320,7 +5321,7 @@ WORD32 isvcd_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
+                     ps_dec = &ps_svc_lyr_dec->s_dec;
+ 
+                     if((0 == ps_svcd_ctxt->u4_num_sps_ctr) || (0 == ps_svcd_ctxt->u4_num_pps_ctr) ||
+-                       (NULL == ps_dec->ps_cur_pps))
++                       (NULL == ps_dec->ps_cur_pps) || (ps_svc_lyr_dec->u1_res_init_done == 0))
+                     {
+                         ps_svcd_ctxt->u1_exit_till_next_IDR = 1;
+                         ps_dec_op->u4_error_code = ERROR_UNKNOWN_NAL;
+diff --git a/decoder/svc/isvcd_parse_slice.c b/decoder/svc/isvcd_parse_slice.c
+index f8270b6c..2dfba525 100644
+--- a/decoder/svc/isvcd_parse_slice.c
++++ b/decoder/svc/isvcd_parse_slice.c
+@@ -703,6 +703,18 @@ WORD32 isvcd_parse_decode_slice_ext_nal(UWORD8 u1_is_idr_slice, UWORD8 u1_nal_re
+         return ERROR_CORRUPTED_SLICE;
+     }
+ 
++    if(ps_svc_lyr_dec->u1_first_mb_addr_check == 1)
++    {
++        if(u2_first_mb_in_slice != 0)
++        {
++            return ERROR_CORRUPTED_SLICE;
++        }
++        else
++        {
++            ps_svc_lyr_dec->u1_first_mb_addr_check = 0;
++        }
++    }
++
+     COPYTHECONTEXT("Slice Header SVC ext: first_mb_in_slice", u2_first_mb_in_slice);
+ 
+     u4_temp = ih264d_uev(pu4_bitstrm_ofst, pu4_bitstrm_buf);
+@@ -1926,6 +1938,18 @@ WORD32 isvcd_parse_decode_slice(UWORD8 u1_is_idr_slice, UWORD8 u1_nal_ref_idc,
+         return ERROR_CORRUPTED_SLICE;
+     }
+ 
++    if(ps_svc_lyr_dec->u1_first_mb_addr_check == 1)
++    {
++        if(u2_first_mb_in_slice != 0)
++        {
++            return ERROR_CORRUPTED_SLICE;
++        }
++        else
++        {
++            ps_svc_lyr_dec->u1_first_mb_addr_check = 0;
++        }
++    }
++
+     COPYTHECONTEXT("SH: first_mb_in_slice", u2_first_mb_in_slice);
+ 
+     u4_temp = ih264d_uev(pu4_bitstrm_ofst, pu4_bitstrm_buf);
+diff --git a/decoder/svc/isvcd_process_epslice.c b/decoder/svc/isvcd_process_epslice.c
+index 62bc5bf2..29e9bbba 100644
+--- a/decoder/svc/isvcd_process_epslice.c
++++ b/decoder/svc/isvcd_process_epslice.c
+@@ -158,6 +158,7 @@ WORD32 isvcd_interlyr_motion_mode_pred(svc_dec_lyr_struct_t *ps_svc_lyr_dec,
+         /* get the current layer ctxt */
+         ps_lyr_mem = &ps_ctxt->as_res_lyr_mem[ps_ctxt->i4_res_id];
+ 
++#if 0
+         /* In case of error mb_mode is set to skip */
+         if(ps_svc_lyr_dec->u1_res_init_done == 0)
+         {
+@@ -191,6 +192,7 @@ WORD32 isvcd_interlyr_motion_mode_pred(svc_dec_lyr_struct_t *ps_svc_lyr_dec,
+             }
+         }
+         else
++#endif
+         {
+             ps_ctxt->i4_listx = i4_listx;
+ 
+diff --git a/decoder/svc/isvcd_structs.h b/decoder/svc/isvcd_structs.h
+index fefd32d5..b891acbe 100644
+--- a/decoder/svc/isvcd_structs.h
++++ b/decoder/svc/isvcd_structs.h
+@@ -661,6 +661,7 @@ typedef struct _SvcDecLyrStruct
+     UWORD32 u4_pps_id_for_layer;
+     UWORD8 u1_error_in_cur_frame;
+     UWORD8 u1_res_init_done;
++    UWORD8 u1_first_mb_addr_check;
+ } svc_dec_lyr_struct_t;
+ 
+ typedef struct

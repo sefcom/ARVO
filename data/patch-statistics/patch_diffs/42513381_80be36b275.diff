@@ -1,0 +1,126 @@
+From 37c59664adcb87bdf3279a5919940785057fe565 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Fri, 5 Aug 2022 19:40:23 +0930
+Subject: [PATCH] asan: ppc64_elf_get_synthetic_symtab heap buffer overflow
+
+Fuzzed input files with sizes of .dynamic not a multiple of dynamic
+tag size can result in reading past the end of the buffer with the
+current simple checks.  Fix that, and use the same check in other
+files that process input object .dynamic section.  (There is no need
+for buffer overflow checks in the linker's generated .dynamic
+section.)
+
+	* elf32-ppc.c (ppc_elf_get_synthetic_symtab): Sanity check
+	.dynamic content buffer reads.
+	* elf64-ppc.c (ppc64_elf_get_synthetic_symtab): Likewise.
+	* elf64-ia64-vms.c (elf64_vms_link_add_object_symbols): Likewise.
+	* elf.c (_bfd_elf_print_private_bfd_data): Simplify .dynamic
+	buffer sanity checks.
+	* elflink.c (elf_link_add_object_symbols): Avoid possible UB
+	subtracting sizeof_dyn from pointer.
+---
+ bfd/elf.c            | 11 +++--------
+ bfd/elf32-ppc.c      |  6 +++---
+ bfd/elf64-ia64-vms.c |  2 +-
+ bfd/elf64-ppc.c      |  6 +++---
+ bfd/elflink.c        |  8 ++++----
+ 5 files changed, 14 insertions(+), 19 deletions(-)
+
+diff --git a/bfd/elf.c b/bfd/elf.c
+index 346eea39b1f..1b9b7fad15a 100644
+--- a/bfd/elf.c
++++ b/bfd/elf.c
+@@ -1721,14 +1721,9 @@ _bfd_elf_print_private_bfd_data (bfd *abfd, void *farg)
+       extdynsize = get_elf_backend_data (abfd)->s->sizeof_dyn;
+       swap_dyn_in = get_elf_backend_data (abfd)->s->swap_dyn_in;
+ 
+-      extdyn = dynbuf;
+-      /* PR 17512: file: 6f427532.  */
+-      if (s->size < extdynsize)
+-	goto error_return;
+-      extdynend = extdyn + s->size;
+-      /* PR 17512: file: id:000006,sig:06,src:000000,op:flip4,pos:5664.
+-	 Fix range check.  */
+-      for (; extdyn <= (extdynend - extdynsize); extdyn += extdynsize)
++      for (extdyn = dynbuf, extdynend = dynbuf + s->size;
++	   (size_t) (extdynend - extdyn) >= extdynsize;
++	   extdyn += extdynsize)
+ 	{
+ 	  Elf_Internal_Dyn dyn;
+ 	  const char *name = "";
+diff --git a/bfd/elf32-ppc.c b/bfd/elf32-ppc.c
+index 3582711d962..1f77e18133a 100644
+--- a/bfd/elf32-ppc.c
++++ b/bfd/elf32-ppc.c
+@@ -1852,9 +1852,9 @@ ppc_elf_get_synthetic_symtab (bfd *abfd, long symcount, asymbol **syms,
+       extdynsize = get_elf_backend_data (abfd)->s->sizeof_dyn;
+       swap_dyn_in = get_elf_backend_data (abfd)->s->swap_dyn_in;
+ 
+-      extdyn = dynbuf;
+-      extdynend = extdyn + dynamic->size;
+-      for (; extdyn < extdynend; extdyn += extdynsize)
++      for (extdyn = dynbuf, extdynend = dynbuf + dynamic->size;
++	   (size_t) (extdynend - extdyn) >= extdynsize;
++	   extdyn += extdynsize)
+ 	{
+ 	  Elf_Internal_Dyn dyn;
+ 	  (*swap_dyn_in) (abfd, extdyn, &dyn);
+diff --git a/bfd/elf64-ia64-vms.c b/bfd/elf64-ia64-vms.c
+index 4d8f98550a3..613dacd755b 100644
+--- a/bfd/elf64-ia64-vms.c
++++ b/bfd/elf64-ia64-vms.c
+@@ -4845,7 +4845,7 @@ elf64_vms_link_add_object_symbols (bfd *abfd, struct bfd_link_info *info)
+ 	}
+ 
+       for (extdyn = dynbuf;
+-	   extdyn < dynbuf + s->size;
++	   (size_t) (dynbuf + s->size - extdyn) >= bed->s->sizeof_dyn;
+ 	   extdyn += bed->s->sizeof_dyn)
+ 	{
+ 	  Elf_Internal_Dyn dyn;
+diff --git a/bfd/elf64-ppc.c b/bfd/elf64-ppc.c
+index cfcd263173c..f1e482faed4 100644
+--- a/bfd/elf64-ppc.c
++++ b/bfd/elf64-ppc.c
+@@ -2513,9 +2513,9 @@ ppc64_elf_get_synthetic_symtab (bfd *abfd,
+ 	  extdynsize = get_elf_backend_data (abfd)->s->sizeof_dyn;
+ 	  swap_dyn_in = get_elf_backend_data (abfd)->s->swap_dyn_in;
+ 
+-	  extdyn = dynbuf;
+-	  extdynend = extdyn + dynamic->size;
+-	  for (; extdyn < extdynend; extdyn += extdynsize)
++	  for (extdyn = dynbuf, extdynend = dynbuf + dynamic->size;
++	       (size_t) (extdynend - extdyn) >= extdynsize;
++	       extdyn += extdynsize)
+ 	    {
+ 	      Elf_Internal_Dyn dyn;
+ 	      (*swap_dyn_in) (abfd, extdyn, &dyn);
+diff --git a/bfd/elflink.c b/bfd/elflink.c
+index 2b1450fa4e1..89dcf26108c 100644
+--- a/bfd/elflink.c
++++ b/bfd/elflink.c
+@@ -4406,7 +4406,7 @@ elf_link_add_object_symbols (bfd *abfd, struct bfd_link_info *info)
+ 	  shlink = elf_elfsections (abfd)[elfsec]->sh_link;
+ 
+ 	  for (extdyn = dynbuf;
+-	       extdyn <= dynbuf + s->size - bed->s->sizeof_dyn;
++	       (size_t) (dynbuf + s->size - extdyn) >= bed->s->sizeof_dyn;
+ 	       extdyn += bed->s->sizeof_dyn)
+ 	    {
+ 	      Elf_Internal_Dyn dyn;
+@@ -8219,9 +8219,9 @@ bfd_elf_get_bfd_needed_list (bfd *abfd,
+   extdynsize = get_elf_backend_data (abfd)->s->sizeof_dyn;
+   swap_dyn_in = get_elf_backend_data (abfd)->s->swap_dyn_in;
+ 
+-  extdyn = dynbuf;
+-  extdynend = extdyn + s->size;
+-  for (; extdyn < extdynend; extdyn += extdynsize)
++  for (extdyn = dynbuf, extdynend = dynbuf + s->size;
++       (size_t) (extdynend - extdyn) >= extdynsize;
++       extdyn += extdynsize)
+     {
+       Elf_Internal_Dyn dyn;
+ 
+-- 
+GitLab
+

@@ -1,0 +1,418 @@
+From b97dc6baa497b5c2d64e342108237ced6bf34b2c Mon Sep 17 00:00:00 2001
+From: Luca Deri <deri@ntop.org>
+Date: Fri, 15 Oct 2021 17:27:27 +0200
+Subject: [PATCH] Removed outdated (and broken) soulseek dissector
+
+---
+ src/include/ndpi_protocol_ids.h            |   2 +-
+ src/lib/ndpi_main.c                        |   9 +-
+ src/lib/protocols/soulseek.c               | 290 ---------------------
+ tests/result/fuzz-2006-06-26-2594.pcap.out |  24 +-
+ 4 files changed, 15 insertions(+), 310 deletions(-)
+ delete mode 100644 src/lib/protocols/soulseek.c
+
+diff --git a/src/include/ndpi_protocol_ids.h b/src/include/ndpi_protocol_ids.h
+index d57b17add76..d9bcec27224 100644
+--- a/src/include/ndpi_protocol_ids.h
++++ b/src/include/ndpi_protocol_ids.h
+@@ -91,7 +91,7 @@ typedef enum {
+   NDPI_PROTOCOL_MONGODB               = 60, /* Leonn Paiva <leonn.paiva@gmail.com> */
+   NDPI_PROTOCOL_QQLIVE                = 61,
+   NDPI_PROTOCOL_THUNDER               = 62,
+-  NDPI_PROTOCOL_SOULSEEK              = 63,
++  NDPI_PROTOCOL_FREE                  = 63, /* FREE */
+   NDPI_PROTOCOL_PS_VUE                = 64,
+   NDPI_PROTOCOL_IRC                   = 65,
+   NDPI_PROTOCOL_AYIYA                 = 66,
+diff --git a/src/lib/ndpi_main.c b/src/lib/ndpi_main.c
+index 182a5ac7ff0..f29fc932278 100644
+--- a/src/lib/ndpi_main.c
++++ b/src/lib/ndpi_main.c
+@@ -1135,8 +1135,8 @@ static void ndpi_init_protocol_defaults(struct ndpi_detection_module_struct *ndp
+ 			  "Thunder", NDPI_PROTOCOL_CATEGORY_DOWNLOAD_FT,
+ 			  ndpi_build_default_ports(ports_a, 0, 0, 0, 0, 0) /* TCP */,
+ 			  ndpi_build_default_ports(ports_b, 0, 0, 0, 0, 0) /* UDP */);
+-  ndpi_set_proto_defaults(ndpi_str, 1 /* cleartext */, NDPI_PROTOCOL_FUN, NDPI_PROTOCOL_SOULSEEK,
+-			  "Soulseek", NDPI_PROTOCOL_CATEGORY_DOWNLOAD_FT,
++  ndpi_set_proto_defaults(ndpi_str, 1 /* cleartext */, NDPI_PROTOCOL_FUN, NDPI_PROTOCOL_FREE,
++			  "FREE", NDPI_PROTOCOL_CATEGORY_DOWNLOAD_FT,
+ 			  ndpi_build_default_ports(ports_a, 0, 0, 0, 0, 0) /* TCP */,
+ 			  ndpi_build_default_ports(ports_b, 0, 0, 0, 0, 0) /* UDP */);
+   ndpi_set_proto_defaults(ndpi_str, 1 /* cleartext */, NDPI_PROTOCOL_ACCEPTABLE, NDPI_PROTOCOL_PS_VUE,
+@@ -2346,8 +2346,6 @@ struct ndpi_detection_module_struct *ndpi_init_detection_module(ndpi_init_prefs
+   ndpi_str->zattoo_connection_timeout = NDPI_ZATTOO_CONNECTION_TIMEOUT * ndpi_str->ticks_per_second;
+   ndpi_str->jabber_stun_timeout = NDPI_JABBER_STUN_TIMEOUT * ndpi_str->ticks_per_second;
+   ndpi_str->jabber_file_transfer_timeout = NDPI_JABBER_FT_TIMEOUT * ndpi_str->ticks_per_second;
+-  ndpi_str->soulseek_connection_ip_tick_timeout =
+-    NDPI_SOULSEEK_CONNECTION_IP_TICK_TIMEOUT * ndpi_str->ticks_per_second;
+ 
+   ndpi_str->ndpi_num_supported_protocols = NDPI_MAX_SUPPORTED_PROTOCOLS;
+   ndpi_str->ndpi_num_custom_protocols = 0;
+@@ -3604,9 +3602,6 @@ void ndpi_set_protocol_detection_bitmask2(struct ndpi_detection_module_struct *n
+   /* APPLEJUICE */
+   init_applejuice_dissector(ndpi_str, &a, detection_bitmask);
+ 
+-  /* SOULSEEK */
+-  init_soulseek_dissector(ndpi_str, &a, detection_bitmask);
+-
+   /* SOCKS */
+   init_socks_dissector(ndpi_str, &a, detection_bitmask);
+ 
+diff --git a/src/lib/protocols/soulseek.c b/src/lib/protocols/soulseek.c
+deleted file mode 100644
+index 50dd987192c..00000000000
+--- a/src/lib/protocols/soulseek.c
++++ /dev/null
+@@ -1,290 +0,0 @@
+-/*
+- * soulseek.c
+- *
+- * Copyright (C) 2016-21 - ntop.org
+- *
+- * This file is part of nDPI, an open source deep packet inspection
+- * library based on the OpenDPI and PACE technology by ipoque GmbH
+- *
+- * nDPI is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU Lesser General Public License as published by
+- * the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * nDPI is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public License
+- * along with nDPI.  If not, see <http://www.gnu.org/licenses/>.
+- *
+- */
+-
+-#include "ndpi_protocol_ids.h"
+-
+-#define NDPI_CURRENT_PROTO NDPI_PROTOCOL_SOULSEEK
+-
+-#include "ndpi_api.h"
+-
+-#define SOULSEEK_DETECT \
+-    if(src != NULL) \
+-	      src->soulseek_last_safe_access_time = packet->current_time_ms; \
+-    if(dst != NULL) \
+-	      dst->soulseek_last_safe_access_time = packet->current_time_ms; \
+-    ndpi_set_detected_protocol(ndpi_struct, flow, NDPI_PROTOCOL_SOULSEEK, NDPI_PROTOCOL_UNKNOWN)
+-
+-void ndpi_search_soulseek_tcp(struct ndpi_detection_module_struct *ndpi_struct,
+-			      struct ndpi_flow_struct *flow)
+-{
+-  struct ndpi_packet_struct *packet = &ndpi_struct->packet;
+-
+-  struct ndpi_id_struct *src = flow->src;
+-  struct ndpi_id_struct *dst = flow->dst;
+-
+-  if(packet->tcp) {
+-
+-    if(flow->detected_protocol_stack[0] == NDPI_PROTOCOL_SOULSEEK) {
+-      NDPI_LOG_DBG2(ndpi_struct, "packet marked as Soulseek\n");
+-      if(src != NULL)
+-	NDPI_LOG_DBG2(ndpi_struct,
+-		 "  SRC bitmask: %u, packet tick %llu , last safe access timestamp: %llu\n",
+-		      NDPI_COMPARE_PROTOCOL_TO_BITMASK(src->detected_protocol_bitmask, NDPI_PROTOCOL_SOULSEEK)
+-		 != 0 ? 1 : 0, (long long unsigned int) packet->current_time_ms,
+-		      (long long unsigned int) src->soulseek_last_safe_access_time);
+-      if(dst != NULL)
+-	NDPI_LOG_DBG2(ndpi_struct,
+-		 "  DST bitmask: %u, packet tick %llu , last safe ts: %llu\n",
+-		 NDPI_COMPARE_PROTOCOL_TO_BITMASK(dst->detected_protocol_bitmask, NDPI_PROTOCOL_SOULSEEK)
+-		 != 0 ? 1 : 0, (long long unsigned int) packet->current_time_ms,
+-		      (long long unsigned int) dst->soulseek_last_safe_access_time);
+-
+-      if(packet->payload_packet_len == 431) {
+-	if(dst != NULL) {
+-	  dst->soulseek_last_safe_access_time = packet->current_time_ms;
+-	}
+-	return;
+-      }
+-      if(packet->payload_packet_len == 12 && get_l32(packet->payload, 4) == 0x02) {
+-	if(src != NULL) {
+-	  src->soulseek_last_safe_access_time = packet->current_time_ms;
+-	  if(packet->tcp != NULL && src->soulseek_listen_port == 0) {
+-	    src->soulseek_listen_port = get_l32(packet->payload, 8);
+-	    return;
+-	  }
+-	}
+-      }
+-
+-      if(src != NULL && ((u_int32_t)(packet->current_time_ms - src->soulseek_last_safe_access_time) < ndpi_struct->soulseek_connection_ip_tick_timeout)) {
+-	NDPI_LOG_DBG2(ndpi_struct,
+-		 "Soulseek: SRC update last safe access time and SKIP_FOR_TIME \n");
+-	src->soulseek_last_safe_access_time = packet->current_time_ms;
+-      }
+-
+-      if(dst != NULL && ((u_int32_t)(packet->current_time_ms - dst->soulseek_last_safe_access_time) < ndpi_struct->soulseek_connection_ip_tick_timeout)) {
+-	NDPI_LOG_DBG2(ndpi_struct,
+-		 "Soulseek: DST update last safe access time and SKIP_FOR_TIME \n");
+-	dst->soulseek_last_safe_access_time = packet->current_time_ms;
+-      }
+-    }
+-
+-
+-    if(dst != NULL && dst->soulseek_listen_port != 0 && dst->soulseek_listen_port == ntohs(packet->tcp->dest)
+-       && ((u_int32_t)(packet->current_time_ms - dst->soulseek_last_safe_access_time) < ndpi_struct->soulseek_connection_ip_tick_timeout)) {
+-      
+-      NDPI_LOG_DBG2(ndpi_struct,
+-	       "Soulseek: Plain detection on Port : %u packet_current_time_ms: %u soulseek_last_safe_access_time: %u soulseek_connection_ip_ticktimeout: %u\n",
+-	       dst->soulseek_listen_port, packet->current_time_ms, dst->soulseek_last_safe_access_time, ndpi_struct->soulseek_connection_ip_tick_timeout);
+-      
+-      dst->soulseek_last_safe_access_time = packet->current_time_ms;
+-      if(src != NULL)
+-	src->soulseek_last_safe_access_time = packet->current_time_ms;
+-
+-      NDPI_LOG_INFO(ndpi_struct, "found Soulseek\n");
+-      ndpi_set_detected_protocol(ndpi_struct, flow, NDPI_PROTOCOL_SOULSEEK, NDPI_PROTOCOL_UNKNOWN);
+-      return;
+-    }
+-    
+-    if(flow->l4.tcp.soulseek_stage == 0) {
+-
+-      u_int32_t index = 0;
+-
+-      if(packet->payload_packet_len >= 12 && packet->payload_packet_len < 300 && get_l32(packet->payload, 4) == 1) {
+-	while (index + 4 < packet->payload_packet_len &&
+-	       !get_u_int16_t(packet->payload, index + 2)
+-	       && (index + get_l32(packet->payload, index)) < (u_int32_t)packet->payload_packet_len - 4) {
+-	  if(get_l32(packet->payload, index) < 8)	/*Minimum soulseek login msg is 8B */
+-	    break;
+-
+-	  if(index + get_l32(packet->payload, index) + 4 <= index) {
+-	    /* avoid overflow */
+-	    break;
+-	  }
+-
+-	  index += get_l32(packet->payload, index) + 4;
+-	} /* while */
+-	
+-	if((packet->payload_packet_len >= (index+4))
+-	   && (index + get_l32(packet->payload, index)) == (u_int32_t)packet->payload_packet_len -4
+-	   && (get_u_int16_t(packet->payload, 10) != 0)) {
+-	  /* This structure seems to be soulseek proto */
+-	  index = get_l32(packet->payload, 8) + 12;	// end of "user name"
+-
+-	  if(((index + 4) <= packet->payload_packet_len)
+-	     && (packet->payload_packet_len >= (index+4))
+-	     && (!get_u_int16_t(packet->payload, index + 2)))	// for passwd len
+-	    {
+-	      index += get_l32(packet->payload, index) + 4;	//end of  "Passwd"
+-	      if((index + 4 + 4) <= packet->payload_packet_len && !get_u_int16_t(packet->payload, index + 6))	// to read version,hashlen
+-		{
+-		  index += get_l32(packet->payload, index + 4) + 8;	// enf of "hash value"
+-		  if(index == get_l32(packet->payload, 0)) {
+-		    
+-		    NDPI_LOG_INFO(ndpi_struct, "found soulseek Login Detected\n");
+-		    SOULSEEK_DETECT;		    
+-		    return;
+-		  }
+-		}
+-	    }
+-	}
+-      }
+-      if (packet->payload_packet_len > 8
+-	  && (packet->payload_packet_len < 200)
+-	  && get_l32(packet->payload, 0) == (u_int32_t)packet->payload_packet_len -4) {
+-	//Server Messages:
+-	const u_int32_t msgcode = get_l32(packet->payload, 4);
+-
+-	if(msgcode == 0x7d) {
+-	  flow->l4.tcp.soulseek_stage = 1 + packet->packet_direction;
+-	  NDPI_LOG_DBG2(ndpi_struct, "Soulseek Messages Search\n");
+-	  return;
+-	} else if(msgcode == 0x02 && packet->payload_packet_len == 12) {
+-	  const u_int32_t soulseek_listen_port = get_l32(packet->payload, 8);
+-
+-	  if(src != NULL) {
+-	    src->soulseek_last_safe_access_time = packet->current_time_ms;
+-
+-	    if(packet->tcp != NULL && src->soulseek_listen_port == 0) {
+-	      src->soulseek_listen_port = soulseek_listen_port;
+-	      NDPI_LOG_DBG2(ndpi_struct, "\n Listen Port Saved : %u", src->soulseek_listen_port);
+-
+-	      if(dst != NULL)
+-		dst->soulseek_last_safe_access_time = packet->current_time_ms;
+-	      
+-	      ndpi_set_detected_protocol(ndpi_struct, flow, NDPI_PROTOCOL_SOULSEEK, NDPI_PROTOCOL_UNKNOWN);
+-	      return;
+-	    }
+-	  }
+-	}
+-	//Peer Messages  : Peer Init Message Detection
+-	if(get_l32(packet->payload, 0) == (u_int32_t)packet->payload_packet_len - 4) {
+-	  const u_int32_t typelen = get_l32(packet->payload, packet->payload_packet_len - 9);
+-	  const u_int8_t type = packet->payload[packet->payload_packet_len - 5];
+-	  const u_int32_t namelen = get_l32(packet->payload, 5);
+-	  if(packet->payload[4] == 0x01 && typelen == 1
+-	      && namelen <= packet->payload_packet_len
+-	      && (4 + 1 + 4 + namelen + 4 + 1 + 4) ==
+-	      packet->payload_packet_len && (type == 'F' || type == 'P' || type == 'D')) {
+-	    NDPI_LOG_INFO(ndpi_struct, "found soulseek\n");
+-	    SOULSEEK_DETECT;
+-	    return;
+-	  }
+-	}
+-	NDPI_LOG_DBG2(ndpi_struct, "3\n");
+-	//Peer Message : Pierce Firewall
+-	if(packet->payload_packet_len == 9 && get_l32(packet->payload, 0) == 5
+-	    && packet->payload[4] <= 0x10 && get_u_int32_t(packet->payload, 5) != 0x00000000) {
+-	  flow->l4.tcp.soulseek_stage = 1 + packet->packet_direction;
+-	  NDPI_LOG_DBG2(ndpi_struct, "Soulseek Size 9 Pierce Firewall\n");
+-	  return;
+-	}
+-      }
+-
+-      if(packet->payload_packet_len > 25 && packet->payload[4] == 0x01 && !get_u_int16_t(packet->payload, 7)
+-	  && !get_u_int16_t(packet->payload, 2)) {
+-	const u_int32_t usrlen = get_l32(packet->payload, 5);
+-
+-	if(usrlen <= (u_int32_t)packet->payload_packet_len - (4 + 1 + 4 + 4 + 1 + 4)) {
+-	  const u_int32_t typelen = get_l32(packet->payload, 4 + 1 + 4 + usrlen);
+-	  const u_int8_t type = packet->payload[4 + 1 + 4 + usrlen + 4];
+-	  if(typelen == 1 && (type == 'F' || type == 'P' || type == 'D')) {
+-	    NDPI_LOG_INFO(ndpi_struct, "found soulseek Pattern command(D|P|F)\n");
+-	    SOULSEEK_DETECT;	    
+-	    return;
+-	  }
+-	}
+-      }
+-
+-    } else if(flow->l4.tcp.soulseek_stage == 2 - packet->packet_direction) {
+-      if(packet->payload_packet_len > 8) {
+-	if((packet->payload[0] || packet->payload[1]) && get_l32(packet->payload, 4) == 9) {
+-	  /* 9 is search result */
+-	  NDPI_LOG_INFO(ndpi_struct, "found soulseek Second Pkt\n");
+-	  SOULSEEK_DETECT;
+-	  return;
+-	}
+-	if(get_l32(packet->payload, 0) == (u_int32_t)packet->payload_packet_len - 4) {
+-	  const u_int32_t msgcode = get_l32(packet->payload, 4);
+-	  if(msgcode == 0x03 && packet->payload_packet_len >= 12)	//Server Message : Get Peer Address
+-	    {
+-	      const u_int32_t usrlen = get_l32(packet->payload, 8);
+-	      if(usrlen <= packet->payload_packet_len && 4 + 4 + 4 + usrlen == packet->payload_packet_len) {
+-		NDPI_LOG_INFO(ndpi_struct, "found soulseek Request Get Peer Address Detected\n");
+-		SOULSEEK_DETECT;		
+-		return;
+-	      }
+-	    }
+-	}
+-      }
+-
+-      if(packet->payload_packet_len == 8 && get_l32(packet->payload, 4) == 0x00000004) {
+-	NDPI_LOG_INFO(ndpi_struct, "found soulseek\n");
+-	SOULSEEK_DETECT;
+-	return;
+-      }
+-
+-      if(packet->payload_packet_len == 4
+-	 && get_u_int16_t(packet->payload, 2) == 0x00 && get_u_int16_t(packet->payload, 0) != 0x00) {
+-	NDPI_LOG_INFO(ndpi_struct, "found soulseek\n");
+-	SOULSEEK_DETECT;	
+-	return;
+-      } else if(packet->payload_packet_len == 4) {
+-	flow->l4.tcp.soulseek_stage = 3;
+-	return;
+-      }
+-    } else if(flow->l4.tcp.soulseek_stage == 1 + packet->packet_direction) {
+-      if(packet->payload_packet_len > 8) {
+-	if(packet->payload[4] == 0x03 && get_l32(packet->payload, 5) == 0x00000031) {
+-	  NDPI_LOG_INFO(ndpi_struct, "found soulseek Second Pkt with SIGNATURE :: 0x0331000000 \n");
+-	  SOULSEEK_DETECT;	  
+-	  return;
+-	}
+-      }
+-    }
+-    if(flow->l4.tcp.soulseek_stage == 3 && packet->payload_packet_len == 8 && !get_u_int32_t(packet->payload, 4)) {
+-
+-      NDPI_LOG_INFO(ndpi_struct, "found soulseek bcz of 8B  pkt\n");
+-      SOULSEEK_DETECT;
+-      return;
+-    }
+-    
+-    if(flow->l4.tcp.soulseek_stage && flow->packet_counter < 11) {
+-      ;
+-    } else {
+-      NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+-    }
+-  }
+-}
+-
+-
+-void init_soulseek_dissector(struct ndpi_detection_module_struct *ndpi_struct, u_int32_t *id, NDPI_PROTOCOL_BITMASK *detection_bitmask)
+-{
+-  ndpi_set_bitmask_protocol_detection("Soulseek", ndpi_struct, detection_bitmask, *id,
+-				      NDPI_PROTOCOL_SOULSEEK,
+-				      ndpi_search_soulseek_tcp,
+-				      NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_WITH_PAYLOAD,
+-				      SAVE_DETECTION_BITMASK_AS_UNKNOWN,
+-				      ADD_TO_DETECTION_BITMASK);
+-
+-  *id += 1;
+-}
+diff --git a/tests/result/fuzz-2006-06-26-2594.pcap.out b/tests/result/fuzz-2006-06-26-2594.pcap.out
+index 6e546693dda..2450cd9e91d 100644
+--- a/tests/result/fuzz-2006-06-26-2594.pcap.out
++++ b/tests/result/fuzz-2006-06-26-2594.pcap.out
+@@ -17,7 +17,7 @@ SIP	85	39540	15
+ 	1	UDP 212.242.33.35:5060 <-> 192.168.1.2:5060 [proto: 100/SIP][ClearText][cat: VoIP/10][23 pkts/11772 bytes <-> 37 pkts/14743 bytes][Goodput ratio: 91/89][1521.43 sec][bytes ratio: -0.112 (Mixed)][IAT c2s/s2c min/avg/max/stddev: 19/227 32597/38366 167478/304738 41340/57147][Pkt Len c2s/s2c min/avg/max/stddev: 344/47 512/398 711/1118 86/358][PLAIN TEXT (SIP/2.0 401 Unauthorized)][Plen Bins: 29,0,0,0,0,0,0,0,0,3,6,0,3,6,8,13,1,0,3,0,1,15,0,0,0,5,0,0,0,0,0,0,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	2	UDP 192.168.1.2:5060 <-> 200.68.120.81:5060 [proto: 100/SIP][ClearText][cat: VoIP/10][9 pkts/4647 bytes <-> 3 pkts/1944 bytes][Goodput ratio: 92/93][66.58 sec][bytes ratio: 0.410 (Upload)][IAT c2s/s2c min/avg/max/stddev: 507/34556 8170/34556 32608/34556 10578/0][Pkt Len c2s/s2c min/avg/max/stddev: 417/637 516/648 864/656 186/8][PLAIN TEXT (INVITEKsip)][Plen Bins: 0,0,0,0,0,0,0,0,0,0,0,59,0,0,0,0,0,0,8,16,0,0,0,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	3	UDP 192.168.1.2:137 -> 192.168.1.255:137 [proto: 10/NetBIOS][ClearText][cat: System/18][71 pkts/6532 bytes -> 0 pkts/0 bytes][Goodput ratio: 54/0][1527.12 sec][Host: eci_domain][bytes ratio: 1.000 (Upload)][IAT c2s/s2c min/avg/max/stddev: 741/0 20522/0 93225/0 24163/0][Pkt Len c2s/s2c min/avg/max/stddev: 92/0 92/0 92/0 0/0][PLAIN TEXT ( EFEDEJ)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	4	TCP 192.168.1.2:2720 <-> 147.234.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][11 pkts/624 bytes <-> 14 pkts/1080 bytes][Goodput ratio: 4/27][0.32 sec][Host: ProFTPD][bytes ratio: -0.268 (Download)][IAT c2s/s2c min/avg/max/stddev: 0/0 24/7 115/18 38/8][Pkt Len c2s/s2c min/avg/max/stddev: 54/60 57/77 70/113 5/19][PLAIN TEXT (220 ProFTPD Server In ECI Telec)][Plen Bins: 66,33,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	4	TCP 192.168.1.2:2720 <-> 147.234.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][11 pkts/624 bytes <-> 14 pkts/1080 bytes][Goodput ratio: 4/27][0.32 sec][Host: ProFTPD][bytes ratio: -0.268 (Download)][IAT c2s/s2c min/avg/max/stddev: 0/0 24/7 115/18 38/8][Pkt Len c2s/s2c min/avg/max/stddev: 54/60 57/77 70/113 5/19][Risk: ** Unsafe Protocol **][Risk Score: 10][PLAIN TEXT (220 ProFTPD Server In ECI Telec)][Plen Bins: 66,33,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	5	UDP 192.168.1.2:5060 -> 212.242.33.35:17860 [proto: 100/SIP][ClearText][cat: VoIP/10][1 pkts/1118 bytes -> 0 pkts/0 bytes][Goodput ratio: 96/0][< 1 sec][PLAIN TEXT (INVITE six)][Plen Bins: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	6	UDP 192.168.1.2:30000 -> 212.242.33.36:40392 [proto: 87/RTP][ClearText][cat: Media/1][5 pkts/1070 bytes -> 0 pkts/0 bytes][Goodput ratio: 80/0][0.05 sec][PLAIN TEXT (goxcffj)][Plen Bins: 0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	7	UDP 192.168.1.2:68 <-> 192.168.1.1:67 [proto: 18/DHCP][ClearText][cat: Network/14][1 pkts/342 bytes <-> 1 pkts/590 bytes][Goodput ratio: 87/93][0.00 sec][Host: d002465][DHCP Fingerprint: 1,15,3,6,44,46,47,31,33,43][PLAIN TEXT (002465Q)][Plen Bins: 0,0,0,0,0,0,0,0,0,50,0,0,0,0,0,0,0,50,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+@@ -115,9 +115,9 @@ SIP	85	39540	15
+ 	99	UDP 192.168.1.2:2829 -> 192.168.1.1:53 [proto: 5/DNS][ClearText][cat: Network/14][2 pkts/172 bytes -> 0 pkts/0 bytes][Goodput ratio: 51/0][1.00 sec][Host: _sip._udp.sip.cybercity.dk][::][PLAIN TEXT (cybercity)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	100	UDP 192.168.1.2:2716 -> 192.168.1.1:53 [proto: 5/DNS][ClearText][cat: Network/14][2 pkts/168 bytes -> 0 pkts/0 bytes][Goodput ratio: 50/0][353.97 sec][Host: _sip._udp.sip.cybercity.dk][::][PLAIN TEXT (cybercity)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	101	UDP 192.168.1.3:53 -> 192.168.1.2:2712 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/144 bytes -> 0 pkts/0 bytes][Goodput ratio: 70/0][< 1 sec][Host: sip.cybercity.dk][212.242.33.35][PLAIN TEXT (cybercity)][Plen Bins: 0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	102	TCP 147.234.1.253:21 -> 192.169.1.2:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/130 bytes -> 0 pkts/0 bytes][Goodput ratio: 58/0][< 1 sec][PLAIN TEXT (331 Anonymous login ok)][Plen Bins: 0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	102	TCP 147.234.1.253:21 -> 192.169.1.2:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/130 bytes -> 0 pkts/0 bytes][Goodput ratio: 58/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][PLAIN TEXT (331 Anonymous login ok)][Plen Bins: 0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	103	TCP 192.168.1.2:2718 -> 147.137.21.94:139 [proto: 10/NetBIOS][ClearText][cat: System/18][2 pkts/124 bytes -> 0 pkts/0 bytes][Goodput ratio: 0/0][2.92 sec][Plen Bins: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	104	TCP 147.234.1.253:21 -> 192.168.1.2:2732 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/113 bytes -> 0 pkts/0 bytes][Goodput ratio: 52/0][< 1 sec][PLAIN TEXT ( Files larger then 250MB will b)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	104	TCP 147.234.1.253:21 -> 192.168.1.2:2732 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/113 bytes -> 0 pkts/0 bytes][Goodput ratio: 52/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][PLAIN TEXT ( Files larger then 250MB will b)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	105	UDP 192.168.1.1:53 -> 192.168.1.2:2572 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/105 bytes -> 0 pkts/0 bytes][Goodput ratio: 59/0][< 1 sec][::][Risk: ** Malformed packet **][Risk Score: 10][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	106	UDP 192.168.1.1:53 -> 192.168.1.2:2723 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/105 bytes -> 0 pkts/0 bytes][Goodput ratio: 59/0][< 1 sec][Host: 1.0.0.127.in-adds.arpa][::][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	107	UDP 192.168.1.1:53 -> 192.168.1.2:2745 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/105 bytes -> 0 pkts/0 bytes][Goodput ratio: 59/0][< 1 sec][Host: 1.0.0.127.in-addr.arpa][::][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+@@ -134,7 +134,7 @@ SIP	85	39540	15
+ 	118	UDP 192.168.130.1:53 -> 192.168.1.2:2741 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/105 bytes -> 0 pkts/0 bytes][Goodput ratio: 59/0][< 1 sec][Host: 1.0.0.127.in-addr.arpa][::][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	119	UDP 192.168.233.1:53 -> 192.168.1.2:2811 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/105 bytes -> 0 pkts/0 bytes][Goodput ratio: 59/0][< 1 sec][Host: 1.0.0.127.in-addr.arpa][::][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	120	UDP 253.168.1.1:53 -> 192.168.1.2:2735 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/105 bytes -> 0 pkts/0 bytes][Goodput ratio: 59/0][< 1 sec][Host: 1.0.0.127.in-addr.arpa][::][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	121	TCP 147.234.1.253:21 -> 192.168.65.2:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/95 bytes -> 0 pkts/0 bytes][Goodput ratio: 43/0][< 1 sec][PLAIN TEXT (230 Guest access granted for an)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	121	TCP 147.234.1.253:21 -> 192.168.65.2:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/95 bytes -> 0 pkts/0 bytes][Goodput ratio: 43/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][PLAIN TEXT (230 Guest access granted for an)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	122	UDP 62.168.1.2:137 -> 192.168.1.255:137 [proto: 10/NetBIOS][ClearText][cat: System/18][1 pkts/92 bytes -> 0 pkts/0 bytes][Goodput ratio: 54/0][< 1 sec][Host: eci_domain][PLAIN TEXT ( EFEDEJ)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	123	UDP 115.0.1.41:137 -> 192.168.1.255:137 [proto: 10/NetBIOS][ClearText][cat: System/18][1 pkts/92 bytes -> 0 pkts/0 bytes][Goodput ratio: 54/0][< 1 sec][Host: workgroup][PLAIN TEXT ( FHEPFCELEHFCEPFFFACACACACACACA)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	124	UDP 192.136.1.2:137 -> 192.168.1.255:137 [proto: 10/NetBIOS][ClearText][cat: System/18][1 pkts/92 bytes -> 0 pkts/0 bytes][Goodput ratio: 54/0][< 1 sec][Host: 5ci_dombin][PLAIN TEXT ( DFEDEJ)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+@@ -221,19 +221,19 @@ SIP	85	39540	15
+ 	205	UDP 192.168.33.2:2782 -> 192.168.1.1:53 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/82 bytes -> 0 pkts/0 bytes][Goodput ratio: 48/0][< 1 sec][::][Risk: ** Malformed packet **][Risk Score: 10][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	206	UDP 194.168.1.2:2807 -> 192.168.1.1:53 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/82 bytes -> 0 pkts/0 bytes][Goodput ratio: 48/0][< 1 sec][::][Risk: ** Malformed packet **][Risk Score: 10][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	207	UDP 200.168.1.2:2735 -> 192.168.1.1:53 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/82 bytes -> 0 pkts/0 bytes][Goodput ratio: 48/0][< 1 sec][Host: 1.0.0.127.in-adds.arpa][::][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	208	TCP 147.234.1.253:21 -> 192.168.1.66:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/81 bytes -> 0 pkts/0 bytes][Goodput ratio: 33/0][< 1 sec][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	208	TCP 147.234.1.253:21 -> 192.168.1.66:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/81 bytes -> 0 pkts/0 bytes][Goodput ratio: 33/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	209	UDP 192.168.1.2:2712 -> 192.37.115.0:53 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/76 bytes -> 0 pkts/0 bytes][Goodput ratio: 44/0][< 1 sec][Host: sip.cybercrty.dk][::][PLAIN TEXT (cybercrty)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	210	UDP 192.168.1.2:2712 -> 192.168.1.1:53 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/76 bytes -> 0 pkts/0 bytes][Goodput ratio: 44/0][< 1 sec][Host: sip.cybercity.dk][::][PLAIN TEXT (cybercity)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	211	UDP 192.168.1.2:2794 -> 192.168.108.1:53 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/76 bytes -> 0 pkts/0 bytes][Goodput ratio: 44/0][< 1 sec][Host: sip.cybercity.dk][::][PLAIN TEXT (cybercity)][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	212	UDP 192.114.1.2:2719 -> 192.168.1.1:53 [proto: 5/DNS][ClearText][cat: Network/14][1 pkts/75 bytes -> 0 pkts/0 bytes][Goodput ratio: 43/0][< 1 sec][Host: ftp.ecite_e.com][::][Plen Bins: 0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	213	TCP 147.234.1.253:21 -> 84.168.1.2:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/73 bytes -> 0 pkts/0 bytes][Goodput ratio: 26/0][< 1 sec][PLAIN TEXT (200 Type set to I)][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	214	TCP 192.168.1.2:2720 -> 147.117.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/73 bytes -> 0 pkts/0 bytes][Goodput ratio: 26/0][< 1 sec][PLAIN TEXT (RETR Site)][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	215	TCP 192.168.1.2:2679 -> 147.234.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/66 bytes -> 0 pkts/0 bytes][Goodput ratio: 18/0][< 1 sec][Risk: ** Clear-text credentials **][Risk Score: 100][PLAIN TEXT (PASS d0)][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	213	TCP 147.234.1.253:21 -> 84.168.1.2:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/73 bytes -> 0 pkts/0 bytes][Goodput ratio: 26/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][PLAIN TEXT (200 Type set to I)][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	214	TCP 192.168.1.2:2720 -> 147.117.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/73 bytes -> 0 pkts/0 bytes][Goodput ratio: 26/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][PLAIN TEXT (RETR Site)][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	215	TCP 192.168.1.2:2679 -> 147.234.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/66 bytes -> 0 pkts/0 bytes][Goodput ratio: 18/0][< 1 sec][Risk: ** Unsafe Protocol **** Clear-text credentials **][Risk Score: 110][PLAIN TEXT (PASS d0)][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	216	TCP 192.168.1.71:2718 -> 147.137.21.122:139 [proto: 10/NetBIOS][ClearText][cat: System/18][1 pkts/62 bytes -> 0 pkts/0 bytes][Goodput ratio: 0/0][< 1 sec][Plen Bins: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	217	TCP 147.234.1.253:21 -> 192.2.1.2:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/60 bytes -> 0 pkts/0 bytes][Goodput ratio: 5/0][< 1 sec][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	218	TCP 147.234.1.253:21 -> 192.168.1.2:2208 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/60 bytes -> 0 pkts/0 bytes][Goodput ratio: 5/0][< 1 sec][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	219	TCP 192.112.1.2:2720 -> 147.234.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/60 bytes -> 0 pkts/0 bytes][Goodput ratio: 10/0][< 1 sec][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+-	220	TCP 37.115.0.2:2639 -> 147.234.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/54 bytes -> 0 pkts/0 bytes][Goodput ratio: 0/0][< 1 sec][Plen Bins: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	217	TCP 147.234.1.253:21 -> 192.2.1.2:2720 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/60 bytes -> 0 pkts/0 bytes][Goodput ratio: 5/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	218	TCP 147.234.1.253:21 -> 192.168.1.2:2208 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/60 bytes -> 0 pkts/0 bytes][Goodput ratio: 5/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	219	TCP 192.112.1.2:2720 -> 147.234.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/60 bytes -> 0 pkts/0 bytes][Goodput ratio: 10/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
++	220	TCP 37.115.0.2:2639 -> 147.234.1.253:21 [proto: 1/FTP_CONTROL][ClearText][cat: Download/7][1 pkts/54 bytes -> 0 pkts/0 bytes][Goodput ratio: 0/0][< 1 sec][Risk: ** Unsafe Protocol **][Risk Score: 10][Plen Bins: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 	221	UDP 192.168.1.6:5060 -> 212.242.33.35:5060 [proto: 100/SIP][ClearText][cat: VoIP/10][1 pkts/47 bytes -> 0 pkts/0 bytes][Goodput ratio: 10/0][< 1 sec][Plen Bins: 100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+ 
+ 

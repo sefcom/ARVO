@@ -1,0 +1,1614 @@
+From 670701075b969962db1b869507318e81e96910d1 Mon Sep 17 00:00:00 2001
+From: Nick Wellnhofer <wellnhofer@aevum.de>
+Date: Wed, 20 Apr 2022 23:17:14 +0200
+Subject: [PATCH] Add configuration flag for XPointer locations support
+
+Add a new configuration flag that controls whether the outdated support
+for XPointer locations (ranges and points) is enabled.
+
+    --with-xptr-locs          # Autotools
+    LIBXML2_WITH_XPTR_LOCS    # CMake
+
+The latest spec for what it essentially an XPath extension seems to be
+this working draft from 2002:
+
+    https://www.w3.org/TR/xptr-xpointer/
+
+The xpointer() scheme is listed as "being reviewed" in the XPointer
+registry since at least 2006. libxml2 seems to be the only modern
+software that tries to implement this spec, but the code has many bugs
+and quality issues.
+
+The flag defaults to "off" and support for this extensions has to be
+requested explicitly. The relevant API functions are deprecated.
+---
+ .gitlab-ci.yml                 |  10 +-
+ CMakeLists.txt                 |   3 +-
+ configure.ac                   |  13 ++
+ debugXML.c                     |  12 ++
+ doc/libxml2-api.xml            |  44 ++++---
+ gentest.py                     |   7 ++
+ include/libxml/xmlversion.h.in |   9 ++
+ include/libxml/xpath.h         |  10 ++
+ include/libxml/xpointer.h      |  23 ++++
+ python/generator.py            |   6 +
+ python/types.c                 |   2 +
+ runtest.c                      |   4 +-
+ schematron.c                   |   2 +
+ testapi.c                      | 213 ++-------------------------------
+ xinclude.c                     |  10 +-
+ xpath.c                        |  80 +++++++++----
+ xpointer.c                     |  20 +++-
+ 17 files changed, 212 insertions(+), 256 deletions(-)
+
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+index f3ac54d57..6f6d80cca 100644
+--- a/.gitlab-ci.yml
++++ b/.gitlab-ci.yml
+@@ -19,33 +19,31 @@
+   script:
+     - |
+       ln -s /tests/xmlconf
+-      sh autogen.sh $CONFIG
++      sh autogen.sh --with-ftp --with-legacy --with-xptr-locs $CONFIG
+       make -j$(nproc) V=1 CFLAGS="$CFLAGS -Werror"
+       make CFLAGS="$CFLAGS -Werror" check
+ 
+ gcc:
+   extends: .test
+   variables:
+-    CONFIG: '--with-ftp --with-legacy'
+     CFLAGS: "-O2 -std=c89 -D_XOPEN_SOURCE=700"
+ 
+ gcc:python3:
+   extends: .test
+   variables:
+-    CONFIG: '--with-ftp --with-legacy'
+     CFLAGS: "-O2"
+     PYTHON: "/usr/bin/python3"
+ 
+ gcc:static:
+   extends: .test
+   variables:
+-    CONFIG: "--disable-shared --with-ftp --with-legacy --without-python"
++    CONFIG: "--disable-shared --without-python"
+     CFLAGS: "-O2"
+ 
+ clang:asan:
+   extends: .test
+   variables:
+-    CONFIG: "--with-ftp --with-legacy --without-python"
++    CONFIG: "--without-python"
+     CC: clang
+     CFLAGS: "-O2 -g -fno-omit-frame-pointer -fsanitize=address,undefined,integer -fno-sanitize-recover=all -Wno-error=cast-align"
+     # LeakSanitizer requires SYS_CAP_PTRACE
+@@ -57,7 +55,7 @@ clang:msan:
+   only:
+     - schedules
+   variables:
+-    CONFIG: "--with-ftp --with-legacy --without-python --without-zlib --without-lzma"
++    CONFIG: "--without-python --without-zlib --without-lzma"
+     CC: clang
+     CFLAGS: "-O2 -g -fno-omit-frame-pointer -fsanitize=memory -Wno-error=cast-align"
+ 
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5046824df..2b5425e18 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -59,6 +59,7 @@ option(LIBXML2_WITH_WRITER "Add the xmlWriter saving interface" ON)
+ option(LIBXML2_WITH_XINCLUDE "Add the XInclude support" ON)
+ option(LIBXML2_WITH_XPATH "Add the XPATH support" ON)
+ option(LIBXML2_WITH_XPTR "Add the XPointer support" ON)
++option(LIBXML2_WITH_XPTR_LOCS "Add support for XPointer locations" OFF)
+ option(LIBXML2_WITH_ZLIB "Use libz" ON)
+ set(LIBXML2_XMLCONF_WORKING_DIR ${CMAKE_CURRENT_BINARY_DIR} CACHE PATH "Working directory for XML Conformance Test Suite")
+ 
+@@ -96,7 +97,7 @@ if(LIBXML2_WITH_ZLIB)
+ 	find_package(ZLIB REQUIRED)
+ endif()
+ 
+-foreach(VARIABLE IN ITEMS WITH_AUTOMATA WITH_C14N WITH_CATALOG WITH_DEBUG WITH_EXPR WITH_FTP WITH_HTML WITH_HTTP WITH_ICONV WITH_ICU WITH_ISO8859X WITH_LEGACY WITH_LZMA WITH_MEM_DEBUG WITH_MODULES WITH_OUTPUT WITH_PATTERN WITH_PUSH WITH_READER WITH_REGEXPS WITH_RUN_DEBUG WITH_SAX1 WITH_SCHEMAS WITH_SCHEMATRON WITH_THREADS WITH_THREAD_ALLOC WITH_TREE WITH_TRIO WITH_UNICODE WITH_VALID WITH_WRITER WITH_XINCLUDE WITH_XPATH WITH_XPTR WITH_ZLIB)
++foreach(VARIABLE IN ITEMS WITH_AUTOMATA WITH_C14N WITH_CATALOG WITH_DEBUG WITH_EXPR WITH_FTP WITH_HTML WITH_HTTP WITH_ICONV WITH_ICU WITH_ISO8859X WITH_LEGACY WITH_LZMA WITH_MEM_DEBUG WITH_MODULES WITH_OUTPUT WITH_PATTERN WITH_PUSH WITH_READER WITH_REGEXPS WITH_RUN_DEBUG WITH_SAX1 WITH_SCHEMAS WITH_SCHEMATRON WITH_THREADS WITH_THREAD_ALLOC WITH_TREE WITH_TRIO WITH_UNICODE WITH_VALID WITH_WRITER WITH_XINCLUDE WITH_XPATH WITH_XPTR WITH_XPTR_LOCS WITH_ZLIB)
+ 	if(LIBXML2_${VARIABLE})
+ 		set(${VARIABLE} 1)
+ 	else()
+diff --git a/configure.ac b/configure.ac
+index 3d36ea551..b4564d718 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -160,6 +160,8 @@ AC_ARG_WITH(xpath,
+ [  --with-xpath            add the XPATH support (on)])
+ AC_ARG_WITH(xptr,
+ [  --with-xptr             add the XPointer support (on)])
++AC_ARG_WITH(xptr-locs,
++[  --with-xptr-locs        add support for XPointer locations (off)])
+ AC_ARG_WITH(modules,
+ [  --with-modules          add the dynamic modules support (on)])
+ AC_ARG_WITH(zlib,
+@@ -199,6 +201,10 @@ if test "$with_reader" = "yes"
+ then
+     with_push=yes
+ fi
++if test "$with_xptr_locs" = "yes"
++then
++    with_xptr=yes
++fi
+ if test "$with_xptr" = "yes"
+ then
+     with_xpath=yes
+@@ -1071,6 +1077,7 @@ AC_SUBST(TEST_CATALOG)
+ if test "$with_xptr" = "no" ; then
+     echo Disabling XPointer support
+     WITH_XPTR=0
++    WITH_XPTR_LOCS=0
+     XPTR_OBJ=
+ else    
+     WITH_XPTR=1
+@@ -1079,8 +1086,14 @@ else
+         echo XPointer requires XPath support - enabling it
+ 	with_xpath=yes
+     fi
++    if test "$with_xptr_locs" = "yes" ; then
++        WITH_XPTR_LOCS=1
++    else
++        WITH_XPTR_LOCS=0
++    fi
+ fi
+ AC_SUBST(WITH_XPTR)
++AC_SUBST(WITH_XPTR_LOCS)
+ AC_SUBST(XPTR_OBJ)
+ 
+ if test "$with_c14n" = "no" ; then
+diff --git a/debugXML.c b/debugXML.c
+index 9a81a2d2b..f451c9d5c 100644
+--- a/debugXML.c
++++ b/debugXML.c
+@@ -1840,6 +1840,7 @@ xmlShellPrintXPathError(int errorType, const char *arg)
+             xmlGenericError(xmlGenericErrorContext,
+                             "%s is a string\n", arg);
+             break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+         case XPATH_POINT:
+             xmlGenericError(xmlGenericErrorContext,
+                             "%s is a point\n", arg);
+@@ -1852,6 +1853,7 @@ xmlShellPrintXPathError(int errorType, const char *arg)
+             xmlGenericError(xmlGenericErrorContext,
+                             "%s is a range\n", arg);
+             break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+         case XPATH_USERS:
+             xmlGenericError(xmlGenericErrorContext,
+                             "%s is user-defined\n", arg);
+@@ -2998,6 +3000,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a string\n", arg);
+                             break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+                         case XPATH_POINT:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a point\n", arg);
+@@ -3010,6 +3013,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a range\n", arg);
+                             break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+                         case XPATH_USERS:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is user-defined\n", arg);
+@@ -3115,6 +3119,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a string\n", arg);
+                             break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+                         case XPATH_POINT:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a point\n", arg);
+@@ -3127,6 +3132,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a range\n", arg);
+                             break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+                         case XPATH_USERS:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is user-defined\n", arg);
+@@ -3192,6 +3198,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a string\n", arg);
+                             break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+                         case XPATH_POINT:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a point\n", arg);
+@@ -3204,6 +3211,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a range\n", arg);
+                             break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+                         case XPATH_USERS:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is user-defined\n", arg);
+@@ -3277,6 +3285,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a string\n", arg);
+                             break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+                         case XPATH_POINT:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a point\n", arg);
+@@ -3289,6 +3298,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a range\n", arg);
+                             break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+                         case XPATH_USERS:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is user-defined\n", arg);
+@@ -3355,6 +3365,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a string\n", arg);
+                             break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+                         case XPATH_POINT:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a point\n", arg);
+@@ -3367,6 +3378,7 @@ xmlShell(xmlDocPtr doc, char *filename, xmlShellReadlineFunc input,
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is a range\n", arg);
+                             break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+                         case XPATH_USERS:
+                             xmlGenericError(xmlGenericErrorContext,
+                                             "%s is user-defined\n", arg);
+diff --git a/doc/libxml2-api.xml b/doc/libxml2-api.xml
+index 91a440a85..73ea942fc 100644
+--- a/doc/libxml2-api.xml
++++ b/doc/libxml2-api.xml
+@@ -4461,6 +4461,12 @@
+     <macro name='XML_XPATH_NOVAR' file='xpath'>
+       <info>forbid variables in expression</info>
+     </macro>
++    <macro name='XPATH_LOCATIONSET' file='xpath'>
++    </macro>
++    <macro name='XPATH_POINT' file='xpath'>
++    </macro>
++    <macro name='XPATH_RANGE' file='xpath'>
++    </macro>
+     <macro name='XP_ERROR' file='xpathInternals'>
+       <info>Macro to raise an XPath error and return.</info>
+       <arg name='X' info='the error code'/>
+@@ -18255,7 +18261,7 @@ Could we use @subtypes for this?'/>
+       <arg name='no' type='int' info='the error number'/>
+     </function>
+     <function name='xmlXPtrBuildNodeList' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Build a node list tree copy of the XPointer result. This will drop Attributes and Namespace declarations.</info>
+       <return type='xmlNodePtr' info='an xmlNodePtr list or NULL. the caller has to free the node tree.'/>
+       <arg name='obj' type='xmlXPathObjectPtr' info='the XPointer result from the evaluation.'/>
+@@ -18268,53 +18274,53 @@ Could we use @subtypes for this?'/>
+       <arg name='ctx' type='xmlXPathContextPtr' info='the XPointer context'/>
+     </function>
+     <function name='xmlXPtrEvalRangePredicate' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>[8]   Predicate ::=   &apos;[&apos; PredicateExpr &apos;]&apos; [9]   PredicateExpr ::=   Expr  Evaluate a predicate as in xmlXPathEvalPredicate() but for a Location Set instead of a node set</info>
+       <return type='void'/>
+       <arg name='ctxt' type='xmlXPathParserContextPtr' info='the XPointer Parser context'/>
+     </function>
+     <function name='xmlXPtrFreeLocationSet' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Free the LocationSet compound (not the actual ranges !).</info>
+       <return type='void'/>
+       <arg name='obj' type='xmlLocationSetPtr' info='the xmlLocationSetPtr to free'/>
+     </function>
+     <function name='xmlXPtrLocationSetAdd' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>add a new xmlXPathObjectPtr to an existing LocationSet If the location already exist in the set @val is freed.</info>
+       <return type='void'/>
+       <arg name='cur' type='xmlLocationSetPtr' info='the initial range set'/>
+       <arg name='val' type='xmlXPathObjectPtr' info='a new xmlXPathObjectPtr'/>
+     </function>
+     <function name='xmlXPtrLocationSetCreate' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlLocationSetPtr of type double and of value @val</info>
+       <return type='xmlLocationSetPtr' info='the newly created object.'/>
+       <arg name='val' type='xmlXPathObjectPtr' info='an initial xmlXPathObjectPtr, or NULL'/>
+     </function>
+     <function name='xmlXPtrLocationSetDel' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Removes an xmlXPathObjectPtr from an existing LocationSet</info>
+       <return type='void'/>
+       <arg name='cur' type='xmlLocationSetPtr' info='the initial range set'/>
+       <arg name='val' type='xmlXPathObjectPtr' info='an xmlXPathObjectPtr'/>
+     </function>
+     <function name='xmlXPtrLocationSetMerge' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Merges two rangesets, all ranges from @val2 are added to @val1</info>
+       <return type='xmlLocationSetPtr' info='val1 once extended or NULL in case of error.'/>
+       <arg name='val1' type='xmlLocationSetPtr' info='the first LocationSet'/>
+       <arg name='val2' type='xmlLocationSetPtr' info='the second LocationSet'/>
+     </function>
+     <function name='xmlXPtrLocationSetRemove' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Removes an entry from an existing LocationSet list.</info>
+       <return type='void'/>
+       <arg name='cur' type='xmlLocationSetPtr' info='the initial range set'/>
+       <arg name='val' type='int' info='the index to remove'/>
+     </function>
+     <function name='xmlXPtrNewCollapsedRange' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type range using a single nodes</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='start' type='xmlNodePtr' info='the starting and ending node'/>
+@@ -18328,20 +18334,20 @@ Could we use @subtypes for this?'/>
+       <arg name='origin' type='xmlNodePtr' info='the element from which a user or program initiated traversal of the link, or NULL.'/>
+     </function>
+     <function name='xmlXPtrNewLocationSetNodeSet' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type LocationSet and initialize it with all the nodes from @set</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='set' type='xmlNodeSetPtr' info='a node set'/>
+     </function>
+     <function name='xmlXPtrNewLocationSetNodes' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type LocationSet and initialize it with the single range made of the two nodes @start and @end</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='start' type='xmlNodePtr' info='the start NodePtr value'/>
+       <arg name='end' type='xmlNodePtr' info='the end NodePtr value or NULL'/>
+     </function>
+     <function name='xmlXPtrNewRange' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type range</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='start' type='xmlNodePtr' info='the starting node'/>
+@@ -18350,49 +18356,49 @@ Could we use @subtypes for this?'/>
+       <arg name='endindex' type='int' info='the ending index'/>
+     </function>
+     <function name='xmlXPtrNewRangeNodeObject' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type range from a not to an object</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='start' type='xmlNodePtr' info='the starting node'/>
+       <arg name='end' type='xmlXPathObjectPtr' info='the ending object'/>
+     </function>
+     <function name='xmlXPtrNewRangeNodePoint' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type range from a node to a point</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='start' type='xmlNodePtr' info='the starting node'/>
+       <arg name='end' type='xmlXPathObjectPtr' info='the ending point'/>
+     </function>
+     <function name='xmlXPtrNewRangeNodes' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type range using 2 nodes</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='start' type='xmlNodePtr' info='the starting node'/>
+       <arg name='end' type='xmlNodePtr' info='the ending node'/>
+     </function>
+     <function name='xmlXPtrNewRangePointNode' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type range from a point to a node</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='start' type='xmlXPathObjectPtr' info='the starting point'/>
+       <arg name='end' type='xmlNodePtr' info='the ending node'/>
+     </function>
+     <function name='xmlXPtrNewRangePoints' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Create a new xmlXPathObjectPtr of type range using 2 Points</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='start' type='xmlXPathObjectPtr' info='the starting point'/>
+       <arg name='end' type='xmlXPathObjectPtr' info='the ending point'/>
+     </function>
+     <function name='xmlXPtrRangeToFunction' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Implement the range-to() XPointer function  Obsolete. range-to is not a real function but a special type of location step which is handled in xpath.c.</info>
+       <return type='void'/>
+       <arg name='ctxt' type='xmlXPathParserContextPtr' info='the XPointer Parser context'/>
+       <arg name='nargs' type='int' info='the number of args'/>
+     </function>
+     <function name='xmlXPtrWrapLocationSet' file='xpointer' module='xpointer'>
+-      <cond>defined(LIBXML_XPTR_ENABLED)</cond>
++      <cond>defined(LIBXML_XPTR_ENABLED) &amp;&amp; defined(LIBXML_XPTR_LOCS_ENABLED)</cond>
+       <info>Wrap the LocationSet @val in a new xmlXPathObjectPtr</info>
+       <return type='xmlXPathObjectPtr' info='the newly created object.'/>
+       <arg name='val' type='xmlLocationSetPtr' info='the LocationSet value'/>
+diff --git a/gentest.py b/gentest.py
+index b71cb1802..c177188f5 100755
+--- a/gentest.py
++++ b/gentest.py
+@@ -155,6 +155,13 @@ skipped_functions = [
+ # Legacy
+ "xmlCleanupPredefinedEntities", "xmlInitializePredefinedEntities",
+ "xmlSetFeature", "xmlGetFeature", "xmlGetFeaturesList",
++# location sets
++"xmlXPtrLocationSetAdd",
++"xmlXPtrLocationSetCreate",
++"xmlXPtrLocationSetDel",
++"xmlXPtrLocationSetMerge",
++"xmlXPtrLocationSetRemove",
++"xmlXPtrWrapLocationSet",
+ ]
+ 
+ #
+diff --git a/include/libxml/xmlversion.h.in b/include/libxml/xmlversion.h.in
+index 944920b22..bdebfe3b0 100644
+--- a/include/libxml/xmlversion.h.in
++++ b/include/libxml/xmlversion.h.in
+@@ -247,6 +247,15 @@ XMLPUBFUN void XMLCALL xmlCheckVersion(int version);
+ #define LIBXML_XPTR_ENABLED
+ #endif
+ 
++/**
++ * LIBXML_XPTR_LOCS_ENABLED:
++ *
++ * Whether support for XPointer locations is configured in
++ */
++#if @WITH_XPTR_LOCS@
++#define LIBXML_XPTR_LOCS_ENABLED
++#endif
++
+ /**
+  * LIBXML_XINCLUDE_ENABLED:
+  *
+diff --git a/include/libxml/xpath.h b/include/libxml/xpath.h
+index a6e364485..bfbc5d6d9 100644
+--- a/include/libxml/xpath.h
++++ b/include/libxml/xpath.h
+@@ -104,13 +104,23 @@ typedef enum {
+     XPATH_BOOLEAN = 2,
+     XPATH_NUMBER = 3,
+     XPATH_STRING = 4,
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     XPATH_POINT = 5,
+     XPATH_RANGE = 6,
+     XPATH_LOCATIONSET = 7,
++#endif
+     XPATH_USERS = 8,
+     XPATH_XSLT_TREE = 9  /* An XSLT value tree, non modifiable */
+ } xmlXPathObjectType;
+ 
++#ifndef LIBXML_XPTR_LOCS_ENABLED
++/** DOC_DISABLE */
++#define XPATH_POINT 5
++#define XPATH_RANGE 6
++#define XPATH_LOCATIONSET 7
++/** DOC_ENABLE */
++#endif
++
+ typedef struct _xmlXPathObject xmlXPathObject;
+ typedef xmlXPathObject *xmlXPathObjectPtr;
+ struct _xmlXPathObject {
+diff --git a/include/libxml/xpointer.h b/include/libxml/xpointer.h
+index b99112b87..ca7bdbe08 100644
+--- a/include/libxml/xpointer.h
++++ b/include/libxml/xpointer.h
+@@ -28,6 +28,7 @@
+ extern "C" {
+ #endif
+ 
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ /*
+  * A Location Set
+  */
+@@ -43,51 +44,68 @@ struct _xmlLocationSet {
+  * Handling of location sets.
+  */
+ 
++XML_DEPRECATED
+ XMLPUBFUN xmlLocationSetPtr XMLCALL
+ 		    xmlXPtrLocationSetCreate	(xmlXPathObjectPtr val);
++XML_DEPRECATED
+ XMLPUBFUN void XMLCALL
+ 		    xmlXPtrFreeLocationSet	(xmlLocationSetPtr obj);
++XML_DEPRECATED
+ XMLPUBFUN xmlLocationSetPtr XMLCALL
+ 		    xmlXPtrLocationSetMerge	(xmlLocationSetPtr val1,
+ 						 xmlLocationSetPtr val2);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewRange		(xmlNodePtr start,
+ 						 int startindex,
+ 						 xmlNodePtr end,
+ 						 int endindex);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewRangePoints	(xmlXPathObjectPtr start,
+ 						 xmlXPathObjectPtr end);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewRangeNodePoint	(xmlNodePtr start,
+ 						 xmlXPathObjectPtr end);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewRangePointNode	(xmlXPathObjectPtr start,
+ 						 xmlNodePtr end);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewRangeNodes	(xmlNodePtr start,
+ 						 xmlNodePtr end);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewLocationSetNodes	(xmlNodePtr start,
+ 						 xmlNodePtr end);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewLocationSetNodeSet(xmlNodeSetPtr set);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewRangeNodeObject	(xmlNodePtr start,
+ 						 xmlXPathObjectPtr end);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrNewCollapsedRange	(xmlNodePtr start);
++XML_DEPRECATED
+ XMLPUBFUN void XMLCALL
+ 		    xmlXPtrLocationSetAdd	(xmlLocationSetPtr cur,
+ 						 xmlXPathObjectPtr val);
++XML_DEPRECATED
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrWrapLocationSet	(xmlLocationSetPtr val);
++XML_DEPRECATED
+ XMLPUBFUN void XMLCALL
+ 		    xmlXPtrLocationSetDel	(xmlLocationSetPtr cur,
+ 						 xmlXPathObjectPtr val);
++XML_DEPRECATED
+ XMLPUBFUN void XMLCALL
+ 		    xmlXPtrLocationSetRemove	(xmlLocationSetPtr cur,
+ 						 int val);
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+ /*
+  * Functions.
+@@ -99,13 +117,18 @@ XMLPUBFUN xmlXPathContextPtr XMLCALL
+ XMLPUBFUN xmlXPathObjectPtr XMLCALL
+ 		    xmlXPtrEval			(const xmlChar *str,
+ 						 xmlXPathContextPtr ctx);
++#ifdef LIBXML_XPTR_LOCS_ENABLED
++XML_DEPRECATED
+ XMLPUBFUN void XMLCALL
+ 		    xmlXPtrRangeToFunction	(xmlXPathParserContextPtr ctxt,
+ 						 int nargs);
++XML_DEPRECATED
+ XMLPUBFUN xmlNodePtr XMLCALL
+ 		    xmlXPtrBuildNodeList	(xmlXPathObjectPtr obj);
++XML_DEPRECATED
+ XMLPUBFUN void XMLCALL
+ 		    xmlXPtrEvalRangePredicate	(xmlXPathParserContextPtr ctxt);
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/python/generator.py b/python/generator.py
+index 409d0ccb5..09474fca0 100755
+--- a/python/generator.py
++++ b/python/generator.py
+@@ -320,6 +320,12 @@ deprecated_funcs = {
+     'xmlSchemaCleanupTypes': True,
+     'xmlSchemaInitTypes': True,
+     'xmlXPathInit': True,
++    'xmlXPtrEvalRangePredicate': True,
++    'xmlXPtrNewCollapsedRange': True,
++    'xmlXPtrNewLocationSetNodes': True,
++    'xmlXPtrNewRange': True,
++    'xmlXPtrNewRangeNodes': True,
++    'xmlXPtrRangeToFunction': True,
+ }
+ 
+ def skip_function(name):
+diff --git a/python/types.c b/python/types.c
+index 75213dd45..27ad50087 100644
+--- a/python/types.c
++++ b/python/types.c
+@@ -603,6 +603,7 @@ libxml_xmlXPathObjectPtrWrap(xmlXPathObjectPtr obj)
+         case XPATH_STRING:
+ 	    ret = PY_IMPORT_STRING((char *) obj->stringval);
+             break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+         case XPATH_POINT:
+         {
+             PyObject *node;
+@@ -704,6 +705,7 @@ libxml_xmlXPathObjectPtrWrap(xmlXPathObjectPtr obj)
+             }
+             break;
+         }
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+         default:
+ #ifdef DEBUG
+             printf("Unable to convert XPath object type %d\n", obj->type);
+diff --git a/runtest.c b/runtest.c
+index ee837caa1..df0dff4d4 100644
+--- a/runtest.c
++++ b/runtest.c
+@@ -2596,7 +2596,7 @@ xpathDocTest(const char *filename,
+     return(ret);
+ }
+ 
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ /**
+  * xptrDocTest:
+  * @filename: the file to parse
+@@ -4527,7 +4527,7 @@ testDesc testDescriptions[] = {
+     { "XPath document queries regression tests" ,
+       xpathDocTest, "./test/XPath/docs/*", NULL, NULL, NULL,
+       0 },
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     { "XPointer document queries regression tests" ,
+       xptrDocTest, "./test/XPath/docs/*", NULL, NULL, NULL,
+       0 },
+diff --git a/schematron.c b/schematron.c
+index 19a3d39a4..68a4c622e 100644
+--- a/schematron.c
++++ b/schematron.c
+@@ -1833,9 +1833,11 @@ xmlSchematronRunTest(xmlSchematronValidCtxtPtr ctxt,
+                     failed = 1;
+                 break;
+             case XPATH_UNDEFINED:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+             case XPATH_POINT:
+             case XPATH_RANGE:
+             case XPATH_LOCATIONSET:
++#endif
+             case XPATH_USERS:
+                 failed = 1;
+                 break;
+diff --git a/testapi.c b/testapi.c
+index 9ab5b9bbf..a3c6c733a 100644
+--- a/testapi.c
++++ b/testapi.c
+@@ -50749,7 +50749,7 @@ static int
+ test_xmlXPtrBuildNodeList(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlNodePtr ret_val;
+     xmlXPathObjectPtr obj; /* the XPointer result from the evaluation. */
+@@ -50824,7 +50824,7 @@ static int
+ test_xmlXPtrEvalRangePredicate(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathParserContextPtr ctxt; /* the XPointer Parser context */
+     int n_ctxt;
+@@ -50851,159 +50851,12 @@ test_xmlXPtrEvalRangePredicate(void) {
+     return(test_ret);
+ }
+ 
+-#ifdef LIBXML_XPTR_ENABLED
+-
+-#define gen_nb_xmlLocationSetPtr 1
+-static xmlLocationSetPtr gen_xmlLocationSetPtr(int no ATTRIBUTE_UNUSED, int nr ATTRIBUTE_UNUSED) {
+-    return(NULL);
+-}
+-static void des_xmlLocationSetPtr(int no ATTRIBUTE_UNUSED, xmlLocationSetPtr val ATTRIBUTE_UNUSED, int nr ATTRIBUTE_UNUSED) {
+-}
+-#endif
+-
+-
+-static int
+-test_xmlXPtrLocationSetAdd(void) {
+-    int test_ret = 0;
+-
+-#if defined(LIBXML_XPTR_ENABLED)
+-    int mem_base;
+-    xmlLocationSetPtr cur; /* the initial range set */
+-    int n_cur;
+-    xmlXPathObjectPtr val; /* a new xmlXPathObjectPtr */
+-    int n_val;
+-
+-    for (n_cur = 0;n_cur < gen_nb_xmlLocationSetPtr;n_cur++) {
+-    for (n_val = 0;n_val < gen_nb_xmlXPathObjectPtr;n_val++) {
+-        mem_base = xmlMemBlocks();
+-        cur = gen_xmlLocationSetPtr(n_cur, 0);
+-        val = gen_xmlXPathObjectPtr(n_val, 1);
+-
+-        xmlXPtrLocationSetAdd(cur, val);
+-        call_tests++;
+-        des_xmlLocationSetPtr(n_cur, cur, 0);
+-        des_xmlXPathObjectPtr(n_val, val, 1);
+-        xmlResetLastError();
+-        if (mem_base != xmlMemBlocks()) {
+-            printf("Leak of %d blocks found in xmlXPtrLocationSetAdd",
+-	           xmlMemBlocks() - mem_base);
+-	    test_ret++;
+-            printf(" %d", n_cur);
+-            printf(" %d", n_val);
+-            printf("\n");
+-        }
+-    }
+-    }
+-    function_tests++;
+-#endif
+-
+-    return(test_ret);
+-}
+-
+-
+-static int
+-test_xmlXPtrLocationSetCreate(void) {
+-    int test_ret = 0;
+-
+-
+-    /* missing type support */
+-    return(test_ret);
+-}
+-
+-
+-static int
+-test_xmlXPtrLocationSetDel(void) {
+-    int test_ret = 0;
+-
+-#if defined(LIBXML_XPTR_ENABLED)
+-    int mem_base;
+-    xmlLocationSetPtr cur; /* the initial range set */
+-    int n_cur;
+-    xmlXPathObjectPtr val; /* an xmlXPathObjectPtr */
+-    int n_val;
+-
+-    for (n_cur = 0;n_cur < gen_nb_xmlLocationSetPtr;n_cur++) {
+-    for (n_val = 0;n_val < gen_nb_xmlXPathObjectPtr;n_val++) {
+-        mem_base = xmlMemBlocks();
+-        cur = gen_xmlLocationSetPtr(n_cur, 0);
+-        val = gen_xmlXPathObjectPtr(n_val, 1);
+-
+-        xmlXPtrLocationSetDel(cur, val);
+-        call_tests++;
+-        des_xmlLocationSetPtr(n_cur, cur, 0);
+-        des_xmlXPathObjectPtr(n_val, val, 1);
+-        xmlResetLastError();
+-        if (mem_base != xmlMemBlocks()) {
+-            printf("Leak of %d blocks found in xmlXPtrLocationSetDel",
+-	           xmlMemBlocks() - mem_base);
+-	    test_ret++;
+-            printf(" %d", n_cur);
+-            printf(" %d", n_val);
+-            printf("\n");
+-        }
+-    }
+-    }
+-    function_tests++;
+-#endif
+-
+-    return(test_ret);
+-}
+-
+-
+-static int
+-test_xmlXPtrLocationSetMerge(void) {
+-    int test_ret = 0;
+-
+-
+-    /* missing type support */
+-    return(test_ret);
+-}
+-
+-
+-static int
+-test_xmlXPtrLocationSetRemove(void) {
+-    int test_ret = 0;
+-
+-#if defined(LIBXML_XPTR_ENABLED)
+-    int mem_base;
+-    xmlLocationSetPtr cur; /* the initial range set */
+-    int n_cur;
+-    int val; /* the index to remove */
+-    int n_val;
+-
+-    for (n_cur = 0;n_cur < gen_nb_xmlLocationSetPtr;n_cur++) {
+-    for (n_val = 0;n_val < gen_nb_int;n_val++) {
+-        mem_base = xmlMemBlocks();
+-        cur = gen_xmlLocationSetPtr(n_cur, 0);
+-        val = gen_int(n_val, 1);
+-
+-        xmlXPtrLocationSetRemove(cur, val);
+-        call_tests++;
+-        des_xmlLocationSetPtr(n_cur, cur, 0);
+-        des_int(n_val, val, 1);
+-        xmlResetLastError();
+-        if (mem_base != xmlMemBlocks()) {
+-            printf("Leak of %d blocks found in xmlXPtrLocationSetRemove",
+-	           xmlMemBlocks() - mem_base);
+-	    test_ret++;
+-            printf(" %d", n_cur);
+-            printf(" %d", n_val);
+-            printf("\n");
+-        }
+-    }
+-    }
+-    function_tests++;
+-#endif
+-
+-    return(test_ret);
+-}
+-
+ 
+ static int
+ test_xmlXPtrNewCollapsedRange(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlNodePtr start; /* the starting and ending node */
+@@ -51047,7 +50900,7 @@ static int
+ test_xmlXPtrNewLocationSetNodeSet(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlNodeSetPtr set; /* a node set */
+@@ -51081,7 +50934,7 @@ static int
+ test_xmlXPtrNewLocationSetNodes(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlNodePtr start; /* the start NodePtr value */
+@@ -51122,7 +50975,7 @@ static int
+ test_xmlXPtrNewRange(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlNodePtr start; /* the starting node */
+@@ -51177,7 +51030,7 @@ static int
+ test_xmlXPtrNewRangeNodeObject(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlNodePtr start; /* the starting node */
+@@ -51218,7 +51071,7 @@ static int
+ test_xmlXPtrNewRangeNodePoint(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlNodePtr start; /* the starting node */
+@@ -51259,7 +51112,7 @@ static int
+ test_xmlXPtrNewRangeNodes(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlNodePtr start; /* the starting node */
+@@ -51300,7 +51153,7 @@ static int
+ test_xmlXPtrNewRangePointNode(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlXPathObjectPtr start; /* the starting point */
+@@ -51341,7 +51194,7 @@ static int
+ test_xmlXPtrNewRangePoints(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathObjectPtr ret_val;
+     xmlXPathObjectPtr start; /* the starting point */
+@@ -51382,7 +51235,7 @@ static int
+ test_xmlXPtrRangeToFunction(void) {
+     int test_ret = 0;
+ 
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_ENABLED) && defined(LIBXML_XPTR_LOCS_ENABLED)
+     int mem_base;
+     xmlXPathParserContextPtr ctxt; /* the XPointer Parser context */
+     int n_ctxt;
+@@ -51416,53 +51269,14 @@ test_xmlXPtrRangeToFunction(void) {
+     return(test_ret);
+ }
+ 
+-
+-static int
+-test_xmlXPtrWrapLocationSet(void) {
+-    int test_ret = 0;
+-
+-#if defined(LIBXML_XPTR_ENABLED)
+-    int mem_base;
+-    xmlXPathObjectPtr ret_val;
+-    xmlLocationSetPtr val; /* the LocationSet value */
+-    int n_val;
+-
+-    for (n_val = 0;n_val < gen_nb_xmlLocationSetPtr;n_val++) {
+-        mem_base = xmlMemBlocks();
+-        val = gen_xmlLocationSetPtr(n_val, 0);
+-
+-        ret_val = xmlXPtrWrapLocationSet(val);
+-        desret_xmlXPathObjectPtr(ret_val);
+-        call_tests++;
+-        des_xmlLocationSetPtr(n_val, val, 0);
+-        xmlResetLastError();
+-        if (mem_base != xmlMemBlocks()) {
+-            printf("Leak of %d blocks found in xmlXPtrWrapLocationSet",
+-	           xmlMemBlocks() - mem_base);
+-	    test_ret++;
+-            printf(" %d", n_val);
+-            printf("\n");
+-        }
+-    }
+-    function_tests++;
+-#endif
+-
+-    return(test_ret);
+-}
+-
+ static int
+ test_xpointer(void) {
+     int test_ret = 0;
+ 
+-    if (quiet == 0) printf("Testing xpointer : 17 of 21 functions ...\n");
++    if (quiet == 0) printf("Testing xpointer : 13 of 21 functions ...\n");
+     test_ret += test_xmlXPtrBuildNodeList();
+     test_ret += test_xmlXPtrEval();
+     test_ret += test_xmlXPtrEvalRangePredicate();
+-    test_ret += test_xmlXPtrLocationSetAdd();
+-    test_ret += test_xmlXPtrLocationSetCreate();
+-    test_ret += test_xmlXPtrLocationSetDel();
+-    test_ret += test_xmlXPtrLocationSetMerge();
+-    test_ret += test_xmlXPtrLocationSetRemove();
+     test_ret += test_xmlXPtrNewCollapsedRange();
+     test_ret += test_xmlXPtrNewContext();
+     test_ret += test_xmlXPtrNewLocationSetNodeSet();
+@@ -51474,7 +51288,6 @@ test_xpointer(void) {
+     test_ret += test_xmlXPtrNewRangePointNode();
+     test_ret += test_xmlXPtrNewRangePoints();
+     test_ret += test_xmlXPtrRangeToFunction();
+-    test_ret += test_xmlXPtrWrapLocationSet();
+ 
+     if (test_ret != 0)
+ 	printf("Module xpointer: %d errors\n", test_ret);
+diff --git a/xinclude.c b/xinclude.c
+index c700fb174..303a8bcaf 100644
+--- a/xinclude.c
++++ b/xinclude.c
+@@ -881,6 +881,7 @@ xmlXIncludeCopyNodeList(xmlXIncludeCtxtPtr ctxt, xmlDocPtr target,
+     return(result);
+ }
+ 
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ /**
+  * xmlXIncludeGetNthChild:
+  * @cur:  the node
+@@ -1120,6 +1121,7 @@ xmlXIncludeCopyRange(xmlXIncludeCtxtPtr ctxt, xmlDocPtr target,
+     }
+     return(list);
+ }
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+ /**
+  * xmlXIncludeBuildNodeList:
+@@ -1218,7 +1220,7 @@ xmlXIncludeCopyXPointer(xmlXIncludeCtxtPtr ctxt, xmlDocPtr target,
+ 	    }
+ 	    break;
+ 	}
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_LOCATIONSET: {
+ 	    xmlLocationSetPtr set = (xmlLocationSetPtr) obj->user;
+ 	    if (set == NULL)
+@@ -1240,10 +1242,10 @@ xmlXIncludeCopyXPointer(xmlXIncludeCtxtPtr ctxt, xmlDocPtr target,
+ 	}
+ 	case XPATH_RANGE:
+ 	    return(xmlXIncludeCopyRange(ctxt, target, source, obj));
+-#endif
+ 	case XPATH_POINT:
+ 	    /* points are ignored in XInclude */
+ 	    break;
++#endif
+ 	default:
+ 	    break;
+     }
+@@ -1595,7 +1597,9 @@ loaded:
+ 	    case XPATH_BOOLEAN:
+ 	    case XPATH_NUMBER:
+ 	    case XPATH_STRING:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	    case XPATH_POINT:
++#endif
+ 	    case XPATH_USERS:
+ 	    case XPATH_XSLT_TREE:
+ 		xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref,
+@@ -1617,9 +1621,11 @@ loaded:
+ 		    return(-1);
+ 		}
+ 
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	    case XPATH_RANGE:
+ 	    case XPATH_LOCATIONSET:
+ 		break;
++#endif
+ 	}
+ 	set = xptr->nodesetval;
+ 	if (set != NULL) {
+diff --git a/xpath.c b/xpath.c
+index f01bf1aa6..0fa02913f 100644
+--- a/xpath.c
++++ b/xpath.c
+@@ -36,7 +36,7 @@
+ #include <libxml/xpathInternals.h>
+ #include <libxml/parserInternals.h>
+ #include <libxml/hash.h>
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ #include <libxml/xpointer.h>
+ #endif
+ #ifdef LIBXML_DEBUG_ENABLED
+@@ -901,7 +901,7 @@ typedef enum {
+     XPATH_OP_PREDICATE,
+     XPATH_OP_FILTER, /* 16 */
+     XPATH_OP_SORT /* 17 */
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     ,XPATH_OP_RANGETO
+ #endif
+ } xmlXPathOp;
+@@ -1352,7 +1352,7 @@ xmlXPathDebugDumpValueTree(FILE *output, xmlNodeSetPtr cur, int depth) {
+     fprintf(output, "%d", i + 1);
+     xmlXPathDebugDumpNodeList(output, cur->nodeTab[0]->children, depth + 1);
+ }
+-#if defined(LIBXML_XPTR_ENABLED)
++#if defined(LIBXML_XPTR_LOCS_ENABLED)
+ static void
+ xmlXPathDebugDumpLocationSet(FILE *output, xmlLocationSetPtr cur, int depth) {
+     int i;
+@@ -1375,7 +1375,7 @@ xmlXPathDebugDumpLocationSet(FILE *output, xmlLocationSetPtr cur, int depth) {
+ 	xmlXPathDebugDumpObject(output, cur->locTab[i], depth + 1);
+     }
+ }
+-#endif /* LIBXML_XPTR_ENABLED */
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+ /**
+  * xmlXPathDebugDumpObject:
+@@ -1444,6 +1444,7 @@ xmlXPathDebugDumpObject(FILE *output, xmlXPathObjectPtr cur, int depth) {
+ 	    xmlDebugDumpString(output, cur->stringval);
+ 	    fprintf(output, "\n");
+ 	    break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_POINT:
+ 	    fprintf(output, "Object is a point : index %d in node", cur->index);
+ 	    xmlXPathDebugDumpNode(output, (xmlNodePtr) cur->user, depth + 1);
+@@ -1479,12 +1480,11 @@ xmlXPathDebugDumpObject(FILE *output, xmlXPathObjectPtr cur, int depth) {
+ 	    }
+ 	    break;
+ 	case XPATH_LOCATIONSET:
+-#if defined(LIBXML_XPTR_ENABLED)
+ 	    fprintf(output, "Object is a Location Set:\n");
+ 	    xmlXPathDebugDumpLocationSet(output,
+ 		    (xmlLocationSetPtr) cur->user, depth);
+-#endif
+ 	    break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	case XPATH_USERS:
+ 	    fprintf(output, "Object is user defined\n");
+ 	    break;
+@@ -1652,7 +1652,7 @@ xmlXPathDebugDumpStepOp(FILE *output, xmlXPathCompExprPtr comp,
+         case XPATH_OP_ARG: fprintf(output, "ARG"); break;
+         case XPATH_OP_PREDICATE: fprintf(output, "PREDICATE"); break;
+         case XPATH_OP_FILTER: fprintf(output, "FILTER"); break;
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+         case XPATH_OP_RANGETO: fprintf(output, "RANGETO"); break;
+ #endif
+ 	default:
+@@ -1844,6 +1844,7 @@ xmlXPathDebugObjUsageRequested(xmlXPathContextPtr ctxt,
+ 		case XPATH_STRING:
+ 		    cache->dbgReusedString++;
+ 		    break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 		case XPATH_POINT:
+ 		    cache->dbgReusedPoint++;
+ 		    break;
+@@ -1853,6 +1854,7 @@ xmlXPathDebugObjUsageRequested(xmlXPathContextPtr ctxt,
+ 		case XPATH_LOCATIONSET:
+ 		    cache->dbgReusedLocset++;
+ 		    break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 		case XPATH_USERS:
+ 		    cache->dbgReusedUsers++;
+ 		    break;
+@@ -1911,6 +1913,7 @@ xmlXPathDebugObjUsageRequested(xmlXPathContextPtr ctxt,
+ 		xmlXPathDebugObjMaxString =
+ 		    xmlXPathDebugObjCounterString;
+ 	    break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_POINT:
+ 	    if (! isCached)
+ 		xmlXPathDebugObjTotalPoint++;
+@@ -1938,6 +1941,7 @@ xmlXPathDebugObjUsageRequested(xmlXPathContextPtr ctxt,
+ 		xmlXPathDebugObjMaxLocset =
+ 		    xmlXPathDebugObjCounterLocset;
+ 	    break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	case XPATH_USERS:
+ 	    if (! isCached)
+ 		xmlXPathDebugObjTotalUsers++;
+@@ -1998,6 +2002,7 @@ xmlXPathDebugObjUsageReleased(xmlXPathContextPtr ctxt,
+ 		case XPATH_STRING:
+ 		    cache->dbgCachedString++;
+ 		    break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 		case XPATH_POINT:
+ 		    cache->dbgCachedPoint++;
+ 		    break;
+@@ -2007,6 +2012,7 @@ xmlXPathDebugObjUsageReleased(xmlXPathContextPtr ctxt,
+ 		case XPATH_LOCATIONSET:
+ 		    cache->dbgCachedLocset++;
+ 		    break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 		case XPATH_USERS:
+ 		    cache->dbgCachedUsers++;
+ 		    break;
+@@ -2035,6 +2041,7 @@ xmlXPathDebugObjUsageReleased(xmlXPathContextPtr ctxt,
+ 	case XPATH_STRING:
+ 	    xmlXPathDebugObjCounterString--;
+ 	    break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_POINT:
+ 	    xmlXPathDebugObjCounterPoint--;
+ 	    break;
+@@ -2044,6 +2051,7 @@ xmlXPathDebugObjUsageReleased(xmlXPathContextPtr ctxt,
+ 	case XPATH_LOCATIONSET:
+ 	    xmlXPathDebugObjCounterLocset--;
+ 	    break;
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	case XPATH_USERS:
+ 	    xmlXPathDebugObjCounterUsers--;
+ 	    break;
+@@ -2696,9 +2704,11 @@ xmlXPathCacheConvertString(xmlXPathContextPtr ctxt, xmlXPathObjectPtr val) {
+ 	res = xmlXPathCastNumberToString(val->floatval);
+ 	break;
+     case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     case XPATH_POINT:
+     case XPATH_RANGE:
+     case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	TODO;
+ 	break;
+     }
+@@ -5377,8 +5387,10 @@ xmlXPathObjectCopy(xmlXPathObjectPtr val) {
+     switch (val->type) {
+ 	case XPATH_BOOLEAN:
+ 	case XPATH_NUMBER:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_POINT:
+ 	case XPATH_RANGE:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	    break;
+ 	case XPATH_STRING:
+ 	    ret->stringval = xmlStrdup(val->stringval);
+@@ -5422,8 +5434,8 @@ xmlXPathObjectCopy(xmlXPathObjectPtr val) {
+ 	    /* Do not deallocate the copied tree value */
+ 	    ret->boolval = 0;
+ 	    break;
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_LOCATIONSET:
+-#ifdef LIBXML_XPTR_ENABLED
+ 	{
+ 	    xmlLocationSetPtr loc = val->user;
+ 	    ret->user = (void *) xmlXPtrLocationSetMerge(NULL, loc);
+@@ -5466,7 +5478,7 @@ xmlXPathFreeObject(xmlXPathObjectPtr obj) {
+ 	    if (obj->nodesetval != NULL)
+ 		xmlXPathFreeNodeSet(obj->nodesetval);
+ 	}
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     } else if (obj->type == XPATH_LOCATIONSET) {
+ 	if (obj->user != NULL)
+ 	    xmlXPtrFreeLocationSet(obj->user);
+@@ -5556,7 +5568,7 @@ xmlXPathReleaseObject(xmlXPathContextPtr ctxt, xmlXPathObjectPtr obj)
+ 		    goto obj_cached;
+ 		}
+ 		break;
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	    case XPATH_LOCATIONSET:
+ 		if (obj->user != NULL) {
+ 		    xmlXPtrFreeLocationSet(obj->user);
+@@ -5759,9 +5771,11 @@ xmlXPathCastToString(xmlXPathObjectPtr val) {
+ 	    break;
+ 	}
+ 	case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_POINT:
+ 	case XPATH_RANGE:
+ 	case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	    TODO
+ 	    ret = xmlStrdup((const xmlChar *) "");
+ 	    break;
+@@ -5804,9 +5818,11 @@ xmlXPathConvertString(xmlXPathObjectPtr val) {
+ 	res = xmlXPathCastNumberToString(val->floatval);
+ 	break;
+     case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     case XPATH_POINT:
+     case XPATH_RANGE:
+     case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	TODO;
+ 	break;
+     }
+@@ -5924,9 +5940,11 @@ xmlXPathCastToNumber(xmlXPathObjectPtr val) {
+ 	ret = xmlXPathCastBooleanToNumber(val->boolval);
+ 	break;
+     case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     case XPATH_POINT:
+     case XPATH_RANGE:
+     case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	TODO;
+ 	ret = xmlXPathNAN;
+ 	break;
+@@ -6036,9 +6054,11 @@ xmlXPathCastToBoolean (xmlXPathObjectPtr val) {
+ 	ret = val->boolval;
+ 	break;
+     case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     case XPATH_POINT:
+     case XPATH_RANGE:
+     case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	TODO;
+ 	ret = 0;
+ 	break;
+@@ -6975,9 +6995,11 @@ xmlXPathEqualValuesCommon(xmlXPathParserContextPtr ctxt,
+ 		    ret = (arg1->boolval == ret);
+ 		    break;
+ 		case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 		case XPATH_POINT:
+ 		case XPATH_RANGE:
+ 		case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 		    TODO
+ 		    break;
+ 		case XPATH_NODESET:
+@@ -7032,9 +7054,11 @@ xmlXPathEqualValuesCommon(xmlXPathParserContextPtr ctxt,
+ 		    }
+ 		    break;
+ 		case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 		case XPATH_POINT:
+ 		case XPATH_RANGE:
+ 		case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 		    TODO
+ 		    break;
+ 		case XPATH_NODESET:
+@@ -7093,9 +7117,11 @@ xmlXPathEqualValuesCommon(xmlXPathParserContextPtr ctxt,
+ 		    }
+ 		    break;
+ 		case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 		case XPATH_POINT:
+ 		case XPATH_RANGE:
+ 		case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 		    TODO
+ 		    break;
+ 		case XPATH_NODESET:
+@@ -7104,9 +7130,11 @@ xmlXPathEqualValuesCommon(xmlXPathParserContextPtr ctxt,
+ 	    }
+ 	    break;
+         case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_POINT:
+ 	case XPATH_RANGE:
+ 	case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 	    TODO
+ 	    break;
+ 	case XPATH_NODESET:
+@@ -7189,9 +7217,11 @@ xmlXPathEqualValues(xmlXPathParserContextPtr ctxt) {
+ 		ret = xmlXPathEqualNodeSetString(arg1, arg2->stringval, 0);
+ 		break;
+ 	    case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	    case XPATH_POINT:
+ 	    case XPATH_RANGE:
+ 	    case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 		TODO
+ 		break;
+ 	}
+@@ -7274,9 +7304,11 @@ xmlXPathNotEqualValues(xmlXPathParserContextPtr ctxt) {
+ 		ret = xmlXPathEqualNodeSetString(arg1, arg2->stringval,1);
+ 		break;
+ 	    case XPATH_USERS:
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	    case XPATH_POINT:
+ 	    case XPATH_RANGE:
+ 	    case XPATH_LOCATIONSET:
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 		TODO
+ 		break;
+ 	}
+@@ -10587,7 +10619,7 @@ xmlXPathCompPathExpr(xmlXPathParserContextPtr ctxt) {
+ 				"PathExpr: Type search\n");
+ #endif
+ 			lc = 1;
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+                     } else if (ctxt->xptr &&
+                                xmlStrEqual(name, BAD_CAST "range-to")) {
+                         lc = 1;
+@@ -11238,7 +11270,7 @@ xmlXPathIsAxisName(const xmlChar *name) {
+  */
+ static void
+ xmlXPathCompStep(xmlXPathParserContextPtr ctxt) {
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     int rangeto = 0;
+     int op2 = -1;
+ #endif
+@@ -11263,7 +11295,7 @@ xmlXPathCompStep(xmlXPathParserContextPtr ctxt) {
+ 	/*
+ 	 * The modification needed for XPointer change to the production
+ 	 */
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	if (ctxt->xptr) {
+ 	    name = xmlXPathParseNCName(ctxt);
+ 	    if ((name != NULL) && (xmlStrEqual(name, BAD_CAST "range-to"))) {
+@@ -11348,7 +11380,7 @@ xmlXPathCompStep(xmlXPathParserContextPtr ctxt) {
+ 	    xmlGenericErrorContextNodeSet(stdout, ctxt->value->nodesetval);
+ #endif
+ 
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ eval_predicates:
+ #endif
+ 	op1 = ctxt->comp->last;
+@@ -11359,7 +11391,7 @@ eval_predicates:
+ 	    xmlXPathCompPredicate(ctxt, 0);
+ 	}
+ 
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	if (rangeto) {
+ 	    PUSH_BINARY_EXPR(XPATH_OP_RANGETO, op2, op1, 0, 0);
+ 	} else
+@@ -11702,7 +11734,7 @@ xmlXPathNodeSetFilter(xmlXPathParserContextPtr ctxt,
+     xpctxt->proximityPosition = oldpp;
+ }
+ 
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ /**
+  * xmlXPathLocationSetFilter:
+  * @ctxt:  the XPath Parser context
+@@ -11819,7 +11851,7 @@ xmlXPathLocationSetFilter(xmlXPathParserContextPtr ctxt,
+     xpctxt->contextSize = oldcs;
+     xpctxt->proximityPosition = oldpp;
+ }
+-#endif /* LIBXML_XPTR_ENABLED */
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+ /**
+  * xmlXPathCompOpEvalPredicate:
+@@ -12875,7 +12907,7 @@ xmlXPathCompOpEvalFilterFirst(xmlXPathParserContextPtr ctxt,
+     if (ctxt->value == NULL)
+ 	return (total);
+ 
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     /*
+     * Hum are we filtering the result of an XPointer expression
+     */
+@@ -12890,7 +12922,7 @@ xmlXPathCompOpEvalFilterFirst(xmlXPathParserContextPtr ctxt,
+ 
+ 	return (total);
+     }
+-#endif /* LIBXML_XPTR_ENABLED */
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+     CHECK_TYPE0(XPATH_NODESET);
+     set = ctxt->value->nodesetval;
+@@ -13298,7 +13330,7 @@ xmlXPathCompOpEval(xmlXPathParserContextPtr ctxt, xmlXPathStepOpPtr op)
+                 if (ctxt->value == NULL)
+                     break;
+ 
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+                 /*
+                  * Hum are we filtering the result of an XPointer expression
+                  */
+@@ -13308,7 +13340,7 @@ xmlXPathCompOpEval(xmlXPathParserContextPtr ctxt, xmlXPathStepOpPtr op)
+                                               1, locset->locNr);
+                     break;
+                 }
+-#endif /* LIBXML_XPTR_ENABLED */
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+                 CHECK_TYPE0(XPATH_NODESET);
+                 set = ctxt->value->nodesetval;
+@@ -13329,7 +13361,7 @@ xmlXPathCompOpEval(xmlXPathParserContextPtr ctxt, xmlXPathStepOpPtr op)
+                 xmlXPathNodeSetSort(ctxt->value->nodesetval);
+ 	    }
+             break;
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+         case XPATH_OP_RANGETO:{
+                 xmlXPathObjectPtr range;
+                 xmlXPathObjectPtr res, obj;
+@@ -13487,7 +13519,7 @@ rangeto_error:
+                 ctxt->context->proximityPosition = oldpp;
+                 break;
+             }
+-#endif /* LIBXML_XPTR_ENABLED */
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+         default:
+             xmlGenericError(xmlGenericErrorContext,
+                             "XPath: unknown precompiled operation %d\n", op->op);
+@@ -13995,7 +14027,7 @@ xmlXPathEvaluatePredicateResult(xmlXPathParserContextPtr ctxt,
+ 	    return(res->nodesetval->nodeNr != 0);
+         case XPATH_STRING:
+ 	    return((res->stringval != NULL) && (res->stringval[0] != 0));
+-#ifdef LIBXML_XPTR_ENABLED
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 	case XPATH_LOCATIONSET:{
+ 	    xmlLocationSetPtr ptr = res->user;
+ 	    if (ptr == NULL)
+diff --git a/xpointer.c b/xpointer.c
+index 02041d3b3..5805407ca 100644
+--- a/xpointer.c
++++ b/xpointer.c
+@@ -132,6 +132,7 @@ xmlXPtrErr(xmlXPathParserContextPtr ctxt, int error,
+  *		A few helper functions for child sequences		*
+  *									*
+  ************************************************************************/
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ /* xmlXPtrAdvanceNode is a private function, but used by xinclude.c */
+ xmlNodePtr xmlXPtrAdvanceNode(xmlNodePtr cur, int *level);
+ /**
+@@ -177,6 +178,7 @@ xmlXPtrGetIndex(xmlNodePtr cur) {
+     }
+     return(i);
+ }
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+ /**
+  * xmlXPtrGetNthChild:
+@@ -205,6 +207,7 @@ xmlXPtrGetNthChild(xmlNodePtr cur, int no) {
+     return(cur);
+ }
+ 
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ /************************************************************************
+  *									*
+  *		Handling of XPointer specific types			*
+@@ -836,6 +839,7 @@ xmlXPtrWrapLocationSet(xmlLocationSetPtr val) {
+     ret->user = (void *) val;
+     return(ret);
+ }
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+ /************************************************************************
+  *									*
+@@ -1125,12 +1129,14 @@ xmlXPtrEvalFullXPtr(xmlXPathParserContextPtr ctxt, xmlChar *name) {
+ 	    xmlXPathObjectPtr obj = ctxt->value;
+ 
+ 	    switch (obj->type) {
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ 		case XPATH_LOCATIONSET: {
+ 		    xmlLocationSetPtr loc = ctxt->value->user;
+ 		    if ((loc != NULL) && (loc->locNr > 0))
+ 			return;
+ 		    break;
+ 		}
++#endif
+ 		case XPATH_NODESET: {
+ 		    xmlNodeSetPtr loc = ctxt->value->nodesetval;
+ 		    if ((loc != NULL) && (loc->nodeNr > 0))
+@@ -1269,6 +1275,7 @@ xmlXPtrEvalXPointer(xmlXPathParserContextPtr ctxt) {
+  *									*
+  ************************************************************************/
+ 
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ static
+ void xmlXPtrStringRangeFunction(xmlXPathParserContextPtr ctxt, int nargs);
+ static
+@@ -1283,6 +1290,7 @@ static
+ void xmlXPtrRangeInsideFunction(xmlXPathParserContextPtr ctxt, int nargs);
+ static
+ void xmlXPtrRangeFunction(xmlXPathParserContextPtr ctxt, int nargs);
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+ /**
+  * xmlXPtrNewContext:
+@@ -1298,10 +1306,13 @@ void xmlXPtrRangeFunction(xmlXPathParserContextPtr ctxt, int nargs);
+ xmlXPathContextPtr
+ xmlXPtrNewContext(xmlDocPtr doc, xmlNodePtr here, xmlNodePtr origin) {
+     xmlXPathContextPtr ret;
++    (void) here;
++    (void) origin;
+ 
+     ret = xmlXPathNewContext(doc);
+     if (ret == NULL)
+ 	return(ret);
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+     ret->xptr = 1;
+     ret->here = here;
+     ret->origin = origin;
+@@ -1320,6 +1331,7 @@ xmlXPtrNewContext(xmlDocPtr doc, xmlNodePtr here, xmlNodePtr origin) {
+ 	                 xmlXPtrHereFunction);
+     xmlXPathRegisterFunc(ret, (xmlChar *)" origin",
+ 	                 xmlXPtrOriginFunction);
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+     return(ret);
+ }
+@@ -1353,8 +1365,10 @@ xmlXPtrEval(const xmlChar *str, xmlXPathContextPtr ctx) {
+     xmlXPtrEvalXPointer(ctxt);
+ 
+     if ((ctxt->value != NULL) &&
+-	(ctxt->value->type != XPATH_NODESET) &&
+-	(ctxt->value->type != XPATH_LOCATIONSET)) {
++#ifdef LIBXML_XPTR_LOCS_ENABLED
++	(ctxt->value->type != XPATH_LOCATIONSET) &&
++#endif
++	(ctxt->value->type != XPATH_NODESET)) {
+         xmlXPtrErr(ctxt, XML_XPTR_EVAL_FAILED,
+ 		"xmlXPtrEval: evaluation failed to return a node set\n",
+ 		   NULL);
+@@ -1395,6 +1409,7 @@ xmlXPtrEval(const xmlChar *str, xmlXPathContextPtr ctx) {
+     return(res);
+ }
+ 
++#ifdef LIBXML_XPTR_LOCS_ENABLED
+ /**
+  * xmlXPtrBuildRangeNodeList:
+  * @range:  a range object
+@@ -2948,6 +2963,7 @@ xmlXPtrEvalRangePredicate(xmlXPathParserContextPtr ctxt) {
+     NEXT;
+     SKIP_BLANKS;
+ }
++#endif /* LIBXML_XPTR_LOCS_ENABLED */
+ 
+ #endif
+ 
+-- 
+GitLab
+

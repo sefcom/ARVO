@@ -1,0 +1,171 @@
+From 84ced9389e1a7f576812e0675b37056331c4dbcd Mon Sep 17 00:00:00 2001
+From: Daniel Stenberg <daniel@haxx.se>
+Date: Fri, 30 Aug 2019 11:29:55 +0200
+Subject: [PATCH] Curl_addr2string: take an addrlen argument too
+
+This allows the function to figure out if a unix domain socket has a
+file name or not associated with it! When a socket is created with
+socketpair(), as done in the fuzzer testing, the path struct member is
+uninitialized and must not be accessed.
+
+Bug: https://crbug.com/oss-fuzz/16699
+
+Closes #4283
+---
+ lib/connect.c         | 30 +++++++++++++++++++-----------
+ lib/connect.h         |  3 ++-
+ lib/vquic/ngtcp2.c    |  3 +--
+ tests/unit/unit1607.c |  2 +-
+ tests/unit/unit1609.c |  2 +-
+ 5 files changed, 24 insertions(+), 16 deletions(-)
+
+diff --git a/lib/connect.c b/lib/connect.c
+index aec397296209..79b8094e726b 100644
+--- a/lib/connect.c
++++ b/lib/connect.c
+@@ -628,7 +628,8 @@ void Curl_persistconninfo(struct connectdata *conn)
+ 
+ /* retrieves ip address and port from a sockaddr structure.
+    note it calls Curl_inet_ntop which sets errno on fail, not SOCKERRNO. */
+-bool Curl_addr2string(struct sockaddr *sa, char *addr, long *port)
++bool Curl_addr2string(struct sockaddr *sa, curl_socklen_t salen,
++                      char *addr, long *port)
+ {
+   struct sockaddr_in *si = NULL;
+ #ifdef ENABLE_IPV6
+@@ -636,6 +637,8 @@ bool Curl_addr2string(struct sockaddr *sa, char *addr, long *port)
+ #endif
+ #if defined(HAVE_SYS_UN_H) && defined(AF_UNIX)
+   struct sockaddr_un *su = NULL;
++#else
++  (void)salen;
+ #endif
+ 
+   switch(sa->sa_family) {
+@@ -661,8 +664,12 @@ bool Curl_addr2string(struct sockaddr *sa, char *addr, long *port)
+ #endif
+ #if defined(HAVE_SYS_UN_H) && defined(AF_UNIX)
+     case AF_UNIX:
+-      su = (struct sockaddr_un*)sa;
+-      msnprintf(addr, MAX_IPADR_LEN, "%s", su->sun_path);
++      if(salen > sizeof(sa_family_t)) {
++        su = (struct sockaddr_un*)sa;
++        msnprintf(addr, MAX_IPADR_LEN, "%s", su->sun_path);
++      }
++      else
++        addr[0] = 0; /* socket with no name */
+       *port = 0;
+       return TRUE;
+ #endif
+@@ -690,10 +697,11 @@ void Curl_updateconninfo(struct connectdata *conn, curl_socket_t sockfd)
+     char buffer[STRERROR_LEN];
+     struct Curl_sockaddr_storage ssrem;
+     struct Curl_sockaddr_storage ssloc;
+-    curl_socklen_t len;
++    curl_socklen_t plen;
++    curl_socklen_t slen;
+ #ifdef HAVE_GETPEERNAME
+-    len = sizeof(struct Curl_sockaddr_storage);
+-    if(getpeername(sockfd, (struct sockaddr*) &ssrem, &len)) {
++    plen = sizeof(struct Curl_sockaddr_storage);
++    if(getpeername(sockfd, (struct sockaddr*) &ssrem, &plen)) {
+       int error = SOCKERRNO;
+       failf(data, "getpeername() failed with errno %d: %s",
+             error, Curl_strerror(error, buffer, sizeof(buffer)));
+@@ -701,9 +709,9 @@ void Curl_updateconninfo(struct connectdata *conn, curl_socket_t sockfd)
+     }
+ #endif
+ #ifdef HAVE_GETSOCKNAME
+-    len = sizeof(struct Curl_sockaddr_storage);
++    slen = sizeof(struct Curl_sockaddr_storage);
+     memset(&ssloc, 0, sizeof(ssloc));
+-    if(getsockname(sockfd, (struct sockaddr*) &ssloc, &len)) {
++    if(getsockname(sockfd, (struct sockaddr*) &ssloc, &slen)) {
+       int error = SOCKERRNO;
+       failf(data, "getsockname() failed with errno %d: %s",
+             error, Curl_strerror(error, buffer, sizeof(buffer)));
+@@ -711,7 +719,7 @@ void Curl_updateconninfo(struct connectdata *conn, curl_socket_t sockfd)
+     }
+ #endif
+ #ifdef HAVE_GETPEERNAME
+-    if(!Curl_addr2string((struct sockaddr*)&ssrem,
++    if(!Curl_addr2string((struct sockaddr*)&ssrem, plen,
+                          conn->primary_ip, &conn->primary_port)) {
+       failf(data, "ssrem inet_ntop() failed with errno %d: %s",
+             errno, Curl_strerror(errno, buffer, sizeof(buffer)));
+@@ -720,7 +728,7 @@ void Curl_updateconninfo(struct connectdata *conn, curl_socket_t sockfd)
+     memcpy(conn->ip_addr_str, conn->primary_ip, MAX_IPADR_LEN);
+ #endif
+ #ifdef HAVE_GETSOCKNAME
+-    if(!Curl_addr2string((struct sockaddr*)&ssloc,
++    if(!Curl_addr2string((struct sockaddr*)&ssloc, slen,
+                          conn->local_ip, &conn->local_port)) {
+       failf(data, "ssloc inet_ntop() failed with errno %d: %s",
+             errno, Curl_strerror(errno, buffer, sizeof(buffer)));
+@@ -1049,7 +1057,7 @@ static CURLcode singleipconnect(struct connectdata *conn,
+     return CURLE_OK;
+ 
+   /* store remote address and port used in this connection attempt */
+-  if(!Curl_addr2string((struct sockaddr*)&addr.sa_addr,
++  if(!Curl_addr2string((struct sockaddr*)&addr.sa_addr, addr.addrlen,
+                        ipaddress, &port)) {
+     /* malformed address or bug in inet_ntop, try next address */
+     failf(data, "sa_addr inet_ntop() failed with errno %d: %s",
+diff --git a/lib/connect.h b/lib/connect.h
+index e44c4a701dd3..b23085a98a86 100644
+--- a/lib/connect.h
++++ b/lib/connect.h
+@@ -51,7 +51,8 @@ timediff_t Curl_timeleft(struct Curl_easy *data,
+ curl_socket_t Curl_getconnectinfo(struct Curl_easy *data,
+                                   struct connectdata **connp);
+ 
+-bool Curl_addr2string(struct sockaddr *sa, char *addr, long *port);
++bool Curl_addr2string(struct sockaddr *sa, curl_socklen_t salen,
++                      char *addr, long *port);
+ 
+ /*
+  * Check if a connection seems to be alive.
+diff --git a/lib/vquic/ngtcp2.c b/lib/vquic/ngtcp2.c
+index d98be181c594..6b3d53ee01a4 100644
+--- a/lib/vquic/ngtcp2.c
++++ b/lib/vquic/ngtcp2.c
+@@ -541,12 +541,11 @@ CURLcode Curl_quic_connect(struct connectdata *conn,
+   uint8_t paramsbuf[64];
+   ngtcp2_transport_params params;
+   ssize_t nwrite;
+-  (void)addrlen;
+ 
+   qs->conn = conn;
+ 
+   /* extract the used address as a string */
+-  if(!Curl_addr2string((struct sockaddr*)addr, ipbuf, &port)) {
++  if(!Curl_addr2string((struct sockaddr*)addr, addrlen, ipbuf, &port)) {
+     char buffer[STRERROR_LEN];
+     failf(data, "ssrem inet_ntop() failed with errno %d: %s",
+           errno, Curl_strerror(errno, buffer, sizeof(buffer)));
+diff --git a/tests/unit/unit1607.c b/tests/unit/unit1607.c
+index 45860422983f..a8b0331ce3af 100644
+--- a/tests/unit/unit1607.c
++++ b/tests/unit/unit1607.c
+@@ -150,7 +150,7 @@ UNITTEST_START
+       if(tests[i].address[j] == &skip)
+         continue;
+ 
+-      if(addr && !Curl_addr2string(addr->ai_addr,
++      if(addr && !Curl_addr2string(addr->ai_addr, addr->ai_addrlen,
+                                    ipaddress, &port)) {
+         fprintf(stderr, "%s:%d tests[%d] failed. getaddressinfo failed.\n",
+                 __FILE__, __LINE__, i);
+diff --git a/tests/unit/unit1609.c b/tests/unit/unit1609.c
+index d919c9ea95dc..8223a147cd76 100644
+--- a/tests/unit/unit1609.c
++++ b/tests/unit/unit1609.c
+@@ -150,7 +150,7 @@ UNITTEST_START
+       if(!addr && !tests[i].address[j])
+         break;
+ 
+-      if(addr && !Curl_addr2string(addr->ai_addr,
++      if(addr && !Curl_addr2string(addr->ai_addr, addr->ai_addrlen,
+                                    ipaddress, &port)) {
+         fprintf(stderr, "%s:%d tests[%d] failed. Curl_addr2string failed.\n",
+                 __FILE__, __LINE__, i);

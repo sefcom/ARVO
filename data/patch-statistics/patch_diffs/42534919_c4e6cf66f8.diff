@@ -1,0 +1,147 @@
+From 04a24f61e069926a6546917ee049dc17fbaf1d03 Mon Sep 17 00:00:00 2001
+From: Arjun <pkillarjun@protonmail.com>
+Date: Wed, 29 May 2024 13:13:24 +0530
+Subject: [PATCH] http: fix use-of-uninitialized-value bug
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This was found via MSan.
+
+In nxt_http_fields_hash() we setup a nxt_lvlhsh_query_t structure and
+initialise a couple of its members.
+
+At some point we call
+
+  lhq->proto->alloc(lhq->pool, nxt_lvlhsh_bucket_size(lhq->proto));
+
+Which in this case is
+
+  void *
+  nxt_lvlhsh_alloc(void *data, size_t size)
+  {
+      return nxt_memalign(size, size);
+  }
+
+So even though lhq.ppol wasn't previously initialised we don't actually
+use it in that particular function.
+
+However MSan triggers on the fact that we are passing an uninitialised
+value into that function.
+
+Indeed, compilers will generally complain about such things, e.g
+
+  /* u.c */
+  struct t {
+  	void *p;
+  	int len;
+  };
+
+  static void test(void *p __attribute__((unused)), int len)
+  {
+  	(void)len;
+  }
+
+  int main(void)
+  {
+  	struct t t;
+
+  	t.len = 42;
+  	test(t.p, t.len);
+
+  	return 0;
+  }
+
+GCC and Clang will produce a -Wuninitialized warning.
+
+But they won't catch the following...
+
+  /* u2.c */
+  struct t {
+          void *p;
+          int len;
+  };
+
+  static void _test(void *p __attribute__((unused)), int len)
+  {
+          (void)len;
+  }
+
+  static void test(struct t *t)
+  {
+          _test(t->p, t->len);
+  }
+
+  int main(void)
+  {
+          struct t t;
+
+          t.len = 42;
+          test(&t);
+
+          return 0;
+  }
+
+Which is why we don't get a compiler warning about lhq.pool.
+
+In this case initialising lhg.pool even though we don't use it here
+seems like the right thing to do and maybe compilers will start being
+able to catch these in the future.
+
+Actually GCC with -fanalyzer does catch the above
+
+  $ gcc -Wall -Wextra -O0 -fanalyzer u2.c
+  u2.c: In function ‘test’:
+  u2.c:15:9: warning: use of uninitialized value ‘*t.p’ [CWE-457] [-Wanalyzer-use-of-uninitialized-value]
+     15 |         _test(t->p, t->len);
+        |         ^~~~~~~~~~~~~~~~~~~
+    ‘main’: events 1-3
+      |
+      |   18 | int main(void)
+      |      |     ^~~~
+      |      |     |
+      |      |     (1) entry to ‘main’
+      |   19 | {
+      |   20 |         struct t t;
+      |      |                  ~
+      |      |                  |
+      |      |                  (2) region created on stack here
+      |......
+      |   23 |         test(&t);
+      |      |         ~~~~~~~~
+      |      |         |
+      |      |         (3) calling ‘test’ from ‘main’
+      |
+      +--> ‘test’: events 4-5
+             |
+             |   13 | static void test(struct t *t)
+             |      |             ^~~~
+             |      |             |
+             |      |             (4) entry to ‘test’
+             |   14 | {
+             |   15 |         _test(t->p, t->len);
+             |      |         ~~~~~~~~~~~~~~~~~~~
+             |      |         |
+             |      |         (5) use of uninitialized value ‘*t.p’ here
+             |
+
+Signed-off-by: Arjun <pkillarjun@protonmail.com>
+Link: <https://clang.llvm.org/docs/MemorySanitizer.html>
+[ Commit message - Andrew ]
+Signed-off-by: Andrew Clayton <a.clayton@nginx.com>
+---
+ src/nxt_http_parse.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/nxt_http_parse.c b/src/nxt_http_parse.c
+index 48be5bdb0..dd490e729 100644
+--- a/src/nxt_http_parse.c
++++ b/src/nxt_http_parse.c
+@@ -1182,6 +1182,7 @@ nxt_http_fields_hash(nxt_lvlhsh_t *hash,
+ 
+     lhq.replace = 0;
+     lhq.proto = &nxt_http_fields_hash_proto;
++    lhq.pool = NULL;
+ 
+     for (i = 0; i < count; i++) {
+         key = NXT_HTTP_FIELD_HASH_INIT;

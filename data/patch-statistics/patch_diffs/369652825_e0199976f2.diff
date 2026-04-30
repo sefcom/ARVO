@@ -1,0 +1,471 @@
+From b5b69dfb04bcec0707275dbbc5a317e77557a0c9 Mon Sep 17 00:00:00 2001
+From: Ken Sharp <Ken.Sharp@artifex.com>
+Date: Sat, 26 Apr 2025 13:33:58 +0100
+Subject: Disable clang compiler optimisation for setjmp/longjmp
+
+We've had a few OSS-fuzz reports involving crashes with longjmp in the
+JPEG error handling code, even after memset'ing the jump buffer. These
+are not reproducible with other compilers (gcc or Visual Studio) and
+do not reproduce with debug builds.
+
+Attempts to investigate suggest the jump buffer is invalid/corrupted
+after longjmp, leading to attempts to use invalid memory.
+
+The suspicion is that there is something about the clang compiler
+optimisation causing a problem with setjmp or longjmp. Preventing
+function inline'ing does not seem to avoid the issue. This commit uses
+the 'optnone' attribute to disable compiler optimisations around all
+functions which use setjmp or longjmp, when the compiler is clang.
+
+For me this resolves the remaining problems, but as with the memset of
+the jump buffer I cannot say that it is a 'fix'.
+---
+ base/setjmp_.h        |  8 ++++++++
+ base/sjpegc.c         |  7 ++++++-
+ base/sjpegd.c         |  6 ++++++
+ base/sjpege.c         | 11 ++++++++++-
+ base/ttinterp.c       |  7 ++++++-
+ devices/gdevpng.c     |  4 +++-
+ gpdl/image/imagetop.c |  4 +++-
+ gpdl/jpgtop.c         |  4 +++-
+ gpdl/pngtop.c         |  5 ++++-
+ pcl/pcl/pgparse.c     |  7 ++++++-
+ xps/xpspng.c          |  5 ++++-
+ 11 files changed, 59 insertions(+), 9 deletions(-)
+
+diff --git a/base/setjmp_.h b/base/setjmp_.h
+index 3ad661d24..b00dd5a1e 100644
+--- a/base/setjmp_.h
++++ b/base/setjmp_.h
+@@ -22,6 +22,14 @@
+ 
+ #include <setjmp.h>
+ 
++#ifndef OPTIMISE_SETJMP
++#  if defined(__clang__) && __clang__==1
++#    define OPTIMIZE_SETJMP __attribute__((optnone))
++#  else
++#    define OPTIMIZE_SETJMP
++#  endif
++#endif
++
+ #ifndef INIT_GS_JMPBUF
+ #  if defined(__clang__) && __clang__==1
+ #    define INIT_GS_JMPBUF 1
+diff --git a/base/sjpegc.c b/base/sjpegc.c
+index 79ac3f424..b984b6b3c 100644
+--- a/base/sjpegc.c
++++ b/base/sjpegc.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2023 Artifex Software, Inc.
++/* Copyright (C) 2001-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -25,6 +25,7 @@
+ #include "sdct.h"
+ #include "sjpeg.h"
+ #include "gsmchunk.h"
++#include "setjmp_.h"
+ 
+ #if !defined(SHARE_JPEG) || SHARE_JPEG==0
+ #include "jmemcust.h"
+@@ -50,6 +51,7 @@
+  * offset_of(jpeg_compress_data, cinfo)==offset_of(jpeg_decompress_data, dinfo)
+  */
+ 
++OPTIMIZE_SETJMP
+ static void
+ gs_jpeg_error_exit(j_common_ptr cinfo)
+ {
+@@ -115,6 +117,7 @@ gs_jpeg_log_error(stream_DCT_state * st)
+  * side-effects from using setjmp.
+  */
+ 
++OPTIMIZE_SETJMP
+ JQUANT_TBL *
+ gs_jpeg_alloc_quant_table(stream_DCT_state * st)
+ {
+@@ -126,6 +129,7 @@ gs_jpeg_alloc_quant_table(stream_DCT_state * st)
+                                   & st->data.compress->cinfo);
+ }
+ 
++OPTIMIZE_SETJMP
+ JHUFF_TBL *
+ gs_jpeg_alloc_huff_table(stream_DCT_state * st)
+ {
+@@ -137,6 +141,7 @@ gs_jpeg_alloc_huff_table(stream_DCT_state * st)
+                                  & st->data.compress->cinfo);
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_destroy(stream_DCT_state * st)
+ {
+diff --git a/base/sjpegd.c b/base/sjpegd.c
+index 1730fac4b..c3bdd03a8 100644
+--- a/base/sjpegd.c
++++ b/base/sjpegd.c
+@@ -24,12 +24,14 @@
+ #include "strimpl.h"
+ #include "sdct.h"
+ #include "sjpeg.h"
++#include "setjmp_.h"
+ 
+ /*
+  * Interface routines.  This layer of routines exists solely to limit
+  * side-effects from using setjmp.
+  */
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_create_decompress(stream_DCT_state * st)
+ {				/* Initialize error handling */
+@@ -50,6 +52,7 @@ gs_jpeg_create_decompress(stream_DCT_state * st)
+     return 0;
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_read_header(stream_DCT_state * st,
+                     boolean require_image)
+@@ -62,6 +65,7 @@ gs_jpeg_read_header(stream_DCT_state * st,
+     return jpeg_read_header(&st->data.decompress->dinfo, require_image);
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_start_decompress(stream_DCT_state * st)
+ {
+@@ -79,6 +83,7 @@ gs_jpeg_start_decompress(stream_DCT_state * st)
+ #endif
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_read_scanlines(stream_DCT_state * st,
+                        JSAMPARRAY scanlines,
+@@ -93,6 +98,7 @@ gs_jpeg_read_scanlines(stream_DCT_state * st,
+                                     scanlines, (JDIMENSION) max_lines);
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_finish_decompress(stream_DCT_state * st)
+ {
+diff --git a/base/sjpege.c b/base/sjpege.c
+index e3832cd7a..8b9bf8a5d 100644
+--- a/base/sjpege.c
++++ b/base/sjpege.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2023 Artifex Software, Inc.
++/* Copyright (C) 2001-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -23,12 +23,14 @@
+ #include "strimpl.h"
+ #include "sdct.h"
+ #include "sjpeg.h"
++#include "setjmp_.h"
+ 
+ /*
+  * Interface routines.  This layer of routines exists solely to limit
+  * side-effects from using setjmp.
+  */
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_create_compress(stream_DCT_state * st)
+ {				/* Initialize error handling */
+@@ -46,6 +48,7 @@ gs_jpeg_create_compress(stream_DCT_state * st)
+     return 0;
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_set_defaults(stream_DCT_state * st)
+ {
+@@ -55,6 +58,7 @@ gs_jpeg_set_defaults(stream_DCT_state * st)
+     return 0;
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_set_colorspace(stream_DCT_state * st,
+                        J_COLOR_SPACE colorspace)
+@@ -65,6 +69,7 @@ gs_jpeg_set_colorspace(stream_DCT_state * st,
+     return 0;
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_set_linear_quality(stream_DCT_state * st,
+                            int scale_factor, boolean force_baseline)
+@@ -76,6 +81,7 @@ gs_jpeg_set_linear_quality(stream_DCT_state * st,
+     return 0;
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_set_quality(stream_DCT_state * st,
+                     int quality, boolean force_baseline)
+@@ -87,6 +93,7 @@ gs_jpeg_set_quality(stream_DCT_state * st,
+     return 0;
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_start_compress(stream_DCT_state * st,
+                        boolean write_all_tables)
+@@ -97,6 +104,7 @@ gs_jpeg_start_compress(stream_DCT_state * st,
+     return 0;
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_write_scanlines(stream_DCT_state * st,
+                         JSAMPARRAY scanlines,
+@@ -108,6 +116,7 @@ gs_jpeg_write_scanlines(stream_DCT_state * st,
+                                      scanlines, (JDIMENSION) num_lines);
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ gs_jpeg_finish_compress(stream_DCT_state * st)
+ {
+diff --git a/base/ttinterp.c b/base/ttinterp.c
+index 6dba3b67e..7843137c0 100644
+--- a/base/ttinterp.c
++++ b/base/ttinterp.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2023 Artifex Software, Inc.
++/* Copyright (C) 2001-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -69,6 +69,7 @@
+ #include "ttcalc.h"
+ #include "ttinterp.h"
+ #include "ttfinp.h"
++#include "setjmp_.h"
+ 
+ #ifdef DEBUG
+ #  define DBG_PAINT    CUR.current_face->font->DebugRepaint(CUR.current_face->font);
+@@ -1290,6 +1291,7 @@ static int nInstrCount=0;
+  *
+  *****************************************************************/
+ 
++OPTIMIZE_SETJMP
+   static TT_F26Dot6  Project( EXEC_OPS TT_F26Dot6  Vx, TT_F26Dot6  Vy )
+   {
+     THROW_PATENTED;
+@@ -1309,6 +1311,7 @@ static int nInstrCount=0;
+  *
+  *****************************************************************/
+ 
++OPTIMIZE_SETJMP
+   static TT_F26Dot6  Dual_Project( EXEC_OPS TT_F26Dot6  Vx, TT_F26Dot6  Vy )
+   {
+     THROW_PATENTED;
+@@ -1328,6 +1331,7 @@ static int nInstrCount=0;
+  *
+  *****************************************************************/
+ 
++OPTIMIZE_SETJMP
+   static TT_F26Dot6  Free_Project( EXEC_OPS TT_F26Dot6  Vx, TT_F26Dot6  Vy )
+   {
+     THROW_PATENTED;
+@@ -4995,6 +4999,7 @@ static int nInstrCount=0;
+ /*                                                              */
+ /****************************************************************/
+ 
++OPTIMIZE_SETJMP
+   TT_Error  RunIns( PExecution_Context  exc )
+   {
+     TT_Error     Result;
+diff --git a/devices/gdevpng.c b/devices/gdevpng.c
+index 8e4501903..59cd9b093 100644
+--- a/devices/gdevpng.c
++++ b/devices/gdevpng.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2023 Artifex Software, Inc.
++/* Copyright (C) 2001-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -57,6 +57,7 @@
+ #include "gxdownscale.h"
+ #include "gxdevsop.h"
+ #include "gscms.h"
++#include "setjmp_.h"
+ 
+ /* ------ The device descriptors ------ */
+ 
+@@ -467,6 +468,7 @@ my_png_flush(png_struct *png)
+ 
+ /* Write out a page in PNG format. */
+ /* This routine is used for all formats. */
++OPTIMIZE_SETJMP
+ static int
+ do_png_print_page(gx_device_png * pdev, gp_file * file, bool monod)
+ {
+diff --git a/gpdl/image/imagetop.c b/gpdl/image/imagetop.c
+index 708e322dd..c4d68f8e1 100644
+--- a/gpdl/image/imagetop.c
++++ b/gpdl/image/imagetop.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2019-2023 Artifex Software, Inc.
++/* Copyright (C) 2019-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -423,6 +423,7 @@ img_term_source(j_decompress_ptr cinfo)
+ {
+ }
+ 
++OPTIMIZE_SETJMP
+ static void
+ img_error_exit(j_common_ptr cinfo)
+ {
+@@ -473,6 +474,7 @@ consume_jpeg_data(img_interp_instance_t *img, stream_cursor_read *pr)
+     return (pr->limit - pr->ptr == img->bytes_available_on_entry);
+ }
+ 
++OPTIMIZE_SETJMP
+ static int
+ img_impl_process(pl_interp_implementation_t * impl, stream_cursor_read * pr)
+ {
+diff --git a/gpdl/jpgtop.c b/gpdl/jpgtop.c
+index 22ffc469f..a0582b705 100644
+--- a/gpdl/jpgtop.c
++++ b/gpdl/jpgtop.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2019-2023 Artifex Software, Inc.
++/* Copyright (C) 2019-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -411,6 +411,7 @@ jpg_term_source(j_decompress_ptr cinfo)
+ {
+ }
+ 
++OPTIMIZE_SETJMP
+ static void
+ jpg_error_exit(j_common_ptr cinfo)
+ {
+@@ -483,6 +484,7 @@ align_setjmp_buffer(void *ptr)
+     return (jmp_buf *)(void *)aligned;
+ }
+ 
++OPTIMIZE_SETJMP
+ static int
+ jpg_impl_process(pl_interp_implementation_t * impl, stream_cursor_read * pr)
+ {
+diff --git a/gpdl/pngtop.c b/gpdl/pngtop.c
+index e50e71e74..9feefb1a9 100644
+--- a/gpdl/pngtop.c
++++ b/gpdl/pngtop.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2019-2023 Artifex Software, Inc.
++/* Copyright (C) 2019-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -26,6 +26,7 @@
+ #include "gspaint.h"
+ #include "plmain.h"
+ #include "png_.h"
++#include "setjmp_.h"
+ 
+ /* Forward decls */
+ 
+@@ -305,6 +306,7 @@ bytes_until_uel(const stream_cursor_read *pr)
+     return pr->limit - pr->ptr;
+ }
+ 
++OPTIMIZE_SETJMP
+ static void
+ my_png_error(png_structp png_ptr, png_const_charp error_msg)
+ {
+@@ -367,6 +369,7 @@ my_png_read(png_structp png_ptr, png_bytep data, png_size_t length)
+     png->file_pos += length;
+ }
+ 
++OPTIMIZE_SETJMP
+ static int
+ do_impl_process(png_interp_instance_t *png, stream_cursor_read * pr, bool eof)
+ {
+diff --git a/pcl/pcl/pgparse.c b/pcl/pcl/pgparse.c
+index 7e787c92b..d5c480dda 100644
+--- a/pcl/pcl/pgparse.c
++++ b/pcl/pcl/pgparse.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2023 Artifex Software, Inc.
++/* Copyright (C) 2001-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -22,6 +22,7 @@
+ #include "gstypes.h"
+ #include "scommon.h"
+ #include "pgmand.h"
++#include "setjmp_.h"
+ 
+ /* ---------------- Command definition ---------------- */
+ 
+@@ -83,6 +84,7 @@ hpgl_process_init(hpgl_parser_state_t * pst)
+ 
+ /* Process a buffer of HP-GL/2 commands. */
+ /* Return 0 if more input needed, 1 if ESC seen, or an error code. */
++OPTIMIZE_SETJMP
+ int
+ hpgl_process(hpgl_parser_state_t * pst, hpgl_state_t * pgls,
+              stream_cursor_read * pr)
+@@ -229,6 +231,9 @@ hpgl_process(hpgl_parser_state_t * pst, hpgl_state_t * pgls,
+  * argument, a pointer to the value if an argument is present, or longjmp if
+  * need more data.  Note that no errors are possible.
+  */
++#if defined(__clang__) && __clang__==1
++__attribute__((optnone))
++#endif
+ static const hpgl_value_t *
+ hpgl_arg(const gs_memory_t * mem, hpgl_parser_state_t * pst)
+ {
+diff --git a/xps/xpspng.c b/xps/xpspng.c
+index 563efad55..c86175691 100644
+--- a/xps/xpspng.c
++++ b/xps/xpspng.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2024 Artifex Software, Inc.
++/* Copyright (C) 2001-2025 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -21,6 +21,7 @@
+ #include "stream.h"
+ #include "strimpl.h"
+ #include "gsstate.h"
++#include "setjmp_.h"
+ 
+ /* silence a warning where #if SHARE_LIBPNG is used when it's undefined */
+ #ifndef SHARE_LIBPNG
+@@ -79,6 +80,7 @@ xps_png_free(png_structp png, png_voidp ptr)
+ }
+ 
+ /* This only determines if we have an alpha value */
++OPTIMIZE_SETJMP
+ int
+ xps_png_has_alpha(xps_context_t *ctx, byte *rbuf, int rlen)
+ {
+@@ -161,6 +163,7 @@ xps_png_has_alpha(xps_context_t *ctx, byte *rbuf, int rlen)
+     return has_alpha;
+ }
+ 
++OPTIMIZE_SETJMP
+ int
+ xps_decode_png(xps_context_t *ctx, byte *rbuf, int rlen, xps_image_t *image)
+ {
+-- 
+cgit v1.2.3
+

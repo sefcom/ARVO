@@ -1,0 +1,150 @@
+From bb99fe7ddb2bc6601bcb0ee30ced6a8cc8cb0564 Mon Sep 17 00:00:00 2001
+From: David Anderson <davea42@linuxmail.org>
+Date: Tue, 7 Mar 2023 16:30:53 -0800
+Subject: [PATCH] Related to oss fuzz 56536, some placew where READ_AREA_LENGTH
+ values where not fully checked. This will require a revisit in a few of these
+ cases 	modified:   src/lib/libdwarf/dwarf_arange.c 	modified:  
+ src/lib/libdwarf/dwarf_debugnames.c 	modified:  
+ src/lib/libdwarf/dwarf_die_deliv.c 	modified:  
+ src/lib/libdwarf/dwarf_frame2.c 	modified:  
+ src/lib/libdwarf/dwarf_global.c 	modified:  
+ src/lib/libdwarf/dwarf_loclists.c 	modified:  
+ src/lib/libdwarf/dwarf_rnglists.c 	modified:  
+ src/lib/libdwarf/dwarf_str_offsets.c
+
+---
+ src/lib/libdwarf/dwarf_arange.c      | 4 +++-
+ src/lib/libdwarf/dwarf_debugnames.c  | 4 +++-
+ src/lib/libdwarf/dwarf_die_deliv.c   | 4 +++-
+ src/lib/libdwarf/dwarf_frame2.c      | 7 ++++++-
+ src/lib/libdwarf/dwarf_global.c      | 1 -
+ src/lib/libdwarf/dwarf_loclists.c    | 3 ++-
+ src/lib/libdwarf/dwarf_rnglists.c    | 3 ++-
+ src/lib/libdwarf/dwarf_str_offsets.c | 5 ++---
+ 8 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/src/lib/libdwarf/dwarf_arange.c b/src/lib/libdwarf/dwarf_arange.c
+index 39914310d..5e49ba563 100644
+--- a/src/lib/libdwarf/dwarf_arange.c
++++ b/src/lib/libdwarf/dwarf_arange.c
+@@ -147,7 +147,9 @@ _dwarf_get_aranges_list(Dwarf_Debug dbg,
+         /*  arange_ptr has been incremented appropriately past
+             the length field by READ_AREA_LENGTH. */
+ 
+-        if (area_length >  dbg->de_debug_aranges.dss_size) {
++        if (area_length >  dbg->de_debug_aranges.dss_size ||
++            (area_length +local_length_size+local_extension_size)
++            > dbg->de_debug_aranges.dss_size ) {
+             free_aranges_chain(dbg,head_chain);
+             _dwarf_error(dbg, error,DW_DLE_ARANGES_HEADER_ERROR);
+             return DW_DLV_ERROR;
+diff --git a/src/lib/libdwarf/dwarf_debugnames.c b/src/lib/libdwarf/dwarf_debugnames.c
+index 6e2175589..b401e3b5d 100644
+--- a/src/lib/libdwarf/dwarf_debugnames.c
++++ b/src/lib/libdwarf/dwarf_debugnames.c
+@@ -398,7 +398,9 @@ read_a_name_table_header(Dwarf_Dnames_Head dn,
+     totaloffset += initial_length;
+     dn->dn_offset_size = (Dwarf_Half)offset_size;
+     /* Two stage length test so overflow is caught. */
+-    if (area_length > remaining_space) {
++    if (area_length > remaining_space ||
++       (area_length +offset_size +local_extension_size) > 
++       remaining_space) {
+         _dwarf_error_string(dbg, error,
+             DW_DLE_DEBUG_NAMES_HEADER_ERROR,
+             "DW_DLE_DEBUG_NAMES_HEADER_ERROR: "
+diff --git a/src/lib/libdwarf/dwarf_die_deliv.c b/src/lib/libdwarf/dwarf_die_deliv.c
+index 7d1465e3d..4988f9c73 100644
+--- a/src/lib/libdwarf/dwarf_die_deliv.c
++++ b/src/lib/libdwarf/dwarf_die_deliv.c
+@@ -444,7 +444,9 @@ read_info_area_length_and_check(Dwarf_Debug dbg,
+         A preliminary sanity check. */
+     max_cu_global_offset =  offset + length +
+         local_extension_size + local_length_size;
+-    if (length > section_size) {
++    if (length > section_size ||
++        (length+local_length_size + local_extension_size)>
++        section_size) {
+         _dwarf_error(dbg, error, DW_DLE_CU_LENGTH_ERROR);
+         return DW_DLV_ERROR;
+     }
+diff --git a/src/lib/libdwarf/dwarf_frame2.c b/src/lib/libdwarf/dwarf_frame2.c
+index 30b92070b..6d42e62df 100644
+--- a/src/lib/libdwarf/dwarf_frame2.c
++++ b/src/lib/libdwarf/dwarf_frame2.c
+@@ -1312,13 +1312,18 @@ _dwarf_read_cie_fde_prefix(Dwarf_Debug dbg,
+         frame_ptr, local_length_size,
+         local_extension_size,error,
+         section_length_in,section_end);
+-
+     if (length == 0) {
+         /*  nul bytes at end of section, seen at end of egcs eh_frame
+             sections (in a.out). Take this as meaning no more CIE/FDE
+             data. We should be very close to end of section. */
+         return DW_DLV_NO_ENTRY;
+     }
++    if (length > section_length_in ||
++        (length +local_length_size + local_extension_size) >
++        section_length_in) {
++        _dwarf_error(dbg,error,DW_DLE_DEBUG_FRAME_LENGTH_BAD);
++        return DW_DLV_ERROR;
++    }
+     if ((frame_ptr + local_length_size) >= section_end) {
+         _dwarf_error(dbg,error,DW_DLE_DEBUG_FRAME_LENGTH_BAD);
+         return DW_DLV_ERROR;
+diff --git a/src/lib/libdwarf/dwarf_global.c b/src/lib/libdwarf/dwarf_global.c
+index 91273cab4..1c1c66f2e 100644
+--- a/src/lib/libdwarf/dwarf_global.c
++++ b/src/lib/libdwarf/dwarf_global.c
+@@ -731,7 +731,6 @@ _dwarf_internal_get_pubnames_like(Dwarf_Debug dbg,
+         }
+         {
+             Dwarf_Small * localend =pubnames_like_ptr + length;
+-
+             if ((length > section_length) ||
+                 (localend > section_end_ptr)){
+                 _dwarf_global_cu_len_error_msg(dbg,
+diff --git a/src/lib/libdwarf/dwarf_loclists.c b/src/lib/libdwarf/dwarf_loclists.c
+index 640229063..a08498707 100644
+--- a/src/lib/libdwarf/dwarf_loclists.c
++++ b/src/lib/libdwarf/dwarf_loclists.c
+@@ -316,7 +316,8 @@ _dwarf_internal_read_loclists_header(Dwarf_Debug dbg,
+         data,offset_size,exten_size,
+         error,
+         sectionlength,end_data);
+-    if (arealen > sectionlength) {
++    if (arealen > sectionlength ||
++        (arealen+offset_size+exten_size) > sectionlength) {
+         dwarfstring m;
+         dwarfstring_constructor(&m);
+         dwarfstring_append_printf_u(&m,
+diff --git a/src/lib/libdwarf/dwarf_rnglists.c b/src/lib/libdwarf/dwarf_rnglists.c
+index 81bbdbe49..778f94d4c 100644
+--- a/src/lib/libdwarf/dwarf_rnglists.c
++++ b/src/lib/libdwarf/dwarf_rnglists.c
+@@ -213,7 +213,8 @@ _dwarf_internal_read_rnglists_header(Dwarf_Debug dbg,
+         data,offset_size,exten_size,
+         error,
+         sectionlength,end_data);
+-    if (arealen > sectionlength) {
++    if (arealen > sectionlength ||
++        (arealen+offset_size+exten_size) > sectionlength) {
+         dwarfstring m;
+         dwarfstring_constructor(&m);
+         dwarfstring_append_printf_u(&m,
+diff --git a/src/lib/libdwarf/dwarf_str_offsets.c b/src/lib/libdwarf/dwarf_str_offsets.c
+index 68977ba9e..30c11241c 100644
+--- a/src/lib/libdwarf/dwarf_str_offsets.c
++++ b/src/lib/libdwarf/dwarf_str_offsets.c
+@@ -258,9 +258,8 @@ _dwarf_trial_read_dwarf_five_hdr(Dwarf_Debug dbg,
+ 
+     }
+     if (length > secsize  ||
+-        secsize <
+-        /* 4 is for the version and padding bytes. */
+-        (length+local_extension_size +local_offset_size)) {
++        (length+local_extension_size +local_offset_size) >
++        secsize) {
+         dwarfstring m;
+ 
+         dwarfstring_constructor(&m);

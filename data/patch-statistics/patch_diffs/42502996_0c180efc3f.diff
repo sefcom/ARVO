@@ -1,0 +1,53 @@
+From a4b209fdcfe799ab97f55c4c9d22d889813fc266 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Fri, 8 Oct 2021 16:42:43 +0200
+Subject: [PATCH] Make weak ref notify robust against bailout
+
+First drop it from EG(weakrefs), as the weakref_unref operation
+may call a destructor, which may bail out.
+
+Fixes oss-fuzz #39718.
+---
+ .../tests/weakrefs/weakmap_dtor_exception.phpt | 18 ++++++++++++++++++
+ Zend/zend_weakrefs.c                           |  2 +-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+ create mode 100644 Zend/tests/weakrefs/weakmap_dtor_exception.phpt
+
+diff --git a/Zend/tests/weakrefs/weakmap_dtor_exception.phpt b/Zend/tests/weakrefs/weakmap_dtor_exception.phpt
+new file mode 100644
+index 0000000000000..97249285cf687
+--- /dev/null
++++ b/Zend/tests/weakrefs/weakmap_dtor_exception.phpt
+@@ -0,0 +1,18 @@
++--TEST--
++Exception during WeakMap destruction during shutdown
++--FILE--
++<?php
++$map = new WeakMap;
++$obj = new stdClass;
++$map[$obj] = new class {
++    function __destruct() {
++        throw new Exception("Test");
++    }
++};
++?>
++--EXPECTF--
++Fatal error: Uncaught Exception: Test in %s:%d
++Stack trace:
++#0 [internal function]: class@anonymous->__destruct()
++#1 {main}
++  thrown in %s on line %d
+diff --git a/Zend/zend_weakrefs.c b/Zend/zend_weakrefs.c
+index b08e973439133..ad20c4cabd36f 100644
+--- a/Zend/zend_weakrefs.c
++++ b/Zend/zend_weakrefs.c
+@@ -157,8 +157,8 @@ void zend_weakrefs_notify(zend_object *object) {
+ 	ZEND_ASSERT(tagged_ptr && "Tracking of the IS_OBJ_WEAKLY_REFERENCE flag should be precise");
+ #endif
+ 	if (tagged_ptr) {
+-		zend_weakref_unref(obj_addr, tagged_ptr);
+ 		zend_hash_index_del(&EG(weakrefs), obj_addr);
++		zend_weakref_unref(obj_addr, tagged_ptr);
+ 	}
+ }
+ 

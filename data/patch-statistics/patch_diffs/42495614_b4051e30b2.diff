@@ -1,0 +1,84 @@
+From e7084d13903029784f74706cd8fdd70277d2ecab Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Tue, 13 Apr 2021 13:59:08 +0300
+Subject: [PATCH] Fix OSS-Fuzz bugs
+
+---
+ source/m3_compile.c | 2 ++
+ source/m3_core.h    | 1 +
+ source/m3_parse.c   | 9 +++++++--
+ 3 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/source/m3_compile.c b/source/m3_compile.c
+index 6fc5e514..78c8588a 100644
+--- a/source/m3_compile.c
++++ b/source/m3_compile.c
+@@ -2207,6 +2207,8 @@ M3Result  Compile_BlockStatements  (IM3Compilation o)
+ {
+     M3Result result = m3Err_none;
+ 
++    _throwif("block code underrun", o->wasm >= o->wasmEnd);
++
+     while (o->wasm < o->wasmEnd)
+     {                                                                   emit_stack_dump (o);
+         m3opcode_t opcode;
+diff --git a/source/m3_core.h b/source/m3_core.h
+index ef06459c..4e858176 100644
+--- a/source/m3_core.h
++++ b/source/m3_core.h
+@@ -163,6 +163,7 @@ M3CodePageHeader;
+ #define d_m3MaxSaneImportsCount             10000
+ #define d_m3MaxSaneExportsCount             10000
+ #define d_m3MaxSaneGlobalsCount             100000
++#define d_m3MaxSaneElementSegments          100000
+ #define d_m3MaxSaneDataSegments             100000
+ #define d_m3MaxSaneUtf8Length               2000
+ #define d_m3MaxSaneFunctionArgRetCount      1000    // still insane, but whatever
+diff --git a/source/m3_parse.c b/source/m3_parse.c
+index d11f3d37..bc3ff38d 100644
+--- a/source/m3_parse.c
++++ b/source/m3_parse.c
+@@ -102,6 +102,7 @@ _               (NormalizeType (& retType, wasmType));
+ 
+             Environment_AddFuncType (io_module->environment, & ftype);
+             io_module->funcTypes [i] = ftype;
++            ftype = NULL; // ownership transfered to environment
+         }
+     }
+ 
+@@ -217,6 +218,7 @@ _               (Module_AddGlobal (io_module, & global, type, isMutable, true /*
+ M3Result  ParseSection_Export  (IM3Module io_module, bytes_t i_bytes, cbytes_t  i_end)
+ {
+     M3Result result = m3Err_none;
++    const char * utf8 = NULL;
+ 
+     u32 numExports;
+ _   (ReadLEB_u32 (& numExports, & i_bytes, i_end));                                 m3log (parse, "** Export [%d]", numExports);
+@@ -225,7 +227,6 @@ _   (ReadLEB_u32 (& numExports, & i_bytes, i_end));
+ 
+     for (u32 i = 0; i < numExports; ++i)
+     {
+-        const char * utf8;
+         u8 exportKind;
+         u32 index;
+ 
+@@ -254,7 +255,9 @@ _       (ReadLEB_u32 (& index, & i_bytes, i_end));
+         m3_Free (utf8);
+     }
+ 
+-    _catch: return result;
++_catch:
++    m3_Free (utf8);
++    return result;
+ }
+ 
+ 
+@@ -305,6 +308,8 @@ M3Result  ParseSection_Element  (IM3Module io_module, bytes_t i_bytes, cbytes_t
+ 
+     _throwif ("error parsing Element section", result);
+ 
++    _throwif("too many element segments", numSegments > d_m3MaxSaneElementSegments);
++
+     io_module->elementSection = i_bytes;
+     io_module->elementSectionEnd = i_end;
+     io_module->numElementSegments = numSegments;

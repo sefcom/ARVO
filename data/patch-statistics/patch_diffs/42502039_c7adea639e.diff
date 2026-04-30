@@ -1,0 +1,171 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1636128174 18000
+#      Fri Nov 05 11:02:54 2021 -0500
+# Node ID b052a71a5db7f76fb028edf4765123324c043316
+# Parent  02742ac3634dfd9f31c2300054b9ccd1c3f0a922
+initialize_jasper(): For JasPer 3.0.0 and later, use resource-limited memory allocators.
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,9 @@
++2021-11-05  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
++
++        * coders/jp2.c (initialize_jasper): For JasPer 3.0.0 and later,
++        use resource-limited memory allocators. JasPer 3.0.0 is not yet
++        released at this time.
++
+ 2021-11-04  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
+         * coders/gif.c (ReadGIFImage): Handle GIF files where the 'opaque'
+diff --git a/VisualMagick/installer/inc/version.isx b/VisualMagick/installer/inc/version.isx
+--- a/VisualMagick/installer/inc/version.isx
++++ b/VisualMagick/installer/inc/version.isx
+@@ -10,5 +10,5 @@
+ 
+ #define public MagickPackageName "GraphicsMagick"
+ #define public MagickPackageVersion "1.4"
+-#define public MagickPackageVersionAddendum ".020211104"
+-#define public MagickPackageReleaseDate "snapshot-20211104"
++#define public MagickPackageVersionAddendum ".020211105"
++#define public MagickPackageReleaseDate "snapshot-20211105"
+diff --git a/coders/jp2.c b/coders/jp2.c
+--- a/coders/jp2.c
++++ b/coders/jp2.c
+@@ -405,57 +405,47 @@
+   ThrowReaderException(code_,reason_,image_); \
+ }
+ 
+-#undef HAVE_JAS_INIT_CUSTOM
+-
+-#if HAVE_JAS_INIT_CUSTOM
+-static void* _MagickReallocateResourceLimitedMemoryTraditional(void *p,const size_t size)
+-{
+-  return _MagickReallocateResourceLimitedMemory(p,1,size,0);
+-}
+-#endif /* if HAVE_JAS_INIT_CUSTOM */
+-
+ /*
+   Initialize Jasper
+ */
++#if HAVE_JAS_INITIALIZE
++static void *alloc_rlm(struct jas_allocator_s *allocator, size_t size)
++{
++  (void) allocator;
++  return _MagickAllocateResourceLimitedMemory(size);
++}
++static void free_rlm(struct jas_allocator_s *allocator, void *pointer)
++{
++  (void) allocator;
++  _MagickFreeResourceLimitedMemory(pointer);
++}
++static void *realloc_rlm(struct jas_allocator_s *allocator, void *pointer,
++                         size_t new_size)
++{
++  (void) allocator;
++  return _MagickReallocateResourceLimitedMemory(pointer,1,new_size,0);
++}
++#endif /* if HAVE_JAS_INITIALIZE */
+ static void initialize_jasper(void)
+ {
+   if (!jasper_initialized)
+     {
+-#if HAVE_JAS_INIT_CUSTOM
+-      jas_conf_t jas_conf;
+-
+-      (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+-                            "Initializing JasPer...");
+-
+-      /* Get the default configuration parameters that were selected at
+-         when the library was built. */
+-      jas_get_default_conf(&jas_conf);
+-
+-      /* Use our own resource-limited memory allocation functions */
+-      jas_conf.allocator.alloc = _MagickAllocateResourceLimitedMemory;
+-      jas_conf.allocator.free = _MagickFreeResourceLimitedMemory;
+-      jas_conf.allocator.realloc = _MagickReallocateResourceLimitedMemoryTraditional;
+-
+-      /* The maximum number of samples allowable in an image to be decoded. */
+-      jas_conf.dec_default_max_samples = JAS_DEC_DEFAULT_MAX_SAMPLES;
+-
+-      /* Do not register jas_cleanup() via atexit() */
+-      jas_conf.atexit_cleanup = false;
+-
+-      if (jas_init_custom(&jas_conf) == 0)
+-        {
+-          jasper_initialized=MagickTrue;
+-        }
+-#elif HAVE_JAS_INITIALIZE
++#if HAVE_JAS_INITIALIZE
+       {
+         /* static jas_std_allocator_t allocator; */
++        static jas_allocator_t allocator;
+         (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+                               "Initializing JasPer...");
+         jas_conf_clear();
+-        /* jas_std_allocator_init(&allocator); */
+-        /* jas_conf_set_allocator(&allocator.base); */
++        /* Use our own resource-limited memory allocation functions */
++        allocator.cleanup = 0;
++        allocator.alloc = alloc_rlm;
++        allocator.free = free_rlm;
++        allocator.realloc = realloc_rlm;
++        /* jas_std_allocator_init(&allocator); */ /* Uses JasPer allocators */
++        jas_conf_set_allocator(&allocator); /* Assigns jas_allocator_t to jas_conf.allocator in library */
+         /* jas_conf_set_debug_level(cmdopts->debug); */
+-        /* jas_conf_set_max_mem(cmdopts->max_mem); */
++        /* jas_conf_set_max_mem(cmdopts->max_mem); */ /* Only pertains to JasPer allocators */
+ 
+         if (jas_initialize() == 0)
+           {
+@@ -471,7 +461,7 @@
+             jasper_initialized=MagickTrue;
+           }
+       }
+-#endif  /* HAVE_JAS_INIT_CUSTOM */
++#endif  /* HAVE_JAS_INITIALIZE */
+ 
+       if (!jasper_initialized)
+         {
+@@ -491,9 +481,9 @@
+     {
+       (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+                             "Destroying JasPer...");
+-#if HAVE_JAS_INITIALIZE || HAVE_JAS_INIT_CUSTOM
++#if HAVE_JAS_INITIALIZE
+       jas_cleanup();
+-#endif /* if HAVE_JAS_INITIALIZE || HAVE_JAS_INIT_CUSTOM */
++#endif /* if HAVE_JAS_INITIALIZE */
+       jasper_initialized=MagickFalse;
+     }
+ }
+diff --git a/magick/version.h b/magick/version.h
+--- a/magick/version.h
++++ b/magick/version.h
+@@ -38,8 +38,8 @@
+ #define MagickLibVersion  0x252200
+ #define MagickLibVersionText  "1.4"
+ #define MagickLibVersionNumber 25,22,0
+-#define MagickChangeDate   "20211104"
+-#define MagickReleaseDate  "snapshot-20211104"
++#define MagickChangeDate   "20211105"
++#define MagickReleaseDate  "snapshot-20211105"
+ 
+ /*
+   The MagickLibInterfaceNewest and MagickLibInterfaceOldest defines
+diff --git a/www/Changelog.html b/www/Changelog.html
+--- a/www/Changelog.html
++++ b/www/Changelog.html
+@@ -35,6 +35,11 @@
+ <div class="document">
+ 
+ 
++<p>2021-11-05  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
++<blockquote>
++* coders/jp2.c (initialize_jasper): For JasPer 3.0.0 and later,
++use resource-limited memory allocators. JasPer 3.0.0 is not yet
++released at this time.</blockquote>
+ <p>2021-11-04  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
+ <blockquote>
+ <p>* coders/gif.c (ReadGIFImage): Handle GIF files where the 'opaque'

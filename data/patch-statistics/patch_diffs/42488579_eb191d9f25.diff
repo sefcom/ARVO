@@ -1,0 +1,42 @@
+From dbb0f62cdcc62858b705b64e75f87787cdf82004 Mon Sep 17 00:00:00 2001
+From: Sebastian Rasmussen <sebras@gmail.com>
+Date: Wed, 2 Dec 2020 11:38:14 +0100
+Subject: [PATCH] Bug 703219: Handle short skips in the subarea stream.
+
+The subarea stream will skip over a number of bytes before it
+starts returning bytes from the underlying stream. Previously
+when the underlying stream did not successfully skip over the
+desired number of bytes subarea_next would return 0, which is not
+related to the value of the first byte of the underlying stream.
+
+The subarea stream has now been changed so that it, instead of
+returning 0, will retry skipping the remaining number of bytes.
+This repeats until all bytes have been skipped, or the underlying
+stream failed to skip over any bytes at all. The latter case is
+treated as if the underlying stream returned EOF, hence the
+subarea stream itself also returns EOF.
+---
+ source/fitz/image.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/source/fitz/image.c b/source/fitz/image.c
+index af9bdbd738..a0bd6c12cf 100644
+--- a/source/fitz/image.c
++++ b/source/fitz/image.c
+@@ -344,12 +344,13 @@ subarea_next(fz_context *ctx, fz_stream *stm, size_t len)
+ 	size_t n;
+ 
+ 	stm->wp = stm->rp = NULL;
+-	if (state->nskip > 0)
++
++	while (state->nskip > 0)
+ 	{
+ 		n = fz_skip(ctx, state->src, state->nskip);
++		if (n == 0)
++			return EOF;
+ 		state->nskip -= n;
+-		if (state->nskip > 0)
+-			return 0;
+ 	}
+ 	if (state->lines == 0)
+ 		return EOF;

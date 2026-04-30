@@ -1,0 +1,117 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1528164018 18000
+#      Mon Jun 04 21:00:18 2018 -0500
+# Node ID f5e2fc49d2d5fa296a852f5f66c60f37dac76853
+# Parent  8b89bd14c7692eaf164e71f975cbe806374aa938
+ReadOnePNGImage(): Skip adding empty raw profile, which caused heap read overflow. (Credit to OSS-Fuzz)
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,10 @@
++2018-06-04  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
++
++	* coders/png.c (ReadOnePNGImage): Skip adding empty raw profile.
++	Fixes oss-fuzz "graphicsmagick/coder_PNG_fuzzer:
++	Heap-buffer-overflow in png_read_raw_profile". (Credit to
++	OSS-Fuzz)
++
+ 2018-06-03  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
+ 	* NEWS.txt: Update NEWS with latest changes.
+diff --git a/coders/png.c b/coders/png.c
+--- a/coders/png.c
++++ b/coders/png.c
+@@ -2694,41 +2694,56 @@
+     image->depth=8;
+ #endif
+   if (png_get_text(ping,ping_info,&text,&num_text) != 0)
+-    for (i=0; i < (long) num_text; i++)
+-      {
+-        /* Check for a profile */
+-
+-        if (logging)
+-          (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+-                                "    Reading PNG text chunk");
+-        if (strlen(text[i].key) > 16 &&
+-            !memcmp(text[i].key, "Raw profile type ",17))
+-          {
+-            if (png_read_raw_profile(image,image_info,text,(int) i) ==
+-              MagickFail)
+-            break;
+-          }
+-        else
+-          {
+-            char
+-              *value;
+-
+-            length=(unsigned long) text[i].text_length;
+-            value=MagickAllocateMemory(char *,length+1);
+-            if (value == (char *) NULL)
+-              {
+-                png_warning(ping, "Could not allocate memory for text chunk");
+-                break;
+-              }
+-            *value='\0';
+-            (void) strlcat(value,text[i].text,length+1);
+-            (void) SetImageAttribute(image,text[i].key,value);
+-            if (logging)
+-              (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+-                                    "      Keyword: %s",text[i].key);
+-            MagickFreeMemory(value);
+-          }
+-      }
++    {
++      if (logging)
++        (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                              "    Text chunks: %u", num_text);
++      for (i=0; i < (long) num_text; i++)
++        {
++          /* Check for a profile */
++
++          if (logging)
++            (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                                  "    Reading PNG text chunk[%ld] key=\"%.16s\","
++                                  " length=%" MAGICK_SSIZE_T_F "u",i,text[i].key,
++                                  (MAGICK_SSIZE_T) text[i].text_length);
++          if (strlen(text[i].key) > 16 &&
++              !memcmp(text[i].key, "Raw profile type ",17))
++            {
++              if (text[i].text_length == 0)
++                {
++                  (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                                        "    Skipping empty raw profile...");
++                }
++              else
++                {
++                  if (png_read_raw_profile(image,image_info,text,(int) i) ==
++                      MagickFail)
++                    break;
++                }
++            }
++          else
++            {
++              char
++                *value;
++
++              length=(unsigned long) text[i].text_length;
++              value=MagickAllocateMemory(char *,length+1);
++              if (value == (char *) NULL)
++                {
++                  png_warning(ping, "Could not allocate memory for text chunk");
++                  break;
++                }
++              *value='\0';
++              (void) strlcat(value,text[i].text,length+1);
++              (void) SetImageAttribute(image,text[i].key,value);
++              if (logging)
++                (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                                      "      Keyword: %s",text[i].key);
++              MagickFreeMemory(value);
++            }
++        }
++    }
+ #ifdef MNG_OBJECT_BUFFERS
+   /*
+     Store the object if necessary.

@@ -1,0 +1,52 @@
+From 425d4b24e08e21e7052e3163d0d69af1c1e591a6 Mon Sep 17 00:00:00 2001
+From: Kimball Thurston <kdt3rd@gmail.com>
+Date: Mon, 29 May 2023 19:19:02 +1200
+Subject: [PATCH] Fix scenario where malformed dwa file could read past end of
+ buffer (#1439)
+
+Fixes OSS-Fuzz 59382
+
+Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+---
+ src/lib/OpenEXRCore/internal_dwa_compressor.h | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/lib/OpenEXRCore/internal_dwa_compressor.h b/src/lib/OpenEXRCore/internal_dwa_compressor.h
+index 688bd51aad..a8e83f4a25 100644
+--- a/src/lib/OpenEXRCore/internal_dwa_compressor.h
++++ b/src/lib/OpenEXRCore/internal_dwa_compressor.h
+@@ -729,6 +729,7 @@ DwaCompressor_uncompress (
+     uint8_t*       outBufferEnd;
+     uint8_t*       packedAcBufferEnd;
+     uint8_t*       packedDcBufferEnd;
++    const uint8_t* dataPtrEnd;
+     const uint8_t* compressedUnknownBuf;
+     const uint8_t* compressedAcBuf;
+     const uint8_t* compressedDcBuf;
+@@ -765,6 +766,7 @@ DwaCompressor_uncompress (
+     compressedSize = unknownCompressedSize + acCompressedSize +
+                      dcCompressedSize + rleCompressedSize;
+ 
++    dataPtrEnd = inPtr + iSize;
+     dataPtr  = inPtr + headerSize;
+     dataLeft = iSize - headerSize;
+ 
+@@ -843,6 +845,18 @@ DwaCompressor_uncompress (
+     compressedDcBuf  = compressedAcBuf + (ptrdiff_t) (acCompressedSize);
+     compressedRleBuf = compressedDcBuf + (ptrdiff_t) (dcCompressedSize);
+ 
++    if (compressedUnknownBuf >= dataPtrEnd ||
++        dataPtr > compressedAcBuf ||
++        compressedAcBuf >= dataPtrEnd ||
++        dataPtr > compressedDcBuf ||
++        compressedDcBuf >= dataPtrEnd ||
++        dataPtr > compressedRleBuf ||
++        compressedRleBuf >= dataPtrEnd ||
++        (compressedRleBuf + rleCompressedSize) > dataPtrEnd)
++    {
++        return EXR_ERR_CORRUPT_CHUNK;
++    }
++
+     //
+     // Sanity check that the version is something we expect. Right now,
+     // we can decode version 0, 1, and 2. v1 adds 'end of block' symbols

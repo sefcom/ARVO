@@ -1,0 +1,649 @@
+From 483efc7e508a06e07d716d23da295eb25ea164f4 Mon Sep 17 00:00:00 2001
+From: George Peter Banyard <girgias@php.net>
+Date: Sat, 7 Dec 2019 02:44:34 +0100
+Subject: [PATCH] Allow empty needles in mb_strpos and mb_strstr function
+ family.
+
+MBstring analogous implementation to 6d578482a933be7597b686b59a935b316161d251
+
+Closes GH-4977
+---
+ ext/mbstring/libmbfl/mbfl/mbfilter.c          | 26 ++++--
+ ext/mbstring/libmbfl/mbfl/mbfilter.h          |  2 +-
+ ext/mbstring/mbstring.c                       | 24 ------
+ .../tests/mb_stripos_empty_needle.phpt        | 86 +++++++++++++++++++
+ .../tests/mb_stristr_empty_needle.phpt        | 37 ++++++++
+ .../tests/mb_strpos_empty_needle.phpt         | 86 +++++++++++++++++++
+ .../tests/mb_strrchr_empty_needle.phpt        | 37 ++++++++
+ .../tests/mb_strripos_empty_needle.phpt       | 86 +++++++++++++++++++
+ .../tests/mb_strrpos_empty_needle.phpt        | 86 +++++++++++++++++++
+ .../tests/mb_strstr_empty_needle.phpt         | 37 ++++++++
+ 10 files changed, 477 insertions(+), 30 deletions(-)
+ create mode 100644 ext/mbstring/tests/mb_stripos_empty_needle.phpt
+ create mode 100644 ext/mbstring/tests/mb_stristr_empty_needle.phpt
+ create mode 100644 ext/mbstring/tests/mb_strpos_empty_needle.phpt
+ create mode 100644 ext/mbstring/tests/mb_strrchr_empty_needle.phpt
+ create mode 100644 ext/mbstring/tests/mb_strripos_empty_needle.phpt
+ create mode 100644 ext/mbstring/tests/mb_strrpos_empty_needle.phpt
+ create mode 100644 ext/mbstring/tests/mb_strstr_empty_needle.phpt
+
+diff --git a/ext/mbstring/libmbfl/mbfl/mbfilter.c b/ext/mbstring/libmbfl/mbfl/mbfilter.c
+index 1cb6d28e7b4e0..6b0aff2a4e04a 100644
+--- a/ext/mbstring/libmbfl/mbfl/mbfilter.c
++++ b/ext/mbstring/libmbfl/mbfl/mbfilter.c
+@@ -656,7 +656,7 @@ filter_count_output(int c, void *data)
+ }
+ 
+ size_t
+-mbfl_strlen(mbfl_string *string)
++mbfl_strlen(const mbfl_string *string)
+ {
+ 	size_t len, n, k;
+ 	unsigned char *p;
+@@ -855,13 +855,29 @@ mbfl_strpos(
+ 		needle_u8 = needle;
+ 	}
+ 
+-	if (needle_u8->len < 1) {
+-		result = (size_t) -8;
++	result = (size_t) -1;
++	if (haystack_u8->len < needle_u8->len) {
+ 		goto out;
+ 	}
+ 
+-	result = (size_t) -1;
+-	if (haystack_u8->len < needle_u8->len) {
++	if (needle_u8->len == 0) {
++		size_t haystack_length = mbfl_strlen(haystack_u8);
++		/* Check if offset is out of bound */
++		if (
++			(offset > 0 && offset > haystack_length)
++			|| (offset < 0 && -offset > haystack_length)
++		) {
++			result = -16;
++			goto out;
++		}
++
++		if (offset < 0) {
++			result = haystack_length + offset;
++		} else if (reverse) {
++			result = haystack_length;
++		} else {
++			result = (size_t) offset;
++		}
+ 		goto out;
+ 	}
+ 
+diff --git a/ext/mbstring/libmbfl/mbfl/mbfilter.h b/ext/mbstring/libmbfl/mbfl/mbfilter.h
+index 0966e2df44b57..edba946f72087 100644
+--- a/ext/mbstring/libmbfl/mbfl/mbfilter.h
++++ b/ext/mbstring/libmbfl/mbfl/mbfilter.h
+@@ -193,7 +193,7 @@ static inline int mbfl_is_error(size_t len) {
+  * strlen
+  */
+ MBFLAPI extern size_t
+-mbfl_strlen(mbfl_string *string);
++mbfl_strlen(const mbfl_string *string);
+ 
+ /*
+  * oddlen
+diff --git a/ext/mbstring/mbstring.c b/ext/mbstring/mbstring.c
+index a0dbb3a30ea9e..1615dc2178cf3 100644
+--- a/ext/mbstring/mbstring.c
++++ b/ext/mbstring/mbstring.c
+@@ -2110,11 +2110,6 @@ PHP_FUNCTION(mb_strpos)
+ 		}
+ 	}
+ 
+-	if (needle.len == 0) {
+-		php_error_docref(NULL, E_WARNING, "Empty delimiter");
+-		RETURN_FALSE;
+-	}
+-
+ 	n = mbfl_strpos(&haystack, &needle, offset, reverse);
+ 	if (!mbfl_is_error(n)) {
+ 		RETVAL_LONG(n);
+@@ -2189,11 +2184,6 @@ PHP_FUNCTION(mb_stripos)
+ 		RETURN_THROWS();
+ 	}
+ 
+-	if (needle.len == 0) {
+-		php_error_docref(NULL, E_WARNING, "Empty delimiter");
+-		RETURN_FALSE;
+-	}
+-
+ 	n = php_mb_stripos(0, (char *)haystack.val, haystack.len, (char *)needle.val, needle.len, offset, from_encoding);
+ 
+ 	if (!mbfl_is_error(n)) {
+@@ -2246,11 +2236,6 @@ PHP_FUNCTION(mb_strstr)
+ 		RETURN_FALSE;
+ 	}
+ 
+-	if (needle.len == 0) {
+-		php_error_docref(NULL, E_WARNING, "Empty delimiter");
+-		RETURN_FALSE;
+-	}
+-
+ 	n = mbfl_strpos(&haystack, &needle, 0, 0);
+ 	if (!mbfl_is_error(n)) {
+ 		if (part) {
+@@ -2350,11 +2335,6 @@ PHP_FUNCTION(mb_stristr)
+ 		RETURN_FALSE;
+ 	}
+ 
+-	if (!needle.len) {
+-		php_error_docref(NULL, E_WARNING, "Empty delimiter");
+-		RETURN_FALSE;
+-	}
+-
+ 	n = php_mb_stripos(0, (char *)haystack.val, haystack.len, (char *)needle.val, needle.len, 0, from_encoding);
+ 	if (mbfl_is_error(n)) {
+ 		RETURN_FALSE;
+@@ -4849,10 +4829,6 @@ MBSTRING_API size_t php_mb_stripos(int mode, const char *old_haystack, size_t ol
+ 			break;
+ 		}
+ 
+-		if (needle.len == 0) {
+-			break;
+-		}
+-
+  		if (offset != 0) {
+  			size_t haystack_char_len = mbfl_strlen(&haystack);
+ 
+diff --git a/ext/mbstring/tests/mb_stripos_empty_needle.phpt b/ext/mbstring/tests/mb_stripos_empty_needle.phpt
+new file mode 100644
+index 0000000000000..31e21f1cd5c91
+--- /dev/null
++++ b/ext/mbstring/tests/mb_stripos_empty_needle.phpt
+@@ -0,0 +1,86 @@
++--TEST--
++Test mb_stripos() function :  with empty needle
++--SKIPIF--
++<?php
++extension_loaded('mbstring') or die('skip');
++function_exists('mb_stripos') or die("skip mb_stripos() is not available in this build");
++?>
++--FILE--
++<?php
++
++mb_internal_encoding('UTF-8');
++
++$string_ascii = 'abc def';
++// Japanese string in UTF-8
++$string_mb = "日本語テキストです。01234５６７８９。";
++
++echo "\n-- ASCII string without offset --\n";
++var_dump(mb_stripos($string_ascii, ''));
++
++echo "\n-- ASCII string with in range positive offset --\n";
++var_dump(mb_stripos($string_ascii, '', 2));
++
++echo "\n-- ASCII string with in range negative offset --\n";
++var_dump(mb_stripos($string_ascii, '', -2));
++
++echo "\n-- ASCII string with out of bound positive offset --\n";
++var_dump(mb_stripos($string_ascii, '', 150));
++
++echo "\n-- ASCII string with out of bound negative offset --\n";
++var_dump(mb_stripos($string_ascii, '', -150));
++
++
++echo "\n-- Multi-byte string without offset --\n";
++var_dump(mb_stripos($string_mb, ''));
++
++echo "\n-- Multi-byte string with in range positive offset --\n";
++var_dump(mb_stripos($string_mb, '', 2));
++
++echo "\n-- Multi-byte string with in range negative offset --\n";
++var_dump(mb_stripos($string_mb, '', -2));
++
++echo "\n-- Multi-byte string with out of bound positive offset --\n";
++var_dump(mb_stripos($string_mb, '', 150));
++
++echo "\n-- Multi-byte string with out of bound negative offset --\n";
++var_dump(mb_stripos($string_mb, '', -150));
++
++?>
++--EXPECTF--
++-- ASCII string without offset --
++int(0)
++
++-- ASCII string with in range positive offset --
++int(2)
++
++-- ASCII string with in range negative offset --
++int(5)
++
++-- ASCII string with out of bound positive offset --
++
++Warning: mb_stripos(): Offset not contained in string in %s on line %d
++bool(false)
++
++-- ASCII string with out of bound negative offset --
++
++Warning: mb_stripos(): Offset not contained in string in %s on line %d
++bool(false)
++
++-- Multi-byte string without offset --
++int(0)
++
++-- Multi-byte string with in range positive offset --
++int(2)
++
++-- Multi-byte string with in range negative offset --
++int(19)
++
++-- Multi-byte string with out of bound positive offset --
++
++Warning: mb_stripos(): Offset not contained in string in %s on line %d
++bool(false)
++
++-- Multi-byte string with out of bound negative offset --
++
++Warning: mb_stripos(): Offset not contained in string in %s on line %d
++bool(false)
+diff --git a/ext/mbstring/tests/mb_stristr_empty_needle.phpt b/ext/mbstring/tests/mb_stristr_empty_needle.phpt
+new file mode 100644
+index 0000000000000..60850a942c5cb
+--- /dev/null
++++ b/ext/mbstring/tests/mb_stristr_empty_needle.phpt
+@@ -0,0 +1,37 @@
++--TEST--
++Test mb_stristr() function : with empty needle
++--SKIPIF--
++<?php
++extension_loaded('mbstring') or die('skip');
++function_exists('mb_stristr') or die("skip mb_stristr() is not available in this build");
++?>
++--FILE--
++<?php
++
++mb_internal_encoding('UTF-8');
++
++$string_ascii = 'abc def';
++// Japanese string in UTF-8
++$string_mb = "日本語テキストです。01234５６７８９。";
++
++echo "\n-- ASCII string --\n";
++var_dump(mb_stristr($string_ascii, '', false, 'ISO-8859-1'));
++var_dump(mb_stristr($string_ascii, ''));
++var_dump(mb_stristr($string_ascii, '', true));
++
++echo "\n-- Multibyte string --\n";
++var_dump(mb_stristr($string_mb, ''));
++var_dump(mb_stristr($string_mb, '', false, 'utf-8'));
++var_dump(mb_stristr($string_mb, '', true));
++
++?>
++--EXPECT--
++-- ASCII string --
++string(7) "abc def"
++string(7) "abc def"
++string(0) ""
++
++-- Multibyte string --
++string(53) "日本語テキストです。01234５６７８９。"
++string(53) "日本語テキストです。01234５６７８９。"
++string(0) ""
+diff --git a/ext/mbstring/tests/mb_strpos_empty_needle.phpt b/ext/mbstring/tests/mb_strpos_empty_needle.phpt
+new file mode 100644
+index 0000000000000..31612647d641f
+--- /dev/null
++++ b/ext/mbstring/tests/mb_strpos_empty_needle.phpt
+@@ -0,0 +1,86 @@
++--TEST--
++Test mb_strpos() function : with empty needle
++--SKIPIF--
++<?php
++extension_loaded('mbstring') or die('skip');
++function_exists('mb_strpos') or die("skip mb_strpos() is not available in this build");
++?>
++--FILE--
++<?php
++
++mb_internal_encoding('UTF-8');
++
++$string_ascii = 'abc def';
++// Japanese string in UTF-8
++$string_mb = "日本語テキストです。01234５６７８９。";
++
++echo "\n-- ASCII string without offset --\n";
++var_dump(mb_strpos($string_ascii, ''));
++
++echo "\n-- ASCII string with in range positive offset --\n";
++var_dump(mb_strpos($string_ascii, '', 2));
++
++echo "\n-- ASCII string with in range negative offset --\n";
++var_dump(mb_strpos($string_ascii, '', -2));
++
++echo "\n-- ASCII string with out of bound positive offset --\n";
++var_dump(mb_strpos($string_ascii, '', 15));
++
++echo "\n-- ASCII string with out of bound negative offset --\n";
++var_dump(mb_strpos($string_ascii, '', -15));
++
++
++echo "\n-- Multi-byte string without offset --\n";
++var_dump(mb_strpos($string_mb, ''));
++
++echo "\n-- Multi-byte string with in range positive offset --\n";
++var_dump(mb_strpos($string_mb, '', 2));
++
++echo "\n-- Multi-byte string with in range negative offset --\n";
++var_dump(mb_strpos($string_mb, '', -2));
++
++echo "\n-- Multi-byte string with out of bound positive offset --\n";
++var_dump(mb_strpos($string_mb, '', 150));
++
++echo "\n-- Multi-byte string with out of bound negative offset --\n";
++var_dump(mb_strpos($string_mb, '', -150));
++
++?>
++--EXPECTF--
++-- ASCII string without offset --
++int(0)
++
++-- ASCII string with in range positive offset --
++int(2)
++
++-- ASCII string with in range negative offset --
++int(5)
++
++-- ASCII string with out of bound positive offset --
++
++Warning: mb_strpos(): Offset not contained in string in %s on line %d
++bool(false)
++
++-- ASCII string with out of bound negative offset --
++
++Warning: mb_strpos(): Offset not contained in string in %s on line %d
++bool(false)
++
++-- Multi-byte string without offset --
++int(0)
++
++-- Multi-byte string with in range positive offset --
++int(2)
++
++-- Multi-byte string with in range negative offset --
++int(19)
++
++-- Multi-byte string with out of bound positive offset --
++
++Warning: mb_strpos(): Offset not contained in string in %s on line %d
++bool(false)
++
++-- Multi-byte string with out of bound negative offset --
++
++Warning: mb_strpos(): Offset not contained in string in %s on line %d
++bool(false)
+diff --git a/ext/mbstring/tests/mb_strrchr_empty_needle.phpt b/ext/mbstring/tests/mb_strrchr_empty_needle.phpt
+new file mode 100644
+index 0000000000000..1efacc90d23eb
+--- /dev/null
++++ b/ext/mbstring/tests/mb_strrchr_empty_needle.phpt
+@@ -0,0 +1,37 @@
++--TEST--
++Test mb_strrchr() function : with empty needle
++--SKIPIF--
++<?php
++extension_loaded('mbstring') or die('skip');
++function_exists('mb_strrchr') or die("skip mb_strrchr() is not available in this build");
++?>
++--FILE--
++<?php
++
++mb_internal_encoding('UTF-8');
++
++$string_ascii = 'abc def';
++// Japanese string in UTF-8
++$string_mb = "日本語テキストです。01234５６７８９。";
++
++echo "\n-- ASCII string --\n";
++var_dump(bin2hex(mb_strrchr($string_ascii, '', false, 'ISO-8859-1')));
++var_dump(bin2hex(mb_strrchr($string_ascii, '')));
++var_dump(bin2hex(mb_strrchr($string_ascii, '', true)));
++
++echo "\n-- Multibyte string --\n";
++var_dump(bin2hex(mb_strrchr($string_mb, '')));
++var_dump(bin2hex(mb_strrchr($string_mb, '', false, 'utf-8')));
++var_dump(bin2hex(mb_strrchr($string_mb, '', true)));
++
++?>
++--EXPECT--
++-- ASCII string --
++string(0) ""
++string(0) ""
++string(0) ""
++
++-- Multibyte string --
++string(0) ""
++string(0) ""
++string(0) ""
+diff --git a/ext/mbstring/tests/mb_strripos_empty_needle.phpt b/ext/mbstring/tests/mb_strripos_empty_needle.phpt
+new file mode 100644
+index 0000000000000..2eaf8cbe1ec1b
+--- /dev/null
++++ b/ext/mbstring/tests/mb_strripos_empty_needle.phpt
+@@ -0,0 +1,86 @@
++--TEST--
++Test mb_strripos() function : with empty needle
++--SKIPIF--
++<?php
++extension_loaded('mbstring') or die('skip');
++function_exists('mb_strripos') or die("skip mb_strripos() is not available in this build");
++?>
++--FILE--
++<?php
++
++mb_internal_encoding('UTF-8');
++
++$string_ascii = 'abc def';
++// Japanese string in UTF-8
++$string_mb = "日本語テキストです。01234５６７８９。";
++
++echo "\n-- ASCII string without offset --\n";
++var_dump(mb_strripos($string_ascii, ''));
++
++echo "\n-- ASCII string with in range positive offset --\n";
++var_dump(mb_strripos($string_ascii, '', 2));
++
++echo "\n-- ASCII string with in range negative offset --\n";
++var_dump(mb_strripos($string_ascii, '', -2));
++
++echo "\n-- ASCII string with out of bound positive offset --\n";
++var_dump(mb_strripos($string_ascii, '', 15));
++
++echo "\n-- ASCII string with out of bound negative offset --\n";
++var_dump(mb_strripos($string_ascii, '', -15));
++
++
++echo "\n-- Multi-byte string without offset --\n";
++var_dump(mb_strripos($string_mb, ''));
++
++echo "\n-- Multi-byte string with in range positive offset --\n";
++var_dump(mb_strripos($string_mb, '', 2));
++
++echo "\n-- Multi-byte string with in range negative offset --\n";
++var_dump(mb_strripos($string_mb, '', -2));
++
++echo "\n-- Multi-byte string with out of bound positive offset --\n";
++var_dump(mb_strripos($string_mb, '', 150));
++
++echo "\n-- Multi-byte string with out of bound negative offset --\n";
++var_dump(mb_strripos($string_mb, '', -150));
++
++?>
++--EXPECTF--
++-- ASCII string without offset --
++int(7)
++
++-- ASCII string with in range positive offset --
++int(7)
++
++-- ASCII string with in range negative offset --
++int(5)
++
++-- ASCII string with out of bound positive offset --
++
++Warning: mb_strripos(): Offset is greater than the length of haystack string in %s on line %d
++bool(false)
++
++-- ASCII string with out of bound negative offset --
++
++Warning: mb_strripos(): Offset is greater than the length of haystack string in %s on line %d
++bool(false)
++
++-- Multi-byte string without offset --
++int(21)
++
++-- Multi-byte string with in range positive offset --
++int(21)
++
++-- Multi-byte string with in range negative offset --
++int(19)
++
++-- Multi-byte string with out of bound positive offset --
++
++Warning: mb_strripos(): Offset is greater than the length of haystack string in %s on line %d
++bool(false)
++
++-- Multi-byte string with out of bound negative offset --
++
++Warning: mb_strripos(): Offset is greater than the length of haystack string in %s on line %d
++bool(false)
+diff --git a/ext/mbstring/tests/mb_strrpos_empty_needle.phpt b/ext/mbstring/tests/mb_strrpos_empty_needle.phpt
+new file mode 100644
+index 0000000000000..a56c9c364b8f2
+--- /dev/null
++++ b/ext/mbstring/tests/mb_strrpos_empty_needle.phpt
+@@ -0,0 +1,86 @@
++--TEST--
++Test mb_strrpos() function :  with empty needle
++--SKIPIF--
++<?php
++extension_loaded('mbstring') or die('skip');
++function_exists('mb_strrpos') or die("skip mb_strrpos() is not available in this build");
++?>
++--FILE--
++<?php
++
++mb_internal_encoding('UTF-8');
++
++$string_ascii = 'abc def';
++// Japanese string in UTF-8
++$string_mb = "日本語テキストです。01234５６７８９。";
++
++echo "\n-- ASCII string without offset --\n";
++var_dump(mb_strrpos($string_ascii, ''));
++
++echo "\n-- ASCII string with in range positive offset --\n";
++var_dump(mb_strrpos($string_ascii, '', 2));
++
++echo "\n-- ASCII string with in range negative offset --\n";
++var_dump(mb_strrpos($string_ascii, '', -2));
++
++echo "\n-- ASCII string with out of bound positive offset --\n";
++var_dump(mb_strrpos($string_ascii, '', 15));
++
++echo "\n-- ASCII string with out of bound negative offset --\n";
++var_dump(mb_strrpos($string_ascii, '', -15));
++
++
++echo "\n-- Multi-byte string without offset --\n";
++var_dump(mb_strrpos($string_mb, ''));
++
++echo "\n-- Multi-byte string with in range positive offset --\n";
++var_dump(mb_strrpos($string_mb, '', 2));
++
++echo "\n-- Multi-byte string with in range negative offset --\n";
++var_dump(mb_strrpos($string_mb, '', -2));
++
++echo "\n-- Multi-byte string with out of bound positive offset --\n";
++var_dump(mb_strrpos($string_mb, '', 150));
++
++echo "\n-- Multi-byte string with out of bound negative offset --\n";
++var_dump(mb_strrpos($string_mb, '', -150));
++
++?>
++--EXPECTF--
++-- ASCII string without offset --
++int(7)
++
++-- ASCII string with in range positive offset --
++int(7)
++
++-- ASCII string with in range negative offset --
++int(5)
++
++-- ASCII string with out of bound positive offset --
++
++Warning: mb_strrpos(): Offset is greater than the length of haystack string in %s on line %d
++bool(false)
++
++-- ASCII string with out of bound negative offset --
++
++Warning: mb_strrpos(): Offset is greater than the length of haystack string in %s on line %d
++bool(false)
++
++-- Multi-byte string without offset --
++int(21)
++
++-- Multi-byte string with in range positive offset --
++int(21)
++
++-- Multi-byte string with in range negative offset --
++int(19)
++
++-- Multi-byte string with out of bound positive offset --
++
++Warning: mb_strrpos(): Offset is greater than the length of haystack string in %s on line %d
++bool(false)
++
++-- Multi-byte string with out of bound negative offset --
++
++Warning: mb_strrpos(): Offset is greater than the length of haystack string in %s on line %d
++bool(false)
+diff --git a/ext/mbstring/tests/mb_strstr_empty_needle.phpt b/ext/mbstring/tests/mb_strstr_empty_needle.phpt
+new file mode 100644
+index 0000000000000..fd72a7707e374
+--- /dev/null
++++ b/ext/mbstring/tests/mb_strstr_empty_needle.phpt
+@@ -0,0 +1,37 @@
++--TEST--
++Test mb_strstr() function : with empty needle
++--SKIPIF--
++<?php
++extension_loaded('mbstring') or die('skip');
++function_exists('mb_strstr') or die("skip mb_strstr() is not available in this build");
++?>
++--FILE--
++<?php
++
++mb_internal_encoding('UTF-8');
++
++$string_ascii = 'abc def';
++// Japanese string in UTF-8
++$string_mb = "日本語テキストです。01234５６７８９。";
++
++echo "\n-- ASCII string --\n";
++var_dump(mb_strstr($string_ascii, '', false, 'ISO-8859-1'));
++var_dump(mb_strstr($string_ascii, ''));
++var_dump(mb_strstr($string_ascii, '', true));
++
++echo "\n-- Multibyte string --\n";
++var_dump(mb_strstr($string_mb, ''));
++var_dump(mb_strstr($string_mb, '', false, 'utf-8'));
++var_dump(mb_strstr($string_mb, '', true));
++
++?>
++--EXPECT--
++-- ASCII string --
++string(7) "abc def"
++string(7) "abc def"
++string(0) ""
++
++-- Multibyte string --
++string(53) "日本語テキストです。01234５６７８９。"
++string(53) "日本語テキストです。01234５６７８９。"
++string(0) ""

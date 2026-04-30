@@ -1,0 +1,61 @@
+From c43a98a5ad48b9160d0b3741fe7319f4f580e26b Mon Sep 17 00:00:00 2001
+From: Chris Liddell <chris.liddell@artifex.com>
+Date: Mon, 22 Aug 2022 16:15:24 +0100
+Subject: oss-fuzz 50370: Always fully tidy up a filter pipeline
+
+When shutting down the device, pdfwrite would flush and close the pipeline
+of filters in place for the main output stream. But s_close_filters() would
+stop the process if a filter in the pipeline threw an error. As pdfwrite
+immediately then closes the ouput file, the ultimate target of the pipeline,
+this would then later cause a crash then the garbager attempted to "sweep up"
+the errant stream objects. Or, in the non-gc use case, it would cause a
+memory leak.
+
+So change s_close_filters() to continue to destroy the filters in the pipeline
+even after an error (but strill return the relevant error), meaning the filter
+pipelines are always cleaned up, even if one or more filters has an error.
+---
+ base/stream.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/base/stream.c b/base/stream.c
+index 6f68d7c24..6b5847257 100644
+--- a/base/stream.c
++++ b/base/stream.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2021 Artifex Software, Inc.
++/* Copyright (C) 2001-2022 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -1294,6 +1294,7 @@ s_add_filter(stream **ps, const stream_template *templat,
+ int
+ s_close_filters(stream **ps, stream *target)
+ {
++    int code = 0;
+     while (*ps != target) {
+         stream *s = *ps;
+         gs_memory_t *mem = s->state->memory;
+@@ -1304,8 +1305,8 @@ s_close_filters(stream **ps, stream *target)
+         int status = sclose(s);
+         stream_state *ss = s->state; /* sclose may set this to s */
+ 
+-        if (status < 0)
+-            return status;
++        if (code == 0)
++            code = status;
+ 
+         if (s->cbuf_string_memory != NULL) { /* stream owns string buffer, so free it */
+             gs_free_object(cbuf_string_memory, cbuf, "s_close_filters(cbuf)");
+@@ -1320,7 +1321,7 @@ s_close_filters(stream **ps, stream *target)
+         }
+         *ps = next;
+     }
+-    return 0;
++    return code;
+ }
+ 
+ /* ------ Stream closing ------ */
+-- 
+cgit v1.2.3
+

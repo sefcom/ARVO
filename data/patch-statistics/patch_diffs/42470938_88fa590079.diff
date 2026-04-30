@@ -1,0 +1,56 @@
+From a1da3f297717c2de70dab88f7783117b78f85e89 Mon Sep 17 00:00:00 2001
+From: Yifeng Sun <pkusunyifeng@gmail.com>
+Date: Thu, 18 Oct 2018 14:10:48 -0700
+Subject: [PATCH] odp-util: Move ufid handling to odp_flow_from_string
+
+When parse_odp_key_mask_attr runs into ufid, it returns length of ufid
+without further parsing. This causes problem to set action in function
+parse_odp_action where nested nlattrs are expected from ofpbuf after.
+
+Since in all callers of parse_odp_key_mask_attr, only odp_flow_from_string
+needs to understand ufid. This patch moves ufid parsing from
+parse_odp_key_mask_attr out to odp_flow_from_string.
+
+Reported-by: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=10850
+Signed-off-by: Yifeng Sun <pkusunyifeng@gmail.com>
+Signed-off-by: Ben Pfaff <blp@ovn.org>
+---
+ lib/odp-util.c | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index c31b96be028..1a52f3bc5ad 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -5366,13 +5366,6 @@ static int
+ parse_odp_key_mask_attr(const char *s, const struct simap *port_names,
+                         struct ofpbuf *key, struct ofpbuf *mask)
+ {
+-    /* Skip UFID. */
+-    ovs_u128 ufid;
+-    int ufid_len = odp_ufid_from_string(s, &ufid);
+-    if (ufid_len) {
+-        return ufid_len;
+-    }
+-
+     SCAN_SINGLE("skb_priority(", uint32_t, u32, OVS_KEY_ATTR_PRIORITY);
+     SCAN_SINGLE("skb_mark(", uint32_t, u32, OVS_KEY_ATTR_SKB_MARK);
+     SCAN_SINGLE_FULLY_MASKED("recirc_id(", uint32_t, u32,
+@@ -5585,6 +5578,17 @@ odp_flow_from_string(const char *s, const struct simap *port_names,
+             return 0;
+         }
+ 
++        /* Skip UFID. */
++        ovs_u128 ufid;
++        retval = odp_ufid_from_string(s, &ufid);
++        if (retval < 0) {
++            key->size = old_size;
++            return -retval;
++        } else if (retval > 0) {
++            s += retval;
++            s += s[0] == ' ' ? 1 : 0;
++        }
++
+         retval = parse_odp_key_mask_attr(s, port_names, key, mask);
+         if (retval < 0) {
+             key->size = old_size;

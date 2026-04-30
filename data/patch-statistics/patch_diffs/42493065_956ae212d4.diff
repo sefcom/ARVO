@@ -1,0 +1,133 @@
+From 74d00a8decebf940d95064ff60042dcb2cbcc2c0 Mon Sep 17 00:00:00 2001
+From: James Carter <jwcart2@gmail.com>
+Date: Wed, 28 Apr 2021 16:07:02 -0400
+Subject: [PATCH] libsepol/cil: Detect degenerate inheritance and exit with an
+ error
+
+A CIL policy with inheritance of the form
+...
+(blockinherit ba)
+(block ba
+  (block b1
+    (blockinherit bb)
+  )
+  (block bb
+    (block b2
+      (blockinherit bc)
+    )
+    (block bc
+      (block b3
+        (blockinherit bd)
+      )
+      (block bd
+        (block b4
+          (blockinherit be)
+        )
+        (block be
+        ...
+will require creating 2^depth copies of the block at the bottom of
+the inheritance chain. This pattern can quickly consume all the
+memory of the system compiling this policy.
+
+The depth of the inheritance chain can be found be walking the
+tree up through the parents and noting how many of the parent
+blocks have been inherited. The number of times a block will be
+copied is found by counting the list of nodes in the "bi_nodes"
+list of the block. To minimize legitimate policies from being
+falsely detected as being degenerate, both the depth and breadth
+(number of copies) are checked and an error is given only if both
+exceed the limits (depth >= 12 and breadth >= 4096).
+
+This problem was found by the secilc-fuzzer.
+
+Signed-off-by: James Carter <jwcart2@gmail.com>
+---
+ libsepol/cil/src/cil_internal.h    |  2 ++
+ libsepol/cil/src/cil_resolve_ast.c | 54 ++++++++++++++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/libsepol/cil/src/cil_internal.h b/libsepol/cil/src/cil_internal.h
+index 9bdcbdd013..74e0b34d6c 100644
+--- a/libsepol/cil/src/cil_internal.h
++++ b/libsepol/cil/src/cil_internal.h
+@@ -48,6 +48,8 @@
+ 
+ #define CIL_MAX_NAME_LENGTH 2048
+ 
++#define CIL_DEGENERATE_INHERITANCE_DEPTH 12
++#define CIL_DEGENERATE_INHERITANCE_BREADTH (0x1 << CIL_DEGENERATE_INHERITANCE_DEPTH)
+ 
+ enum cil_pass {
+ 	CIL_PASS_INIT = 0,
+diff --git a/libsepol/cil/src/cil_resolve_ast.c b/libsepol/cil/src/cil_resolve_ast.c
+index 5389df43fe..6890964728 100644
+--- a/libsepol/cil/src/cil_resolve_ast.c
++++ b/libsepol/cil/src/cil_resolve_ast.c
+@@ -2410,6 +2410,55 @@ int cil_check_recursive_blockinherit(struct cil_tree_node *bi_node)
+ 	return rc;
+ }
+ 
++/*
++ * Detect degenerate inheritance of the form:
++ * ...
++ * (blockinherit ba)
++ * (block ba
++ *    (block b1
++ *      (blockinherit bb)
++ *    )
++ *    (block bb
++ *      (block b2
++ *        (blockinherit bc)
++ *      )
++ *      (block bc
++ *      ...
++ */
++static int cil_check_for_degenerate_inheritance(struct cil_tree_node *current)
++{
++	struct cil_block *block = current->data;
++	struct cil_tree_node *node;
++	struct cil_list_item *item;
++	unsigned depth;
++	unsigned breadth = 0;
++
++	cil_list_for_each(item, block->bi_nodes) {
++		breadth++;
++	}
++
++	if (breadth >= CIL_DEGENERATE_INHERITANCE_BREADTH) {
++		node = current->parent;
++		depth = 0;
++		while (node && node->flavor != CIL_ROOT) {
++			if (node->flavor == CIL_BLOCK) {
++				block = node->data;
++				if (block->bi_nodes != NULL) {
++					depth++;
++				}
++			}
++			node = node->parent;
++		}
++
++		if (depth >= CIL_DEGENERATE_INHERITANCE_DEPTH) {
++			cil_tree_log(current, CIL_ERR, "Degenerate inheritance detected (depth=%u, breadth=%u)", depth, breadth);
++			return SEPOL_ERR;
++		}
++	}
++
++	return SEPOL_OK;
++}
++
+ int cil_resolve_blockinherit_copy(struct cil_tree_node *current, void *extra_args)
+ {
+ 	struct cil_block *block = current->data;
+@@ -2426,6 +2475,11 @@ int cil_resolve_blockinherit_copy(struct cil_tree_node *current, void *extra_arg
+ 
+ 	db = args->db;
+ 
++	rc = cil_check_for_degenerate_inheritance(current);
++	if (rc != SEPOL_OK) {
++		goto exit;
++	}
++
+ 	// Make sure this is the original block and not a merged block from a blockinherit
+ 	if (current != block->datum.nodes->head->data) {
+ 		rc = SEPOL_OK;

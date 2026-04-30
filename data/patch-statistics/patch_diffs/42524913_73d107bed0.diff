@@ -1,0 +1,1789 @@
+From 40faced6c18baa6fbc7c1fbd409d59d6ddecc74f Mon Sep 17 00:00:00 2001
+From: Alexander Smorkalov <alexander.smorkalov@xperience.ai>
+Date: Mon, 20 May 2024 13:44:43 +0300
+Subject: [PATCH] OpenJPEG update to 2.5.2.
+
+---
+ 3rdparty/openjpeg/openjp2/bio.c               |  26 +--
+ 3rdparty/openjpeg/openjp2/bio.h               |   8 +
+ 3rdparty/openjpeg/openjp2/dwt.c               |   4 +-
+ 3rdparty/openjpeg/openjp2/ht_dec.c            |  56 +++++-
+ 3rdparty/openjpeg/openjp2/j2k.c               | 142 +++++++++------
+ 3rdparty/openjpeg/openjp2/j2k.h               |  21 ++-
+ 3rdparty/openjpeg/openjp2/jp2.c               | 142 ++++++---------
+ .../openjpeg/openjp2/libopenjp2.pc.cmake.in   |  11 +-
+ 3rdparty/openjpeg/openjp2/openjpeg.c          |   7 +-
+ 3rdparty/openjpeg/openjp2/openjpeg.h          |  10 +-
+ .../openjpeg/openjp2/opj_config.h.cmake.in    |   6 +-
+ .../openjp2/opj_config_private.h.cmake.in     |   3 +-
+ 3rdparty/openjpeg/openjp2/opj_includes.h      |   3 +-
+ 3rdparty/openjpeg/openjp2/opj_intmath.h       |  11 ++
+ 3rdparty/openjpeg/openjp2/pi.c                | 171 +++++++++---------
+ 3rdparty/openjpeg/openjp2/t1.c                |  12 +-
+ .../openjpeg/openjp2/t1_ht_generate_luts.c    |  10 +-
+ 3rdparty/openjpeg/openjp2/t2.c                |  27 ++-
+ 3rdparty/openjpeg/openjp2/tcd.c               | 151 ++++++++++++----
+ 3rdparty/openjpeg/openjp2/tcd.h               |  27 +--
+ 3rdparty/openjpeg/openjp2/tgt.c               |   4 +-
+ 3rdparty/openjpeg/openjp2/thread.c            |   2 +-
+ 22 files changed, 496 insertions(+), 358 deletions(-)
+
+diff --git a/3rdparty/openjpeg/openjp2/bio.c b/3rdparty/openjpeg/openjp2/bio.c
+index 09dcd7f52492..8106df754edb 100644
+--- a/3rdparty/openjpeg/openjp2/bio.c
++++ b/3rdparty/openjpeg/openjp2/bio.c
+@@ -43,12 +43,6 @@
+ /** @name Local static functions */
+ /*@{*/
+ 
+-/**
+-Write a bit
+-@param bio BIO handle
+-@param b Bit to write (0 or 1)
+-*/
+-static void opj_bio_putbit(opj_bio_t *bio, OPJ_UINT32 b);
+ /**
+ Read a bit
+ @param bio BIO handle
+@@ -100,16 +94,6 @@ static OPJ_BOOL opj_bio_bytein(opj_bio_t *bio)
+     return OPJ_TRUE;
+ }
+ 
+-static void opj_bio_putbit(opj_bio_t *bio, OPJ_UINT32 b)
+-{
+-    if (bio->ct == 0) {
+-        opj_bio_byteout(
+-            bio); /* MSD: why not check the return value of this function ? */
+-    }
+-    bio->ct--;
+-    bio->buf |= b << bio->ct;
+-}
+-
+ static OPJ_UINT32 opj_bio_getbit(opj_bio_t *bio)
+ {
+     if (bio->ct == 0) {
+@@ -162,6 +146,16 @@ void opj_bio_init_dec(opj_bio_t *bio, OPJ_BYTE *bp, OPJ_UINT32 len)
+     bio->ct = 0;
+ }
+ 
++void opj_bio_putbit(opj_bio_t *bio, OPJ_UINT32 b)
++{
++    if (bio->ct == 0) {
++        opj_bio_byteout(
++            bio); /* MSD: why not check the return value of this function ? */
++    }
++    bio->ct--;
++    bio->buf |= b << bio->ct;
++}
++
+ void opj_bio_write(opj_bio_t *bio, OPJ_UINT32 v, OPJ_UINT32 n)
+ {
+     OPJ_INT32 i;
+diff --git a/3rdparty/openjpeg/openjp2/bio.h b/3rdparty/openjpeg/openjp2/bio.h
+index 448fdda2190c..d482f9ead5a7 100644
+--- a/3rdparty/openjpeg/openjp2/bio.h
++++ b/3rdparty/openjpeg/openjp2/bio.h
+@@ -106,6 +106,14 @@ Write bits
+ @param n Number of bits to write
+ */
+ void opj_bio_write(opj_bio_t *bio, OPJ_UINT32 v, OPJ_UINT32 n);
++
++/**
++Write a bit
++@param bio BIO handle
++@param b Bit to write (0 or 1)
++*/
++void opj_bio_putbit(opj_bio_t *bio, OPJ_UINT32 b);
++
+ /**
+ Read bits
+ @param bio BIO handle
+diff --git a/3rdparty/openjpeg/openjp2/dwt.c b/3rdparty/openjpeg/openjp2/dwt.c
+index abc500eca6bb..6b18c5dd6e9d 100644
+--- a/3rdparty/openjpeg/openjp2/dwt.c
++++ b/3rdparty/openjpeg/openjp2/dwt.c
+@@ -2083,7 +2083,9 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
+     OPJ_SIZE_T h_mem_size;
+     int num_threads;
+ 
+-    if (numres == 1U) {
++    /* Not entirely sure for the return code of w == 0 which is triggered per */
++    /* https://github.com/uclouvain/openjpeg/issues/1505 */
++    if (numres == 1U || w == 0) {
+         return OPJ_TRUE;
+     }
+     num_threads = opj_thread_pool_get_thread_count(tp);
+diff --git a/3rdparty/openjpeg/openjp2/ht_dec.c b/3rdparty/openjpeg/openjp2/ht_dec.c
+index 85e7266919a3..a554b24a6a2c 100644
+--- a/3rdparty/openjpeg/openjp2/ht_dec.c
++++ b/3rdparty/openjpeg/openjp2/ht_dec.c
+@@ -55,7 +55,13 @@
+ #define OPJ_COMPILER_GNUC
+ #endif
+ 
+-#if defined(OPJ_COMPILER_MSVC) && defined(_M_ARM64)
++#if defined(OPJ_COMPILER_MSVC) && defined(_M_ARM64) \
++    && !defined(_M_ARM64EC) && !defined(_M_CEE_PURE) && !defined(__CUDACC__) \
++    && !defined(__INTEL_COMPILER) && !defined(__clang__)
++#define MSVC_NEON_INTRINSICS
++#endif
++
++#ifdef MSVC_NEON_INTRINSICS
+ #include <arm64_neon.h>
+ #endif
+ 
+@@ -75,7 +81,7 @@ OPJ_UINT32 population_count(OPJ_UINT32 val)
+ {
+ #if defined(OPJ_COMPILER_MSVC) && (defined(_M_IX86) || defined(_M_AMD64))
+     return (OPJ_UINT32)__popcnt(val);
+-#elif defined(OPJ_COMPILER_MSVC) && defined(_M_ARM64)
++#elif defined(OPJ_COMPILER_MSVC) && defined(MSVC_NEON_INTRINSICS)
+     const __n64 temp = neon_cnt(__uint64ToN64_v(val));
+     return neon_addv8(temp).n8_i8[0];
+ #elif (defined OPJ_COMPILER_GNUC)
+@@ -301,7 +307,7 @@ void mel_decode(dec_mel_t *melp)
+   *  @param [in]  scup is the length of MEL+VLC segments
+   */
+ static INLINE
+-void mel_init(dec_mel_t *melp, OPJ_UINT8* bbuf, int lcup, int scup)
++OPJ_BOOL mel_init(dec_mel_t *melp, OPJ_UINT8* bbuf, int lcup, int scup)
+ {
+     int num;
+     int i;
+@@ -323,7 +329,9 @@ void mel_init(dec_mel_t *melp, OPJ_UINT8* bbuf, int lcup, int scup)
+         OPJ_UINT64 d;
+         int d_bits;
+ 
+-        assert(melp->unstuff == OPJ_FALSE || melp->data[0] <= 0x8F);
++        if (melp->unstuff == OPJ_TRUE && melp->data[0] > 0x8F) {
++            return OPJ_FALSE;
++        }
+         d = (melp->size > 0) ? *melp->data : 0xFF; // if buffer is consumed
+         // set data to 0xFF
+         if (melp->size == 1) {
+@@ -339,6 +347,7 @@ void mel_init(dec_mel_t *melp, OPJ_UINT8* bbuf, int lcup, int scup)
+     }
+     melp->tmp <<= (64 - melp->bits); //push all the way up so the first bit
+     // is the MSB
++    return OPJ_TRUE;
+ }
+ 
+ //************************************************************************/
+@@ -1070,7 +1079,7 @@ static OPJ_BOOL opj_t1_allocate_buffers(
+         if (flagssize > t1->flagssize) {
+ 
+             opj_aligned_free(t1->flags);
+-            t1->flags = (opj_flag_t*) opj_aligned_malloc(flagssize);
++            t1->flags = (opj_flag_t*) opj_aligned_malloc(flagssize * sizeof(opj_flag_t));
+             if (!t1->flags) {
+                 /* FIXME event manager error callback */
+                 return OPJ_FALSE;
+@@ -1078,7 +1087,7 @@ static OPJ_BOOL opj_t1_allocate_buffers(
+         }
+         t1->flagssize = flagssize;
+ 
+-        memset(t1->flags, 0, flagssize);
++        memset(t1->flags, 0, flagssize * sizeof(opj_flag_t));
+     }
+ 
+     t1->w = w;
+@@ -1087,6 +1096,26 @@ static OPJ_BOOL opj_t1_allocate_buffers(
+     return OPJ_TRUE;
+ }
+ 
++/**
++Decode 1 HT code-block
++@param t1 T1 handle
++@param cblk Code-block coding parameters
++@param orient
++@param roishift Region of interest shifting value
++@param cblksty Code-block style
++@param p_manager the event manager
++@param p_manager_mutex mutex for the event manager
++@param check_pterm whether PTERM correct termination should be checked
++*/
++OPJ_BOOL opj_t1_ht_decode_cblk(opj_t1_t *t1,
++                               opj_tcd_cblk_dec_t* cblk,
++                               OPJ_UINT32 orient,
++                               OPJ_UINT32 roishift,
++                               OPJ_UINT32 cblksty,
++                               opj_event_mgr_t *p_manager,
++                               opj_mutex_t* p_manager_mutex,
++                               OPJ_BOOL check_pterm);
++
+ //************************************************************************/
+ /** @brief Decodes one codeblock, processing the cleanup, siginificance
+   *         propagation, and magnitude refinement pass
+@@ -1194,6 +1223,9 @@ OPJ_BOOL opj_t1_ht_decode_cblk(opj_t1_t *t1,
+ 
+         /* Concatenate all chunks */
+         cblkdata = t1->cblkdatabuffer;
++        if (cblkdata == NULL) {
++            return OPJ_FALSE;
++        }
+         cblk_len = 0;
+         for (i = 0; i < cblk->numchunks; i++) {
+             memcpy(cblkdata + cblk_len, cblk->chunks[i].data, cblk->chunks[i].len);
+@@ -1381,7 +1413,17 @@ OPJ_BOOL opj_t1_ht_decode_cblk(opj_t1_t *t1,
+     }
+ 
+     // init structures
+-    mel_init(&mel, coded_data, lcup, scup);
++    if (mel_init(&mel, coded_data, lcup, scup) == OPJ_FALSE) {
++        if (p_manager_mutex) {
++            opj_mutex_lock(p_manager_mutex);
++        }
++        opj_event_msg(p_manager, EVT_ERROR, "Malformed HT codeblock. "
++                      "Incorrect MEL segment sequence.\n");
++        if (p_manager_mutex) {
++            opj_mutex_unlock(p_manager_mutex);
++        }
++        return OPJ_FALSE;
++    }
+     rev_init(&vlc, coded_data, lcup, scup);
+     frwd_init(&magsgn, coded_data, lcup - scup, 0xFF);
+     if (num_passes > 1) { // needs to be tested
+diff --git a/3rdparty/openjpeg/openjp2/j2k.c b/3rdparty/openjpeg/openjp2/j2k.c
+index d3b2258dfc95..c0551870b2bd 100644
+--- a/3rdparty/openjpeg/openjp2/j2k.c
++++ b/3rdparty/openjpeg/openjp2/j2k.c
+@@ -2333,10 +2333,8 @@ static OPJ_BOOL opj_j2k_read_siz(opj_j2k_t *p_j2k,
+     }
+ 
+     /* Compute the number of tiles */
+-    l_cp->tw = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)(l_image->x1 - l_cp->tx0),
+-                                           (OPJ_INT32)l_cp->tdx);
+-    l_cp->th = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)(l_image->y1 - l_cp->ty0),
+-                                           (OPJ_INT32)l_cp->tdy);
++    l_cp->tw = opj_uint_ceildiv(l_image->x1 - l_cp->tx0, l_cp->tdx);
++    l_cp->th = opj_uint_ceildiv(l_image->y1 - l_cp->ty0, l_cp->tdy);
+ 
+     /* Check that the number of tiles is valid */
+     if (l_cp->tw == 0 || l_cp->th == 0 || l_cp->tw > 65535 / l_cp->th) {
+@@ -2353,12 +2351,12 @@ static OPJ_BOOL opj_j2k_read_siz(opj_j2k_t *p_j2k,
+             (p_j2k->m_specific_param.m_decoder.m_start_tile_x - l_cp->tx0) / l_cp->tdx;
+         p_j2k->m_specific_param.m_decoder.m_start_tile_y =
+             (p_j2k->m_specific_param.m_decoder.m_start_tile_y - l_cp->ty0) / l_cp->tdy;
+-        p_j2k->m_specific_param.m_decoder.m_end_tile_x = (OPJ_UINT32)opj_int_ceildiv((
+-                    OPJ_INT32)(p_j2k->m_specific_param.m_decoder.m_end_tile_x - l_cp->tx0),
+-                (OPJ_INT32)l_cp->tdx);
+-        p_j2k->m_specific_param.m_decoder.m_end_tile_y = (OPJ_UINT32)opj_int_ceildiv((
+-                    OPJ_INT32)(p_j2k->m_specific_param.m_decoder.m_end_tile_y - l_cp->ty0),
+-                (OPJ_INT32)l_cp->tdy);
++        p_j2k->m_specific_param.m_decoder.m_end_tile_x = opj_uint_ceildiv(
++                    p_j2k->m_specific_param.m_decoder.m_end_tile_x - l_cp->tx0,
++                    l_cp->tdx);
++        p_j2k->m_specific_param.m_decoder.m_end_tile_y = opj_uint_ceildiv(
++                    p_j2k->m_specific_param.m_decoder.m_end_tile_y - l_cp->ty0,
++                    l_cp->tdy);
+     } else {
+         p_j2k->m_specific_param.m_decoder.m_start_tile_x = 0;
+         p_j2k->m_specific_param.m_decoder.m_start_tile_y = 0;
+@@ -3961,9 +3959,12 @@ static OPJ_BOOL opj_j2k_merge_ppm(opj_cp_t *p_cp, opj_event_mgr_t * p_manager)
+                     opj_read_bytes(l_data, &l_N_ppm, 4);
+                     l_data += 4;
+                     l_data_size -= 4;
+-                    l_ppm_data_size +=
+-                        l_N_ppm; /* can't overflow, max 256 markers of max 65536 bytes, that is when PPM markers are not corrupted which is checked elsewhere */
+ 
++                    if (l_ppm_data_size > UINT_MAX - l_N_ppm) {
++                        opj_event_msg(p_manager, EVT_ERROR, "Too large value for Nppm\n");
++                        return OPJ_FALSE;
++                    }
++                    l_ppm_data_size += l_N_ppm;
+                     if (l_data_size >= l_N_ppm) {
+                         l_data_size -= l_N_ppm;
+                         l_data += l_N_ppm;
+@@ -6726,7 +6727,7 @@ OPJ_BOOL opj_j2k_set_threads(opj_j2k_t *j2k, OPJ_UINT32 num_threads)
+     return OPJ_FALSE;
+ }
+ 
+-static int opj_j2k_get_default_thread_count()
++static int opj_j2k_get_default_thread_count(void)
+ {
+     const char* num_threads_str = getenv("OPJ_NUM_THREADS");
+     int num_cpus;
+@@ -7666,6 +7667,27 @@ OPJ_BOOL opj_j2k_setup_encoder(opj_j2k_t *p_j2k,
+         return OPJ_FALSE;
+     }
+ 
++    if (parameters->cp_fixed_alloc) {
++        if (parameters->cp_matrice == NULL) {
++            opj_event_msg(p_manager, EVT_ERROR,
++                          "cp_fixed_alloc set, but cp_matrice missing\n");
++            return OPJ_FALSE;
++        }
++
++        if (parameters->tcp_numlayers > J2K_TCD_MATRIX_MAX_LAYER_COUNT) {
++            opj_event_msg(p_manager, EVT_ERROR,
++                          "tcp_numlayers when cp_fixed_alloc set should not exceed %d\n",
++                          J2K_TCD_MATRIX_MAX_LAYER_COUNT);
++            return OPJ_FALSE;
++        }
++        if (parameters->numresolution > J2K_TCD_MATRIX_MAX_RESOLUTION_COUNT) {
++            opj_event_msg(p_manager, EVT_ERROR,
++                          "numresolution when cp_fixed_alloc set should not exceed %d\n",
++                          J2K_TCD_MATRIX_MAX_RESOLUTION_COUNT);
++            return OPJ_FALSE;
++        }
++    }
++
+     p_j2k->m_specific_param.m_encoder.m_nb_comps = image->numcomps;
+ 
+     /* keep a link to cp so that we can destroy it later in j2k_destroy_compress */
+@@ -7885,15 +7907,17 @@ OPJ_BOOL opj_j2k_setup_encoder(opj_j2k_t *p_j2k,
+     cp->m_specific_param.m_enc.m_max_comp_size = (OPJ_UINT32)
+             parameters->max_comp_size;
+     cp->rsiz = parameters->rsiz;
+-    cp->m_specific_param.m_enc.m_disto_alloc = (OPJ_UINT32)
+-            parameters->cp_disto_alloc & 1u;
+-    cp->m_specific_param.m_enc.m_fixed_alloc = (OPJ_UINT32)
+-            parameters->cp_fixed_alloc & 1u;
+-    cp->m_specific_param.m_enc.m_fixed_quality = (OPJ_UINT32)
+-            parameters->cp_fixed_quality & 1u;
+-
+-    /* mod fixed_quality */
+-    if (parameters->cp_fixed_alloc && parameters->cp_matrice) {
++    if (parameters->cp_fixed_alloc) {
++        cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy = FIXED_LAYER;
++    } else if (parameters->cp_fixed_quality) {
++        cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy =
++            FIXED_DISTORTION_RATIO;
++    } else {
++        cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy =
++            RATE_DISTORTION_RATIO;
++    }
++
++    if (parameters->cp_fixed_alloc) {
+         size_t array_size = (size_t)parameters->tcp_numlayers *
+                             (size_t)parameters->numresolution * 3 * sizeof(OPJ_INT32);
+         cp->m_specific_param.m_enc.m_matrice = (OPJ_INT32 *) opj_malloc(array_size);
+@@ -7931,21 +7955,24 @@ OPJ_BOOL opj_j2k_setup_encoder(opj_j2k_t *p_j2k,
+ 
+         /* UniPG>> */
+ #ifdef USE_JPWL
+-        cp->comment = (char*)opj_malloc(clen + strlen(version) + 11);
++        const size_t cp_comment_buf_size = clen + strlen(version) + 11;
++        cp->comment = (char*)opj_malloc(cp_comment_buf_size);
+         if (!cp->comment) {
+             opj_event_msg(p_manager, EVT_ERROR,
+                           "Not enough memory to allocate comment string\n");
+             return OPJ_FALSE;
+         }
+-        sprintf(cp->comment, "%s%s with JPWL", comment, version);
++        snprintf(cp->comment, cp_comment_buf_size, "%s%s with JPWL",
++                 comment, version);
+ #else
+-        cp->comment = (char*)opj_malloc(clen + strlen(version) + 1);
++        const size_t cp_comment_buf_size = clen + strlen(version) + 1;
++        cp->comment = (char*)opj_malloc(cp_comment_buf_size);
+         if (!cp->comment) {
+             opj_event_msg(p_manager, EVT_ERROR,
+                           "Not enough memory to allocate comment string\n");
+             return OPJ_FALSE;
+         }
+-        sprintf(cp->comment, "%s%s", comment, version);
++        snprintf(cp->comment, cp_comment_buf_size, "%s%s", comment, version);
+ #endif
+         /* <<UniPG */
+     }
+@@ -7963,10 +7990,8 @@ OPJ_BOOL opj_j2k_setup_encoder(opj_j2k_t *p_j2k,
+             opj_event_msg(p_manager, EVT_ERROR, "Invalid tile height\n");
+             return OPJ_FALSE;
+         }
+-        cp->tw = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)(image->x1 - cp->tx0),
+-                                             (OPJ_INT32)cp->tdx);
+-        cp->th = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)(image->y1 - cp->ty0),
+-                                             (OPJ_INT32)cp->tdy);
++        cp->tw = opj_uint_ceildiv(image->x1 - cp->tx0, cp->tdx);
++        cp->th = opj_uint_ceildiv(image->y1 - cp->ty0, cp->tdy);
+         /* Check that the number of tiles is valid */
+         if (cp->tw > 65535 / cp->th) {
+             opj_event_msg(p_manager, EVT_ERROR,
+@@ -8051,22 +8076,25 @@ OPJ_BOOL opj_j2k_setup_encoder(opj_j2k_t *p_j2k,
+ 
+     for (tileno = 0; tileno < cp->tw * cp->th; tileno++) {
+         opj_tcp_t *tcp = &cp->tcps[tileno];
++        const OPJ_BOOL fixed_distoratio =
++            cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy ==
++            FIXED_DISTORTION_RATIO;
+         tcp->numlayers = (OPJ_UINT32)parameters->tcp_numlayers;
+ 
+         for (j = 0; j < tcp->numlayers; j++) {
+             if (OPJ_IS_CINEMA(cp->rsiz) || OPJ_IS_IMF(cp->rsiz)) {
+-                if (cp->m_specific_param.m_enc.m_fixed_quality) {
++                if (fixed_distoratio) {
+                     tcp->distoratio[j] = parameters->tcp_distoratio[j];
+                 }
+                 tcp->rates[j] = parameters->tcp_rates[j];
+             } else {
+-                if (cp->m_specific_param.m_enc.m_fixed_quality) {       /* add fixed_quality */
++                if (fixed_distoratio) {
+                     tcp->distoratio[j] = parameters->tcp_distoratio[j];
+                 } else {
+                     tcp->rates[j] = parameters->tcp_rates[j];
+                 }
+             }
+-            if (!cp->m_specific_param.m_enc.m_fixed_quality &&
++            if (!fixed_distoratio &&
+                     tcp->rates[j] <= 1.0) {
+                 tcp->rates[j] = 0.0;    /* force lossless */
+             }
+@@ -10160,10 +10188,8 @@ static OPJ_BOOL opj_j2k_update_image_dimensions(opj_image_t* p_image,
+             return OPJ_FALSE;
+         }
+ 
+-        l_img_comp->x0 = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)p_image->x0,
+-                         (OPJ_INT32)l_img_comp->dx);
+-        l_img_comp->y0 = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)p_image->y0,
+-                         (OPJ_INT32)l_img_comp->dy);
++        l_img_comp->x0 = opj_uint_ceildiv(p_image->x0, l_img_comp->dx);
++        l_img_comp->y0 = opj_uint_ceildiv(p_image->y0, l_img_comp->dy);
+         l_comp_x1 = opj_int_ceildiv((OPJ_INT32)p_image->x1, (OPJ_INT32)l_img_comp->dx);
+         l_comp_y1 = opj_int_ceildiv((OPJ_INT32)p_image->y1, (OPJ_INT32)l_img_comp->dy);
+ 
+@@ -10366,8 +10392,8 @@ OPJ_BOOL opj_j2k_set_decode_area(opj_j2k_t *p_j2k,
+         p_j2k->m_specific_param.m_decoder.m_end_tile_x = l_cp->tw;
+         p_image->x1 = l_image->x1;
+     } else {
+-        p_j2k->m_specific_param.m_decoder.m_end_tile_x = (OPJ_UINT32)opj_int_ceildiv(
+-                    p_end_x - (OPJ_INT32)l_cp->tx0, (OPJ_INT32)l_cp->tdx);
++        p_j2k->m_specific_param.m_decoder.m_end_tile_x = opj_uint_ceildiv((
++                    OPJ_UINT32)p_end_x - l_cp->tx0, l_cp->tdx);
+         p_image->x1 = (OPJ_UINT32)p_end_x;
+     }
+ 
+@@ -10390,8 +10416,8 @@ OPJ_BOOL opj_j2k_set_decode_area(opj_j2k_t *p_j2k,
+         p_j2k->m_specific_param.m_decoder.m_end_tile_y = l_cp->th;
+         p_image->y1 = l_image->y1;
+     } else {
+-        p_j2k->m_specific_param.m_decoder.m_end_tile_y = (OPJ_UINT32)opj_int_ceildiv(
+-                    p_end_y - (OPJ_INT32)l_cp->ty0, (OPJ_INT32)l_cp->tdy);
++        p_j2k->m_specific_param.m_decoder.m_end_tile_y = opj_uint_ceildiv((
++                    OPJ_UINT32)p_end_y - l_cp->ty0, l_cp->tdy);
+         p_image->y1 = (OPJ_UINT32)p_end_y;
+     }
+     /* ----- */
+@@ -11078,6 +11104,10 @@ static OPJ_BOOL opj_j2k_read_SQcd_SQcc(opj_j2k_t *p_j2k,
+                 l_tccp->stepsizes[l_band_no].mant = 0;
+             }
+         }
++
++        if (*p_header_size < l_num_band) {
++            return OPJ_FALSE;
++        }
+         *p_header_size = *p_header_size - l_num_band;
+     } else {
+         for (l_band_no = 0; l_band_no < l_num_band; l_band_no++) {
+@@ -11088,6 +11118,10 @@ static OPJ_BOOL opj_j2k_read_SQcd_SQcc(opj_j2k_t *p_j2k,
+                 l_tccp->stepsizes[l_band_no].mant = l_tmp & 0x7ff;
+             }
+         }
++
++        if (*p_header_size < 2 * l_num_band) {
++            return OPJ_FALSE;
++        }
+         *p_header_size = *p_header_size - 2 * l_num_band;
+     }
+ 
+@@ -11315,9 +11349,12 @@ static void opj_j2k_dump_MH_info(opj_j2k_t* p_j2k, FILE* out_stream)
+ 
+     fprintf(out_stream, "Codestream info from main header: {\n");
+ 
+-    fprintf(out_stream, "\t tx0=%d, ty0=%d\n", p_j2k->m_cp.tx0, p_j2k->m_cp.ty0);
+-    fprintf(out_stream, "\t tdx=%d, tdy=%d\n", p_j2k->m_cp.tdx, p_j2k->m_cp.tdy);
+-    fprintf(out_stream, "\t tw=%d, th=%d\n", p_j2k->m_cp.tw, p_j2k->m_cp.th);
++    fprintf(out_stream, "\t tx0=%" PRIu32 ", ty0=%" PRIu32 "\n", p_j2k->m_cp.tx0,
++            p_j2k->m_cp.ty0);
++    fprintf(out_stream, "\t tdx=%" PRIu32 ", tdy=%" PRIu32 "\n", p_j2k->m_cp.tdx,
++            p_j2k->m_cp.tdy);
++    fprintf(out_stream, "\t tw=%" PRIu32 ", th=%" PRIu32 "\n", p_j2k->m_cp.tw,
++            p_j2k->m_cp.th);
+     opj_j2k_dump_tile_info(p_j2k->m_specific_param.m_decoder.m_default_tcp,
+                            (OPJ_INT32)p_j2k->m_private_image->numcomps, out_stream);
+     fprintf(out_stream, "}\n");
+@@ -11947,7 +11984,7 @@ static OPJ_BOOL opj_j2k_move_data_from_codec_to_output_image(opj_j2k_t * p_j2k,
+             p_image->comps[compno].data = p_j2k->m_output_image->comps[compno].data;
+ #if 0
+             char fn[256];
+-            sprintf(fn, "/tmp/%d.raw", compno);
++            snprintf(fn, sizeof fn, "/tmp/%d.raw", compno);
+             FILE *debug = fopen(fn, "wb");
+             fwrite(p_image->comps[compno].data, sizeof(OPJ_INT32),
+                    p_image->comps[compno].w * p_image->comps[compno].h, debug);
+@@ -12073,10 +12110,8 @@ OPJ_BOOL opj_j2k_get_tile(opj_j2k_t *p_j2k,
+ 
+         l_img_comp->factor = p_j2k->m_private_image->comps[compno].factor;
+ 
+-        l_img_comp->x0 = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)p_image->x0,
+-                         (OPJ_INT32)l_img_comp->dx);
+-        l_img_comp->y0 = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)p_image->y0,
+-                         (OPJ_INT32)l_img_comp->dy);
++        l_img_comp->x0 = opj_uint_ceildiv(p_image->x0, l_img_comp->dx);
++        l_img_comp->y0 = opj_uint_ceildiv(p_image->y0, l_img_comp->dy);
+         l_comp_x1 = opj_int_ceildiv((OPJ_INT32)p_image->x1, (OPJ_INT32)l_img_comp->dx);
+         l_comp_y1 = opj_int_ceildiv((OPJ_INT32)p_image->y1, (OPJ_INT32)l_img_comp->dy);
+ 
+@@ -12456,12 +12491,9 @@ static void opj_get_tile_dimensions(opj_image_t * l_image,
+ 
+     *l_width  = (OPJ_UINT32)(l_tilec->x1 - l_tilec->x0);
+     *l_height = (OPJ_UINT32)(l_tilec->y1 - l_tilec->y0);
+-    *l_offset_x = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)l_image->x0,
+-                  (OPJ_INT32)l_img_comp->dx);
+-    *l_offset_y = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)l_image->y0,
+-                  (OPJ_INT32)l_img_comp->dy);
+-    *l_image_width = (OPJ_UINT32)opj_int_ceildiv((OPJ_INT32)l_image->x1 -
+-                     (OPJ_INT32)l_image->x0, (OPJ_INT32)l_img_comp->dx);
++    *l_offset_x = opj_uint_ceildiv(l_image->x0, l_img_comp->dx);
++    *l_offset_y = opj_uint_ceildiv(l_image->y0, l_img_comp->dy);
++    *l_image_width = opj_uint_ceildiv(l_image->x1 - l_image->x0, l_img_comp->dx);
+     *l_stride = *l_image_width - *l_width;
+     *l_tile_offset = ((OPJ_UINT32)l_tilec->x0 - *l_offset_x) + ((
+                          OPJ_UINT32)l_tilec->y0 - *l_offset_y) * *l_image_width;
+diff --git a/3rdparty/openjpeg/openjp2/j2k.h b/3rdparty/openjpeg/openjp2/j2k.h
+index 04fba645affe..e0b9688a353f 100644
+--- a/3rdparty/openjpeg/openjp2/j2k.h
++++ b/3rdparty/openjpeg/openjp2/j2k.h
+@@ -113,6 +113,9 @@ The functions in J2K.C have for goal to read/write the several parts of the code
+ 
+ #define J2K_MAX_POCS    32      /**< Maximum number of POCs */
+ 
++#define J2K_TCD_MATRIX_MAX_LAYER_COUNT 10
++#define J2K_TCD_MATRIX_MAX_RESOLUTION_COUNT 10
++
+ /* ----------------------------------------------------------------------- */
+ 
+ /**
+@@ -272,7 +275,7 @@ typedef struct opj_tcp {
+     OPJ_UINT32 ppt_data_size;
+     /** size of ppt_data*/
+     OPJ_UINT32 ppt_len;
+-    /** add fixed_quality */
++    /** PSNR values */
+     OPJ_FLOAT32 distoratio[100];
+     /** tile-component coding parameters */
+     opj_tccp_t *tccps;
+@@ -314,6 +317,14 @@ typedef struct opj_tcp {
+ } opj_tcp_t;
+ 
+ 
++/**
++Rate allocation strategy
++*/
++typedef enum {
++    RATE_DISTORTION_RATIO = 0,    /** allocation by rate/distortion */
++    FIXED_DISTORTION_RATIO = 1,   /** allocation by fixed distortion ratio (PSNR) (fixed quality) */
++    FIXED_LAYER = 2,              /** allocation by fixed layer (number of passes per layer / resolution / subband) */
++} J2K_QUALITY_LAYER_ALLOCATION_STRATEGY;
+ 
+ 
+ typedef struct opj_encoding_param {
+@@ -325,12 +336,8 @@ typedef struct opj_encoding_param {
+     OPJ_INT32 *m_matrice;
+     /** Flag determining tile part generation*/
+     OPJ_BYTE m_tp_flag;
+-    /** allocation by rate/distortion */
+-    OPJ_BITFIELD m_disto_alloc : 1;
+-    /** allocation by fixed layer */
+-    OPJ_BITFIELD m_fixed_alloc : 1;
+-    /** add fixed_quality */
+-    OPJ_BITFIELD m_fixed_quality : 1;
++    /** Quality layer allocation strategy */
++    J2K_QUALITY_LAYER_ALLOCATION_STRATEGY m_quality_layer_alloc_strategy;
+     /** Enabling Tile part generation*/
+     OPJ_BITFIELD m_tp_on : 1;
+ }
+diff --git a/3rdparty/openjpeg/openjp2/jp2.c b/3rdparty/openjpeg/openjp2/jp2.c
+index 17572195e391..6015190e1f5b 100644
+--- a/3rdparty/openjpeg/openjp2/jp2.c
++++ b/3rdparty/openjpeg/openjp2/jp2.c
+@@ -1108,7 +1108,7 @@ static OPJ_BOOL opj_jp2_apply_pclr(opj_image_t *image,
+         pcol = cmap[i].pcol;
+         src = old_comps[cmp].data;
+         assert(src); /* verified above */
+-        max = new_comps[pcol].w * new_comps[pcol].h;
++        max = new_comps[i].w * new_comps[i].h;
+ 
+         /* Direct use: */
+         if (cmap[i].mtyp == 0) {
+@@ -1594,22 +1594,10 @@ static OPJ_BOOL opj_jp2_read_colr(opj_jp2_t *jp2,
+     return OPJ_TRUE;
+ }
+ 
+-OPJ_BOOL opj_jp2_decode(opj_jp2_t *jp2,
+-                        opj_stream_private_t *p_stream,
+-                        opj_image_t* p_image,
+-                        opj_event_mgr_t * p_manager)
++static OPJ_BOOL opj_jp2_apply_color_postprocessing(opj_jp2_t *jp2,
++        opj_image_t* p_image,
++        opj_event_mgr_t * p_manager)
+ {
+-    if (!p_image) {
+-        return OPJ_FALSE;
+-    }
+-
+-    /* J2K decoding */
+-    if (! opj_j2k_decode(jp2->j2k, p_stream, p_image, p_manager)) {
+-        opj_event_msg(p_manager, EVT_ERROR,
+-                      "Failed to decode the codestream in the JP2 file\n");
+-        return OPJ_FALSE;
+-    }
+-
+     if (jp2->j2k->m_specific_param.m_decoder.m_numcomps_to_decode) {
+         /* Bypass all JP2 component transforms */
+         return OPJ_TRUE;
+@@ -1620,21 +1608,6 @@ OPJ_BOOL opj_jp2_decode(opj_jp2_t *jp2,
+             return OPJ_FALSE;
+         }
+ 
+-        /* Set Image Color Space */
+-        if (jp2->enumcs == 16) {
+-            p_image->color_space = OPJ_CLRSPC_SRGB;
+-        } else if (jp2->enumcs == 17) {
+-            p_image->color_space = OPJ_CLRSPC_GRAY;
+-        } else if (jp2->enumcs == 18) {
+-            p_image->color_space = OPJ_CLRSPC_SYCC;
+-        } else if (jp2->enumcs == 24) {
+-            p_image->color_space = OPJ_CLRSPC_EYCC;
+-        } else if (jp2->enumcs == 12) {
+-            p_image->color_space = OPJ_CLRSPC_CMYK;
+-        } else {
+-            p_image->color_space = OPJ_CLRSPC_UNKNOWN;
+-        }
+-
+         if (jp2->color.jp2_pclr) {
+             /* Part 1, I.5.3.4: Either both or none : */
+             if (!jp2->color.jp2_pclr->cmap) {
+@@ -1650,17 +1623,30 @@ OPJ_BOOL opj_jp2_decode(opj_jp2_t *jp2,
+         if (jp2->color.jp2_cdef) {
+             opj_jp2_apply_cdef(p_image, &(jp2->color), p_manager);
+         }
+-
+-        if (jp2->color.icc_profile_buf) {
+-            p_image->icc_profile_buf = jp2->color.icc_profile_buf;
+-            p_image->icc_profile_len = jp2->color.icc_profile_len;
+-            jp2->color.icc_profile_buf = NULL;
+-        }
+     }
+ 
+     return OPJ_TRUE;
+ }
+ 
++OPJ_BOOL opj_jp2_decode(opj_jp2_t *jp2,
++                        opj_stream_private_t *p_stream,
++                        opj_image_t* p_image,
++                        opj_event_mgr_t * p_manager)
++{
++    if (!p_image) {
++        return OPJ_FALSE;
++    }
++
++    /* J2K decoding */
++    if (! opj_j2k_decode(jp2->j2k, p_stream, p_image, p_manager)) {
++        opj_event_msg(p_manager, EVT_ERROR,
++                      "Failed to decode the codestream in the JP2 file\n");
++        return OPJ_FALSE;
++    }
++
++    return opj_jp2_apply_color_postprocessing(jp2, p_image, p_manager);
++}
++
+ static OPJ_BOOL opj_jp2_write_jp2h(opj_jp2_t *jp2,
+                                    opj_stream_private_t *stream,
+                                    opj_event_mgr_t * p_manager
+@@ -2843,6 +2829,8 @@ OPJ_BOOL opj_jp2_read_header(opj_stream_private_t *p_stream,
+                              opj_event_mgr_t * p_manager
+                             )
+ {
++    int ret;
++
+     /* preconditions */
+     assert(jp2 != 00);
+     assert(p_stream != 00);
+@@ -2876,10 +2864,34 @@ OPJ_BOOL opj_jp2_read_header(opj_stream_private_t *p_stream,
+         return OPJ_FALSE;
+     }
+ 
+-    return opj_j2k_read_header(p_stream,
+-                               jp2->j2k,
+-                               p_image,
+-                               p_manager);
++    ret = opj_j2k_read_header(p_stream,
++                              jp2->j2k,
++                              p_image,
++                              p_manager);
++
++    if (p_image && *p_image) {
++        /* Set Image Color Space */
++        if (jp2->enumcs == 16) {
++            (*p_image)->color_space = OPJ_CLRSPC_SRGB;
++        } else if (jp2->enumcs == 17) {
++            (*p_image)->color_space = OPJ_CLRSPC_GRAY;
++        } else if (jp2->enumcs == 18) {
++            (*p_image)->color_space = OPJ_CLRSPC_SYCC;
++        } else if (jp2->enumcs == 24) {
++            (*p_image)->color_space = OPJ_CLRSPC_EYCC;
++        } else if (jp2->enumcs == 12) {
++            (*p_image)->color_space = OPJ_CLRSPC_CMYK;
++        } else {
++            (*p_image)->color_space = OPJ_CLRSPC_UNKNOWN;
++        }
++
++        if (jp2->color.icc_profile_buf) {
++            (*p_image)->icc_profile_buf = jp2->color.icc_profile_buf;
++            (*p_image)->icc_profile_len = jp2->color.icc_profile_len;
++            jp2->color.icc_profile_buf = NULL;
++        }
++    }
++    return ret;
+ }
+ 
+ static OPJ_BOOL opj_jp2_setup_encoding_validation(opj_jp2_t *jp2,
+@@ -3123,53 +3135,7 @@ OPJ_BOOL opj_jp2_get_tile(opj_jp2_t *p_jp2,
+         return OPJ_FALSE;
+     }
+ 
+-    if (p_jp2->j2k->m_specific_param.m_decoder.m_numcomps_to_decode) {
+-        /* Bypass all JP2 component transforms */
+-        return OPJ_TRUE;
+-    }
+-
+-    if (!opj_jp2_check_color(p_image, &(p_jp2->color), p_manager)) {
+-        return OPJ_FALSE;
+-    }
+-
+-    /* Set Image Color Space */
+-    if (p_jp2->enumcs == 16) {
+-        p_image->color_space = OPJ_CLRSPC_SRGB;
+-    } else if (p_jp2->enumcs == 17) {
+-        p_image->color_space = OPJ_CLRSPC_GRAY;
+-    } else if (p_jp2->enumcs == 18) {
+-        p_image->color_space = OPJ_CLRSPC_SYCC;
+-    } else if (p_jp2->enumcs == 24) {
+-        p_image->color_space = OPJ_CLRSPC_EYCC;
+-    } else if (p_jp2->enumcs == 12) {
+-        p_image->color_space = OPJ_CLRSPC_CMYK;
+-    } else {
+-        p_image->color_space = OPJ_CLRSPC_UNKNOWN;
+-    }
+-
+-    if (p_jp2->color.jp2_pclr) {
+-        /* Part 1, I.5.3.4: Either both or none : */
+-        if (!p_jp2->color.jp2_pclr->cmap) {
+-            opj_jp2_free_pclr(&(p_jp2->color));
+-        } else {
+-            if (!opj_jp2_apply_pclr(p_image, &(p_jp2->color), p_manager)) {
+-                return OPJ_FALSE;
+-            }
+-        }
+-    }
+-
+-    /* Apply the color space if needed */
+-    if (p_jp2->color.jp2_cdef) {
+-        opj_jp2_apply_cdef(p_image, &(p_jp2->color), p_manager);
+-    }
+-
+-    if (p_jp2->color.icc_profile_buf) {
+-        p_image->icc_profile_buf = p_jp2->color.icc_profile_buf;
+-        p_image->icc_profile_len = p_jp2->color.icc_profile_len;
+-        p_jp2->color.icc_profile_buf = NULL;
+-    }
+-
+-    return OPJ_TRUE;
++    return opj_jp2_apply_color_postprocessing(p_jp2, p_image, p_manager);
+ }
+ 
+ /* ----------------------------------------------------------------------- */
+diff --git a/3rdparty/openjpeg/openjp2/libopenjp2.pc.cmake.in b/3rdparty/openjpeg/openjp2/libopenjp2.pc.cmake.in
+index 62159b00a4b1..2ade312b2948 100644
+--- a/3rdparty/openjpeg/openjp2/libopenjp2.pc.cmake.in
++++ b/3rdparty/openjpeg/openjp2/libopenjp2.pc.cmake.in
+@@ -1,9 +1,9 @@
+ prefix=@CMAKE_INSTALL_PREFIX@
+-bindir=${prefix}/@OPENJPEG_INSTALL_BIN_DIR@
+-mandir=${prefix}/@OPENJPEG_INSTALL_MAN_DIR@
+-docdir=${prefix}/@OPENJPEG_INSTALL_DOC_DIR@
+-libdir=${prefix}/@OPENJPEG_INSTALL_LIB_DIR@
+-includedir=${prefix}/@OPENJPEG_INSTALL_INCLUDE_DIR@
++bindir=@bindir@
++mandir=@mandir@
++docdir=@docdir@
++libdir=@libdir@
++includedir=@includedir@
+ 
+ Name: openjp2
+ Description: JPEG2000 library (Part 1 and 2)
+@@ -12,3 +12,4 @@ Version: @OPENJPEG_VERSION@
+ Libs: -L${libdir} -lopenjp2
+ Libs.private: -lm
+ Cflags: -I${includedir}
++Cflags.private: -DOPJ_STATIC
+diff --git a/3rdparty/openjpeg/openjp2/openjpeg.c b/3rdparty/openjpeg/openjp2/openjpeg.c
+index 29d3ee528ccc..382d8f4f0f12 100644
+--- a/3rdparty/openjpeg/openjp2/openjpeg.c
++++ b/3rdparty/openjpeg/openjp2/openjpeg.c
+@@ -144,6 +144,11 @@ static void opj_close_from_file(void* p_user_data)
+ /* ---------------------------------------------------------------------- */
+ #ifdef _WIN32
+ #ifndef OPJ_STATIC
++
++/* declaration to avoid warning: no previous prototype for 'DllMain' */
++BOOL APIENTRY
++DllMain(HINSTANCE hModule, DWORD ul_reason_for_call, LPVOID lpReserved);
++
+ BOOL APIENTRY
+ DllMain(HINSTANCE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+ {
+@@ -433,7 +438,7 @@ OPJ_BOOL OPJ_CALLCONV opj_setup_decoder(opj_codec_t *p_codec,
+     return OPJ_FALSE;
+ }
+ 
+-OPJ_API OPJ_BOOL OPJ_CALLCONV opj_decoder_set_strict_mode(opj_codec_t *p_codec,
++OPJ_BOOL OPJ_CALLCONV opj_decoder_set_strict_mode(opj_codec_t *p_codec,
+         OPJ_BOOL strict)
+ {
+     if (p_codec) {
+diff --git a/3rdparty/openjpeg/openjp2/openjpeg.h b/3rdparty/openjpeg/openjp2/openjpeg.h
+index ebce53db0d82..67d168bb5785 100644
+--- a/3rdparty/openjpeg/openjp2/openjpeg.h
++++ b/3rdparty/openjpeg/openjp2/openjpeg.h
+@@ -122,7 +122,7 @@ typedef float         OPJ_FLOAT32;
+ typedef double        OPJ_FLOAT64;
+ typedef unsigned char OPJ_BYTE;
+ 
+-#include "opj_stdint.h"
++#include <stdint.h>
+ 
+ typedef int8_t   OPJ_INT8;
+ typedef uint8_t  OPJ_UINT8;
+@@ -138,6 +138,8 @@ typedef int64_t  OPJ_OFF_T; /* 64-bit file offset type */
+ #include <stdio.h>
+ typedef size_t   OPJ_SIZE_T;
+ 
++#include "opj_config.h"
++
+ /* Avoid compile-time warning because parameter is not used */
+ #define OPJ_ARG_NOT_USED(x) (void)(x)
+ 
+@@ -405,7 +407,7 @@ typedef struct opj_cparameters {
+     int cp_disto_alloc;
+     /** allocation by fixed layer */
+     int cp_fixed_alloc;
+-    /** add fixed_quality */
++    /** allocation by fixed quality (PSNR) */
+     int cp_fixed_quality;
+     /** fixed layer */
+     int *cp_matrice;
+@@ -829,9 +831,9 @@ typedef struct opj_tile_info {
+     int pdy[33];
+     /** information concerning packets inside tile */
+     opj_packet_info_t *packet;
+-    /** add fixed_quality */
++    /** number of pixels of the tile */
+     int numpix;
+-    /** add fixed_quality */
++    /** distortion of the tile */
+     double distotile;
+     /** number of markers */
+     int marknum;
+diff --git a/3rdparty/openjpeg/openjp2/opj_config.h.cmake.in b/3rdparty/openjpeg/openjp2/opj_config.h.cmake.in
+index 5f762ca3daa9..64884b65248d 100644
+--- a/3rdparty/openjpeg/openjp2/opj_config.h.cmake.in
++++ b/3rdparty/openjpeg/openjp2/opj_config.h.cmake.in
+@@ -1,5 +1,7 @@
++#ifndef OPJ_CONFIG_H_INCLUDED
++#define OPJ_CONFIG_H_INCLUDED
++
+ /* create opj_config.h for CMake */
+-#cmakedefine OPJ_HAVE_STDINT_H 		@OPJ_HAVE_STDINT_H@
+ 
+ /*--------------------------------------------------------------------------*/
+ /* OpenJPEG Versioning                                                      */
+@@ -8,3 +10,5 @@
+ #define OPJ_VERSION_MAJOR @OPENJPEG_VERSION_MAJOR@
+ #define OPJ_VERSION_MINOR @OPENJPEG_VERSION_MINOR@
+ #define OPJ_VERSION_BUILD @OPENJPEG_VERSION_BUILD@
++
++#endif
+diff --git a/3rdparty/openjpeg/openjp2/opj_config_private.h.cmake.in b/3rdparty/openjpeg/openjp2/opj_config_private.h.cmake.in
+index c41f9066242d..c559282c578b 100644
+--- a/3rdparty/openjpeg/openjp2/opj_config_private.h.cmake.in
++++ b/3rdparty/openjpeg/openjp2/opj_config_private.h.cmake.in
+@@ -1,5 +1,4 @@
+ /* create opj_config_private.h for CMake */
+-#cmakedefine OPJ_HAVE_INTTYPES_H 	@OPJ_HAVE_INTTYPES_H@
+ 
+ #define OPJ_PACKAGE_VERSION "@PACKAGE_VERSION@"
+ 
+@@ -11,6 +10,8 @@
+ /*#cmakedefine HAVE_SYS_STAT_H @HAVE_SYS_STAT_H@*/
+ /*#cmakedefine HAVE_SYS_TYPES_H @HAVE_SYS_TYPES_H@ */
+ /*#cmakedefine HAVE_UNISTD_H @HAVE_UNISTD_H@*/
++/*#cmakedefine HAVE_INTTYPES_H @HAVE_INTTYPES_H@ */
++/*#cmakedefine HAVE_STDINT_H @HAVE_STDINT_H@ */
+ 
+ #cmakedefine _LARGEFILE_SOURCE
+ #cmakedefine _LARGE_FILES
+diff --git a/3rdparty/openjpeg/openjp2/opj_includes.h b/3rdparty/openjpeg/openjp2/opj_includes.h
+index 0a8628c96b30..13613ce521c1 100644
+--- a/3rdparty/openjpeg/openjp2/opj_includes.h
++++ b/3rdparty/openjpeg/openjp2/opj_includes.h
+@@ -55,6 +55,8 @@
+ #include <ctype.h>
+ #include <assert.h>
+ #include <limits.h>
++#include <stdint.h>
++#include <inttypes.h>
+ 
+ /*
+   Use fseeko() and ftello() if they are available since they use
+@@ -218,7 +220,6 @@ typedef unsigned int OPJ_BITFIELD;
+ 
+ #define OPJ_UNUSED(x) (void)x
+ 
+-#include "opj_inttypes.h"
+ #include "opj_clock.h"
+ #include "opj_malloc.h"
+ #include "event.h"
+diff --git a/3rdparty/openjpeg/openjp2/opj_intmath.h b/3rdparty/openjpeg/openjp2/opj_intmath.h
+index 1b0c9d033283..cce7a3cafa72 100644
+--- a/3rdparty/openjpeg/openjp2/opj_intmath.h
++++ b/3rdparty/openjpeg/openjp2/opj_intmath.h
+@@ -173,6 +173,17 @@ static INLINE OPJ_UINT32  opj_uint_ceildiv(OPJ_UINT32  a, OPJ_UINT32  b)
+     return (OPJ_UINT32)(((OPJ_UINT64)a + b - 1) / b);
+ }
+ 
++/**
++Divide an integer and round upwards
++@return Returns a divided by b
++*/
++static INLINE OPJ_UINT32  opj_uint64_ceildiv_res_uint32(OPJ_UINT64 a,
++        OPJ_UINT64 b)
++{
++    assert(b);
++    return (OPJ_UINT32)((a + b - 1) / b);
++}
++
+ /**
+ Divide an integer by a power of 2 and round upwards
+ @return Returns a divided by 2^b
+diff --git a/3rdparty/openjpeg/openjp2/pi.c b/3rdparty/openjpeg/openjp2/pi.c
+index 38f1ba5a70f3..15ac331425d9 100644
+--- a/3rdparty/openjpeg/openjp2/pi.c
++++ b/3rdparty/openjpeg/openjp2/pi.c
+@@ -411,41 +411,37 @@ static OPJ_BOOL opj_pi_next_rpcl(opj_pi_iterator_t * pi)
+                     }
+                     res = &comp->resolutions[pi->resno];
+                     levelno = comp->numresolutions - 1 - pi->resno;
+-                    /* Avoids division by zero */
+-                    /* Relates to id_000004,sig_06,src_000679,op_arith8,pos_49,val_-17 */
+-                    /* of  https://github.com/uclouvain/openjpeg/issues/938 */
+-                    if (levelno >= 32 ||
+-                            ((comp->dx << levelno) >> levelno) != comp->dx ||
+-                            ((comp->dy << levelno) >> levelno) != comp->dy) {
+-                        continue;
+-                    }
+-                    if ((comp->dx << levelno) > INT_MAX ||
+-                            (comp->dy << levelno) > INT_MAX) {
++
++                    if ((OPJ_UINT32)(((OPJ_UINT64)comp->dx << levelno) >> levelno) != comp->dx ||
++                            (OPJ_UINT32)(((OPJ_UINT64)comp->dy << levelno) >> levelno) != comp->dy) {
+                         continue;
+                     }
+-                    trx0 = opj_uint_ceildiv(pi->tx0, (comp->dx << levelno));
+-                    try0 = opj_uint_ceildiv(pi->ty0, (comp->dy << levelno));
+-                    trx1 = opj_uint_ceildiv(pi->tx1, (comp->dx << levelno));
+-                    try1 = opj_uint_ceildiv(pi->ty1, (comp->dy << levelno));
++
++                    trx0 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->tx0,
++                                                         ((OPJ_UINT64)comp->dx << levelno));
++                    try0 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->ty0,
++                                                         ((OPJ_UINT64)comp->dy << levelno));
++                    trx1 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->tx1,
++                                                         ((OPJ_UINT64)comp->dx << levelno));
++                    try1 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->ty1,
++                                                         ((OPJ_UINT64)comp->dy << levelno));
+                     rpx = res->pdx + levelno;
+                     rpy = res->pdy + levelno;
+ 
+-                    /* To avoid divisions by zero / undefined behaviour on shift */
+-                    /* in below tests */
+-                    /* Fixes reading id:000026,sig:08,src:002419,op:int32,pos:60,val:+32 */
+-                    /* of https://github.com/uclouvain/openjpeg/issues/938 */
+-                    if (rpx >= 31 || ((comp->dx << rpx) >> rpx) != comp->dx ||
+-                            rpy >= 31 || ((comp->dy << rpy) >> rpy) != comp->dy) {
++                    if ((OPJ_UINT32)(((OPJ_UINT64)comp->dx << rpx) >> rpx) != comp->dx ||
++                            (OPJ_UINT32)(((OPJ_UINT64)comp->dy << rpy) >> rpy) != comp->dy) {
+                         continue;
+                     }
+ 
+                     /* See ISO-15441. B.12.1.3 Resolution level-position-component-layer progression */
+-                    if (!((pi->y % (comp->dy << rpy) == 0) || ((pi->y == pi->ty0) &&
+-                            ((try0 << levelno) % (1U << rpy))))) {
++                    if (!(((OPJ_UINT64)pi->y % ((OPJ_UINT64)comp->dy << rpy) == 0) ||
++                            ((pi->y == pi->ty0) &&
++                             (((OPJ_UINT64)try0 << levelno) % ((OPJ_UINT64)1U << rpy))))) {
+                         continue;
+                     }
+-                    if (!((pi->x % (comp->dx << rpx) == 0) || ((pi->x == pi->tx0) &&
+-                            ((trx0 << levelno) % (1U << rpx))))) {
++                    if (!(((OPJ_UINT64)pi->x % ((OPJ_UINT64)comp->dx << rpx) == 0) ||
++                            ((pi->x == pi->tx0) &&
++                             (((OPJ_UINT64)trx0 << levelno) % ((OPJ_UINT64)1U << rpx))))) {
+                         continue;
+                     }
+ 
+@@ -457,11 +453,11 @@ static OPJ_BOOL opj_pi_next_rpcl(opj_pi_iterator_t * pi)
+                         continue;
+                     }
+ 
+-                    prci = opj_uint_floordivpow2(opj_uint_ceildiv(pi->x,
+-                                                 (comp->dx << levelno)), res->pdx)
++                    prci = opj_uint_floordivpow2(opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->x,
++                                                 ((OPJ_UINT64)comp->dx << levelno)), res->pdx)
+                            - opj_uint_floordivpow2(trx0, res->pdx);
+-                    prcj = opj_uint_floordivpow2(opj_uint_ceildiv(pi->y,
+-                                                 (comp->dy << levelno)), res->pdy)
++                    prcj = opj_uint_floordivpow2(opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->y,
++                                                 ((OPJ_UINT64)comp->dy << levelno)), res->pdy)
+                            - opj_uint_floordivpow2(try0, res->pdy);
+                     pi->precno = prci + prcj * res->pw;
+                     for (pi->layno = pi->poc.layno0; pi->layno < pi->poc.layno1; pi->layno++) {
+@@ -549,41 +545,37 @@ static OPJ_BOOL opj_pi_next_pcrl(opj_pi_iterator_t * pi)
+                     OPJ_UINT32 prci, prcj;
+                     res = &comp->resolutions[pi->resno];
+                     levelno = comp->numresolutions - 1 - pi->resno;
+-                    /* Avoids division by zero */
+-                    /* Relates to id_000004,sig_06,src_000679,op_arith8,pos_49,val_-17 */
+-                    /* of  https://github.com/uclouvain/openjpeg/issues/938 */
+-                    if (levelno >= 32 ||
+-                            ((comp->dx << levelno) >> levelno) != comp->dx ||
+-                            ((comp->dy << levelno) >> levelno) != comp->dy) {
+-                        continue;
+-                    }
+-                    if ((comp->dx << levelno) > INT_MAX ||
+-                            (comp->dy << levelno) > INT_MAX) {
++
++                    if ((OPJ_UINT32)(((OPJ_UINT64)comp->dx << levelno) >> levelno) != comp->dx ||
++                            (OPJ_UINT32)(((OPJ_UINT64)comp->dy << levelno) >> levelno) != comp->dy) {
+                         continue;
+                     }
+-                    trx0 = opj_uint_ceildiv(pi->tx0, (comp->dx << levelno));
+-                    try0 = opj_uint_ceildiv(pi->ty0, (comp->dy << levelno));
+-                    trx1 = opj_uint_ceildiv(pi->tx1, (comp->dx << levelno));
+-                    try1 = opj_uint_ceildiv(pi->ty1, (comp->dy << levelno));
++
++                    trx0 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->tx0,
++                                                         ((OPJ_UINT64)comp->dx << levelno));
++                    try0 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->ty0,
++                                                         ((OPJ_UINT64)comp->dy << levelno));
++                    trx1 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->tx1,
++                                                         ((OPJ_UINT64)comp->dx << levelno));
++                    try1 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->ty1,
++                                                         ((OPJ_UINT64)comp->dy << levelno));
+                     rpx = res->pdx + levelno;
+                     rpy = res->pdy + levelno;
+ 
+-                    /* To avoid divisions by zero / undefined behaviour on shift */
+-                    /* in below tests */
+-                    /* Relates to id:000019,sig:08,src:001098,op:flip1,pos:49 */
+-                    /* of https://github.com/uclouvain/openjpeg/issues/938 */
+-                    if (rpx >= 31 || ((comp->dx << rpx) >> rpx) != comp->dx ||
+-                            rpy >= 31 || ((comp->dy << rpy) >> rpy) != comp->dy) {
++                    if ((OPJ_UINT32)(((OPJ_UINT64)comp->dx << rpx) >> rpx) != comp->dx ||
++                            (OPJ_UINT32)(((OPJ_UINT64)comp->dy << rpy) >> rpy) != comp->dy) {
+                         continue;
+                     }
+ 
+                     /* See ISO-15441. B.12.1.4 Position-component-resolution level-layer progression */
+-                    if (!((pi->y % (comp->dy << rpy) == 0) || ((pi->y == pi->ty0) &&
+-                            ((try0 << levelno) % (1U << rpy))))) {
++                    if (!(((OPJ_UINT64)pi->y % ((OPJ_UINT64)comp->dy << rpy) == 0) ||
++                            ((pi->y == pi->ty0) &&
++                             (((OPJ_UINT64)try0 << levelno) % ((OPJ_UINT64)1U << rpy))))) {
+                         continue;
+                     }
+-                    if (!((pi->x % (comp->dx << rpx) == 0) || ((pi->x == pi->tx0) &&
+-                            ((trx0 << levelno) % (1U << rpx))))) {
++                    if (!(((OPJ_UINT64)pi->x % ((OPJ_UINT64)comp->dx << rpx) == 0) ||
++                            ((pi->x == pi->tx0) &&
++                             (((OPJ_UINT64)trx0 << levelno) % ((OPJ_UINT64)1U << rpx))))) {
+                         continue;
+                     }
+ 
+@@ -595,11 +587,11 @@ static OPJ_BOOL opj_pi_next_pcrl(opj_pi_iterator_t * pi)
+                         continue;
+                     }
+ 
+-                    prci = opj_uint_floordivpow2(opj_uint_ceildiv(pi->x,
+-                                                 (comp->dx << levelno)), res->pdx)
++                    prci = opj_uint_floordivpow2(opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->x,
++                                                 ((OPJ_UINT64)comp->dx << levelno)), res->pdx)
+                            - opj_uint_floordivpow2(trx0, res->pdx);
+-                    prcj = opj_uint_floordivpow2(opj_uint_ceildiv(pi->y,
+-                                                 (comp->dy << levelno)), res->pdy)
++                    prcj = opj_uint_floordivpow2(opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->y,
++                                                 ((OPJ_UINT64)comp->dy << levelno)), res->pdy)
+                            - opj_uint_floordivpow2(try0, res->pdy);
+                     pi->precno = prci + prcj * res->pw;
+                     for (pi->layno = pi->poc.layno0; pi->layno < pi->poc.layno1; pi->layno++) {
+@@ -685,40 +677,37 @@ static OPJ_BOOL opj_pi_next_cprl(opj_pi_iterator_t * pi)
+                     OPJ_UINT32 prci, prcj;
+                     res = &comp->resolutions[pi->resno];
+                     levelno = comp->numresolutions - 1 - pi->resno;
+-                    /* Avoids division by zero on id_000004,sig_06,src_000679,op_arith8,pos_49,val_-17 */
+-                    /* of  https://github.com/uclouvain/openjpeg/issues/938 */
+-                    if (levelno >= 32 ||
+-                            ((comp->dx << levelno) >> levelno) != comp->dx ||
+-                            ((comp->dy << levelno) >> levelno) != comp->dy) {
+-                        continue;
+-                    }
+-                    if ((comp->dx << levelno) > INT_MAX ||
+-                            (comp->dy << levelno) > INT_MAX) {
++
++                    if ((OPJ_UINT32)(((OPJ_UINT64)comp->dx << levelno) >> levelno) != comp->dx ||
++                            (OPJ_UINT32)(((OPJ_UINT64)comp->dy << levelno) >> levelno) != comp->dy) {
+                         continue;
+                     }
+-                    trx0 = opj_uint_ceildiv(pi->tx0, (comp->dx << levelno));
+-                    try0 = opj_uint_ceildiv(pi->ty0, (comp->dy << levelno));
+-                    trx1 = opj_uint_ceildiv(pi->tx1, (comp->dx << levelno));
+-                    try1 = opj_uint_ceildiv(pi->ty1, (comp->dy << levelno));
++
++                    trx0 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->tx0,
++                                                         ((OPJ_UINT64)comp->dx << levelno));
++                    try0 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->ty0,
++                                                         ((OPJ_UINT64)comp->dy << levelno));
++                    trx1 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->tx1,
++                                                         ((OPJ_UINT64)comp->dx << levelno));
++                    try1 = opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->ty1,
++                                                         ((OPJ_UINT64)comp->dy << levelno));
+                     rpx = res->pdx + levelno;
+                     rpy = res->pdy + levelno;
+ 
+-                    /* To avoid divisions by zero / undefined behaviour on shift */
+-                    /* in below tests */
+-                    /* Fixes reading id:000019,sig:08,src:001098,op:flip1,pos:49 */
+-                    /* of https://github.com/uclouvain/openjpeg/issues/938 */
+-                    if (rpx >= 31 || ((comp->dx << rpx) >> rpx) != comp->dx ||
+-                            rpy >= 31 || ((comp->dy << rpy) >> rpy) != comp->dy) {
++                    if ((OPJ_UINT32)(((OPJ_UINT64)comp->dx << rpx) >> rpx) != comp->dx ||
++                            (OPJ_UINT32)(((OPJ_UINT64)comp->dy << rpy) >> rpy) != comp->dy) {
+                         continue;
+                     }
+ 
+                     /* See ISO-15441. B.12.1.5 Component-position-resolution level-layer progression */
+-                    if (!((pi->y % (comp->dy << rpy) == 0) || ((pi->y == pi->ty0) &&
+-                            ((try0 << levelno) % (1U << rpy))))) {
++                    if (!(((OPJ_UINT64)pi->y % ((OPJ_UINT64)comp->dy << rpy) == 0) ||
++                            ((pi->y == pi->ty0) &&
++                             (((OPJ_UINT64)try0 << levelno) % ((OPJ_UINT64)1U << rpy))))) {
+                         continue;
+                     }
+-                    if (!((pi->x % (comp->dx << rpx) == 0) || ((pi->x == pi->tx0) &&
+-                            ((trx0 << levelno) % (1U << rpx))))) {
++                    if (!(((OPJ_UINT64)pi->x % ((OPJ_UINT64)comp->dx << rpx) == 0) ||
++                            ((pi->x == pi->tx0) &&
++                             (((OPJ_UINT64)trx0 << levelno) % ((OPJ_UINT64)1U << rpx))))) {
+                         continue;
+                     }
+ 
+@@ -730,11 +719,11 @@ static OPJ_BOOL opj_pi_next_cprl(opj_pi_iterator_t * pi)
+                         continue;
+                     }
+ 
+-                    prci = opj_uint_floordivpow2(opj_uint_ceildiv(pi->x,
+-                                                 (comp->dx << levelno)), res->pdx)
++                    prci = opj_uint_floordivpow2(opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->x,
++                                                 ((OPJ_UINT64)comp->dx << levelno)), res->pdx)
+                            - opj_uint_floordivpow2(trx0, res->pdx);
+-                    prcj = opj_uint_floordivpow2(opj_uint_ceildiv(pi->y,
+-                                                 (comp->dy << levelno)), res->pdy)
++                    prcj = opj_uint_floordivpow2(opj_uint64_ceildiv_res_uint32((OPJ_UINT64)pi->y,
++                                                 ((OPJ_UINT64)comp->dy << levelno)), res->pdy)
+                            - opj_uint_floordivpow2(try0, res->pdy);
+                     pi->precno = (OPJ_UINT32)(prci + prcj * res->pw);
+                     for (pi->layno = pi->poc.layno0; pi->layno < pi->poc.layno1; pi->layno++) {
+@@ -837,18 +826,24 @@ static void opj_get_encoding_parameters(const opj_image_t *p_image,
+ 
+         /* use custom size for precincts */
+         for (resno = 0; resno < l_tccp->numresolutions; ++resno) {
+-            OPJ_UINT32 l_dx, l_dy;
++            OPJ_UINT64 l_dx, l_dy;
+ 
+             /* precinct width and height */
+             l_pdx = l_tccp->prcw[resno];
+             l_pdy = l_tccp->prch[resno];
+ 
+-            l_dx = l_img_comp->dx * (1u << (l_pdx + l_tccp->numresolutions - 1 - resno));
+-            l_dy = l_img_comp->dy * (1u << (l_pdy + l_tccp->numresolutions - 1 - resno));
++            l_dx = l_img_comp->dx * ((OPJ_UINT64)1u << (l_pdx + l_tccp->numresolutions - 1 -
++                                     resno));
++            l_dy = l_img_comp->dy * ((OPJ_UINT64)1u << (l_pdy + l_tccp->numresolutions - 1 -
++                                     resno));
+ 
+             /* take the minimum size for dx for each comp and resolution */
+-            *p_dx_min = opj_uint_min(*p_dx_min, l_dx);
+-            *p_dy_min = opj_uint_min(*p_dy_min, l_dy);
++            if (l_dx <= UINT_MAX) {
++                *p_dx_min = opj_uint_min(*p_dx_min, (OPJ_UINT32)l_dx);
++            }
++            if (l_dy <= UINT_MAX) {
++                *p_dy_min = opj_uint_min(*p_dy_min, (OPJ_UINT32)l_dy);
++            }
+ 
+             /* various calculations of extents */
+             l_level_no = l_tccp->numresolutions - 1 - resno;
+diff --git a/3rdparty/openjpeg/openjp2/t1.c b/3rdparty/openjpeg/openjp2/t1.c
+index f5fd233917d2..52e466eb974a 100644
+--- a/3rdparty/openjpeg/openjp2/t1.c
++++ b/3rdparty/openjpeg/openjp2/t1.c
+@@ -1410,7 +1410,6 @@ static void opj_t1_dec_clnpass(
+ }
+ 
+ 
+-/** mod fixed_quality */
+ static OPJ_FLOAT64 opj_t1_getwmsedec(
+     OPJ_INT32 nmsedec,
+     OPJ_UINT32 compno,
+@@ -2313,7 +2312,7 @@ OPJ_BOOL opj_t1_encode_cblks(opj_tcd_t* tcd,
+     OPJ_UINT32 compno, resno, bandno, precno, cblkno;
+     opj_mutex_t* mutex = opj_mutex_create();
+ 
+-    tile->distotile = 0;        /* fixed_quality */
++    tile->distotile = 0;
+ 
+     for (compno = 0; compno < tile->numcomps; ++compno) {
+         opj_tcd_tilecomp_t* tilec = &tile->comps[compno];
+@@ -2401,7 +2400,6 @@ static int opj_t1_enc_is_term_pass(opj_tcd_cblk_enc_t* cblk,
+ }
+ 
+ 
+-/** mod fixed_quality */
+ static OPJ_FLOAT64 opj_t1_encode_cblk(opj_t1_t *t1,
+                                       opj_tcd_cblk_enc_t* cblk,
+                                       OPJ_UINT32 orient,
+@@ -2443,6 +2441,13 @@ static OPJ_FLOAT64 opj_t1_encode_cblk(opj_t1_t *t1,
+             OPJ_INT32 tmp = *datap;
+             if (tmp < 0) {
+                 OPJ_UINT32 tmp_unsigned;
++                if (tmp == INT_MIN) {
++                    /* To avoid undefined behaviour when negating INT_MIN */
++                    /* but if we go here, it means we have supplied an input */
++                    /* with more bit depth than we we can really support. */
++                    /* Cf https://github.com/uclouvain/openjpeg/issues/1432 */
++                    tmp = INT_MIN + 1;
++                }
+                 max = opj_int_max(max, -tmp);
+                 tmp_unsigned = opj_to_smr(tmp);
+                 memcpy(datap, &tmp_unsigned, sizeof(OPJ_INT32));
+@@ -2498,7 +2503,6 @@ static OPJ_FLOAT64 opj_t1_encode_cblk(opj_t1_t *t1,
+             break;
+         }
+ 
+-        /* fixed_quality */
+         tempwmsedec = opj_t1_getwmsedec(nmsedec, compno, level, orient, bpno, qmfbid,
+                                         stepsize, numcomps, mct_norms, mct_numcomps) ;
+         cumwmsedec += tempwmsedec;
+diff --git a/3rdparty/openjpeg/openjp2/t1_ht_generate_luts.c b/3rdparty/openjpeg/openjp2/t1_ht_generate_luts.c
+index 6876e3fd7f0a..22382a5a4af5 100644
+--- a/3rdparty/openjpeg/openjp2/t1_ht_generate_luts.c
++++ b/3rdparty/openjpeg/openjp2/t1_ht_generate_luts.c
+@@ -38,12 +38,7 @@
+ #include <string.h>
+ #include <stdio.h>
+ #include <assert.h>
+-
+-typedef int OPJ_BOOL;
+-#define OPJ_TRUE 1
+-#define OPJ_FALSE 0
+-
+-#include "opj_stdint.h"
++#include <stdint.h>
+ 
+ typedef int8_t   OPJ_INT8;
+ typedef uint8_t  OPJ_UINT8;
+@@ -53,6 +48,9 @@ typedef int32_t  OPJ_INT32;
+ typedef uint32_t OPJ_UINT32;
+ typedef int64_t  OPJ_INT64;
+ typedef uint64_t OPJ_UINT64;
++typedef int OPJ_BOOL;
++#define OPJ_TRUE 1
++#define OPJ_FALSE 0
+ 
+ //************************************************************************/
+ /** @brief HT decoding tables, as given in the standard
+diff --git a/3rdparty/openjpeg/openjp2/t2.c b/3rdparty/openjpeg/openjp2/t2.c
+index ebda005267e6..781a6a59a165 100644
+--- a/3rdparty/openjpeg/openjp2/t2.c
++++ b/3rdparty/openjpeg/openjp2/t2.c
+@@ -167,9 +167,9 @@ static OPJ_BOOL opj_t2_init_seg(opj_tcd_cblk_dec_t* cblk,
+ static void opj_t2_putcommacode(opj_bio_t *bio, OPJ_INT32 n)
+ {
+     while (--n >= 0) {
+-        opj_bio_write(bio, 1, 1);
++        opj_bio_putbit(bio, 1);
+     }
+-    opj_bio_write(bio, 0, 1);
++    opj_bio_putbit(bio, 0);
+ }
+ 
+ static OPJ_UINT32 opj_t2_getcommacode(opj_bio_t *bio)
+@@ -184,7 +184,7 @@ static OPJ_UINT32 opj_t2_getcommacode(opj_bio_t *bio)
+ static void opj_t2_putnumpasses(opj_bio_t *bio, OPJ_UINT32 n)
+ {
+     if (n == 1) {
+-        opj_bio_write(bio, 0, 1);
++        opj_bio_putbit(bio, 0);
+     } else if (n == 2) {
+         opj_bio_write(bio, 2, 2);
+     } else if (n <= 5) {
+@@ -801,7 +801,7 @@ static OPJ_BOOL opj_t2_encode_packet(OPJ_UINT32 tileno,
+         }
+     }
+ #endif
+-    opj_bio_write(bio, packet_empty ? 0 : 1, 1);           /* Empty header bit */
++    opj_bio_putbit(bio, packet_empty ? 0 : 1);           /* Empty header bit */
+ 
+     /* Writing Packet header */
+     band = res->bands;
+@@ -849,7 +849,7 @@ static OPJ_BOOL opj_t2_encode_packet(OPJ_UINT32 tileno,
+             if (!cblk->numpasses) {
+                 opj_tgt_encode(bio, prc->incltree, cblkno, (OPJ_INT32)(layno + 1));
+             } else {
+-                opj_bio_write(bio, layer->numpasses != 0, 1);
++                opj_bio_putbit(bio, layer->numpasses != 0);
+             }
+ 
+             /* if cblk not included, go to the next cblk  */
+@@ -978,7 +978,9 @@ static OPJ_BOOL opj_t2_encode_packet(OPJ_UINT32 tileno,
+                 return OPJ_FALSE;
+             }
+ 
+-            memcpy(c, layer->data, layer->len);
++            if (p_t2_mode == FINAL_PASS) {
++                memcpy(c, layer->data, layer->len);
++            }
+             cblk->numpasses += layer->numpasses;
+             c += layer->len;
+             length -= layer->len;
+@@ -1227,9 +1229,17 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
+                 while (!opj_tgt_decode(l_bio, l_prc->imsbtree, cblkno, (OPJ_INT32)i)) {
+                     ++i;
+                 }
+-
+                 l_cblk->Mb = (OPJ_UINT32)l_band->numbps;
+-                l_cblk->numbps = (OPJ_UINT32)l_band->numbps + 1 - i;
++                if ((OPJ_UINT32)l_band->numbps + 1 < i) {
++                    /* Not totally sure what we should do in that situation,
++                     * but that avoids the integer overflow of
++                     * https://github.com/uclouvain/openjpeg/pull/1488
++                     * while keeping the regression test suite happy.
++                     */
++                    l_cblk->numbps = (OPJ_UINT32)(l_band->numbps + 1 - (int)i);
++                } else {
++                    l_cblk->numbps = (OPJ_UINT32)l_band->numbps + 1 - i;
++                }
+                 l_cblk->numlenbits = 3;
+             }
+ 
+@@ -1590,6 +1600,7 @@ static OPJ_BOOL opj_t2_skip_packet_data(opj_t2_t* p_t2,
+                                       "skip: segment too long (%d) with max (%d) for codeblock %d (p=%d, b=%d, r=%d, c=%d)\n",
+                                       l_seg->newlen, p_max_length, cblkno, p_pi->precno, bandno, p_pi->resno,
+                                       p_pi->compno);
++                        return OPJ_TRUE;
+                     }
+                 }
+ 
+diff --git a/3rdparty/openjpeg/openjp2/tcd.c b/3rdparty/openjpeg/openjp2/tcd.c
+index 8f0aac0aa078..687aa61bb094 100644
+--- a/3rdparty/openjpeg/openjp2/tcd.c
++++ b/3rdparty/openjpeg/openjp2/tcd.c
+@@ -42,6 +42,8 @@
+ #include "opj_includes.h"
+ #include "opj_common.h"
+ 
++// #define DEBUG_RATE_ALLOC
++
+ /* ----------------------------------------------------------------------- */
+ 
+ /* TODO MSD: */
+@@ -143,6 +145,9 @@ static OPJ_BOOL opj_tcd_code_block_enc_allocate_data(opj_tcd_cblk_enc_t *
+  */
+ static void opj_tcd_code_block_enc_deallocate(opj_tcd_precinct_t * p_precinct);
+ 
++static
++void opj_tcd_makelayer_fixed(opj_tcd_t *tcd, OPJ_UINT32 layno,
++                             OPJ_UINT32 final);
+ 
+ /**
+ Free the memory allocated for encoding
+@@ -224,6 +229,7 @@ opj_tcd_t* opj_tcd_create(OPJ_BOOL p_is_decoder)
+ 
+ /* ----------------------------------------------------------------------- */
+ 
++static
+ void opj_tcd_rateallocate_fixed(opj_tcd_t *tcd)
+ {
+     OPJ_UINT32 layno;
+@@ -234,17 +240,23 @@ void opj_tcd_rateallocate_fixed(opj_tcd_t *tcd)
+ }
+ 
+ 
+-void opj_tcd_makelayer(opj_tcd_t *tcd,
+-                       OPJ_UINT32 layno,
+-                       OPJ_FLOAT64 thresh,
+-                       OPJ_UINT32 final)
++/* ----------------------------------------------------------------------- */
++
++/** Returns OPJ_TRUE if the layer allocation is unchanged w.r.t to the previous
++ * invokation with a different threshold */
++static
++OPJ_BOOL opj_tcd_makelayer(opj_tcd_t *tcd,
++                           OPJ_UINT32 layno,
++                           OPJ_FLOAT64 thresh,
++                           OPJ_UINT32 final)
+ {
+     OPJ_UINT32 compno, resno, bandno, precno, cblkno;
+     OPJ_UINT32 passno;
+ 
+     opj_tcd_tile_t *tcd_tile = tcd->tcd_image->tiles;
++    OPJ_BOOL layer_allocation_is_same = OPJ_TRUE;
+ 
+-    tcd_tile->distolayer[layno] = 0;        /* fixed_quality */
++    tcd_tile->distolayer[layno] = 0;
+ 
+     for (compno = 0; compno < tcd_tile->numcomps; compno++) {
+         opj_tcd_tilecomp_t *tilec = &tcd_tile->comps[compno];
+@@ -304,7 +316,10 @@ void opj_tcd_makelayer(opj_tcd_t *tcd,
+                             }
+                         }
+ 
+-                        layer->numpasses = n - cblk->numpassesinlayers;
++                        if (layer->numpasses != n - cblk->numpassesinlayers) {
++                            layer_allocation_is_same = OPJ_FALSE;
++                            layer->numpasses = n - cblk->numpassesinlayers;
++                        }
+ 
+                         if (!layer->numpasses) {
+                             layer->disto = 0;
+@@ -323,7 +338,7 @@ void opj_tcd_makelayer(opj_tcd_t *tcd,
+                                            cblk->passes[cblk->numpassesinlayers - 1].distortiondec;
+                         }
+ 
+-                        tcd_tile->distolayer[layno] += layer->disto;    /* fixed_quality */
++                        tcd_tile->distolayer[layno] += layer->disto;
+ 
+                         if (final) {
+                             cblk->numpassesinlayers = n;
+@@ -333,14 +348,17 @@ void opj_tcd_makelayer(opj_tcd_t *tcd,
+             }
+         }
+     }
++    return layer_allocation_is_same;
+ }
+ 
++/** For m_quality_layer_alloc_strategy == FIXED_LAYER */
++static
+ void opj_tcd_makelayer_fixed(opj_tcd_t *tcd, OPJ_UINT32 layno,
+                              OPJ_UINT32 final)
+ {
+     OPJ_UINT32 compno, resno, bandno, precno, cblkno;
+     OPJ_INT32 value;                        /*, matrice[tcd_tcp->numlayers][tcd_tile->comps[0].numresolutions][3]; */
+-    OPJ_INT32 matrice[10][10][3];
++    OPJ_INT32 matrice[J2K_TCD_MATRIX_MAX_LAYER_COUNT][J2K_TCD_MATRIX_MAX_RESOLUTION_COUNT][3];
+     OPJ_UINT32 i, j, k;
+ 
+     opj_cp_t *cp = tcd->cp;
+@@ -440,6 +458,11 @@ void opj_tcd_makelayer_fixed(opj_tcd_t *tcd, OPJ_UINT32 layno,
+     }
+ }
+ 
++/** Rate allocation for the following methods:
++ * - allocation by rate/distortio (m_quality_layer_alloc_strategy == RATE_DISTORTION_RATIO)
++ * - allocation by fixed quality  (m_quality_layer_alloc_strategy == FIXED_DISTORTION_RATIO)
++ */
++static
+ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+                               OPJ_BYTE *dest,
+                               OPJ_UINT32 * p_data_written,
+@@ -450,8 +473,8 @@ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+     OPJ_UINT32 compno, resno, bandno, precno, cblkno, layno;
+     OPJ_UINT32 passno;
+     OPJ_FLOAT64 min, max;
+-    OPJ_FLOAT64 cumdisto[100];      /* fixed_quality */
+-    const OPJ_FLOAT64 K = 1;                /* 1.1; fixed_quality */
++    OPJ_FLOAT64 cumdisto[100];
++    const OPJ_FLOAT64 K = 1;
+     OPJ_FLOAT64 maxSE = 0;
+ 
+     opj_cp_t *cp = tcd->cp;
+@@ -461,7 +484,7 @@ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+     min = DBL_MAX;
+     max = 0;
+ 
+-    tcd_tile->numpix = 0;           /* fixed_quality */
++    tcd_tile->numpix = 0;
+ 
+     for (compno = 0; compno < tcd_tile->numcomps; compno++) {
+         opj_tcd_tilecomp_t *tilec = &tcd_tile->comps[compno];
+@@ -511,9 +534,12 @@ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+                             }
+                         } /* passno */
+ 
+-                        /* fixed_quality */
+-                        tcd_tile->numpix += ((cblk->x1 - cblk->x0) * (cblk->y1 - cblk->y0));
+-                        tilec->numpix += ((cblk->x1 - cblk->x0) * (cblk->y1 - cblk->y0));
++                        {
++                            const OPJ_SIZE_T cblk_pix_count = (OPJ_SIZE_T)((cblk->x1 - cblk->x0) *
++                                                              (cblk->y1 - cblk->y0));
++                            tcd_tile->numpix += cblk_pix_count;
++                            tilec->numpix += cblk_pix_count;
++                        }
+                     } /* cbklno */
+                 } /* precno */
+             } /* bandno */
+@@ -527,8 +553,8 @@ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+     /* index file */
+     if (cstr_info) {
+         opj_tile_info_t *tile_info = &cstr_info->tile[tcd->tcd_tileno];
+-        tile_info->numpix = tcd_tile->numpix;
+-        tile_info->distotile = tcd_tile->distotile;
++        tile_info->numpix = (int)tcd_tile->numpix;
++        tile_info->distotile = (int)tcd_tile->distotile;
+         tile_info->thresh = (OPJ_FLOAT64 *) opj_malloc(tcd_tcp->numlayers * sizeof(
+                                 OPJ_FLOAT64));
+         if (!tile_info->thresh) {
+@@ -545,35 +571,54 @@ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+         OPJ_FLOAT64 goodthresh = 0;
+         OPJ_FLOAT64 stable_thresh = 0;
+         OPJ_UINT32 i;
+-        OPJ_FLOAT64 distotarget;                /* fixed_quality */
++        OPJ_FLOAT64 distotarget;
+ 
+-        /* fixed_quality */
+         distotarget = tcd_tile->distotile - ((K * maxSE) / pow((OPJ_FLOAT32)10,
+                                              tcd_tcp->distoratio[layno] / 10));
+ 
+         /* Don't try to find an optimal threshold but rather take everything not included yet, if
+-          -r xx,yy,zz,0   (disto_alloc == 1 and rates == 0)
+-          -q xx,yy,zz,0   (fixed_quality == 1 and distoratio == 0)
++          -r xx,yy,zz,0   (m_quality_layer_alloc_strategy == RATE_DISTORTION_RATIO and rates == NULL)
++          -q xx,yy,zz,0   (m_quality_layer_alloc_strategy == FIXED_DISTORTION_RATIO and distoratio == NULL)
+           ==> possible to have some lossy layers and the last layer for sure lossless */
+-        if (((cp->m_specific_param.m_enc.m_disto_alloc == 1) &&
++        if (((cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy ==
++                RATE_DISTORTION_RATIO) &&
+                 (tcd_tcp->rates[layno] > 0.0f)) ||
+-                ((cp->m_specific_param.m_enc.m_fixed_quality == 1) &&
++                ((cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy ==
++                  FIXED_DISTORTION_RATIO) &&
+                  (tcd_tcp->distoratio[layno] > 0.0))) {
+             opj_t2_t*t2 = opj_t2_create(tcd->image, cp);
+             OPJ_FLOAT64 thresh = 0;
++            OPJ_BOOL last_layer_allocation_ok = OPJ_FALSE;
+ 
+             if (t2 == 00) {
+                 return OPJ_FALSE;
+             }
+ 
+             for (i = 0; i < 128; ++i) {
+-                OPJ_FLOAT64 distoachieved = 0;  /* fixed_quality */
+-
+-                thresh = (lo + hi) / 2;
+-
+-                opj_tcd_makelayer(tcd, layno, thresh, 0);
++                OPJ_FLOAT64 distoachieved = 0;
++                OPJ_BOOL layer_allocation_is_same;
++
++                OPJ_FLOAT64 new_thresh = (lo + hi) / 2;
++                /* Stop iterating when the threshold has stabilized enough */
++                /* 0.5 * 1e-5 is somewhat arbitrary, but has been selected */
++                /* so that this doesn't change the results of the regression */
++                /* test suite. */
++                if (fabs(new_thresh - thresh) <= 0.5 * 1e-5 * thresh) {
++                    break;
++                }
++                thresh = new_thresh;
++#ifdef DEBUG_RATE_ALLOC
++                opj_event_msg(p_manager, EVT_INFO, "layno=%u, iter=%u, thresh=%g",
++                              layno, i, new_thresh);
++#endif
+ 
+-                if (cp->m_specific_param.m_enc.m_fixed_quality) {       /* fixed_quality */
++                layer_allocation_is_same = opj_tcd_makelayer(tcd, layno, thresh, 0) && i != 0;
++#ifdef DEBUG_RATE_ALLOC
++                opj_event_msg(p_manager, EVT_INFO, "--> layer_allocation_is_same = %d",
++                              layer_allocation_is_same);
++#endif
++                if (cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy ==
++                        FIXED_DISTORTION_RATIO) {
+                     if (OPJ_IS_CINEMA(cp->rsiz) || OPJ_IS_IMF(cp->rsiz)) {
+                         if (! opj_t2_encode_packets(t2, tcd->tcd_tileno, tcd_tile, layno + 1, dest,
+                                                     p_data_written, maxlen, cstr_info, NULL, tcd->cur_tp_num, tcd->tp_pos,
+@@ -605,17 +650,41 @@ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+                         }
+                         lo = thresh;
+                     }
+-                } else {
+-                    if (! opj_t2_encode_packets(t2, tcd->tcd_tileno, tcd_tile, layno + 1, dest,
+-                                                p_data_written, maxlen, cstr_info, NULL, tcd->cur_tp_num, tcd->tp_pos,
+-                                                tcd->cur_pino,
+-                                                THRESH_CALC, p_manager)) {
+-                        /* TODO: what to do with l ??? seek / tell ??? */
+-                        /* opj_event_msg(tcd->cinfo, EVT_INFO, "rate alloc: len=%d, max=%d\n", l, maxlen); */
++                } else { /* Disto/rate based optimization */
++                    /* Check if the layer allocation done by opj_tcd_makelayer()
++                     * is compatible of the maximum rate allocation. If not,
++                     * retry with a higher threshold.
++                     * If OK, try with a lower threshold.
++                     * Call opj_t2_encode_packets() only if opj_tcd_makelayer()
++                     * has resulted in different truncation points since its last
++                     * call. */
++                    if ((layer_allocation_is_same && !last_layer_allocation_ok) ||
++                            (!layer_allocation_is_same &&
++                             ! opj_t2_encode_packets(t2, tcd->tcd_tileno, tcd_tile, layno + 1, dest,
++                                                     p_data_written, maxlen, cstr_info, NULL, tcd->cur_tp_num, tcd->tp_pos,
++                                                     tcd->cur_pino,
++                                                     THRESH_CALC, p_manager))) {
++
++#ifdef DEBUG_RATE_ALLOC
++                        if (!layer_allocation_is_same) {
++                            opj_event_msg(p_manager, EVT_INFO,
++                                          "--> check rate alloc failed (> maxlen=%u)\n", maxlen);
++                        }
++#endif
++                        last_layer_allocation_ok = OPJ_FALSE;
+                         lo = thresh;
+                         continue;
+                     }
+ 
++#ifdef DEBUG_RATE_ALLOC
++                    if (!layer_allocation_is_same) {
++                        opj_event_msg(p_manager, EVT_INFO,
++                                      "--> check rate alloc success (len=%u <= maxlen=%u)\n", *p_data_written,
++                                      maxlen);
++                    }
++#endif
++
++                    last_layer_allocation_ok = OPJ_TRUE;
+                     hi = thresh;
+                     stable_thresh = thresh;
+                 }
+@@ -635,7 +704,6 @@ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+ 
+         opj_tcd_makelayer(tcd, layno, goodthresh, 1);
+ 
+-        /* fixed_quality */
+         cumdisto[layno] = (layno == 0) ? tcd_tile->distolayer[0] :
+                           (cumdisto[layno - 1] + tcd_tile->distolayer[layno]);
+     }
+@@ -2247,6 +2315,9 @@ static OPJ_BOOL opj_tcd_dc_level_shift_decode(opj_tcd_t *p_tcd)
+             l_max = (OPJ_INT32)((1U << l_img_comp->prec) - 1);
+         }
+ 
++        if (l_width == 0 || l_height == 0) {
++            continue;
++        }
+ 
+         if (l_tccp->qmfbid == 1) {
+             for (j = 0; j < l_height; ++j) {
+@@ -2599,10 +2670,10 @@ static OPJ_BOOL opj_tcd_rate_allocate_encode(opj_tcd_t *p_tcd,
+         p_cstr_info->index_write = 0;
+     }
+ 
+-    if (l_cp->m_specific_param.m_enc.m_disto_alloc ||
+-            l_cp->m_specific_param.m_enc.m_fixed_quality)  {
+-        /* fixed_quality */
+-        /* Normal Rate/distortion allocation */
++    if (l_cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy ==
++            RATE_DISTORTION_RATIO ||
++            l_cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy ==
++            FIXED_DISTORTION_RATIO)  {
+         if (! opj_tcd_rateallocate(p_tcd, p_dest_data, &l_nb_written, p_max_dest_size,
+                                    p_cstr_info, p_manager)) {
+             return OPJ_FALSE;
+diff --git a/3rdparty/openjpeg/openjp2/tcd.h b/3rdparty/openjpeg/openjp2/tcd.h
+index 340c2bf8a646..f659869a1344 100644
+--- a/3rdparty/openjpeg/openjp2/tcd.h
++++ b/3rdparty/openjpeg/openjp2/tcd.h
+@@ -222,8 +222,8 @@ typedef struct opj_tcd_tilecomp {
+     OPJ_UINT32 win_x1;
+     OPJ_UINT32 win_y1;
+ 
+-    /* add fixed_quality */
+-    OPJ_INT32 numpix;
++    /* number of pixels */
++    OPJ_SIZE_T numpix;
+ } opj_tcd_tilecomp_t;
+ 
+ 
+@@ -235,9 +235,9 @@ typedef struct opj_tcd_tile {
+     OPJ_INT32 x0, y0, x1, y1;
+     OPJ_UINT32 numcomps;            /* number of components in tile */
+     opj_tcd_tilecomp_t *comps;  /* Components information */
+-    OPJ_INT32 numpix;               /* add fixed_quality */
+-    OPJ_FLOAT64 distotile;          /* add fixed_quality */
+-    OPJ_FLOAT64 distolayer[100];    /* add fixed_quality */
++    OPJ_SIZE_T numpix;               /* number of pixels */
++    OPJ_FLOAT64 distotile;          /* distortion of the tile */
++    OPJ_FLOAT64 distolayer[100];    /* distortion per layer */
+     OPJ_UINT32 packno;              /* packet number */
+ } opj_tcd_tile_t;
+ 
+@@ -369,23 +369,6 @@ OPJ_BOOL opj_tcd_init(opj_tcd_t *p_tcd,
+ OPJ_BOOL opj_tcd_init_decode_tile(opj_tcd_t *p_tcd, OPJ_UINT32 p_tile_no,
+                                   opj_event_mgr_t* p_manager);
+ 
+-void opj_tcd_makelayer_fixed(opj_tcd_t *tcd, OPJ_UINT32 layno,
+-                             OPJ_UINT32 final);
+-
+-void opj_tcd_rateallocate_fixed(opj_tcd_t *tcd);
+-
+-void opj_tcd_makelayer(opj_tcd_t *tcd,
+-                       OPJ_UINT32 layno,
+-                       OPJ_FLOAT64 thresh,
+-                       OPJ_UINT32 final);
+-
+-OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
+-                              OPJ_BYTE *dest,
+-                              OPJ_UINT32 * p_data_written,
+-                              OPJ_UINT32 len,
+-                              opj_codestream_info_t *cstr_info,
+-                              opj_event_mgr_t *p_manager);
+-
+ /**
+  * Gets the maximum tile size that will be taken by the tile once decoded.
+  */
+diff --git a/3rdparty/openjpeg/openjp2/tgt.c b/3rdparty/openjpeg/openjp2/tgt.c
+index 0cbad12c42ef..711d753f46c1 100644
+--- a/3rdparty/openjpeg/openjp2/tgt.c
++++ b/3rdparty/openjpeg/openjp2/tgt.c
+@@ -287,12 +287,12 @@ void opj_tgt_encode(opj_bio_t *bio, opj_tgt_tree_t *tree, OPJ_UINT32 leafno,
+         while (low < threshold) {
+             if (low >= node->value) {
+                 if (!node->known) {
+-                    opj_bio_write(bio, 1, 1);
++                    opj_bio_putbit(bio, 1);
+                     node->known = 1;
+                 }
+                 break;
+             }
+-            opj_bio_write(bio, 0, 1);
++            opj_bio_putbit(bio, 0);
+             ++low;
+         }
+ 
+diff --git a/3rdparty/openjpeg/openjp2/thread.c b/3rdparty/openjpeg/openjp2/thread.c
+index f2fca2ee4af8..240810b1c44b 100644
+--- a/3rdparty/openjpeg/openjp2/thread.c
++++ b/3rdparty/openjpeg/openjp2/thread.c
+@@ -221,7 +221,7 @@ struct opj_thread_t {
+     HANDLE hThread;
+ };
+ 
+-unsigned int __stdcall opj_thread_callback_adapter(void *info)
++static unsigned int __stdcall opj_thread_callback_adapter(void *info)
+ {
+     opj_thread_t* thread = (opj_thread_t*) info;
+     HANDLE hEvent = NULL;

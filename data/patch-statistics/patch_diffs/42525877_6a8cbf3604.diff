@@ -1,0 +1,82 @@
+From a77f5019f5731d79eb6f6dee7c3eb2d9d447ef2c Mon Sep 17 00:00:00 2001
+From: James Almer <jamrial@gmail.com>
+Date: Fri, 30 Jun 2023 22:20:28 -0300
+Subject: [PATCH] avcodec/cbs_h266: store SubpicIdVal in the context
+
+And use it to derive CurrSubpicIdx
+
+Signed-off-by: James Almer <jamrial@gmail.com>
+---
+ libavcodec/cbs_h266.h                 |  1 +
+ libavcodec/cbs_h266_syntax_template.c | 34 +++++++++++++--------------
+ 2 files changed, 18 insertions(+), 17 deletions(-)
+
+diff --git a/libavcodec/cbs_h266.h b/libavcodec/cbs_h266.h
+index be3c744426..9e823919af 100644
+--- a/libavcodec/cbs_h266.h
++++ b/libavcodec/cbs_h266.h
+@@ -552,6 +552,7 @@ typedef struct H266RawPPS {
+     uint16_t num_tiles_in_pic;
+     uint16_t slice_height_in_ctus[VVC_MAX_SLICES];
+     uint16_t num_slices_in_subpic[VVC_MAX_SLICES];
++    uint16_t sub_pic_id_val[VVC_MAX_SLICES];
+ } H266RawPPS;
+ 
+ typedef struct H266RawAUD {
+diff --git a/libavcodec/cbs_h266_syntax_template.c b/libavcodec/cbs_h266_syntax_template.c
+index f48b89cac9..f1cd45f815 100644
+--- a/libavcodec/cbs_h266_syntax_template.c
++++ b/libavcodec/cbs_h266_syntax_template.c
+@@ -1706,6 +1706,15 @@ static int FUNC(pps) (CodedBitstreamContext *ctx, RWContext *rw,
+         }
+     }
+ 
++    for (i = 0; i <= sps->sps_num_subpics_minus1; i++) {
++        if (sps->sps_subpic_id_mapping_explicitly_signalled_flag)
++            current->sub_pic_id_val[i] = current->pps_subpic_id_mapping_present_flag
++                                       ? current->pps_subpic_id[i]
++                                       : sps->sps_subpic_id[i];
++        else
++            current->sub_pic_id_val[i] = i;
++    }
++
+     pic_width_in_ctbs_y = AV_CEIL_RSHIFT
+         (current->pps_pic_width_in_luma_samples, (sps->sps_log2_ctu_size_minus5 + 5));
+     pic_height_in_ctbs_y = AV_CEIL_RSHIFT(
+@@ -2697,25 +2706,16 @@ static int FUNC(slice_header) (CodedBitstreamContext *ctx, RWContext *rw,
+ 
+     if (sps->sps_subpic_info_present_flag) {
+         ub(sps->sps_subpic_id_len_minus1 + 1, sh_subpic_id);
+-        if (sps->sps_subpic_id_mapping_explicitly_signalled_flag) {
+-            for (i = 0; i <= sps->sps_num_subpics_minus1; i++) {
+-                uint16_t subpic_id_val =
+-                    pps->pps_subpic_id_mapping_present_flag ?
+-                    pps->pps_subpic_id[i] : sps->sps_subpic_id[i];
+-                if (subpic_id_val == current->sh_subpic_id) {
+-                    curr_subpic_idx = i;
+-                    break;
+-                }
+-            }
+-        } else {
+-            curr_subpic_idx = current->sh_subpic_id;
+-            if (curr_subpic_idx > sps->sps_num_subpics_minus1) {
+-                av_log(ctx->log_ctx, AV_LOG_ERROR,
+-                       "sh_subpic_id(%d) should in range [0, %d]\n",
+-                       curr_subpic_idx, sps->sps_num_subpics_minus1);
+-                return AVERROR_INVALIDDATA;
++        for (i = 0; i <= sps->sps_num_subpics_minus1; i++) {
++            if (pps->sub_pic_id_val[i] == current->sh_subpic_id) {
++                curr_subpic_idx = i;
++                break;
+             }
+         }
++        if (i > sps->sps_num_subpics_minus1) {
++            av_log(ctx->log_ctx, AV_LOG_ERROR, "invalid CurrSubpicIdx %d\n", i);
++            return AVERROR_INVALIDDATA;
++        }
+     } else {
+         curr_subpic_idx = 0;
+     }
+-- 
+2.25.1
+

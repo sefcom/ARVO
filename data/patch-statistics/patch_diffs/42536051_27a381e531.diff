@@ -1,0 +1,68 @@
+From 16f9adc2744c5b4ab738df5fb99defdb9eb91c85 Mon Sep 17 00:00:00 2001
+From: Gerald Combs <gerald@wireshark.org>
+Date: Wed, 28 Aug 2024 09:04:06 -0700
+Subject: [PATCH] 802.11 Radio: Add a bounds check
+
+We're limited to 4 .11be user slots. Enforce that.
+
+Fixes #20019
+---
+ epan/dissectors/packet-ieee80211-radio.c | 9 +++++++++
+ wiretap/wtap.h                           | 3 ++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/epan/dissectors/packet-ieee80211-radio.c b/epan/dissectors/packet-ieee80211-radio.c
+index ccc869e3501..1a35fec3d3e 100644
+--- a/epan/dissectors/packet-ieee80211-radio.c
++++ b/epan/dissectors/packet-ieee80211-radio.c
+@@ -104,6 +104,7 @@ static expert_field ei_wlan_radio_assumed_non_greenfield;
+ static expert_field ei_wlan_radio_assumed_no_stbc;
+ static expert_field ei_wlan_radio_assumed_no_extension_streams;
+ static expert_field ei_wlan_radio_assumed_bcc_fec;
++static expert_field ei_wlan_radio_11be_num_users;
+ 
+ static int wlan_radio_tap;
+ static int wlan_radio_timeline_tap;
+@@ -1160,6 +1161,10 @@ dissect_wlan_radio_phdr(tvbuff_t * tvb, packet_info * pinfo, proto_tree * tree,
+         can_calculate_rate = true;
+         /*for each user*/
+         for (i = 0; i < info_11be->num_users; i++) {
++          if (i >= PHDR_802_11BE_MAX_USERS) {
++            expert_add_info(pinfo, radio_tree, &ei_wlan_radio_11be_num_users);
++            break;
++          }
+           unsigned nsts = info_11be->user[i].nsts;
+           unsigned bw_idx = 0;
+           /* Do we have all the fields needed to compute rate ?*/
+@@ -1921,6 +1926,10 @@ void proto_register_ieee80211_radio(void)
+     { &ei_wlan_radio_assumed_bcc_fec,
+       { "wlan_radio.assumed.bcc_fec", PI_ASSUMPTION, PI_WARN,
+         "No fec type information was available, assuming bcc fec.", EXPFILL }},
++
++    { &ei_wlan_radio_11be_num_users,
++      { "wlan_radio.assumed.bcc_fec", PI_MALFORMED, PI_WARN,
++        "Number of users in the 802.11be header exceeds available slots.", EXPFILL }},
+   };
+ 
+   module_t *wlan_radio_module;
+diff --git a/wiretap/wtap.h b/wiretap/wtap.h
+index a6d7ad28483..31a1a9ebae5 100644
+--- a/wiretap/wtap.h
++++ b/wiretap/wtap.h
+@@ -785,6 +785,7 @@ struct ieee_802_11be_user_info {
+     unsigned rsv2:2;
+ };
+ 
++#define PHDR_802_11BE_MAX_USERS 4
+ struct ieee_802_11be {
+     /* Which of this information is present? */
+     unsigned has_ru_mru_size:1;
+@@ -795,7 +796,7 @@ struct ieee_802_11be {
+     uint8_t  ru_mru_size:4;  /* RU/MRU allocation */
+     uint8_t  gi:2;           /* Guard Interval */
+     uint8_t  num_users;
+-    struct ieee_802_11be_user_info user[4]; /* Adding info for only upto 4 users */
++    struct ieee_802_11be_user_info user[PHDR_802_11BE_MAX_USERS]; /* Adding info for only upto 4 users */
+ };
+ 
+ 

@@ -1,0 +1,924 @@
+From 6c573e7f33380e60b583294e9ec5d68ae351c3cf Mon Sep 17 00:00:00 2001
+From: Varun Khaneja <ca.aawc@yahoo.com>
+Date: Tue, 21 Nov 2017 08:18:40 -0800
+Subject: [PATCH] Upload v5.6.1.3
+
+---
+ arccmt.cpp   | 11 +++++++++--
+ archive.cpp  |  2 +-
+ arcread.cpp  | 52 +++++++++++++++++++++++++++++++++-------------------
+ cmddata.cpp  |  2 +-
+ extract.cpp  | 46 ++++++++++++++++++++++++++--------------------
+ file.cpp     | 45 +++++++++++++++++++++++++++++++++++++++++----
+ file.hpp     |  3 ++-
+ filefn.cpp   |  2 +-
+ find.cpp     |  2 +-
+ headers.hpp  |  6 +++---
+ list.cpp     | 36 ++++++++++++++++++++++++++++--------
+ makefile     |  2 +-
+ pathfn.cpp   |  4 ++--
+ rartypes.hpp |  9 ++++++---
+ rawint.hpp   |  2 +-
+ rawread.cpp  |  2 +-
+ rdwrfn.cpp   |  7 ++++---
+ rdwrfn.hpp   |  8 +++++---
+ recvol5.cpp  |  2 ++
+ smallfn.cpp  |  6 +++---
+ smallfn.hpp  |  4 ++--
+ timefn.cpp   | 16 ++++++++--------
+ ulinks.cpp   |  7 +++++--
+ unicode.cpp  | 31 ++++++++++++++++++++++++-------
+ unpack20.cpp |  2 +-
+ 25 files changed, 211 insertions(+), 98 deletions(-)
+
+diff --git a/arccmt.cpp b/arccmt.cpp
+index 79963b2..e0db392 100644
+--- a/arccmt.cpp
++++ b/arccmt.cpp
+@@ -22,7 +22,8 @@ bool Archive::GetComment(Array<wchar> *CmtData)
+       // Old style (RAR 2.9) archive comment embedded into the main 
+       // archive header.
+       Seek(SFXSize+SIZEOF_MARKHEAD3+SIZEOF_MAINHEAD3,SEEK_SET);
+-      ReadHeader();
++      if (!ReadHeader())
++        return false;
+     }
+     else
+     {
+@@ -67,6 +68,7 @@ bool Archive::GetComment(Array<wchar> *CmtData)
+     DataIO.EnableShowProgress(false);
+     DataIO.SetPackedSizeToRead(CmtLength);
+     DataIO.UnpHash.Init(HASH_CRC32,1);
++    DataIO.SetNoFileHeader(true); // this->FileHead is not filled yet.
+ 
+     Unpack CmtUnpack(&DataIO);
+     CmtUnpack.Init(0x10000,false);
+@@ -99,7 +101,12 @@ bool Archive::GetComment(Array<wchar> *CmtData)
+     if (CmtLength==0)
+       return false;
+     Array<byte> CmtRaw(CmtLength);
+-    Read(&CmtRaw[0],CmtLength);
++    int ReadSize=Read(&CmtRaw[0],CmtLength);
++    if (ReadSize>=0 && (uint)ReadSize<CmtLength) // Comment is shorter than declared.
++    {
++      CmtLength=ReadSize;
++      CmtRaw.Alloc(CmtLength);
++    }
+ 
+     if (Format!=RARFMT14 && CommHead.CommCRC!=(~CRC32(0xffffffff,&CmtRaw[0],CmtLength)&0xffff))
+     {
+diff --git a/archive.cpp b/archive.cpp
+index a519177..2abe60d 100644
+--- a/archive.cpp
++++ b/archive.cpp
+@@ -193,7 +193,7 @@ bool Archive::IsArchive(bool EnableBroken)
+ 
+   bool HeadersLeft; // Any headers left to read.
+   // Skip the archive encryption header if any and read the main header.
+-  while (HeadersLeft=(ReadHeader()!=0))
++  while ((HeadersLeft=(ReadHeader()!=0))==true) // Additional parentheses to silence Clang.
+   {
+     SeekToNext();
+ 
+diff --git a/arcread.cpp b/arcread.cpp
+index acba581..a4900f9 100644
+--- a/arcread.cpp
++++ b/arcread.cpp
+@@ -26,11 +26,18 @@ size_t Archive::ReadHeader()
+       break;
+   }
+ 
++  // It is important to check ReadSize>0 here, because it is normal
++  // for RAR2 and RAR3 archives without end of archive block to have
++  // NextBlockPos==CurBlockPos after the end of archive has reached.
+   if (ReadSize>0 && NextBlockPos<=CurBlockPos)
+   {
+     BrokenHeaderMsg();
+-    return 0;
++    ReadSize=0;
+   }
++
++  if (ReadSize==0)
++    CurHeaderType=HEAD_UNKNOWN;
++
+   return ReadSize;
+ }
+ 
+@@ -85,7 +92,7 @@ size_t Archive::SearchRR()
+ 
+ void Archive::UnexpEndArcMsg()
+ {
+-  uint64 ArcSize=FileLength();
++  int64 ArcSize=FileLength();
+ 
+   // If block positions are equal to file size, this is not an error.
+   // It can happen when we reached the end of older RAR 1.5 archive,
+@@ -113,6 +120,17 @@ void Archive::UnkEncVerMsg(const wchar *Name)
+ }
+ 
+ 
++// Return f in case of signed integer overflow or negative parameters
++// or v1+v2 otherwise. We use it for file offsets, which are signed
++// for compatibility with off_t in POSIX file functions and third party code.
++// Signed integer overflow is the undefined behavior according to
++// C++ standard and it causes fuzzers to complain.
++inline int64 SafeAdd(int64 v1,int64 v2,int64 f)
++{
++  return v1>=0 && v2>=0 && v1<=MAX_INT64-v2 ? v1+v2 : f;
++}
++
++
+ size_t Archive::ReadHeader15()
+ {
+   RawRead Raw(this);
+@@ -296,8 +314,8 @@ size_t Archive::ReadHeader15()
+           // until we find the end of file marker in compressed data.
+           hd->UnknownUnpSize=(LowUnpSize==0xffffffff);
+         }
+-        hd->PackSize=UINT32TO64(HighPackSize,hd->DataSize);
+-        hd->UnpSize=UINT32TO64(HighUnpSize,LowUnpSize);
++        hd->PackSize=INT32TO64(HighPackSize,hd->DataSize);
++        hd->UnpSize=INT32TO64(HighUnpSize,LowUnpSize);
+         if (hd->UnknownUnpSize)
+           hd->UnpSize=INT64NDF;
+ 
+@@ -351,7 +369,7 @@ size_t Archive::ReadHeader15()
+               int64 CurPos=Tell();
+               RecoveryPercent=ToPercent(RecoverySize,CurPos);
+               // Round fractional percent exceeding .5 to upper value.
+-              if ((int)ToPercent(RecoverySize+CurPos/200,CurPos)>RecoveryPercent)
++              if (ToPercent(RecoverySize+CurPos/200,CurPos)>RecoveryPercent)
+                 RecoveryPercent++;
+             }
+           }
+@@ -397,7 +415,9 @@ size_t Archive::ReadHeader15()
+             CurTime->SetLocal(&rlt);
+           }
+         }
+-        NextBlockPos+=hd->PackSize;
++        // Set to 0 in case of overflow, so end of ReadHeader cares about it.
++        NextBlockPos=SafeAdd(NextBlockPos,hd->PackSize,0);
++
+         bool CRCProcessedOnly=hd->CommentInHeader;
+         ushort HeaderCRC=Raw.GetCRC15(CRCProcessedOnly);
+         if (hd->HeadCRC!=HeaderCRC)
+@@ -546,12 +566,6 @@ size_t Archive::ReadHeader15()
+     }
+   }
+ 
+-  if (NextBlockPos<=CurBlockPos)
+-  {
+-    BrokenHeaderMsg();
+-    return 0;
+-  }
+-
+   return Raw.Size();
+ }
+ 
+@@ -677,7 +691,9 @@ size_t Archive::ReadHeader50()
+   if ((ShortBlock.Flags & HFL_DATA)!=0)
+     DataSize=Raw.GetV();
+ 
+-  NextBlockPos=CurBlockPos+FullHeaderSize(ShortBlock.HeadSize)+DataSize;
++  NextBlockPos=CurBlockPos+FullHeaderSize(ShortBlock.HeadSize);
++  // Set to 0 in case of overflow, so end of ReadHeader cares about it.
++  NextBlockPos=SafeAdd(NextBlockPos,DataSize,0);
+ 
+   switch(ShortBlock.HeaderType)
+   {
+@@ -875,11 +891,6 @@ size_t Archive::ReadHeader50()
+       break;
+   }
+ 
+-  if (NextBlockPos<=CurBlockPos)
+-  {
+-    BrokenHeaderMsg();
+-    return 0;
+-  }
+   return Raw.Size();
+ }
+ 
+@@ -946,7 +957,7 @@ void Archive::ProcessExtra50(RawRead *Raw,size_t ExtraSize,BaseBlock *bb)
+ 
+     FieldSize=int64(NextPos-Raw->GetPos()); // Field size without size and type fields.
+ 
+-    if (FieldSize<0) // FieldType longer than field itself.
++    if (FieldSize<0) // FieldType is longer than expected extra field size.
+       break;
+ 
+     if (bb->HeaderType==HEAD_MAIN)
+@@ -1217,6 +1228,9 @@ size_t Archive::ReadHeader14()
+     FileHead.PackSize=FileHead.DataSize;
+     FileHead.WinSize=0x10000;
+ 
++    FileHead.HostOS=HOST_MSDOS;
++    FileHead.HSType=HSYS_WINDOWS;
++
+     FileHead.mtime.SetDos(FileTime);
+ 
+     Raw.Read(NameSize);
+diff --git a/cmddata.cpp b/cmddata.cpp
+index d8a9391..1b6da65 100644
+--- a/cmddata.cpp
++++ b/cmddata.cpp
+@@ -1362,7 +1362,7 @@ uint CommandData::GetExclAttr(const wchar *Str)
+ bool CommandData::CheckWinSize()
+ {
+   // Define 0x100000000 as macro to avoid troubles with older compilers.
+-  const uint64 MaxDictSize=UINT32TO64(1,0);
++  const uint64 MaxDictSize=INT32TO64(1,0);
+   // Limit the dictionary size to 4 GB.
+   for (uint64 I=0x10000;I<=MaxDictSize;I*=2)
+     if (WinSize==I)
+diff --git a/extract.cpp b/extract.cpp
+index 31fba05..abdd928 100644
+--- a/extract.cpp
++++ b/extract.cpp
+@@ -149,7 +149,7 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
+   }
+ #endif
+ 
+-  uint64 VolumeSetSize=0; // Total size of volumes after the current volume.
++  int64 VolumeSetSize=0; // Total size of volumes after the current volume.
+ 
+   if (Arc.Volume)
+   {
+@@ -226,18 +226,6 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
+ 
+ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+ {
+-  // We can get negative sizes in corrupt archive and it is unacceptable
+-  // for size comparisons in CmdExtract::UnstoreFile and ComprDataIO::UnpRead,
+-  // where we cast sizes to size_t and can exceed another read or available
+-  // size. We could fix it when reading an archive. But we prefer to do it
+-  // here, because this function is called directly in unrar.dll, so we fix
+-  // bad parameters passed to dll. Also we want to see real negative sizes
+-  // in the listing of corrupt archive.
+-//  if (Arc.FileHead.PackSize<0)
+-//    Arc.FileHead.PackSize=0;
+-  if (Arc.FileHead.UnpSize<0)
+-    Arc.FileHead.UnpSize=0;
+-
+   wchar Command=Cmd->Command[0];
+   if (HeaderSize==0)
+     if (DataIO.UnpVolume)
+@@ -256,6 +244,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+     }
+     else
+       return false;
++
+   HEADER_TYPE HeaderType=Arc.GetHeaderType();
+   if (HeaderType!=HEAD_FILE)
+   {
+@@ -285,6 +274,19 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+   }
+   PrevProcessed=false;
+ 
++  // We can get negative sizes in corrupt archive and it is unacceptable
++  // for size comparisons in ComprDataIO::UnpRead, where we cast sizes
++  // to size_t and can exceed another read or available size. We could fix it
++  // when reading an archive. But we prefer to do it here, because this
++  // function is called directly in unrar.dll, so we fix bad parameters
++  // passed to dll. Also we want to see real negative sizes in the listing
++  // of corrupt archive. To prevent uninitialized data access perform
++  // these checks after rejecting zero length and non-file headers above.
++  if (Arc.FileHead.PackSize<0)
++    Arc.FileHead.PackSize=0;
++  if (Arc.FileHead.UnpSize<0)
++    Arc.FileHead.UnpSize=0;
++
+   if (!Cmd->Recurse && MatchedArgs>=Cmd->FileArgs.ItemsCount() && AllMatchesExact)
+     return false;
+ 
+@@ -782,15 +784,17 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+ void CmdExtract::UnstoreFile(ComprDataIO &DataIO,int64 DestUnpSize)
+ {
+   Array<byte> Buffer(File::CopyBufferSize());
+-  while (1)
++  while (true)
+   {
+-    uint Code=DataIO.UnpRead(&Buffer[0],Buffer.Size());
+-    if (Code==0 || (int)Code==-1)
++    int ReadSize=DataIO.UnpRead(&Buffer[0],Buffer.Size());
++    if (ReadSize<=0)
+       break;
+-    Code=Code<DestUnpSize ? Code:(uint)DestUnpSize;
+-    DataIO.UnpWrite(&Buffer[0],Code);
+-    if (DestUnpSize>=0)
+-      DestUnpSize-=Code;
++    int WriteSize=ReadSize<DestUnpSize ? ReadSize:(int)DestUnpSize;
++    if (WriteSize>0)
++    {
++      DataIO.UnpWrite(&Buffer[0],WriteSize);
++      DestUnpSize-=WriteSize;
++    }
+   }
+ }
+ 
+@@ -811,6 +815,7 @@ bool CmdExtract::ExtractFileCopy(File &New,wchar *ArcName,wchar *NameNew,wchar *
+   }
+ 
+   Array<char> Buffer(0x100000);
++  int64 CopySize=0;
+ 
+   while (true)
+   {
+@@ -819,6 +824,7 @@ bool CmdExtract::ExtractFileCopy(File &New,wchar *ArcName,wchar *NameNew,wchar *
+     if (ReadSize==0)
+       break;
+     New.Write(&Buffer[0],ReadSize);
++    CopySize+=ReadSize;
+   }
+ 
+   return true;
+diff --git a/file.cpp b/file.cpp
+index 9b4775a..e2bb42a 100644
+--- a/file.cpp
++++ b/file.cpp
+@@ -511,7 +511,7 @@ int64 File::Tell()
+       ErrHandler.SeekError(FileName);
+     else
+       return -1;
+-  return UINT32TO64(HighDist,LowDist);
++  return INT32TO64(HighDist,LowDist);
+ #else
+ #ifdef FILE_USE_OPEN
+   return lseek(hFile,0,SEEK_CUR);
+@@ -668,12 +668,11 @@ void File::GetOpenFileTime(RarTime *ft)
+ }
+ 
+ 
+-uint64 File::FileLength()
++int64 File::FileLength()
+ {
+   SaveFilePos SavePos(*this);
+   Seek(0,SEEK_END);
+-  int64 Pos=Tell();
+-  return Pos<0 ? 0 : Pos;
++  return Tell();
+ }
+ 
+ 
+@@ -690,3 +689,41 @@ bool File::IsDevice()
+ }
+ 
+ 
++#ifndef SFX_MODULE
++int64 File::Copy(File &Dest,int64 Length)
++{
++  Array<byte> Buffer(File::CopyBufferSize());
++  int64 CopySize=0;
++  bool CopyAll=(Length==INT64NDF);
++
++  while (CopyAll || Length>0)
++  {
++    Wait();
++    size_t SizeToRead=(!CopyAll && Length<(int64)Buffer.Size()) ? (size_t)Length:Buffer.Size();
++    byte *Buf=&Buffer[0];
++    int ReadSize=Read(Buf,SizeToRead);
++    if (ReadSize==0)
++      break;
++    size_t WriteSize=ReadSize;
++#ifdef _WIN_ALL
++    // For FAT32 USB flash drives in Windows if first write is 4 KB or more,
++    // write caching is disabled and "write through" is enabled, resulting
++    // in bad performance, especially for many small files. It happens when
++    // we create SFX archive on USB drive, because SFX module is written first.
++    // So we split the first write to small 1 KB followed by rest of data.
++    if (CopySize==0 && WriteSize>=4096)
++    {
++      const size_t FirstWrite=1024;
++      Dest.Write(Buf,FirstWrite);
++      Buf+=FirstWrite;
++      WriteSize-=FirstWrite;
++    }
++#endif
++    Dest.Write(Buf,WriteSize);
++    CopySize+=ReadSize;
++    if (!CopyAll)
++      Length-=ReadSize;
++  }
++  return CopySize;
++}
++#endif
+diff --git a/file.hpp b/file.hpp
+index 784ef01..f8cff4f 100644
+--- a/file.hpp
++++ b/file.hpp
+@@ -97,7 +97,7 @@ class File
+     static void SetCloseFileTimeByName(const wchar *Name,RarTime *ftm,RarTime *fta);
+     void GetOpenFileTime(RarTime *ft);
+     bool IsOpened() {return hFile!=FILE_BAD_HANDLE;};
+-    uint64 FileLength();
++    int64 FileLength();
+     void SetHandleType(FILE_HANDLETYPE Type) {HandleType=Type;}
+     FILE_HANDLETYPE GetHandleType() {return HandleType;}
+     bool IsDevice();
+@@ -105,6 +105,7 @@ class File
+     FileHandle GetHandle() {return hFile;}
+     void SetHandle(FileHandle Handle) {Close();hFile=Handle;}
+     void SetIgnoreReadErrors(bool Mode) {IgnoreReadErrors=Mode;}
++    int64 Copy(File &Dest,int64 Length=INT64NDF);
+     void SetAllowDelete(bool Allow) {AllowDelete=Allow;}
+     void SetExceptions(bool Allow) {AllowExceptions=Allow;}
+ #ifdef _WIN_ALL
+diff --git a/filefn.cpp b/filefn.cpp
+index edda8f1..4eb7b9b 100644
+--- a/filefn.cpp
++++ b/filefn.cpp
+@@ -152,7 +152,7 @@ int64 GetFreeDisk(const wchar *Name)
+   uiUserFree.u.LowPart=uiUserFree.u.HighPart=0;
+   if (GetDiskFreeSpaceEx(*Root!=0 ? Root:NULL,&uiUserFree,&uiTotalSize,&uiTotalFree) &&
+       uiUserFree.u.HighPart<=uiTotalFree.u.HighPart)
+-    return UINT32TO64(uiUserFree.u.HighPart,uiUserFree.u.LowPart);
++    return INT32TO64(uiUserFree.u.HighPart,uiUserFree.u.LowPart);
+   return 0;
+ #elif defined(_UNIX)
+   wchar Root[NM];
+diff --git a/find.cpp b/find.cpp
+index 0abe89d..812af6b 100644
+--- a/find.cpp
++++ b/find.cpp
+@@ -200,7 +200,7 @@ HANDLE FindFile::Win32Find(HANDLE hFind,const wchar *Mask,FindData *fd)
+   {
+     wcsncpyz(fd->Name,Mask,ASIZE(fd->Name));
+     SetName(fd->Name,FindData.cFileName,ASIZE(fd->Name));
+-    fd->Size=UINT32TO64(FindData.nFileSizeHigh,FindData.nFileSizeLow);
++    fd->Size=INT32TO64(FindData.nFileSizeHigh,FindData.nFileSizeLow);
+     fd->FileAttr=FindData.dwFileAttributes;
+     fd->ftCreationTime=FindData.ftCreationTime;
+     fd->ftLastAccessTime=FindData.ftLastAccessTime;
+diff --git a/headers.hpp b/headers.hpp
+index 2b7baff..9486478 100644
+--- a/headers.hpp
++++ b/headers.hpp
+@@ -191,9 +191,9 @@ struct FileHeader:BlockHeader
+   RarTime ctime;
+   RarTime atime;
+ 
+-  uint64 PackSize;
+-  uint64 UnpSize;
+-  uint64 MaxSize; // Reserve size bytes for vint of this size.
++  int64 PackSize;
++  int64 UnpSize;
++  int64 MaxSize; // Reserve size bytes for vint of this size.
+ 
+   HashValue FileHash;
+ 
+diff --git a/list.cpp b/list.cpp
+index 8e077b3..561122b 100644
+--- a/list.cpp
++++ b/list.cpp
+@@ -8,7 +8,7 @@ static void ListNewSubHeader(CommandData *Cmd,Archive &Arc);
+ 
+ void ListArchive(CommandData *Cmd)
+ {
+-  uint64 SumPackSize=0,SumUnpSize=0;
++  int64 SumPackSize=0,SumUnpSize=0;
+   uint ArcCount=0,SumFileCount=0;
+   bool Technical=(Cmd->Command[1]=='T');
+   bool ShowService=Technical && Cmd->Command[2]=='A';
+@@ -30,7 +30,7 @@ void ListArchive(CommandData *Cmd)
+     bool FileMatched=true;
+     while (1)
+     {
+-      uint64 TotalPackSize=0,TotalUnpSize=0;
++      int64 TotalPackSize=0,TotalUnpSize=0;
+       uint FileCount=0;
+       if (Arc.IsArchive(true))
+       {
+@@ -125,7 +125,7 @@ void ListArchive(CommandData *Cmd)
+             if (Verbose)
+             {
+               mprintf(L"\n----------- ---------  -------- ----- ---------- -----  --------  ----");
+-              mprintf(L"\n%21ls %9ls %3u%%  %-27ls %u",UnpSizeText,
++              mprintf(L"\n%21ls %9ls %3d%%  %-27ls %u",UnpSizeText,
+                       PackSizeText,ToPercentUnlim(TotalPackSize,TotalUnpSize),
+                       VolNumText,FileCount);
+             }
+@@ -174,7 +174,7 @@ void ListArchive(CommandData *Cmd)
+     itoa(SumPackSize,PackSizeText,ASIZE(PackSizeText));
+ 
+     if (Verbose)
+-      mprintf(L"%21ls %9ls %3u%% %28ls %u",UnpSizeText,PackSizeText,
++      mprintf(L"%21ls %9ls %3d%% %28ls %u",UnpSizeText,PackSizeText,
+               ToPercentUnlim(SumPackSize,SumUnpSize),L"",SumFileCount);
+     else
+       mprintf(L"%21ls %18s %lu",UnpSizeText,L"",SumFileCount);
+@@ -237,7 +237,7 @@ void ListFileHeader(Archive &Arc,FileHeader &hd,bool &TitleShown,bool Verbose,bo
+       if (hd.SplitAfter)
+         wcscpy(RatioStr,L"-->");
+       else
+-        swprintf(RatioStr,ASIZE(RatioStr),L"%u%%",ToPercentUnlim(hd.PackSize,hd.UnpSize));
++        swprintf(RatioStr,ASIZE(RatioStr),L"%d%%",ToPercentUnlim(hd.PackSize,hd.UnpSize));
+ 
+   wchar DateStr[50];
+   hd.mtime.GetText(DateStr,ASIZE(DateStr),Technical);
+@@ -286,9 +286,9 @@ void ListFileHeader(Archive &Arc,FileHeader &hd,bool &TitleShown,bool Verbose,bo
+           }
+           else
+           {
+-            size_t SizeToRead=(size_t)Min(hd.PackSize,ASIZE(LinkTargetA)-1);
+-            size_t DataSize=(size_t)Arc.Read(LinkTargetA,SizeToRead);
+-            LinkTargetA[Min(DataSize,ASIZE(LinkTargetA)-1)]=0;
++            int DataSize=(int)Min(hd.PackSize,ASIZE(LinkTargetA)-1);
++            Arc.Read(LinkTargetA,DataSize);
++            LinkTargetA[DataSize > 0 ? DataSize : 0] = 0;
+           }
+           wchar LinkTarget[NM];
+           CharToWide(LinkTargetA,LinkTarget,ASIZE(LinkTarget));
+@@ -406,6 +406,26 @@ void ListFileHeader(Archive &Arc,FileHeader &hd,bool &TitleShown,bool Verbose,bo
+   mprintf(L"%ls",Name);
+ }
+ 
++/*
++void ListSymLink(Archive &Arc)
++{
++  if (Arc.FileHead.HSType==HSYS_UNIX && (Arc.FileHead.FileAttr & 0xF000)==0xA000)
++    if (Arc.FileHead.Encrypted)
++    {
++      // Link data are encrypted. We would need to ask for password
++      // and initialize decryption routine to display the link target.
++      mprintf(L"\n%22ls %ls",L"-->",L"*<-?->");
++    }
++    else
++    {
++      char FileName[NM];
++      uint DataSize=(uint)Min(Arc.FileHead.PackSize,sizeof(FileName)-1);
++      Arc.Read(FileName,DataSize);
++      FileName[DataSize]=0;
++      mprintf(L"\n%22ls %ls",L"-->",GetWide(FileName));
++    }
++}
++*/
+ 
+ void ListFileAttr(uint A,HOST_SYSTEM_TYPE HostType,wchar *AttrStr,size_t AttrSize)
+ {
+diff --git a/makefile b/makefile
+index 4f46c2a..f70755f 100644
+--- a/makefile
++++ b/makefile
+@@ -3,7 +3,7 @@
+ 
+ # Linux using GCC
+ CXX=c++
+-CXXFLAGS=-O2
++CXXFLAGS=-O2 -Wno-logical-op-parentheses -Wno-switch -Wno-dangling-else
+ LIBFLAGS=-fPIC
+ DEFINES=-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -DRAR_SMP
+ STRIP=strip
+diff --git a/pathfn.cpp b/pathfn.cpp
+index a40389c..2868067 100644
+--- a/pathfn.cpp
++++ b/pathfn.cpp
+@@ -260,9 +260,9 @@ bool EnumConfigPaths(uint Number,wchar *Path,size_t MaxSize,bool Create)
+   {
+     char *EnvStr=getenv("HOME");
+     if (EnvStr!=NULL)
+-      GetWideName(EnvStr,NULL,Path,MaxSize);
++      CharToWide(EnvStr,Path,MaxSize);
+     else
+-      wcsncpyz(Path, ConfPath[0], MaxSize);
++      wcsncpyz(Path,ConfPath[0],MaxSize);
+     return true;
+   }
+   Number--;
+diff --git a/rartypes.hpp b/rartypes.hpp
+index 67cfdcc..1ec97c9 100644
+--- a/rartypes.hpp
++++ b/rartypes.hpp
+@@ -16,17 +16,20 @@ typedef wchar_t          wchar;  // Unicode character
+ #define GET_SHORT16(x) (sizeof(ushort)==2 ? (ushort)(x):((x)&0xffff))
+ 
+ // Make 64 bit integer from two 32 bit.
+-#define UINT32TO64(high,low) ((((uint64)(high))<<32)+((uint64)low))
++#define INT32TO64(high,low) ((((uint64)(high))<<32)+((uint64)low))
++
++// Maximum int64 value.
++#define MAX_INT64 int64(INT32TO64(0x7fffffff,0xffffffff))
+ 
+ // Special int64 value, large enough to never be found in real life.
+ // We use it in situations, when we need to indicate that parameter 
+ // is not defined and probably should be calculated inside of function.
+ // Lower part is intentionally 0x7fffffff, not 0xffffffff, to make it 
+ // compatible with 32 bit int64.
+-#define INT64NDF UINT32TO64(0x7fffffff,0x7fffffff)
++#define INT64NDF INT32TO64(0x7fffffff,0x7fffffff)
+ 
+ // Maximum uint64 value.
+-#define MAX_UINT64 UINT32TO64(0xffffffff,0xffffffff)
++#define MAX_UINT64 INT32TO64(0xffffffff,0xffffffff)
+ #define UINT64NDF MAX_UINT64
+ 
+ #endif
+diff --git a/rawint.hpp b/rawint.hpp
+index 9e521e0..3037988 100644
+--- a/rawint.hpp
++++ b/rawint.hpp
+@@ -28,7 +28,7 @@ inline uint64 RawGet8(const void *Data)
+ {
+ #if defined(BIG_ENDIAN) || !defined(ALLOW_MISALIGNED)
+   byte *D=(byte *)Data;
+-  return UINT32TO64(RawGet4(D+4),RawGet4(D));
++  return INT32TO64(RawGet4(D+4),RawGet4(D));
+ #else
+   return *(uint64 *)Data;
+ #endif
+diff --git a/rawread.cpp b/rawread.cpp
+index 6099720..d99bac8 100644
+--- a/rawread.cpp
++++ b/rawread.cpp
+@@ -108,7 +108,7 @@ uint RawRead::Get4()
+ uint64 RawRead::Get8()
+ {
+   uint Low=Get4(),High=Get4();
+-  return UINT32TO64(High,Low);
++  return INT32TO64(High,Low);
+ }
+ 
+ 
+diff --git a/rdwrfn.cpp b/rdwrfn.cpp
+index bb1902a..f75f664 100644
+--- a/rdwrfn.cpp
++++ b/rdwrfn.cpp
+@@ -19,6 +19,7 @@ void ComprDataIO::Init()
+   ShowProgress=true;
+   TestMode=false;
+   SkipUnpCRC=false;
++  NoFileHeader=false;
+   PackVolume=false;
+   UnpVolume=false;
+   NextVolumeMissing=false;
+@@ -73,10 +74,10 @@ int ComprDataIO::UnpRead(byte *Addr,size_t Count)
+     }
+     else
+     {
+-      size_t SizeToRead=Count>UnpPackedSize ? (size_t)UnpPackedSize:Count;
++      size_t SizeToRead=((int64)Count>UnpPackedSize) ? (size_t)UnpPackedSize:Count;
+       if (SizeToRead > 0)
+       {
+-        if (UnpVolume && Decryption && Count>UnpPackedSize)
++        if (UnpVolume && Decryption && (int64)Count>UnpPackedSize)
+         {
+           // We need aligned blocks for decryption and we want "Keep broken
+           // files" to work efficiently with missing encrypted volumes.
+@@ -95,7 +96,7 @@ int ComprDataIO::UnpRead(byte *Addr,size_t Count)
+           return -1;
+         ReadSize=SrcFile->Read(ReadAddr,SizeToRead);
+         FileHeader *hd=SubHead!=NULL ? SubHead:&SrcArc->FileHead;
+-        if (hd->SplitAfter)
++        if (!NoFileHeader && hd->SplitAfter)
+           PackedDataHash.Update(ReadAddr,ReadSize);
+       }
+     }
+diff --git a/rdwrfn.hpp b/rdwrfn.hpp
+index a3e6a25..070010e 100644
+--- a/rdwrfn.hpp
++++ b/rdwrfn.hpp
+@@ -27,11 +27,12 @@ class ComprDataIO
+     size_t UnpWrSize;
+     byte *UnpWrAddr;
+ 
+-    uint64 UnpPackedSize;
++    int64 UnpPackedSize;
+ 
+     bool ShowProgress;
+     bool TestMode;
+     bool SkipUnpCRC;
++    bool NoFileHeader;
+ 
+     File *SrcFile;
+     File *DestFile;
+@@ -59,9 +60,10 @@ class ComprDataIO
+     void UnpWrite(byte *Addr,size_t Count);
+     void EnableShowProgress(bool Show) {ShowProgress=Show;}
+     void GetUnpackedData(byte **Data,size_t *Size);
+-    void SetPackedSizeToRead(uint64 Size) {UnpPackedSize=Size;}
++    void SetPackedSizeToRead(int64 Size) {UnpPackedSize=Size;}
+     void SetTestMode(bool Mode) {TestMode=Mode;}
+     void SetSkipUnpCRC(bool Skip) {SkipUnpCRC=Skip;}
++    void SetNoFileHeader(bool Mode) {NoFileHeader=Mode;}
+     void SetFiles(File *SrcFile,File *DestFile);
+     void SetCommand(CmdAdd *Cmd) {Command=Cmd;}
+     void SetSubHeader(FileHeader *hd,int64 *Pos) {SubHead=hd;SubHeadPos=Pos;}
+@@ -77,7 +79,7 @@ class ComprDataIO
+     bool UnpVolume;
+     bool NextVolumeMissing;
+     int64 UnpArcSize;
+-    uint64 CurPackRead,CurPackWrite,CurUnpRead,CurUnpWrite;
++    int64 CurPackRead,CurPackWrite,CurUnpRead,CurUnpWrite;
+ 
+ 
+     // Size of already processed archives.
+diff --git a/recvol5.cpp b/recvol5.cpp
+index 8272b07..fddc25d 100644
+--- a/recvol5.cpp
++++ b/recvol5.cpp
+@@ -139,6 +139,8 @@ bool RecVolumes5::Restore(RAROptions *Cmd,const wchar *Name,bool Silent)
+   wcsncpyz(ArcName,Name,ASIZE(ArcName));
+ 
+   wchar *Num=GetVolNumPart(ArcName);
++  if (Num==ArcName)
++    return false; // Number part is missing in the name.
+   while (Num>ArcName && IsDigit(*(Num-1)))
+     Num--;
+   wcsncpyz(Num,L"*.*",ASIZE(ArcName)-(Num-ArcName));
+diff --git a/smallfn.cpp b/smallfn.cpp
+index 624dae6..81259d0 100644
+--- a/smallfn.cpp
++++ b/smallfn.cpp
+@@ -1,6 +1,6 @@
+ #include "rar.hpp"
+ 
+-uint ToPercent(uint64 N1,uint64 N2)
++int ToPercent(int64 N1,int64 N2)
+ {
+   if (N2<N1)
+     return 100;
+@@ -9,11 +9,11 @@ uint ToPercent(uint64 N1,uint64 N2)
+ 
+ 
+ // Allows the percent larger than 100.
+-uint ToPercentUnlim(uint64 N1,uint64 N2)
++int ToPercentUnlim(int64 N1,int64 N2)
+ {
+   if (N2==0)
+     return 0;
+-  return uint(N1*100/N2);
++  return (int)(N1*100/N2);
+ }
+ 
+ 
+diff --git a/smallfn.hpp b/smallfn.hpp
+index d3bcef1..f53daa8 100644
+--- a/smallfn.hpp
++++ b/smallfn.hpp
+@@ -1,8 +1,8 @@
+ #ifndef _RAR_SMALLFN_
+ #define _RAR_SMALLFN_
+ 
+-uint ToPercent(uint64 N1,uint64 N2);
+-uint ToPercentUnlim(uint64 N1,uint64 N2);
++int ToPercent(int64 N1,int64 N2);
++int ToPercentUnlim(int64 N1,int64 N2);
+ void RARInitData();
+ 
+ #endif
+diff --git a/timefn.cpp b/timefn.cpp
+index 66779eb..63f4660 100644
+--- a/timefn.cpp
++++ b/timefn.cpp
+@@ -25,9 +25,9 @@ void RarTime::GetLocal(RarLocalTime *lt)
+     // Correct precision loss (low 4 decimal digits) in FileTimeToSystemTime.
+     FILETIME rft;
+     SystemTimeToFileTime(&st1,&rft);
+-    uint64 Corrected=UINT32TO64(ft.dwHighDateTime,ft.dwLowDateTime)-
+-                     UINT32TO64(rft.dwHighDateTime,rft.dwLowDateTime)+
+-                     UINT32TO64(lft.dwHighDateTime,lft.dwLowDateTime);
++    uint64 Corrected=INT32TO64(ft.dwHighDateTime,ft.dwLowDateTime)-
++                     INT32TO64(rft.dwHighDateTime,rft.dwLowDateTime)+
++                     INT32TO64(lft.dwHighDateTime,lft.dwLowDateTime);
+     lft.dwLowDateTime=(DWORD)Corrected;
+     lft.dwHighDateTime=(DWORD)(Corrected>>32);
+   }
+@@ -100,9 +100,9 @@ void RarTime::SetLocal(RarLocalTime *lt)
+       // Correct precision loss (low 4 decimal digits) in FileTimeToSystemTime.
+       FILETIME rft;
+       SystemTimeToFileTime(&st2,&rft);
+-      uint64 Corrected=UINT32TO64(lft.dwHighDateTime,lft.dwLowDateTime)-
+-                       UINT32TO64(rft.dwHighDateTime,rft.dwLowDateTime)+
+-                       UINT32TO64(ft.dwHighDateTime,ft.dwLowDateTime);
++      uint64 Corrected=INT32TO64(lft.dwHighDateTime,lft.dwLowDateTime)-
++                       INT32TO64(rft.dwHighDateTime,rft.dwLowDateTime)+
++                       INT32TO64(ft.dwHighDateTime,ft.dwLowDateTime);
+       ft.dwLowDateTime=(DWORD)Corrected;
+       ft.dwHighDateTime=(DWORD)(Corrected>>32);
+     }
+@@ -184,7 +184,7 @@ void RarTime::SetUnix(time_t ut)
+ uint64 RarTime::GetUnixNS()
+ {
+   // 11644473600000000000 - number of ns between 01-01-1601 and 01-01-1970.
+-  uint64 ushift=UINT32TO64(0xA1997B0B,0x4C6A0000);
++  uint64 ushift=INT32TO64(0xA1997B0B,0x4C6A0000);
+   return itime*(1000000000/TICKS_PER_SECOND)-ushift;
+ }
+ 
+@@ -193,7 +193,7 @@ uint64 RarTime::GetUnixNS()
+ void RarTime::SetUnixNS(uint64 ns)
+ {
+   // 11644473600000000000 - number of ns between 01-01-1601 and 01-01-1970.
+-  uint64 ushift=UINT32TO64(0xA1997B0B,0x4C6A0000);
++  uint64 ushift=INT32TO64(0xA1997B0B,0x4C6A0000);
+   itime=(ns+ushift)/(1000000000/TICKS_PER_SECOND);
+ }
+ 
+diff --git a/ulinks.cpp b/ulinks.cpp
+index ad2d9cc..1656824 100644
+--- a/ulinks.cpp
++++ b/ulinks.cpp
+@@ -50,8 +50,11 @@ bool ExtractUnixLink30(CommandData *Cmd,ComprDataIO &DataIO,Archive &Arc,const w
+   char Target[NM];
+   if (IsLink(Arc.FileHead.FileAttr))
+   {
+-    size_t DataSize=(size_t)Min(Arc.FileHead.PackSize,ASIZE(Target)-1);
+-    DataIO.UnpRead((byte *)Target,DataSize);
++    size_t DataSize=(size_t)Arc.FileHead.PackSize;
++    if (DataSize>ASIZE(Target)-1)
++      return false;
++    if ((size_t)DataIO.UnpRead((byte *)Target,DataSize)!=DataSize)
++      return false;
+     Target[DataSize]=0;
+ 
+     DataIO.UnpHash.Init(Arc.FileHead.FileHash.Type,1);
+diff --git a/unicode.cpp b/unicode.cpp
+index b426082..8ce752a 100644
+--- a/unicode.cpp
++++ b/unicode.cpp
+@@ -36,7 +36,25 @@ bool WideToChar(const wchar *Src,char *Dest,size_t DestSize)
+     mbstate_t ps; // Use thread safe external state based functions.
+     memset (&ps, 0, sizeof(ps));
+     const wchar *SrcParam=Src; // wcsrtombs can change the pointer.
++
++    // Some implementations of wcsrtombs can cause memory analyzing tools
++    // like valgrind to report uninitialized data access. It happens because
++    // internally these implementations call SSE4 based wcslen function,
++    // which reads 16 bytes at once including those beyond of trailing 0.
+     size_t ResultingSize=wcsrtombs(Dest,&SrcParam,DestSize,&ps);
++
++    if (ResultingSize==(size_t)-1 && errno==EILSEQ)
++    {
++      // Aborted on inconvertible character not zero terminating the result.
++      // EILSEQ helps to distinguish it from small output buffer abort.
++      // We want to convert as much as we can, so we clean the output buffer
++      // and repeat conversion.
++      memset (&ps, 0, sizeof(ps));
++      SrcParam=Src; // wcsrtombs can change the pointer.
++      memset(Dest,0,DestSize);
++      ResultingSize=wcsrtombs(Dest,&SrcParam,DestSize,&ps);
++    }
++
+     if (ResultingSize==(size_t)-1)
+       RetCode=false;
+     if (ResultingSize==0 && *Src!=0)
+@@ -122,13 +140,8 @@ bool WideToCharMap(const wchar *Src,char *Dest,size_t DestSize,bool &Success)
+ 
+   Success=true;
+   uint SrcPos=0,DestPos=0;
+-  while (DestPos<DestSize-MB_CUR_MAX)
++  while (Src[SrcPos]!=0 && DestPos<DestSize-MB_CUR_MAX)
+   {
+-    if (Src[SrcPos]==0)
+-    {
+-      Dest[DestPos]=0;
+-      break;
+-    }
+     if (uint(Src[SrcPos])==MappedStringMark)
+     {
+       SrcPos++;
+@@ -143,13 +156,17 @@ bool WideToCharMap(const wchar *Src,char *Dest,size_t DestSize,bool &Success)
+       mbstate_t ps;
+       memset(&ps,0,sizeof(ps));
+       if (wcrtomb(Dest+DestPos,Src[SrcPos],&ps)==-1)
++      {
++        Dest[DestPos]='_';
+         Success=false;
++      }
+       SrcPos++;
+       memset(&ps,0,sizeof(ps));
+       int Length=mbrlen(Dest+DestPos,MB_CUR_MAX,&ps);
+       DestPos+=Max(Length,1);
+     }
+   }
++  Dest[Min(DestPos,DestSize-1)]=0;
+   return true;
+ }
+ #endif
+@@ -170,7 +187,6 @@ void CharToWideMap(const char *Src,wchar *Dest,size_t DestSize,bool &Success)
+   {
+     if (Src[SrcPos]==0)
+     {
+-      Dest[DestPos]=0;
+       Success=true;
+       break;
+     }
+@@ -202,6 +218,7 @@ void CharToWideMap(const char *Src,wchar *Dest,size_t DestSize,bool &Success)
+       DestPos++;
+     }
+   }
++  Dest[Min(DestPos,DestSize-1)]=0;
+ }
+ #endif
+ 
+diff --git a/unpack20.cpp b/unpack20.cpp
+index 7ace2e4..a7a41c3 100644
+--- a/unpack20.cpp
++++ b/unpack20.cpp
+@@ -248,7 +248,7 @@ bool Unpack::ReadTables20()
+     MakeDecodeTables(&Table[NC20],&BlockTables.DD,DC20);
+     MakeDecodeTables(&Table[NC20+DC20],&BlockTables.RD,RC20);
+   }
+-  memcpy(UnpOldTable20,Table,sizeof(UnpOldTable20));
++  memcpy(UnpOldTable20,Table,TableSize);
+   return true;
+ }
+ 

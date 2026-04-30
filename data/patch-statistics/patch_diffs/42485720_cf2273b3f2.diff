@@ -1,0 +1,136 @@
+From 650fbf88fae47c315ac4ba1c5519423664e4119e Mon Sep 17 00:00:00 2001
+From: Ingo Berg <github_contact@beltoforion.de>
+Date: Thu, 16 Jul 2020 23:17:27 +0200
+Subject: [PATCH] fix for oss-fuzz issue 24167
+
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24167
+---
+ CHANGELOG                     |  7 +++++--
+ samples/example1/example1.cpp |  1 +
+ src/muParserBase.cpp          |  8 +++++++-
+ src/muParserTest.cpp          | 30 ++++++++++++++++++------------
+ 4 files changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/CHANGELOG b/CHANGELOG
+index 3ff3b68..5698b02 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -26,7 +26,7 @@ GitHub Master
+      class interface as well as the C-interface. Before the linux shared library was using the class interface and the 
+      windows dll was using the C-interface.
+     
+-     Only the C-Interface is safe to use when you intent to bring an executable to another linux distribution or windows version. 
++     Only the C-Interface is safe to use when you intent to bring an executable to another linux distribution or windows version! 
+      This is up to the client software. I cannot change this because on linux the shared library was always using the class 
+      interface. Usually this is not a problem since distributions compile all applications from scratch. 
+ 
+@@ -34,8 +34,11 @@ GitHub Master
+      version compiled for another operating system or linux distribution! You must either use the C-Interface if you 
+      want this or use a static library build of muparser!
+ 
++  Security Fixes: (The issues were present in all prior stable releases)
++   * https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24167 
++
+   Bugfixes:
+-    * fixed a couple of issues for building the C-Interface (muParserDLL.cpp/.h) with wide character support.
++   * fixed a couple of issues for building the C-Interface (muParserDLL.cpp/.h) with wide character support.
+ 
+ Rev 2.3.2: 17.06.2020
+ ---------------------
+diff --git a/samples/example1/example1.cpp b/samples/example1/example1.cpp
+index e07b261..582fdfa 100644
+--- a/samples/example1/example1.cpp
++++ b/samples/example1/example1.cpp
+@@ -380,6 +380,7 @@ static int CheckKeywords(const mu::char_type* a_szLine, mu::Parser& a_Parser)
+ 	}
+ 	else if (sLine == _T("dbg"))
+ 	{
++//		string_type dbg = _T(R"(avg(0>3?4:(""),0^3?4:("")))");
+ 		string_type dbg = _T(R"(avg(0>3?4:(""),0^3?4:("")))");
+ 		a_Parser.SetExpr(dbg);
+ 		mu::console() << dbg;
+diff --git a/src/muParserBase.cpp b/src/muParserBase.cpp
+index 3fbddc4..5d1c415 100644
+--- a/src/muParserBase.cpp
++++ b/src/muParserBase.cpp
+@@ -890,18 +890,24 @@ namespace mu
+ 		while (a_stOpt.size() && a_stOpt.top().GetCode() == cmELSE)
+ 		{
+ 			MUP_ASSERT(!a_stOpt.empty())
+-				token_type opElse = a_stOpt.top();
++			token_type opElse = a_stOpt.top();
+ 			a_stOpt.pop();
+ 
+ 			// Take the value associated with the else branch from the value stack
+ 			MUP_ASSERT(!a_stVal.empty());
+ 			token_type vVal2 = a_stVal.top();
++			if (vVal2.GetType() != tpDBL)
++				Error(ecUNEXPECTED_STR, m_pTokenReader->GetPos());
++			
+ 			a_stVal.pop();
+ 
+ 			// it then else is a ternary operator Pop all three values from the value s
+ 			// tack and just return the right value
+ 			MUP_ASSERT(!a_stVal.empty());
+ 			token_type vVal1 = a_stVal.top();
++			if (vVal1.GetType() != tpDBL)
++				Error(ecUNEXPECTED_STR, m_pTokenReader->GetPos());
++
+ 			a_stVal.pop();
+ 
+ 			MUP_ASSERT(!a_stVal.empty());
+diff --git a/src/muParserTest.cpp b/src/muParserTest.cpp
+index 3b94bc3..9d39436 100644
+--- a/src/muParserTest.cpp
++++ b/src/muParserTest.cpp
+@@ -139,13 +139,13 @@ namespace mu
+ 			// from oss-fuzz: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=23410
+ 			iStat += ThrowTest(_T(R"(6 - 6 ? 4 : "", ? 4 : "", ? 4 : "")"), ecUNEXPECTED_STR,  true);
+ 			// variations:
+-			iStat += ThrowTest(_T(R"(avg(0?4:(""),1))"), ecVAL_EXPECTED);
+-			iStat += ThrowTest(_T(R"(1 ? 4 : "")"), ecUNEXPECTED_STR, true);
+-			iStat += ThrowTest(_T(R"(1 ? "" : 4)"), ecUNEXPECTED_STR, true);
+-			iStat += ThrowTest(_T(R"(1 ? "" : "")"), ecUNEXPECTED_STR, true);
+-			iStat += ThrowTest(_T(R"(0 ? 4 : "")"), ecUNEXPECTED_STR, true);
+-			iStat += ThrowTest(_T(R"(0 ? 4 : (""))"), ecSTR_RESULT, true);
+-			iStat += ThrowTest(_T(R"(1 ? 4 : "")"), ecUNEXPECTED_STR, true);
++			iStat += ThrowTest(_T(R"(avg(0?4:(""),1))"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(1 ? 4 : "")"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(1 ? "" : 4)"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(1 ? "" : "")"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(0 ? 4 : "")"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(0 ? 4 : (""))"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(1 ? 4 : "")"), ecUNEXPECTED_STR);
+ 
+ 			// from oss-fuzz: https://oss-fuzz.com/testcase-detail/5106868061208576
+ 			iStat += ThrowTest(_T(R"("","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",8)"), ecSTR_RESULT);
+@@ -634,8 +634,8 @@ namespace mu
+ 			iStat += ThrowTest(_T("6, +, +, +, +, +, +, +, +, +, +, +, +, +, +, 1, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +, +"), ecUNEXPECTED_ARG_SEP, true);
+ 
+ 			// misplaced string argument			
+-			iStat += ThrowTest(_T(R"(sin(0?4:("")))"), ecVAL_EXPECTED);
+-			iStat += ThrowTest(_T(R"(avg(0?4:(""),1))"), ecVAL_EXPECTED);
++			iStat += ThrowTest(_T(R"(sin(0?4:("")))"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(avg(0?4:(""),1))"), ecUNEXPECTED_STR);
+ 
+ 			// Compound expressions
+ 			iStat += EqnTest(_T("1,2,3"), 3, true);
+@@ -944,9 +944,15 @@ namespace mu
+ 			mu::console() << _T("testing if-then-else operator...");
+ 
+ 			// from oss-fuzz.com: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24167
+-//			iStat += ThrowTest(_T(R"(avg(0?(""):4,1))"), ecVAL_EXPECTED);
+-//			iStat += ThrowTest(_T("avg(0>3?4:(\"\"),0^3?4:(\"\"))"), ecUNEXPECTED_ARG_SEP);
+-//			iStat += ThrowTest(_T("0^3^avg(0>3?4:(\"\"),0^3?4:(\"\"))"), ecUNEXPECTED_ARG_SEP);
++			iStat += ThrowTest(_T(R"(0^3^avg(0>3?4:(""),0^3?4:("")))"), ecUNEXPECTED_STR);
++			// derivatives
++			iStat += ThrowTest(_T(R"(avg(0?(""):4,1))"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(avg(0>3?4:(""),0^3?4:("")))"), ecUNEXPECTED_STR);
++
++			iStat += ThrowTest(_T(R"(0?4:(""))"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"((0)?4:(""))"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"((0>3)?4:(""))"), ecUNEXPECTED_STR);
++			iStat += ThrowTest(_T(R"(0>3?4:(""))"), ecUNEXPECTED_STR);
+ 
+ 			// from oss-fuzz.com: https://oss-fuzz.com/testcase-detail/4777121158529024
+ 			iStat += ThrowTest(_T("3!=min(0?2>2,2>5,1:6)"), ecUNEXPECTED_ARG_SEP);

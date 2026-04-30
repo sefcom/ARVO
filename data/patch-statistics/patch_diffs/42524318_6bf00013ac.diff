@@ -1,0 +1,277 @@
+From 2d620e5d249608e654ef7e7aeea05f2764bf519d Mon Sep 17 00:00:00 2001
+From: Reini Urban <rurban@cpan.org>
+Date: Tue, 31 Oct 2023 23:30:37 +0100
+Subject: [PATCH] encode,json: downgrade TV strings to TFv
+
+which might be shorter than the TF, so skip the slack.
+---
+ src/bits.c     | 44 ++++++++++++++++++++++++++++++++++
+ src/bits.h     |  5 ++++
+ src/encode.c   | 65 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ src/out_json.c | 58 +++++++++++++++++++++++++++++++++++++++++---
+ 4 files changed, 168 insertions(+), 4 deletions(-)
+
+diff --git a/src/bits.c b/src/bits.c
+index 474d6d90f9..7e442151c1 100644
+--- a/src/bits.c
++++ b/src/bits.c
+@@ -1700,6 +1700,50 @@ bit_write_TF (Bit_Chain *restrict dat, BITCODE_TF restrict chain,
+     }
+ }
+ 
++/** Write fixed-length text from variable length string
++    (possibly downgraded from shorter string).
++ */
++void
++bit_write_TFv (Bit_Chain *restrict dat, BITCODE_TF restrict chain,
++              size_t length)
++{
++  size_t len;
++  if (!chain)
++    {
++      loglevel = dat->opts & DWG_OPTS_LOGLEVEL;
++      if (length > 0)
++        LOG_ERROR ("Empty TF with length %" PRIuSIZE, length);
++      if (length <= 128) // either chain or length is wrong
++        {
++          for (size_t i = 0; i < length; i++)
++            bit_write_RC (dat, 0);
++        }
++      return;
++    }
++  if (dat->byte + length > dat->size)
++    bit_chain_alloc_size (dat, (dat->byte + length) - dat->size);
++  len = strlen ((char *)chain);
++  if (dat->bit == 0)
++    {
++      if (len >= length) // long enough
++        memcpy (&dat->chain[dat->byte], chain, length);
++      else // shorter
++        memcpy (&dat->chain[dat->byte], chain, len);
++      // no need to memclean, calloc'ed
++      dat->byte += length;
++    }
++  else
++    {
++      for (size_t i = 0; i < length; i++)
++        {
++          if (i < len)
++            bit_write_RC (dat, (BITCODE_RC)chain[i]);
++          else
++            bit_write_RC (dat, 0);
++        }
++    }
++}
++
+ /** Read simple text. After usage, the allocated memory must be properly freed.
+  */
+ ATTRIBUTE_MALLOC
+diff --git a/src/bits.h b/src/bits.h
+index 1385e63dfc..294f6990ba 100644
+--- a/src/bits.h
++++ b/src/bits.h
+@@ -200,6 +200,11 @@ BITCODE_TF bit_read_bits (Bit_Chain *dat, size_t bits) ATTRIBUTE_MALLOC;
+ 
+ void bit_write_TF (Bit_Chain *restrict dat, BITCODE_TF restrict chain,
+                    size_t length);
++/** Write fixed-length text from variable length string
++    (possibly downgraded from shorter string).
++ */
++void bit_write_TFv (Bit_Chain *restrict dat, BITCODE_TF restrict chain,
++                    size_t length);
+ 
+ /* read ASCII string, with length as BS */
+ BITCODE_TV bit_read_TV (Bit_Chain *restrict dat);
+diff --git a/src/encode.c b/src/encode.c
+index c7e248571d..6a81057f2e 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -266,6 +266,26 @@ const unsigned char unknown_section[53]
+       }                                                                       \
+     LOG_TRACE_TF (FIELD_VALUE (nam), (int)len);                               \
+   }
++// zero-terminated fixed buffer, which might be shorter
++#define FIELD_TFv(nam, len, dxf)                                              \
++  {                                                                           \
++    LOG_TRACE (#nam ": %s [TFv %d %d]\n", _obj->nam, (int)len, dxf);          \
++    if (len > 0 && len < MAX_SIZE_TF)                                         \
++      {                                                                       \
++        if (!_obj->nam)                                                       \
++          { /* empty field, write zeros */                                    \
++            for (int _i = 0; _i < (int)(len); _i++)                           \
++              bit_write_RC (dat, 0);                                          \
++          }                                                                   \
++        /* The source might not be long enough. or it is, just with a zero */ \
++        /* Luckily TFF's are only preR13 */                                   \
++        else                                                                  \
++          {                                                                   \
++            bit_write_TFv (dat, (BITCODE_TF)_obj->nam, len);                  \
++          }                                                                   \
++      }                                                                       \
++    LOG_TRACE_TF (FIELD_VALUE (nam), (int)len);                               \
++  }
+ #define FIELD_BINARY(nam, len, dxf)                                           \
+   {                                                                           \
+     LOG_TRACE (#nam ": %s [TF %d %d]\n", _obj->nam, (int)len, dxf);           \
+@@ -286,7 +306,6 @@ const unsigned char unknown_section[53]
+     LOG_INSANE_TF (FIELD_VALUE (nam), (int)len);                              \
+   }
+ #define FIELD_TFF(nam, len, dxf) FIELD_TF (nam, len, dxf)
+-#define FIELD_TFv(nam, len, dxf) FIELD_TF (nam, len, dxf)
+ #define FIELD_TU(nam, dxf)                                                    \
+   {                                                                           \
+     if (_obj->nam)                                                            \
+@@ -5936,6 +5955,45 @@ dwg_encode_common_entity_handle_data (Bit_Chain *dat, Bit_Chain *hdl_dat,
+   return error;
+ }
+ 
++#if 0
++// converted from TV to possibly longer TFv
++void
++downgrade_preR13_header_variables (Bit_Chain *dat, Dwg_Data *restrict dwg)
++{
++  if (dat->from_version >= R_13b1)
++    {
++      // downgrade TV to TFv
++      dwg->header_vars.MENU = realloc (dwg->header_vars.MENU, 15);
++      dwg->header_vars.DIMBLK_T = realloc (dwg->header_vars.DIMBLK_T, 33);
++      if (dwg->header.numheader_vars > 114)
++        {
++          dwg->header_vars.DIMPOST = realloc (dwg->header_vars.DIMPOST, 16);
++          dwg->header_vars.DIMAPOST = realloc (dwg->header_vars.DIMAPOST, 16);
++        }
++      if (dwg->header.numheader_vars > 129)
++        {
++          dwg->header_vars.DIMBLK1_T
++              = realloc (dwg->header_vars.DIMBLK1_T, 33);
++          dwg->header_vars.DIMBLK2_T
++              = realloc (dwg->header_vars.DIMBLK2_T, 33);
++          dwg->header_vars.unknown_string
++              = realloc (dwg->header_vars.unknown_string, 33);
++        }
++      if (dwg->header.numheader_vars > 160)
++        {
++          dwg->header_vars.unit1_name
++              = realloc (dwg->header_vars.unit1_name, 33);
++          dwg->header_vars.unit2_name
++              = realloc (dwg->header_vars.unit2_name, 33);
++          dwg->header_vars.unit3_name
++              = realloc (dwg->header_vars.unit3_name, 33);
++          dwg->header_vars.unit4_name
++              = realloc (dwg->header_vars.unit4_name, 33);
++        }
++    }
++}
++#endif
++
+ static int
+ encode_preR13_header_variables (Bit_Chain *dat, Dwg_Data *restrict dwg)
+ {
+@@ -5944,6 +6002,11 @@ encode_preR13_header_variables (Bit_Chain *dat, Dwg_Data *restrict dwg)
+   Bit_Chain *hdl_dat = dat;
+   int error = 0;
+ 
++  // PRE (R_13b1)
++  // {
++  //   if (dat->from_version >= R_13b1)
++  //     downgrade_preR13_header_variables (dat, dwg);
++  // }
+   // clang-format off
+   #include "header_variables_r11.spec"
+   // clang-format on
+diff --git a/src/out_json.c b/src/out_json.c
+index b3101732c7..c9de205acf 100644
+--- a/src/out_json.c
++++ b/src/out_json.c
+@@ -48,6 +48,8 @@ static wchar_t *wcquote (wchar_t *restrict dest, const wchar_t *restrict src);
+ static void print_wcquote (Bit_Chain *restrict dat,
+                            dwg_wchar_t *restrict wstr);
+ #endif
++void json_write_TFv (Bit_Chain *restrict dat, const BITCODE_TF restrict src,
++                     const size_t len);
+ // write even past the \0, to keep existing slack
+ void json_write_TF (Bit_Chain *restrict dat, const BITCODE_TF restrict src,
+                     const size_t len);
+@@ -291,13 +293,18 @@ static char *_path_field (const char *path);
+     KEY (nam);                                                                \
+     VALUE_TEXT_TU ((BITCODE_TU)wstr);                                         \
+   }
++// may be downgraded from TV, thus shorter
+ #define FIELD_TFv(nam, len, dxf)                                              \
++  {                                                                           \
++    FIRSTPREFIX fprintf (dat->fh, "\"%s\": ", _path_field (#nam));            \
++    json_write_TFv (dat, (const BITCODE_TF)_obj->nam, len);                   \
++  }
++#define FIELD_TF(nam, len, dxf)                                               \
+   {                                                                           \
+     FIRSTPREFIX fprintf (dat->fh, "\"%s\": ", _path_field (#nam));            \
+     json_write_TF (dat, (const BITCODE_TF)_obj->nam, len);                    \
+   }
+-#define FIELD_TF(nam, len, dxf) FIELD_TFv (nam, len, dxf)
+-#define FIELD_TFF(nam, len, dxf) FIELD_TFv (nam, len, dxf)
++#define FIELD_TFF(nam, len, dxf) FIELD_TF (nam, len, dxf)
+ 
+ #define FIELD_VALUE(nam) _obj->nam
+ #define ANYCODE -1
+@@ -1391,8 +1398,51 @@ wcquote (wchar_t *restrict dest, const wchar_t *restrict src)
+ 
+ #endif /* HAVE_NATIVE_WCHAR2 */
+ 
++/* Don't write past the strlen.
++   TODO: convert to utf8.
++*/
++void
++json_write_TFv (Bit_Chain *restrict dat, const BITCODE_TF restrict src,
++               const size_t len)
++{
++  const size_t slen = src ? strlen ((char *)src) : 0;
++  fputc ('"', dat->fh);
++  if (!slen)
++    {
++      fputc ('"', dat->fh);
++      return;
++    }
++  for (size_t i = 0; i < MIN (slen, len); i++)
++    {
++      const unsigned char c = src[i];
++      if (c == '\r' || c == '\n' || c == '"' || c == '\\')
++        {
++          fputc ('\\', dat->fh);
++          if (c == '\r')
++            fputc ('r', dat->fh);
++          else if (c == '\n')
++            fputc ('n', dat->fh);
++          else
++            fputc (c, dat->fh);
++        }
++      else if (c == '\\' && i + 6 < len && src[i] == 'U' && src[i + 1] == '+'
++               && ishex (src[i + 2]) && ishex (src[i + 3])
++               && ishex (src[i + 4]) && ishex (src[i + 5]))
++        {
++          fputc ('\\', dat->fh);
++          fputc ('u', dat->fh);
++          i += 3;
++        }
++      else if (c < 0x1f)
++        fprintf (dat->fh, "\\u00%02x", c);
++      else
++        fputc (c, dat->fh);
++    }
++  fputc ('"', dat->fh);
++}
++
+ /* Write even past the \0, to keep existing slack.
+-   Don't convert to utf8.
++   TODO: convert to utf8.
+ */
+ void
+ json_write_TF (Bit_Chain *restrict dat, const BITCODE_TF restrict src,
+@@ -1961,6 +2011,8 @@ json_header_write (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+   // separate funcs to catch the return, and end with ENDRECORD
+   PRE (R_13b1)
+   {
++    // if (dat->from_version >= R_13b1)
++    //   downgrade_preR13_header_variables (dat, dwg);
+     error = json_preR13_header_write_private (dat, dwg);
+   }
+   LATER_VERSIONS

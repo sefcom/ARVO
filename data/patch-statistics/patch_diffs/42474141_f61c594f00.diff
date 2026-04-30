@@ -1,0 +1,58 @@
+From fab45352f5d6b2f516fed8a86c0d197bb7c27958 Mon Sep 17 00:00:00 2001
+From: Jonathan Hui <jonhui@google.com>
+Date: Fri, 15 Mar 2019 21:46:02 -0700
+Subject: [PATCH] [meshcop] process ChannelMaskTlv in message (#3690)
+
+Allows arbitrary number of Channel Mask entries.
+---
+ src/core/meshcop/meshcop_tlvs.cpp | 36 +++++++++++++++++++++++++++----
+ 1 file changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/meshcop/meshcop_tlvs.cpp b/src/core/meshcop/meshcop_tlvs.cpp
+index c319ab641b5..f407dc24a0c 100644
+--- a/src/core/meshcop/meshcop_tlvs.cpp
++++ b/src/core/meshcop/meshcop_tlvs.cpp
+@@ -236,11 +236,39 @@ uint32_t ChannelMaskTlv::GetChannelMask(void) const
+ 
+ uint32_t ChannelMaskTlv::GetChannelMask(const Message &aMessage)
+ {
+-    uint32_t       mask = 0;
+-    ChannelMaskTlv channelMaskTlv;
++    uint32_t mask = 0;
++    uint16_t offset;
++    uint16_t end;
+ 
+-    SuccessOrExit(GetTlv(aMessage, kChannelMask, sizeof(channelMaskTlv), channelMaskTlv));
+-    mask = channelMaskTlv.GetChannelMask();
++    SuccessOrExit(GetValueOffset(aMessage, kChannelMask, offset, end));
++    end += offset;
++
++    while (offset + sizeof(ChannelMaskEntryBase) <= end)
++    {
++        ChannelMaskEntry entry;
++
++        aMessage.Read(offset, sizeof(ChannelMaskEntryBase), &entry);
++        VerifyOrExit(offset + entry.GetEntrySize() <= end);
++
++        switch (entry.GetChannelPage())
++        {
++#if OPENTHREAD_CONFIG_RADIO_2P4GHZ_OQPSK_SUPPORT
++        case OT_RADIO_CHANNEL_PAGE_0:
++            aMessage.Read(offset, sizeof(entry), &entry);
++            mask |= entry.GetMask() & OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MASK;
++            break;
++#endif
++
++#if OPENTHREAD_CONFIG_RADIO_915MHZ_OQPSK_SUPPORT
++        case OT_RADIO_CHANNEL_PAGE_2:
++            aMessage.Read(offset, sizeof(entry), &entry);
++            mask |= entry.GetMask() & OT_RADIO_915MHZ_OQPSK_CHANNEL_MASK;
++            break;
++#endif
++        }
++
++        offset += entry.GetEntrySize();
++    }
+ 
+ exit:
+     return mask;

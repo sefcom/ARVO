@@ -1,0 +1,181 @@
+From 707708d83188b04ea0b7b0ae2487aa8ac7e62f41 Mon Sep 17 00:00:00 2001
+From: "Diego F. Aranha" <dfaranha@gmail.com>
+Date: Sun, 7 Feb 2021 12:35:53 +0100
+Subject: [PATCH] Update code to use DV functions instead of manual copy.
+
+---
+ src/bn/relic_bn_mul.c                | 45 ++++++++--------------------
+ src/bn/relic_bn_sqr.c                | 26 +++++-----------
+ src/low/gmp_sec/relic_bn_shift_low.c | 29 ------------------
+ 3 files changed, 20 insertions(+), 80 deletions(-)
+
+diff --git a/src/bn/relic_bn_mul.c b/src/bn/relic_bn_mul.c
+index 25edfe85f..f8902cf8b 100644
+--- a/src/bn/relic_bn_mul.c
++++ b/src/bn/relic_bn_mul.c
+@@ -48,11 +48,10 @@
+  * @param[in] level			- the number of Karatsuba steps to apply.
+  */
+ static void bn_mul_karat_imp(bn_t c, const bn_t a, const bn_t b, int level) {
+-	int h;
+-	bn_t a0, a1, b0, b1, a0b0, a1b1;
+-	bn_t t;
+-	const dig_t *tmpa, *tmpb;
+-	dig_t *t0;
++	bn_t a0, a1, b0, b1, a0b0, a1b1, t;
++
++	/* Compute half the digits of a or b. */
++	int h = RLC_MIN(a->used, b->used) >> 1;
+ 
+ 	bn_null(a0);
+ 	bn_null(a1);
+@@ -62,42 +61,24 @@ static void bn_mul_karat_imp(bn_t c, const bn_t a, const bn_t b, int level) {
+ 	bn_null(a1b1);
+ 	bn_null(t);
+ 
+-	/* Compute half the digits of a or b. */
+-	h = RLC_MIN(a->used, b->used) >> 1;
+-
+ 	RLC_TRY {
+ 		/* Allocate the temp variables. */
+-		bn_new(a0);
+-		bn_new(a1);
+-		bn_new(b0);
+-		bn_new(b1);
++		bn_new_size(a0, h);
++		bn_new_size(a1, h);
++		bn_new_size(b0, a->used - h);
++		bn_new_size(b1, b->used - h);
+ 		bn_new(a0b0);
+ 		bn_new(a1b1);
+ 		bn_new(t);
+ 
++		/* a = a1 || a0, b = b1 || b0 */
+ 		a0->used = b0->used = h;
+ 		a1->used = a->used - h;
+ 		b1->used = b->used - h;
+-
+-		tmpa = a->dp;
+-		tmpb = b->dp;
+-
+-		/* a = a1 || a0 */
+-		t0 = a0->dp;
+-		for (int i = 0; i < h; i++, t0++, tmpa++)
+-			*t0 = *tmpa;
+-		t0 = a1->dp;
+-		for (int i = 0; i < a1->used; i++, t0++, tmpa++)
+-			*t0 = *tmpa;
+-
+-		/* b = b1 || b0 */
+-		t0 = b0->dp;
+-		for (int i = 0; i < h; i++, t0++, tmpb++)
+-			*t0 = *tmpb;
+-		t0 = b1->dp;
+-		for (int i = 0; i < b1->used; i++, t0++, tmpb++)
+-			*t0 = *tmpb;
+-
++		dv_copy(a0->dp, a->dp, h);
++		dv_copy(a1->dp, a->dp + h, a->used - h);
++		dv_copy(b0->dp, b->dp, h);
++		dv_copy(b1->dp, b->dp + h, b->used - h);
+ 		bn_trim(a0);
+ 		bn_trim(b0);
+ 		bn_trim(a1);
+diff --git a/src/bn/relic_bn_sqr.c b/src/bn/relic_bn_sqr.c
+index 940acc75f..a510add99 100644
+--- a/src/bn/relic_bn_sqr.c
++++ b/src/bn/relic_bn_sqr.c
+@@ -48,10 +48,8 @@
+  * @param[in] level			- the number of Karatsuba steps to apply.
+  */
+ static void bn_sqr_karat_imp(bn_t c, const bn_t a, int level) {
+-	int h;
+ 	bn_t a0, a1, a0a0, a1a1, t;
+-	const dig_t *tmpa;
+-	dig_t *t0;
++	int h = a->used >> 1;
+ 
+ 	bn_null(a0);
+ 	bn_null(a1);
+@@ -59,31 +57,21 @@ static void bn_sqr_karat_imp(bn_t c, const bn_t a, int level) {
+ 	bn_null(a1a1);
+ 	bn_null(t);
+ 
+-	/* Compute half the digits of a or b. */
+-	h = a->used >> 1;
+-
+ 	RLC_TRY {
+ 		/* Allocate the temp variables. */
+-		bn_new(a0);
+-		bn_new(a1);
++		bn_new_size(a0, h);
++		bn_new_size(a1, a->used - h);
+ 		bn_new(a0a0);
+ 		bn_new(a1a1);
+ 		bn_new(t);
+ 
++		/* a = a1 || a0 */
+ 		a0->used = h;
+ 		a1->used = a->used - h;
+-
+-		tmpa = a->dp;
+-
+-		/* a = a1 || a0 */
+-		t0 = a0->dp;
+-		for (int i = 0; i < h; i++, t0++, tmpa++)
+-			*t0 = *tmpa;
+-		t0 = a1->dp;
+-		for (int i = 0; i < a1->used; i++, t0++, tmpa++)
+-			*t0 = *tmpa;
+-
++		dv_copy(a0->dp, a->dp, h);
++		dv_copy(a1->dp, a->dp + h, a->used - h);
+ 		bn_trim(a0);
++		bn_trim(a1);
+ 
+ 		if (level <= 1) {
+ 			/* a0a0 = a0 * a0 and a1a1 = a1 * a1 */
+diff --git a/src/low/gmp_sec/relic_bn_shift_low.c b/src/low/gmp_sec/relic_bn_shift_low.c
+index aba348ea9..cc41a8950 100644
+--- a/src/low/gmp_sec/relic_bn_shift_low.c
++++ b/src/low/gmp_sec/relic_bn_shift_low.c
+@@ -49,22 +49,6 @@ dig_t bn_lshb_low(dig_t *c, const dig_t *a, int size, int bits) {
+ 	return mpn_lshift(c, a, size, bits);
+ }
+ 
+-void dv_lshd(dig_t *c, const dig_t *a, int size, int digits) {
+-	dig_t *top;
+-	const dig_t *bot;
+-	int i;
+-
+-	top = c + size + digits - 1;
+-	bot = a + size - 1;
+-
+-	for (i = 0; i < size; i++, top--, bot--) {
+-		*top = *bot;
+-	}
+-	for (i = 0; i < digits; i++, c++) {
+-		*c = 0;
+-	}
+-}
+-
+ dig_t bn_rsh1_low(dig_t *c, const dig_t *a, int size) {
+ 	return mpn_rshift(c, a, size, 1);
+ }
+@@ -72,16 +56,3 @@ dig_t bn_rsh1_low(dig_t *c, const dig_t *a, int size) {
+ dig_t bn_rshb_low(dig_t *c, const dig_t *a, int size, int bits) {
+ 	return mpn_rshift(c, a, size, bits);
+ }
+-
+-void dv_rshd(dig_t *c, const dig_t *a, int size, int digits) {
+-	const dig_t *top;
+-	dig_t *bot;
+-	int i;
+-
+-	top = a + digits;
+-	bot = c;
+-
+-	for (i = 0; i < size - digits; i++, top++, bot++) {
+-		*bot = *top;
+-	}
+-}

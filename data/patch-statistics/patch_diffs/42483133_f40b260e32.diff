@@ -1,0 +1,267 @@
+From 97f2d9cf5cdaee655e5a5527c78f42715b61ad51 Mon Sep 17 00:00:00 2001
+From: Riccardo Schirone <ret2libc@users.noreply.github.com>
+Date: Mon, 8 Jun 2020 13:26:49 +0200
+Subject: [PATCH] Fix elf reloc crash (#17004)
+
+* Fix wrong computation in get_next_not_analysed_offset
+
+* Uses virtual address in read_reloc and use elf_v2p to convert it to
+  the right offset in the file, instead of relying on base->baddr
+  directly. Dynamic info contain virtual address, not offsets.
+* get_next_not_analyzed_offset should return the offset starting from
+  section_vaddr, to ensure the offset can never be decremented.
+
+* use num_relocs to possibly limit the number of stored relocations
+
+Using num_relocs works both as a defensive measure in case the initial
+size computed by get_num_relocs_approx is wrong and as a way to limit
+the number of relocation entries read by the parser, in case the
+relocation section is so big that we can't allocate enough memory
+(probably a fake section).
+
+* Add support for AARCH64 reloc entries
+---
+ libr/bin/format/elf/elf.c     | 83 ++++++++++++++++++++---------------
+ libr/bin/p/bin_elf.inc        | 10 +++++
+ test/db/formats/elf/elf-relro | 65 +++++++++++++++++++++++++++
+ 3 files changed, 123 insertions(+), 35 deletions(-)
+
+diff --git a/libr/bin/format/elf/elf.c b/libr/bin/format/elf/elf.c
+index f116704b8ece7..61e259a7bbd90 100644
+--- a/libr/bin/format/elf/elf.c
++++ b/libr/bin/format/elf/elf.c
+@@ -2562,7 +2562,12 @@ static void fix_rva_and_offset(ELFOBJ *bin, RBinElfReloc *r, size_t pos) {
+ 	}
+ }
+ 
+-static bool read_reloc(ELFOBJ *bin, RBinElfReloc *r, Elf_(Xword) rel_mode, ut64 offset) {
++static bool read_reloc(ELFOBJ *bin, RBinElfReloc *r, Elf_(Xword) rel_mode, ut64 vaddr) {
++	ut64 offset = Elf_(r_bin_elf_v2p_new) (bin, vaddr);
++	if (offset == UT64_MAX) {
++		return false;
++	}
++
+ 	size_t size_struct = get_size_rel_mode (rel_mode);
+ 
+ 	ut8 buf[sizeof (Elf_(Rela))] = { 0 };
+@@ -2650,57 +2655,56 @@ static size_t get_num_relocs_approx(ELFOBJ *bin) {
+ 	return get_num_relocs_dynamic (bin) + get_num_relocs_sections (bin);
+ }
+ 
+-static size_t populate_relocs_record_from_dynamic(ELFOBJ *bin, RBinElfReloc *relocs, size_t pos) {
++static size_t populate_relocs_record_from_dynamic(ELFOBJ *bin, RBinElfReloc *relocs, size_t pos, size_t num_relocs) {
+ 	size_t offset;
+-	size_t i = 0;
+ 	size_t size = get_size_rel_mode (bin->dyn_info.dt_pltrel);
+ 
+-	for (offset = 0; offset < bin->dyn_info.dt_pltrelsz; offset += size) {
+-		read_reloc (bin, relocs + pos, bin->dyn_info.dt_pltrel,
+-				bin->dyn_info.dt_jmprel + offset - bin->baddr);
++	for (offset = 0; offset < bin->dyn_info.dt_pltrelsz && pos < num_relocs; offset += size, pos++) {
++		if (!read_reloc (bin, relocs + pos, bin->dyn_info.dt_pltrel, bin->dyn_info.dt_jmprel + offset)) {
++			break;
++		}
+ 		fix_rva_and_offset_exec_file (bin, relocs + pos);
+-		pos++;
+-		++i;
+ 	}
+ 
+-	for (offset = 0; offset < bin->dyn_info.dt_relasz; offset += bin->dyn_info.dt_relaent) {
+-		read_reloc (bin, relocs + pos, DT_RELA, bin->dyn_info.dt_rela + offset - bin->baddr);
++	for (offset = 0; offset < bin->dyn_info.dt_relasz && pos < num_relocs; offset += bin->dyn_info.dt_relaent, pos++) {
++		if (!read_reloc (bin, relocs + pos, DT_RELA, bin->dyn_info.dt_rela + offset)) {
++			break;
++		}
+ 		fix_rva_and_offset_exec_file (bin, relocs + pos);
+-		pos++;
+ 	}
+ 
+-	for (offset = 0; offset < bin->dyn_info.dt_relsz; offset += bin->dyn_info.dt_relent) {
+-		read_reloc (bin, relocs + pos, DT_REL, bin->dyn_info.dt_rel + offset - bin->baddr);
++	for (offset = 0; offset < bin->dyn_info.dt_relsz && pos < num_relocs; offset += bin->dyn_info.dt_relent, pos++) {
++		if (!read_reloc (bin, relocs + pos, DT_REL, bin->dyn_info.dt_rel + offset)) {
++			break;
++		}
+ 		fix_rva_and_offset_exec_file (bin, relocs + pos);
+-		pos++;
+ 	}
+ 
+ 	return pos;
+ }
+ 
+-static size_t get_next_not_analysed_offset(ELFOBJ *bin, size_t section_offset, size_t offset, size_t base_addr) {
++static size_t get_next_not_analysed_offset(ELFOBJ *bin, size_t section_vaddr, size_t offset) {
++	size_t gvaddr = section_vaddr + offset;
+ 
+-	size_t g_offset = section_offset + offset;
+-
+-	if (bin->dyn_info.dt_rela != ELF_ADDR_MAX && bin->dyn_info.dt_rela - base_addr <= g_offset
+-		&& g_offset < bin->dyn_info.dt_rela + bin->dyn_info.dt_relasz - base_addr) {
+-		return bin->dyn_info.dt_rela + bin->dyn_info.dt_relasz - g_offset - base_addr;
++	if (bin->dyn_info.dt_rela != ELF_ADDR_MAX && bin->dyn_info.dt_rela <= gvaddr
++		&& gvaddr < bin->dyn_info.dt_rela + bin->dyn_info.dt_relasz) {
++		return bin->dyn_info.dt_rela + bin->dyn_info.dt_relasz - section_vaddr;
+ 	}
+ 
+-	if (bin->dyn_info.dt_rel != ELF_ADDR_MAX && bin->dyn_info.dt_rel - base_addr <= g_offset
+-		&& g_offset < bin->dyn_info.dt_rel + bin->dyn_info.dt_relsz - base_addr) {
+-		return bin->dyn_info.dt_rel + bin->dyn_info.dt_relsz - g_offset - base_addr;
++	if (bin->dyn_info.dt_rel != ELF_ADDR_MAX && bin->dyn_info.dt_rel <= gvaddr
++		&& gvaddr < bin->dyn_info.dt_rel + bin->dyn_info.dt_relsz) {
++		return bin->dyn_info.dt_rel + bin->dyn_info.dt_relsz - section_vaddr;
+ 	}
+ 
+-	if (bin->dyn_info.dt_jmprel != ELF_ADDR_MAX && bin->dyn_info.dt_jmprel - base_addr <= g_offset
+-		&& g_offset < bin->dyn_info.dt_jmprel + bin->dyn_info.dt_pltrelsz - base_addr) {
+-		return bin->dyn_info.dt_jmprel + bin->dyn_info.dt_pltrelsz - g_offset - base_addr;
++	if (bin->dyn_info.dt_jmprel != ELF_ADDR_MAX && bin->dyn_info.dt_jmprel <= gvaddr
++		&& gvaddr < bin->dyn_info.dt_jmprel + bin->dyn_info.dt_pltrelsz) {
++		return bin->dyn_info.dt_jmprel + bin->dyn_info.dt_pltrelsz - section_vaddr;
+ 	}
+ 
+ 	return offset;
+ }
+ 
+-static size_t populate_relocs_record_from_section(ELFOBJ *bin, RBinElfReloc *relocs, size_t pos) {
++static size_t populate_relocs_record_from_section(ELFOBJ *bin, RBinElfReloc *relocs, size_t pos, size_t num_relocs) {
+ 	size_t size, i, j;
+ 	Elf_(Xword) rel_mode;
+ 
+@@ -2717,11 +2721,11 @@ static size_t populate_relocs_record_from_section(ELFOBJ *bin, RBinElfReloc *rel
+ 
+ 		size = get_size_rel_mode (rel_mode);
+ 
+-		for (j = get_next_not_analysed_offset (bin, bin->g_sections[i].offset, 0, bin->baddr);
+-			j < bin->g_sections[i].size;
+-			j = get_next_not_analysed_offset (bin, bin->g_sections[i].offset, j + size, bin->baddr)) {
++		for (j = get_next_not_analysed_offset (bin, bin->g_sections[i].rva, 0);
++			j < bin->g_sections[i].size && pos < num_relocs;
++			j = get_next_not_analysed_offset (bin, bin->g_sections[i].rva, j + size)) {
+ 
+-			if (!read_reloc (bin, relocs + pos, rel_mode, bin->g_sections[i].offset + j)) {
++			if (!read_reloc (bin, relocs + pos, rel_mode, bin->g_sections[i].rva + j)) {
+ 				break;
+ 			}
+ 
+@@ -2736,14 +2740,23 @@ static size_t populate_relocs_record_from_section(ELFOBJ *bin, RBinElfReloc *rel
+ static RBinElfReloc *populate_relocs_record(ELFOBJ *bin) {
+ 	size_t i = 0;
+ 	size_t num_relocs = get_num_relocs_approx (bin);
+-	RBinElfReloc *relocs = calloc (num_relocs + 1, sizeof (RBinElfReloc));
++	RBinElfReloc *relocs = R_NEWS0 (RBinElfReloc, num_relocs + 1);
++	if (!relocs) {
++		// In case we can't allocate enough memory for all the claimed
++		// relocation entries, try to parse only the ones specified in
++		// the dynamic segment.
++		num_relocs = get_num_relocs_dynamic (bin);
++		relocs = R_NEWS0 (RBinElfReloc, num_relocs + 1);
++		if (!relocs) {
++			return NULL;
++		}
++	}
+ 
+-	i = populate_relocs_record_from_dynamic (bin, relocs, i);
+-	i = populate_relocs_record_from_section (bin, relocs, i);
++	i = populate_relocs_record_from_dynamic (bin, relocs, i, num_relocs);
++	i = populate_relocs_record_from_section (bin, relocs, i, num_relocs);
+ 	relocs[i].last = 1;
+ 
+ 	bin->g_reloc_num = i;
+-
+ 	return relocs;
+ }
+ 
+diff --git a/libr/bin/p/bin_elf.inc b/libr/bin/p/bin_elf.inc
+index 64ff8b20e6a09..b90529ee54a54 100644
+--- a/libr/bin/p/bin_elf.inc
++++ b/libr/bin/p/bin_elf.inc
+@@ -648,6 +648,16 @@ static RBinReloc *reloc_convert(struct Elf_(r_bin_elf_obj_t) *bin, RBinElfReloc
+ 		 ////eprintf("TODO(eddyb): uninmplemented ELF/ARM reloc type %i\n", rel->type);
+ 		}
+ 		break;
++	case EM_AARCH64: switch (rel->type) {
++		case R_AARCH64_NONE: break;
++		case R_AARCH64_ABS32: ADD (32, 0);
++		case R_AARCH64_ABS16: ADD (16, 0);
++		case R_AARCH64_GLOB_DAT: SET (64);
++		case R_AARCH64_JUMP_SLOT: SET (64);
++		case R_AARCH64_RELATIVE: ADD (64, B);
++		default: break; // reg relocations
++		}
++		break;
+ 	default: break;
+ 	}
+ 
+diff --git a/test/db/formats/elf/elf-relro b/test/db/formats/elf/elf-relro
+index 947ab7296293a..1c9b2c961d9c8 100644
+--- a/test/db/formats/elf/elf-relro
++++ b/test/db/formats/elf/elf-relro
+@@ -1,3 +1,68 @@
++NAME=ELF: arm64 relocs crashing
++FILE=-
++CMDS=!!rabin2 -qzz bins/elf/librsjni_androix.so~?
++EXPECT=<<EOF
++549
++EOF
++RUN
++
++NAME=ELF: arm64 relocs crashing
++FILE=bins/elf/librsjni_androix.so
++CMDS=ir
++EXPECT=<<EOF
++[Relocations]
++
++vaddr      paddr      type   name
++---------------------------------
++0x0000e210 0x0000e210 SET_64 __cxa_finalize
++0x0000e218 0x0000e218 SET_64 __stack_chk_fail
++0x0000e220 0x0000e220 SET_64 dlopen
++0x0000e228 0x0000e228 SET_64 loadSymbols(void*, dispatchTable&, int)
++0x0000e230 0x0000e230 SET_64 dlerror
++0x0000e238 0x0000e238 SET_64 __android_log_print
++0x0000e240 0x0000e240 SET_64 dlclose
++0x0000e248 0x0000e248 SET_64 loadIOSuppSyms(void*, ioSuppDT&)
++0x0000e250 0x0000e250 SET_64 malloc
++0x0000e258 0x0000e258 SET_64 calloc
++0x0000e260 0x0000e260 SET_64 free
++0x0000e268 0x0000e268 SET_64 AndroidBitmap_lockPixels
++0x0000e270 0x0000e270 SET_64 AndroidBitmap_getInfo
++0x0000e278 0x0000e278 SET_64 AndroidBitmap_unlockPixels
++0x0000e280 0x0000e280 SET_64 memcpy
++0x0000e288 0x0000e288 SET_64 memset
++0x0000e290 0x0000e290 SET_64 dlsym
++
++
++17 relocations
++EOF
++RUN
++
++NAME=ELF: arm64 imports crashing
++FILE=bins/elf/librsjni_androix.so
++CMDS=ii
++EXPECT=<<EOF
++[Imports]
++nth vaddr      bind   type lib name
++-----------------------------------
++1   0x0000b7c0 GLOBAL FUNC     __cxa_finalize
++2   0x0000b880 GLOBAL FUNC     AndroidBitmap_getInfo
++3   0x0000b870 GLOBAL FUNC     AndroidBitmap_lockPixels
++4   0x0000b890 GLOBAL FUNC     AndroidBitmap_unlockPixels
++5   0x0000b810 GLOBAL FUNC     __android_log_print
++6   0x0000b7d0 GLOBAL FUNC     __stack_chk_fail
++7   0x0000b850 GLOBAL FUNC     calloc
++8   0x0000b820 GLOBAL FUNC     dlclose
++9   0x0000b800 GLOBAL FUNC     dlerror
++10  0x0000b7e0 GLOBAL FUNC     dlopen
++11  0x0000b8c0 GLOBAL FUNC     dlsym
++12  0x0000b860 GLOBAL FUNC     free
++13  0x0000b840 GLOBAL FUNC     malloc
++14  0x0000b8a0 GLOBAL FUNC     memcpy
++15  0x0000b8b0 GLOBAL FUNC     memset
++
++EOF
++RUN
++
+ NAME=ELF: corkami elf-relro - sections
+ FILE=bins/elf/analysis/elf-relro
+ CMDS=iS~rel

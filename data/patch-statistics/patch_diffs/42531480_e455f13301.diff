@@ -1,0 +1,45 @@
+From 308f71a6e80751eae09f08cdfdc996a77510e5a5 Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Tue, 2 Jan 2024 11:37:40 +0100
+Subject: [PATCH] TLS: fix heap-buffer-overflow (#2235)
+
+```
+==53992==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x511000007e04 at pc 0x555da2165fd0 bp 0x7ffddf7e3990 sp 0x7ffddf7e3988
+READ of size 2 at 0x511000007e04 thread T0
+    #0 0x555da2165fcf in processClientServerHello /home/ivan/svnrepos/nDPI/src/lib/protocols/tls.c:2384:50
+    #1 0x555da217c31f in processTLSBlock /home/ivan/svnrepos/nDPI/src/lib/protocols/tls.c:908:5
+    #2 0x555da2176720 in ndpi_search_tls_udp /home/ivan/svnrepos/nDPI/src/lib/protocols/tls.c:1273:11
+    #3 0x555da215a628 in ndpi_search_tls_wrapper /home/ivan/svnrepos/nDPI/src/lib/protocols/tls.c:2883:5
+    #4 0x555da1e95c30 in check_ndpi_detection_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:6720:6
+    #5 0x555da1e969f3 in check_ndpi_udp_flow_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:6756:10
+    #6 0x555da1e96394 in ndpi_check_flow_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:6789:12
+    #7 0x555da1ea7991 in ndpi_internal_detection_process_packet /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:7929:15
+    #8 0x555da1ea547f in ndpi_detection_process_packet /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:8104:22
+    #9 0x555da1de137f in packet_processing /home/ivan/svnrepos/nDPI/fuzz/../example/reader_util.c:1721:31
+    #10 0x555da1de137f in ndpi_workflow_process_packet /home/ivan/svnrepos/nDPI/fuzz/../example/reader_util.c:2438:1
+```
+
+Found by oss-fuzzer
+See: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=65362
+---
+ src/lib/protocols/tls.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib/protocols/tls.c b/src/lib/protocols/tls.c
+index fb3bd7d2ecb..485357e065f 100644
+--- a/src/lib/protocols/tls.c
++++ b/src/lib/protocols/tls.c
+@@ -2378,11 +2378,11 @@ int processClientServerHello(struct ndpi_detection_module_struct *ndpi_struct,
+ #endif
+ 
+ 		ja.client.num_signature_algorithms = ndpi_min(sa_size, MAX_NUM_JA);
+-		for(i=0, id=0; i<tot_signature_algorithms_len && s_offset+i<total_len; i += 2) {
++		for(i=0, id=0; i<tot_signature_algorithms_len && s_offset+i+1<total_len; i += 2) {
+ 		  ja.client.signature_algorithms[id++] = ntohs(*(u_int16_t*)&packet->payload[s_offset+i]);
+ 		}
+ 		
+-		for(i=0, id=0; i<tot_signature_algorithms_len && s_offset+i<total_len; i++) {
++		for(i=0, id=0; i<tot_signature_algorithms_len && s_offset+i+1<total_len; i++) {
+ 		  int rc = ndpi_snprintf(&ja.client.signature_algorithms_str[i*2],
+ 					 sizeof(ja.client.signature_algorithms_str)-i*2,
+ 					 "%02X", packet->payload[s_offset+i]);

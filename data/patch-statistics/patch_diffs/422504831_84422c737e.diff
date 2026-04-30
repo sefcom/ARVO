@@ -1,0 +1,79 @@
+From 19fb7bbfae61a52faa21934516310fedc8aaefd2 Mon Sep 17 00:00:00 2001
+From: mwish <maplewish117@gmail.com>
+Date: Tue, 24 Jun 2025 18:39:30 +0800
+Subject: [PATCH] GH-46724: [C++][Parquet] OSSFuzz: Prevent from Bad-cast in
+ handling statistics (#46725)
+
+### Rationale for this change
+
+See issue
+
+### What changes are included in this PR?
+
+Checked before a cast here
+
+### Are these changes tested?
+
+no
+
+### Are there any user-facing changes?
+
+no
+* GitHub Issue: #46724
+
+Authored-by: mwish <maplewish117@gmail.com>
+Signed-off-by: Antoine Pitrou <antoine@python.org>
+---
+ cpp/src/parquet/metadata.cc | 10 ++++++++--
+ cpp/src/parquet/metadata.h  |  2 +-
+ testing                     |  2 +-
+ 3 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/cpp/src/parquet/metadata.cc b/cpp/src/parquet/metadata.cc
+index 81567ba75b5..97e502f46be 100644
+--- a/cpp/src/parquet/metadata.cc
++++ b/cpp/src/parquet/metadata.cc
+@@ -122,7 +122,13 @@ static std::shared_ptr<geospatial::GeoStatistics> MakeColumnGeometryStats(
+ 
+ std::shared_ptr<Statistics> MakeColumnStats(const format::ColumnMetaData& meta_data,
+                                             const ColumnDescriptor* descr) {
+-  switch (static_cast<Type::type>(meta_data.type)) {
++  auto metadata_type = LoadEnumSafe(&meta_data.type);
++  if (descr->physical_type() != metadata_type) {
++    throw ParquetException(
++        "ColumnMetaData type does not match ColumnDescriptor physical type: " +
++        TypeToString(metadata_type) + " vs. " + TypeToString(descr->physical_type()));
++  }
++  switch (metadata_type) {
+     case Type::BOOLEAN:
+       return MakeTypedColumnStats<BooleanType>(meta_data, descr);
+     case Type::INT32:
+@@ -1541,7 +1547,7 @@ bool ApplicationVersion::VersionEq(const ApplicationVersion& other_version) cons
+ // parquet-mr/parquet-column/src/main/java/org/apache/parquet/CorruptStatistics.java
+ // PARQUET-686 has more discussion on statistics
+ bool ApplicationVersion::HasCorrectStatistics(Type::type col_type,
+-                                              EncodedStatistics& statistics,
++                                              const EncodedStatistics& statistics,
+                                               SortOrder::type sort_order) const {
+   // parquet-cpp version 1.3.0 and parquet-mr 1.10.0 onwards stats are computed
+   // correctly for all types
+diff --git a/cpp/src/parquet/metadata.h b/cpp/src/parquet/metadata.h
+index f7b7bf9aac9..3380adbf56a 100644
+--- a/cpp/src/parquet/metadata.h
++++ b/cpp/src/parquet/metadata.h
+@@ -72,7 +72,7 @@ class PARQUET_EXPORT ApplicationVersion {
+   bool VersionEq(const ApplicationVersion& other_version) const;
+ 
+   // Checks if the Version has the correct statistics for a given column
+-  bool HasCorrectStatistics(Type::type primitive, EncodedStatistics& statistics,
++  bool HasCorrectStatistics(Type::type primitive, const EncodedStatistics& statistics,
+                             SortOrder::type sort_order = SortOrder::SIGNED) const;
+ };
+ 
+diff --git a/testing b/testing
+index d2a13712303..ab28408180a 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit d2a13712303498963395318a4eb42872e66aead7
++Subproject commit ab28408180afb1e46621732dc6cbf0f1c44ed444

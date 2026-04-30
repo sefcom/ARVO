@@ -1,0 +1,321 @@
+From 6af596d9e8a0dfd9c175b7e56b848b969af191ae Mon Sep 17 00:00:00 2001
+From: Ali Mohammad Pur <ali.mpfard@gmail.com>
+Date: Sat, 22 May 2021 23:33:26 +0430
+Subject: [PATCH] LibJS+LibWeb: Make Uint8ClampedArray use TypedArray
+
+Instead of being its own separate unrelated class.
+This automatically makes typed array properties available to it,
+as well as making it available to the runtime.
+---
+ Userland/Libraries/LibJS/CMakeLists.txt       |  1 -
+ Userland/Libraries/LibJS/Forward.h            | 21 +++---
+ Userland/Libraries/LibJS/Runtime/TypedArray.h | 33 ++++++----
+ .../LibJS/Runtime/Uint8ClampedArray.cpp       | 65 -------------------
+ .../LibJS/Runtime/Uint8ClampedArray.h         | 37 -----------
+ .../CodeGenerators/WrapperGenerator.cpp       |  4 +-
+ Userland/Libraries/LibWeb/HTML/ImageData.cpp  |  4 +-
+ 7 files changed, 36 insertions(+), 129 deletions(-)
+ delete mode 100644 Userland/Libraries/LibJS/Runtime/Uint8ClampedArray.cpp
+ delete mode 100644 Userland/Libraries/LibJS/Runtime/Uint8ClampedArray.h
+
+diff --git a/Userland/Libraries/LibJS/CMakeLists.txt b/Userland/Libraries/LibJS/CMakeLists.txt
+index 86a78ff059d1d5..6bf8f452583d4f 100644
+--- a/Userland/Libraries/LibJS/CMakeLists.txt
++++ b/Userland/Libraries/LibJS/CMakeLists.txt
+@@ -82,7 +82,6 @@ set(SOURCES
+     Runtime/TypedArray.cpp
+     Runtime/TypedArrayConstructor.cpp
+     Runtime/TypedArrayPrototype.cpp
+-    Runtime/Uint8ClampedArray.cpp
+     Runtime/VM.cpp
+     Runtime/Value.cpp
+     Runtime/WithScope.cpp
+diff --git a/Userland/Libraries/LibJS/Forward.h b/Userland/Libraries/LibJS/Forward.h
+index 7914f420038505..3d5737ec8518a0 100644
+--- a/Userland/Libraries/LibJS/Forward.h
++++ b/Userland/Libraries/LibJS/Forward.h
+@@ -54,14 +54,15 @@
+     __JS_ENUMERATE(TypeError, type_error, TypeErrorPrototype, TypeErrorConstructor, void)                                                  \
+     __JS_ENUMERATE(URIError, uri_error, URIErrorPrototype, URIErrorConstructor, void)
+ 
+-#define JS_ENUMERATE_TYPED_ARRAYS                                                                      \
+-    __JS_ENUMERATE(Uint8Array, uint8_array, Uint8ArrayPrototype, Uint8ArrayConstructor, u8)            \
+-    __JS_ENUMERATE(Uint16Array, uint16_array, Uint16ArrayPrototype, Uint16ArrayConstructor, u16)       \
+-    __JS_ENUMERATE(Uint32Array, uint32_array, Uint32ArrayPrototype, Uint32ArrayConstructor, u32)       \
+-    __JS_ENUMERATE(Int8Array, int8_array, Int8ArrayPrototype, Int8ArrayConstructor, i8)                \
+-    __JS_ENUMERATE(Int16Array, int16_array, Int16ArrayPrototype, Int16ArrayConstructor, i16)           \
+-    __JS_ENUMERATE(Int32Array, int32_array, Int32ArrayPrototype, Int32ArrayConstructor, i32)           \
+-    __JS_ENUMERATE(Float32Array, float32_array, Float32ArrayPrototype, Float32ArrayConstructor, float) \
++#define JS_ENUMERATE_TYPED_ARRAYS                                                                                               \
++    __JS_ENUMERATE(Uint8Array, uint8_array, Uint8ArrayPrototype, Uint8ArrayConstructor, u8)                                     \
++    __JS_ENUMERATE(Uint8ClampedArray, uint8_clamped_array, Uint8ClampedArrayPrototype, Uint8ClampedArrayConstructor, ClampedU8) \
++    __JS_ENUMERATE(Uint16Array, uint16_array, Uint16ArrayPrototype, Uint16ArrayConstructor, u16)                                \
++    __JS_ENUMERATE(Uint32Array, uint32_array, Uint32ArrayPrototype, Uint32ArrayConstructor, u32)                                \
++    __JS_ENUMERATE(Int8Array, int8_array, Int8ArrayPrototype, Int8ArrayConstructor, i8)                                         \
++    __JS_ENUMERATE(Int16Array, int16_array, Int16ArrayPrototype, Int16ArrayConstructor, i16)                                    \
++    __JS_ENUMERATE(Int32Array, int32_array, Int32ArrayPrototype, Int32ArrayConstructor, i32)                                    \
++    __JS_ENUMERATE(Float32Array, float32_array, Float32ArrayPrototype, Float32ArrayConstructor, float)                          \
+     __JS_ENUMERATE(Float64Array, float64_array, Float64ArrayPrototype, Float64ArrayConstructor, double)
+ 
+ #define JS_ENUMERATE_ITERATOR_PROTOTYPES          \
+@@ -131,7 +132,6 @@ class Shape;
+ class Statement;
+ class Symbol;
+ class Token;
+-class Uint8ClampedArray;
+ class VM;
+ class Value;
+ enum class DeclarationKind;
+@@ -146,6 +146,9 @@ class ProxyConstructor;
+ class TypedArrayConstructor;
+ class TypedArrayPrototype;
+ 
++// Tag type used to differentiate between u8 as used by Uint8Array and u8 as used by Uint8ClampedArray.
++struct ClampedU8;
++
+ #define __JS_ENUMERATE(ClassName, snake_name, ConstructorName, PrototypeName, ArrayType) \
+     class ClassName;                                                                     \
+     class ConstructorName;                                                               \
+diff --git a/Userland/Libraries/LibJS/Runtime/TypedArray.h b/Userland/Libraries/LibJS/Runtime/TypedArray.h
+index 30bcc0f246a5c0..49a9f2ce10565b 100644
+--- a/Userland/Libraries/LibJS/Runtime/TypedArray.h
++++ b/Userland/Libraries/LibJS/Runtime/TypedArray.h
+@@ -44,22 +44,29 @@ class TypedArrayBase : public Object {
+     virtual void visit_edges(Visitor&) override;
+ };
+ 
++struct ClampedU8 {
++};
++
+ template<typename T>
+ class TypedArray : public TypedArrayBase {
+     JS_OBJECT(TypedArray, TypedArrayBase);
+ 
++    using UnderlyingBufferDataType = Conditional<IsSame<ClampedU8, T>, u8, T>;
++
+ public:
+     virtual bool put_by_index(u32 property_index, Value value) override
+     {
+         if (property_index >= m_array_length)
+             return Base::put_by_index(property_index, value);
+ 
+-        if constexpr (sizeof(T) < 4) {
++        if constexpr (sizeof(UnderlyingBufferDataType) < 4) {
+             auto number = value.to_i32(global_object());
+             if (vm().exception())
+                 return {};
++            if constexpr (IsSame<T, ClampedU8>)
++                number = clamp(number, 0, 255);
+             data()[property_index] = number;
+-        } else if constexpr (sizeof(T) == 4 || sizeof(T) == 8) {
++        } else if constexpr (sizeof(UnderlyingBufferDataType) == 4 || sizeof(UnderlyingBufferDataType) == 8) {
+             auto number = value.to_double(global_object());
+             if (vm().exception())
+                 return {};
+@@ -75,13 +82,13 @@ class TypedArray : public TypedArrayBase {
+         if (property_index >= m_array_length)
+             return Base::get_by_index(property_index);
+ 
+-        if constexpr (sizeof(T) < 4) {
++        if constexpr (sizeof(UnderlyingBufferDataType) < 4) {
+             return Value((i32)data()[property_index]);
+-        } else if constexpr (sizeof(T) == 4 || sizeof(T) == 8) {
++        } else if constexpr (sizeof(UnderlyingBufferDataType) == 4 || sizeof(UnderlyingBufferDataType) == 8) {
+             auto value = data()[property_index];
+-            if constexpr (IsFloatingPoint<T>) {
++            if constexpr (IsFloatingPoint<UnderlyingBufferDataType>) {
+                 return Value((double)value);
+-            } else if constexpr (NumericLimits<T>::is_signed()) {
++            } else if constexpr (NumericLimits<UnderlyingBufferDataType>::is_signed()) {
+                 if (value > NumericLimits<i32>::max() || value < NumericLimits<i32>::min())
+                     return Value((double)value);
+             } else {
+@@ -94,23 +101,23 @@ class TypedArray : public TypedArrayBase {
+         }
+     }
+ 
+-    Span<const T> data() const
++    Span<const UnderlyingBufferDataType> data() const
+     {
+-        return { reinterpret_cast<const T*>(m_viewed_array_buffer->buffer().data() + m_byte_offset), m_array_length };
++        return { reinterpret_cast<const UnderlyingBufferDataType*>(m_viewed_array_buffer->buffer().data() + m_byte_offset), m_array_length };
+     }
+-    Span<T> data()
++    Span<UnderlyingBufferDataType> data()
+     {
+-        return { reinterpret_cast<T*>(m_viewed_array_buffer->buffer().data() + m_byte_offset), m_array_length };
++        return { reinterpret_cast<UnderlyingBufferDataType*>(m_viewed_array_buffer->buffer().data() + m_byte_offset), m_array_length };
+     }
+ 
+-    virtual size_t element_size() const override { return sizeof(T); };
++    virtual size_t element_size() const override { return sizeof(UnderlyingBufferDataType); };
+ 
+ protected:
+     TypedArray(u32 array_length, Object& prototype)
+         : TypedArrayBase(prototype)
+     {
+-        VERIFY(!Checked<u32>::multiplication_would_overflow(array_length, sizeof(T)));
+-        m_viewed_array_buffer = ArrayBuffer::create(global_object(), array_length * sizeof(T));
++        VERIFY(!Checked<u32>::multiplication_would_overflow(array_length, sizeof(UnderlyingBufferDataType)));
++        m_viewed_array_buffer = ArrayBuffer::create(global_object(), array_length * sizeof(UnderlyingBufferDataType));
+         if (array_length)
+             VERIFY(!data().is_null());
+         m_array_length = array_length;
+diff --git a/Userland/Libraries/LibJS/Runtime/Uint8ClampedArray.cpp b/Userland/Libraries/LibJS/Runtime/Uint8ClampedArray.cpp
+deleted file mode 100644
+index f801c90dfd3aa4..00000000000000
+--- a/Userland/Libraries/LibJS/Runtime/Uint8ClampedArray.cpp
++++ /dev/null
+@@ -1,65 +0,0 @@
+-/*
+- * Copyright (c) 2020, Andreas Kling <kling@serenityos.org>
+- *
+- * SPDX-License-Identifier: BSD-2-Clause
+- */
+-
+-#include <AK/Function.h>
+-#include <LibJS/Runtime/Error.h>
+-#include <LibJS/Runtime/GlobalObject.h>
+-#include <LibJS/Runtime/Uint8ClampedArray.h>
+-
+-namespace JS {
+-
+-Uint8ClampedArray* Uint8ClampedArray::create(GlobalObject& global_object, u32 length)
+-{
+-    return global_object.heap().allocate<Uint8ClampedArray>(global_object, length, *global_object.array_prototype());
+-}
+-
+-Uint8ClampedArray::Uint8ClampedArray(u32 length, Object& prototype)
+-    : Object(prototype)
+-    , m_length(length)
+-{
+-    auto& vm = this->vm();
+-    define_native_property(vm.names.length, length_getter, {});
+-    m_data = (u8*)calloc(m_length, 1);
+-}
+-
+-Uint8ClampedArray::~Uint8ClampedArray()
+-{
+-    VERIFY(m_data);
+-    free(m_data);
+-    m_data = nullptr;
+-}
+-
+-JS_DEFINE_NATIVE_GETTER(Uint8ClampedArray::length_getter)
+-{
+-    auto* this_object = vm.this_value(global_object).to_object(global_object);
+-    if (!this_object)
+-        return {};
+-    if (StringView(this_object->class_name()) != "Uint8ClampedArray") {
+-        vm.throw_exception<TypeError>(global_object, ErrorType::NotA, "Uint8ClampedArray");
+-        return {};
+-    }
+-    return Value(static_cast<const Uint8ClampedArray*>(this_object)->length());
+-}
+-
+-bool Uint8ClampedArray::put_by_index(u32 property_index, Value value)
+-{
+-    if (property_index >= m_length)
+-        return Base::put_by_index(property_index, value);
+-    auto number = value.to_i32(global_object());
+-    if (vm().exception())
+-        return {};
+-    m_data[property_index] = clamp(number, 0, 255);
+-    return true;
+-}
+-
+-Value Uint8ClampedArray::get_by_index(u32 property_index) const
+-{
+-    if (property_index >= m_length)
+-        return Base::get_by_index(property_index);
+-    return Value((i32)m_data[property_index]);
+-}
+-
+-}
+diff --git a/Userland/Libraries/LibJS/Runtime/Uint8ClampedArray.h b/Userland/Libraries/LibJS/Runtime/Uint8ClampedArray.h
+deleted file mode 100644
+index a9480096c70933..00000000000000
+--- a/Userland/Libraries/LibJS/Runtime/Uint8ClampedArray.h
++++ /dev/null
+@@ -1,37 +0,0 @@
+-/*
+- * Copyright (c) 2020, Andreas Kling <kling@serenityos.org>
+- *
+- * SPDX-License-Identifier: BSD-2-Clause
+- */
+-
+-#pragma once
+-
+-#include <LibJS/Runtime/Object.h>
+-
+-namespace JS {
+-
+-class Uint8ClampedArray final : public Object {
+-    JS_OBJECT(Uint8ClampedArray, Object);
+-
+-public:
+-    static Uint8ClampedArray* create(GlobalObject&, u32 length);
+-
+-    Uint8ClampedArray(u32 length, Object& prototype);
+-    virtual ~Uint8ClampedArray() override;
+-
+-    i32 length() const { return m_length; }
+-
+-    virtual bool put_by_index(u32 property_index, Value value) override;
+-    virtual Value get_by_index(u32 property_index) const override;
+-
+-    u8* data() { return m_data; }
+-    const u8* data() const { return m_data; }
+-
+-private:
+-    JS_DECLARE_NATIVE_GETTER(length_getter);
+-
+-    u8* m_data { nullptr };
+-    u32 m_length { 0 };
+-};
+-
+-}
+diff --git a/Userland/Libraries/LibWeb/CodeGenerators/WrapperGenerator.cpp b/Userland/Libraries/LibWeb/CodeGenerators/WrapperGenerator.cpp
+index 72fc832e646bc9..b315645c44912c 100644
+--- a/Userland/Libraries/LibWeb/CodeGenerators/WrapperGenerator.cpp
++++ b/Userland/Libraries/LibWeb/CodeGenerators/WrapperGenerator.cpp
+@@ -856,7 +856,7 @@ void generate_implementation(const IDL::Interface& interface)
+ #include <LibJS/Runtime/Error.h>
+ #include <LibJS/Runtime/Function.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+-#include <LibJS/Runtime/Uint8ClampedArray.h>
++#include <LibJS/Runtime/TypedArray.h>
+ #include <LibJS/Runtime/Value.h>
+ #include <LibWeb/Bindings/@prototype_class@.h>
+ #include <LibWeb/Bindings/@wrapper_class@.h>
+@@ -1200,7 +1200,7 @@ void generate_prototype_implementation(const IDL::Interface& interface)
+ #include <LibJS/Runtime/Error.h>
+ #include <LibJS/Runtime/Function.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+-#include <LibJS/Runtime/Uint8ClampedArray.h>
++#include <LibJS/Runtime/TypedArray.h>
+ #include <LibWeb/Bindings/@prototype_class@.h>
+ #include <LibWeb/Bindings/@wrapper_class@.h>
+ #include <LibWeb/Bindings/CSSStyleDeclarationWrapper.h>
+diff --git a/Userland/Libraries/LibWeb/HTML/ImageData.cpp b/Userland/Libraries/LibWeb/HTML/ImageData.cpp
+index b44bb247a2f474..e9044829edeb5c 100644
+--- a/Userland/Libraries/LibWeb/HTML/ImageData.cpp
++++ b/Userland/Libraries/LibWeb/HTML/ImageData.cpp
+@@ -5,7 +5,7 @@
+  */
+ 
+ #include <LibGfx/Bitmap.h>
+-#include <LibJS/Runtime/Uint8ClampedArray.h>
++#include <LibJS/Runtime/TypedArray.h>
+ #include <LibWeb/HTML/ImageData.h>
+ 
+ namespace Web::HTML {
+@@ -26,7 +26,7 @@ RefPtr<ImageData> ImageData::create_with_size(JS::GlobalObject& global_object, i
+ 
+     auto data_handle = JS::make_handle(data);
+ 
+-    auto bitmap = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::RGBA8888, Gfx::IntSize(width, height), 1, width * sizeof(u32), (u32*)data->data());
++    auto bitmap = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::RGBA8888, Gfx::IntSize(width, height), 1, width * sizeof(u32), data->data().data());
+     if (!bitmap)
+         return nullptr;
+     return adopt_ref(*new ImageData(bitmap.release_nonnull(), move(data_handle)));

@@ -1,0 +1,222 @@
+diff --git a/src/sksl/SkSLIRGenerator.cpp b/src/sksl/SkSLIRGenerator.cpp
+index f3b9b0e..90b5c77 100644
+--- a/src/sksl/SkSLIRGenerator.cpp
++++ b/src/sksl/SkSLIRGenerator.cpp
+@@ -1265,7 +1265,8 @@
+                      ASTNode::TypeData(e.getString(), false, false));
+     const Type* type = this->convertType(enumType);
+     Modifiers modifiers(layout, Modifiers::kConst_Flag);
+-    AutoSymbolTable table(this);
++    std::shared_ptr<SymbolTable> oldTable = fSymbolTable;
++    fSymbolTable = std::make_shared<SymbolTable>(fSymbolTable);
+     for (auto iter = e.begin(); iter != e.end(); ++iter) {
+         const ASTNode& child = *iter;
+         SkASSERT(child.fKind == ASTNode::Kind::kEnumCase);
+@@ -1273,10 +1274,12 @@
+         if (child.begin() != child.end()) {
+             value = this->convertExpression(*child.begin());
+             if (!value) {
++                fSymbolTable = oldTable;
+                 return;
+             }
+             if (!this->getConstantInt(*value, &currentValue)) {
+                 fErrors.error(value->fOffset, "enum value must be a constant integer");
++                fSymbolTable = oldTable;
+                 return;
+             }
+         }
+@@ -1287,8 +1290,11 @@
+                                                      Variable::kGlobal_Storage, value.get()));
+         fSymbolTable->takeOwnershipOfIRNode(std::move(value));
+     }
++    // Now we orphanize the Enum's symbol table, so that future lookups in it are strict
++    fSymbolTable->fParent = nullptr;
+     fProgramElements->push_back(std::unique_ptr<ProgramElement>(
+             new Enum(e.fOffset, e.getString(), fSymbolTable, fIsBuiltinCode)));
++    fSymbolTable = oldTable;
+ }
+ 
+ const Type* IRGenerator::convertType(const ASTNode& type) {
+@@ -2626,38 +2632,41 @@
+                                                    found->second.literal(fContext, offset)));
+ }
+ 
+-std::unique_ptr<Expression> IRGenerator::findEnumRef(
+-                                           int offset,
+-                                           const Type& type,
+-                                           StringFragment field,
+-                                           std::vector<std::unique_ptr<ProgramElement>>& elements) {
+-    for (const auto& e : elements) {
+-        if (e->kind() == ProgramElement::Kind::kEnum && type.name() == e->as<Enum>().fTypeName) {
+-            std::shared_ptr<SymbolTable> old = fSymbolTable;
+-            fSymbolTable = e->as<Enum>().fSymbols;
+-            std::unique_ptr<Expression> result = convertIdentifier(ASTNode(&fFile->fNodes, offset,
+-                                                                         ASTNode::Kind::kIdentifier,
+-                                                                         field));
+-            if (result) {
+-                const Variable& v = result->as<VariableReference>().fVariable;
+-                SkASSERT(v.fInitialValue);
+-                result = std::make_unique<IntLiteral>(
+-                        offset, v.fInitialValue->as<IntLiteral>().fValue, &type);
+-            }
+-            fSymbolTable = old;
+-            return result;
+-        }
+-    }
+-    return nullptr;
+-}
+-
+ std::unique_ptr<Expression> IRGenerator::convertTypeField(int offset, const Type& type,
+                                                           StringFragment field) {
+-    std::unique_ptr<Expression> result = this->findEnumRef(offset, type, field, *fProgramElements);
+-    if (fInherited && !result) {
+-        result = this->findEnumRef(offset, type, field, *fInherited);
++    // Find the Enum element that this type refers to (if any)
++    auto findEnum = [=](std::vector<std::unique_ptr<ProgramElement>>& elements) -> ProgramElement* {
++        for (const auto& e : elements) {
++            if (e->is<Enum>() && type.name() == e->as<Enum>().fTypeName) {
++                return e.get();
++            }
++        }
++        return nullptr;
++    };
++    const ProgramElement* enumElement = findEnum(*fProgramElements);
++    if (fInherited && !enumElement) {
++        enumElement = findEnum(*fInherited);
+     }
+-    if (!result) {
++
++    if (enumElement) {
++        // We found the Enum element. Look for 'field' as a member.
++        std::shared_ptr<SymbolTable> old = fSymbolTable;
++        fSymbolTable = enumElement->as<Enum>().fSymbols;
++        std::unique_ptr<Expression> result = convertIdentifier(
++                ASTNode(&fFile->fNodes, offset, ASTNode::Kind::kIdentifier, field));
++        if (result) {
++            const Variable& v = result->as<VariableReference>().fVariable;
++            SkASSERT(v.fInitialValue);
++            result = std::make_unique<IntLiteral>(
++                    offset, v.fInitialValue->as<IntLiteral>().fValue, &type);
++        } else {
++            fErrors.error(offset,
++                          "type '" + type.fName + "' does not have a field named '" + field + "'");
++        }
++        fSymbolTable = old;
++        return result;
++    } else {
++        // No Enum element? Check the intrinsics, clone it into the program, try again.
+         auto found = fIntrinsics->find(type.fName);
+         if (found != fIntrinsics->end()) {
+             SkASSERT(!found->second.fAlreadyIncluded);
+@@ -2665,10 +2674,10 @@
+             fProgramElements->push_back(found->second.fIntrinsic->clone());
+             return this->convertTypeField(offset, type, field);
+         }
+-        fErrors.error(offset, "type '" + type.fName + "' does not have a field named '" + field +
+-                              "'");
++        fErrors.error(offset,
++                      "type '" + type.fName + "' does not have a field named '" + field + "'");
++        return nullptr;
+     }
+-    return result;
+ }
+ 
+ std::unique_ptr<Expression> IRGenerator::convertIndexExpression(const ASTNode& index) {
+diff --git a/src/sksl/SkSLIRGenerator.h b/src/sksl/SkSLIRGenerator.h
+index 478bc64..365fe62 100644
+--- a/src/sksl/SkSLIRGenerator.h
++++ b/src/sksl/SkSLIRGenerator.h
+@@ -144,10 +144,6 @@
+     std::unique_ptr<Expression> convertFieldExpression(const ASTNode& expression);
+     std::unique_ptr<Expression> convertIndexExpression(const ASTNode& expression);
+     std::unique_ptr<Expression> convertPostfixExpression(const ASTNode& expression);
+-    std::unique_ptr<Expression> findEnumRef(int offset,
+-                                            const Type& type,
+-                                            StringFragment field,
+-                                            std::vector<std::unique_ptr<ProgramElement>>& elements);
+     std::unique_ptr<Expression> convertTypeField(int offset, const Type& type,
+                                                  StringFragment field);
+     std::unique_ptr<Expression> convertField(std::unique_ptr<Expression> base,
+diff --git a/src/sksl/SkSLRehydrator.cpp b/src/sksl/SkSLRehydrator.cpp
+index c0c2783..73bb03d 100644
+--- a/src/sksl/SkSLRehydrator.cpp
++++ b/src/sksl/SkSLRehydrator.cpp
+@@ -265,7 +265,7 @@
+     switch (kind) {
+         case Rehydrator::kEnum_Command: {
+             StringFragment typeName = this->readString();
+-            std::shared_ptr<SymbolTable> symbols = this->symbolTable();
++            std::shared_ptr<SymbolTable> symbols = this->symbolTable(/*inherit=*/false);
+             for (auto& s : symbols->fOwnedSymbols) {
+                 SkASSERT(s->kind() == Symbol::Kind::kVariable);
+                 Variable& v = (Variable&) *s;
+@@ -560,14 +560,16 @@
+     }
+ }
+ 
+-std::shared_ptr<SymbolTable> Rehydrator::symbolTable() {
++std::shared_ptr<SymbolTable> Rehydrator::symbolTable(bool inherit) {
+     int command = this->readU8();
+     if (command == kVoid_Command) {
+         return nullptr;
+     }
+     SkASSERT(command == kSymbolTable_Command);
+     uint16_t ownedCount = this->readU16();
+-    std::shared_ptr<SymbolTable> result(new SymbolTable(fSymbolTable));
++    std::shared_ptr<SymbolTable> oldTable = fSymbolTable;
++    std::shared_ptr<SymbolTable> result = inherit ? std::make_shared<SymbolTable>(fSymbolTable)
++                                                  : std::make_shared<SymbolTable>(fErrors);
+     fSymbolTable = result;
+     std::vector<const Symbol*> ownedSymbols;
+     ownedSymbols.reserve(ownedCount);
+@@ -582,7 +584,7 @@
+         int index = this->readU16();
+         fSymbolTable->addWithoutOwnership(name, ownedSymbols[index]);
+     }
+-    fSymbolTable = fSymbolTable->fParent;
++    fSymbolTable = oldTable;
+     return result;
+ }
+ 
+diff --git a/src/sksl/SkSLRehydrator.h b/src/sksl/SkSLRehydrator.h
+index 1b4ee6f..9b208ae 100644
+--- a/src/sksl/SkSLRehydrator.h
++++ b/src/sksl/SkSLRehydrator.h
+@@ -143,6 +143,7 @@
+     Rehydrator(Context* context, std::shared_ptr<SymbolTable> symbolTable,
+                ErrorReporter* errorReporter, const uint8_t* src, size_t length)
+         : fContext(*context)
++        , fErrors(errorReporter)
+         , fSymbolTable(std::move(symbolTable))
+         , fStart(src)
+         SkDEBUGCODE(, fEnd(fStart + length)) {
+@@ -154,7 +155,7 @@
+ 
+     std::vector<std::unique_ptr<ProgramElement>> elements();
+ 
+-    std::shared_ptr<SymbolTable> symbolTable();
++    std::shared_ptr<SymbolTable> symbolTable(bool inherit = true);
+ 
+ private:
+     int8_t readS8() {
+@@ -224,6 +225,7 @@
+     const Type* type();
+ 
+     Context& fContext;
++    ErrorReporter* fErrors;
+     std::shared_ptr<SymbolTable> fSymbolTable;
+     std::vector<const Symbol*> fSymbols;
+ 
+diff --git a/src/sksl/ir/SkSLSymbolTable.h b/src/sksl/ir/SkSLSymbolTable.h
+index be541ad..058fe29 100644
+--- a/src/sksl/ir/SkSLSymbolTable.h
++++ b/src/sksl/ir/SkSLSymbolTable.h
+@@ -63,7 +63,7 @@
+ 
+     std::unordered_map<StringFragment, const Symbol*>::iterator end();
+ 
+-    const std::shared_ptr<SymbolTable> fParent;
++    std::shared_ptr<SymbolTable> fParent;
+ 
+     std::vector<std::unique_ptr<const Symbol>> fOwnedSymbols;
+ 

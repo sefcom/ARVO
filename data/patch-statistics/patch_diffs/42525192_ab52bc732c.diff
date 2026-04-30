@@ -1,0 +1,69 @@
+From b236b7a588ac2973a057ec578011cdc17c26f16d Mon Sep 17 00:00:00 2001
+From: Nick Wellnhofer <wellnhofer@aevum.de>
+Date: Thu, 8 Jun 2023 21:53:05 +0200
+Subject: [PATCH] parser: Halt parser when growing buffer results in OOM
+
+Fix short-lived regression from previous commit.
+
+It might be safer to make xmlBufSetInputBaseCur use the original buffer
+even in case of errors.
+
+Found by OSS-Fuzz.
+---
+ buf.c             | 4 ++++
+ encoding.c        | 4 +++-
+ parserInternals.c | 6 +++++-
+ 3 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/buf.c b/buf.c
+index f876ea99f..fbaf926a6 100644
+--- a/buf.c
++++ b/buf.c
+@@ -1100,6 +1100,10 @@ xmlBufSetInputBaseCur(xmlBufPtr buf, xmlParserInputPtr input,
+                       size_t base, size_t cur) {
+     if (input == NULL)
+         return(-1);
++    /*
++     * TODO: It might be safer to keep using the buffer content if there
++     * was an error.
++     */
+     if ((buf == NULL) || (buf->error)) {
+         input->base = input->cur = input->end = BAD_CAST "";
+         return(-1);
+diff --git a/encoding.c b/encoding.c
+index 0a1b48678..3d461cd37 100644
+--- a/encoding.c
++++ b/encoding.c
+@@ -2143,8 +2143,10 @@ xmlCharEncInput(xmlParserInputBufferPtr input, int flush)
+         toconv = 64 * 1024;
+     written = xmlBufAvail(out);
+     if (toconv * 2 >= written) {
+-        if (xmlBufGrow(out, toconv * 2) < 0)
++        if (xmlBufGrow(out, toconv * 2) < 0) {
++            input->error = XML_ERR_NO_MEMORY;
+             return(XML_ENC_ERR_MEMORY);
++        }
+         written = xmlBufAvail(out);
+     }
+     if ((written > 128 * 1024) && (flush == 0))
+diff --git a/parserInternals.c b/parserInternals.c
+index bc65c6312..5c267cd2a 100644
+--- a/parserInternals.c
++++ b/parserInternals.c
+@@ -566,8 +566,12 @@ xmlParserGrow(xmlParserCtxtPtr ctxt) {
+     ret = xmlParserInputBufferGrow(buf, INPUT_CHUNK);
+     xmlBufSetInputBaseCur(buf->buffer, in, 0, curBase);
+ 
+-    if (ret < 0)
++    if (ret < 0) {
+         xmlFatalErr(ctxt, buf->error, NULL);
++        /* Buffer contents may be lost in case of memory errors. */
++        if (buf->error == XML_ERR_NO_MEMORY)
++            xmlHaltParser(ctxt);
++    }
+ 
+     return(ret);
+ }
+-- 
+GitLab
+

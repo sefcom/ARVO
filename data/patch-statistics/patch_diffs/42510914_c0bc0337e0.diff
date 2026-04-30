@@ -1,0 +1,44 @@
+From 9e629ba3649464a928b0af75ddd246b3defee128 Mon Sep 17 00:00:00 2001
+From: Aleks L <93376818+sashashura@users.noreply.github.com>
+Date: Thu, 28 Jul 2022 11:32:26 +0100
+Subject: [PATCH] Fixes Heap-use-after-free in dwg_free_TABLEGEOMETRY_private
+
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=46847
+
+The title is somewhat misleading, because it is a read out of bounds, but the memory out of the bounds is previously allocated and then freed, so it says use after free.
+In `add_TABLEGEOMETRY_Cell` function when `o->num_cells` equals to zero, the call to calloc doesn't return NULL because of https://linux.die.net/man/3/calloc#:~:text=If%20nmemb%20or%20size%20is%200%2C%20then%20calloc()%20returns%20either%20NULL%2C%20or%20a%20unique%20pointer%20value%20that%20can%20later%20be%20successfully%20passed%20to%20free().
+So it passes the check
+```cpp
+  if (!o->cells)
+    {
+      o->num_cells = 0;
+      return NULL;
+    }
+```
+Next it goes to `switch (pair->code)` which is 10. So it fails the `CHECK` because `i == -1` and return NULL, however the `o->cells` has the the address from zeor size calloc call.
+```cpp
+#define CHK_cells                                                             \
+  if (i < 0 || i >= (int)num_cells || !o->cells)                              \
+    return NULL;                                                              \
+```
+Later in `dwg_free_TABLEGEOMETRY_private` an offset of `tablegeometry` is added to the address in `o->cells` so it reasult in heap read overflow.
+---
+ src/in_dxf.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/in_dxf.c b/src/in_dxf.c
+index 0d2e6279b3..89c57db482 100644
+--- a/src/in_dxf.c
++++ b/src/in_dxf.c
+@@ -5092,6 +5092,11 @@ add_TABLEGEOMETRY_Cell (Dwg_Object *restrict obj, Bit_Chain *restrict dat,
+   BITCODE_H hdl;
+   BITCODE_BL num_cells = o->num_cells;
+   int i = -1, j = -1;
++	
++  if (num_cells < 1)
++    {
++      return NULL;
++    }
+ 
+   o->cells = (Dwg_TABLEGEOMETRY_Cell *)xcalloc (
+       num_cells, sizeof (Dwg_TABLEGEOMETRY_Cell));

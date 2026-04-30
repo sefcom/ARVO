@@ -1,0 +1,52 @@
+From f3384ee3b2c81621e961dc60bac0a23c3c73386e Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Wed, 7 Jun 2017 09:06:57 +0000
+Subject: [PATCH] NTF: fix heap buffer overflow. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=2130. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@38927 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/ogr/ogrsf_frmts/ntf/ntf_raster.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/gdal/ogr/ogrsf_frmts/ntf/ntf_raster.cpp b/gdal/ogr/ogrsf_frmts/ntf/ntf_raster.cpp
+index 43475db2f4f8..83e7e32afbd0 100644
+--- a/gdal/ogr/ogrsf_frmts/ntf/ntf_raster.cpp
++++ b/gdal/ogr/ogrsf_frmts/ntf/ntf_raster.cpp
+@@ -196,7 +196,7 @@ CPLErr NTFFileReader::ReadRasterColumn( int iColumn, float *pafElev )
+         const double dfVOffset = atoi(poRecord->GetField(56,65));
+         const double dfVScale = atoi(poRecord->GetField(66,75)) * 0.001;
+ 
+-        for( int iPixel = 0; iPixel < nRasterXSize; iPixel++ )
++        for( int iPixel = 0; iPixel < nRasterYSize; iPixel++ )
+         {
+             pafElev[iPixel] = (float) (dfVOffset + dfVScale *
+                 atoi(poRecord->GetField(84+iPixel*4,87+iPixel*4)));
+@@ -208,7 +208,7 @@ CPLErr NTFFileReader::ReadRasterColumn( int iColumn, float *pafElev )
+ /* -------------------------------------------------------------------- */
+     else if( pafElev != NULL && GetProductId() == NPC_LANDFORM_PROFILE_DTM )
+     {
+-        for( int iPixel = 0; iPixel < nRasterXSize; iPixel++ )
++        for( int iPixel = 0; iPixel < nRasterYSize; iPixel++ )
+         {
+             pafElev[iPixel] = (float)
+            (atoi(poRecord->GetField(19+iPixel*5,23+iPixel*5)) * GetZMult());
+@@ -357,7 +357,7 @@ OGRFeature *OGRNTFRasterLayer::GetFeature( GIntBig nFeatureId )
+ /*      Do we need to load a different column.                          */
+ /* -------------------------------------------------------------------- */
+     iReqColumn = ((int)nFeatureId - 1) / poReader->GetRasterYSize();
+-    iReqRow = (int)nFeatureId - iReqColumn * poReader->GetRasterXSize() - 1;
++    iReqRow = (int)nFeatureId - iReqColumn * poReader->GetRasterYSize() - 1;
+ 
+     if( iReqColumn != iColumnOffset )
+     {
+@@ -365,6 +365,8 @@ OGRFeature *OGRNTFRasterLayer::GetFeature( GIntBig nFeatureId )
+         if( poReader->ReadRasterColumn( iReqColumn, pafColumn ) != CE_None )
+             return NULL;
+     }
++    if( iReqRow < 0 || iReqRow >= poReader->GetRasterYSize() )
++        return NULL;
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Create a corresponding feature.                                 */

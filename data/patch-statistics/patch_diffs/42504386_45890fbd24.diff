@@ -1,0 +1,172 @@
+From b431e7a3fe8bcd47e38e5b5a6720272861449ed5 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Sun, 14 Nov 2021 18:07:50 +1030
+Subject: [PATCH] sync libbacktrace from gcc
+
+---
+ libbacktrace/ChangeLog | 17 +++++++++++++++++
+ libbacktrace/btest.c   | 24 ++++++++++++++++++++----
+ libbacktrace/elf.c     | 32 ++++++++++++++++----------------
+ libbacktrace/xztest.c  |  2 +-
+ 4 files changed, 54 insertions(+), 21 deletions(-)
+
+diff --git a/libbacktrace/ChangeLog b/libbacktrace/ChangeLog
+index dc986b9370e..983f81672fb 100644
+--- a/libbacktrace/ChangeLog
++++ b/libbacktrace/ChangeLog
+@@ -1,3 +1,20 @@
++2021-11-12  Martin Liska  <mliska@suse.cz>
++
++	PR libbacktrace/103167
++	* elf.c (elf_uncompress_lzma_block): Cast to unsigned int.
++	(elf_uncompress_lzma): Likewise.
++	* xztest.c (test_samples): memcpy only if v > 0.
++
++2021-10-22  Martin Liska  <mliska@suse.cz>
++
++	PR testsuite/102742
++	* btest.c (MIN_DESCRIPTOR): New.
++	(MAX_DESCRIPTOR): Likewise.
++	(check_available_files): Likewise.
++	(check_open_files): Check only file descriptors that
++	were not available at the entry.
++	(main): Call check_available_files.
++
+ 2021-08-13  Sergei Trofimovich  <siarheit@google.com>
+ 
+ 	* install-debuginfo-for-buildid.sh.in: Force non-localized readelf
+diff --git a/libbacktrace/btest.c b/libbacktrace/btest.c
+index 9f9c03babf3..7ef6d320497 100644
+--- a/libbacktrace/btest.c
++++ b/libbacktrace/btest.c
+@@ -38,6 +38,7 @@ POSSIBILITY OF SUCH DAMAGE.  */
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <sys/stat.h>
+ 
+ #include "filenames.h"
+ 
+@@ -458,16 +459,29 @@ test5 (void)
+   return failures;
+ }
+ 
++#define MIN_DESCRIPTOR 3
++#define MAX_DESCRIPTOR 10
++
++static int fstat_status[MAX_DESCRIPTOR];
++
++/* Check files that are available.  */
++
++static void
++check_available_files (void)
++{
++  struct stat s;
++  for (unsigned i = MIN_DESCRIPTOR; i < MAX_DESCRIPTOR; i++)
++    fstat_status[i] = fstat (i, &s);
++}
++
+ /* Check that are no files left open.  */
+ 
+ static void
+ check_open_files (void)
+ {
+-  int i;
+-
+-  for (i = 3; i < 10; i++)
++  for (unsigned i = MIN_DESCRIPTOR; i < MAX_DESCRIPTOR; i++)
+     {
+-      if (close (i) == 0)
++      if (fstat_status[i] != 0 && close (i) == 0)
+ 	{
+ 	  fprintf (stderr,
+ 		   "ERROR: descriptor %d still open after tests complete\n",
+@@ -482,6 +496,8 @@ check_open_files (void)
+ int
+ main (int argc ATTRIBUTE_UNUSED, char **argv)
+ {
++  check_available_files ();
++
+   state = backtrace_create_state (argv[0], BACKTRACE_SUPPORTS_THREADS,
+ 				  error_callback_create, NULL);
+ 
+diff --git a/libbacktrace/elf.c b/libbacktrace/elf.c
+index 79d56146fc6..8b87b2dd6b9 100644
+--- a/libbacktrace/elf.c
++++ b/libbacktrace/elf.c
+@@ -3172,10 +3172,10 @@ elf_uncompress_lzma_block (const unsigned char *compressed,
+   /* Block header CRC.  */
+   computed_crc = elf_crc32 (0, compressed + block_header_offset,
+ 			    block_header_size - 4);
+-  stream_crc = (compressed[off]
+-		| (compressed[off + 1] << 8)
+-		| (compressed[off + 2] << 16)
+-		| (compressed[off + 3] << 24));
++  stream_crc = ((uint32_t)compressed[off]
++		| ((uint32_t)compressed[off + 1] << 8)
++		| ((uint32_t)compressed[off + 2] << 16)
++		| ((uint32_t)compressed[off + 3] << 24));
+   if (unlikely (computed_crc != stream_crc))
+     {
+       elf_uncompress_failed ();
+@@ -3785,10 +3785,10 @@ elf_uncompress_lzma (struct backtrace_state *state,
+ 
+   /* Next comes a CRC of the stream flags.  */
+   computed_crc = elf_crc32 (0, compressed + 6, 2);
+-  stream_crc = (compressed[8]
+-		| (compressed[9] << 8)
+-		| (compressed[10] << 16)
+-		| (compressed[11] << 24));
++  stream_crc = ((uint32_t)compressed[8]
++		| ((uint32_t)compressed[9] << 8)
++		| ((uint32_t)compressed[10] << 16)
++		| ((uint32_t)compressed[11] << 24));
+   if (unlikely (computed_crc != stream_crc))
+     {
+       elf_uncompress_failed ();
+@@ -3829,10 +3829,10 @@ elf_uncompress_lzma (struct backtrace_state *state,
+ 
+   /* Before that is a footer CRC.  */
+   computed_crc = elf_crc32 (0, compressed + offset, 6);
+-  stream_crc = (compressed[offset - 4]
+-		| (compressed[offset - 3] << 8)
+-		| (compressed[offset - 2] << 16)
+-		| (compressed[offset - 1] << 24));
++  stream_crc = ((uint32_t)compressed[offset - 4]
++		| ((uint32_t)compressed[offset - 3] << 8)
++		| ((uint32_t)compressed[offset - 2] << 16)
++		| ((uint32_t)compressed[offset - 1] << 24));
+   if (unlikely (computed_crc != stream_crc))
+     {
+       elf_uncompress_failed ();
+@@ -3888,10 +3888,10 @@ elf_uncompress_lzma (struct backtrace_state *state,
+   /* Next is a CRC of the index.  */
+   computed_crc = elf_crc32 (0, compressed + index_offset,
+ 			    offset - index_offset);
+-  stream_crc = (compressed[offset]
+-		| (compressed[offset + 1] << 8)
+-		| (compressed[offset + 2] << 16)
+-		| (compressed[offset + 3] << 24));
++  stream_crc = ((uint32_t)compressed[offset]
++		| ((uint32_t)compressed[offset + 1] << 8)
++		| ((uint32_t)compressed[offset + 2] << 16)
++		| ((uint32_t)compressed[offset + 3] << 24));
+   if (unlikely (computed_crc != stream_crc))
+     {
+       elf_uncompress_failed ();
+diff --git a/libbacktrace/xztest.c b/libbacktrace/xztest.c
+index b2533cb1804..6c60ff50159 100644
+--- a/libbacktrace/xztest.c
++++ b/libbacktrace/xztest.c
+@@ -172,7 +172,7 @@ test_samples (struct backtrace_state *state)
+ 		       tests[i].name, uncompressed_len, v);
+ 	      ++failures;
+ 	    }
+-	  else if (memcmp (tests[i].uncompressed, uncompressed, v) != 0)
++	  else if (v > 0 && memcmp (tests[i].uncompressed, uncompressed, v) != 0)
+ 	    {
+ 	      size_t j;
+ 
+-- 
+GitLab
+

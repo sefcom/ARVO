@@ -1,0 +1,74 @@
+From 232f5fc9f3bed8e1b02bca5d10b2eca444e30f95 Mon Sep 17 00:00:00 2001
+From: Jay Berkenbilt <ejb@ql.org>
+Date: Thu, 22 Oct 2020 06:27:25 -0400
+Subject: [PATCH] Handle jpeg library fuzz false positives
+
+The jpeg library has some assembly code that is missed by the compiler
+instrumentation used by memory sanitization. There is a runtime
+environment variable that is used to work around this issue.
+---
+ fuzz/dct_fuzzer.cc  | 6 ++++++
+ fuzz/qpdf_fuzzer.cc | 6 ++++++
+ libqpdf/Pl_DCT.cc   | 1 +
+ 3 files changed, 13 insertions(+)
+
+diff --git a/fuzz/dct_fuzzer.cc b/fuzz/dct_fuzzer.cc
+index 450b4df26..b051819a7 100644
+--- a/fuzz/dct_fuzzer.cc
++++ b/fuzz/dct_fuzzer.cc
+@@ -2,6 +2,7 @@
+ #include <qpdf/Pl_DCT.hh>
+ #include <iostream>
+ #include <stdexcept>
++#include <cstdlib>
+ 
+ class FuzzHelper
+ {
+@@ -46,6 +47,11 @@ FuzzHelper::run()
+ 
+ extern "C" int LLVMFuzzerTestOneInput(unsigned char const* data, size_t size)
+ {
++#ifndef _WIN32
++    // Used by jpeg library to work around false positives in memory
++    // sanitizer.
++    setenv("JSIMD_FORCENONE", "1", 1);
++#endif
+     FuzzHelper f(data, size);
+     f.run();
+     return 0;
+diff --git a/fuzz/qpdf_fuzzer.cc b/fuzz/qpdf_fuzzer.cc
+index 32b9a0fb5..eb6791a43 100644
+--- a/fuzz/qpdf_fuzzer.cc
++++ b/fuzz/qpdf_fuzzer.cc
+@@ -9,6 +9,7 @@
+ #include <qpdf/QPDFPageLabelDocumentHelper.hh>
+ #include <qpdf/QPDFOutlineDocumentHelper.hh>
+ #include <qpdf/QPDFAcroFormDocumentHelper.hh>
++#include <cstdlib>
+ 
+ class DiscardContents: public QPDFObjectHandle::ParserCallbacks
+ {
+@@ -223,6 +224,11 @@ FuzzHelper::run()
+ 
+ extern "C" int LLVMFuzzerTestOneInput(unsigned char const* data, size_t size)
+ {
++#ifndef _WIN32
++    // Used by jpeg library to work around false positives in memory
++    // sanitizer.
++    setenv("JSIMD_FORCENONE", "1", 1);
++#endif
+     FuzzHelper f(data, size);
+     f.run();
+     return 0;
+diff --git a/libqpdf/Pl_DCT.cc b/libqpdf/Pl_DCT.cc
+index 7231486d8..2ddafecba 100644
+--- a/libqpdf/Pl_DCT.cc
++++ b/libqpdf/Pl_DCT.cc
+@@ -8,6 +8,7 @@
+ #include <stdexcept>
+ #include <stdlib.h>
+ #include <string>
++#include <cstring>
+ 
+ #if BITS_IN_JSAMPLE != 8
+ # error "qpdf does not support libjpeg built with BITS_IN_JSAMPLE != 8"

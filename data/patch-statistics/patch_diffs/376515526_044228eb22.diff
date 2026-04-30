@@ -1,0 +1,220 @@
+From 037fb170336b7aa4a71beae89bd6761d49f23053 Mon Sep 17 00:00:00 2001
+From: Zoltan Herczeg <zherczeg7@gmail.com>
+Date: Thu, 7 Nov 2024 11:25:48 +0100
+Subject: [PATCH] Don't write code during size computation (#547)
+
+Co-authored-by: Zoltan Herczeg <hzmester@freemail.hu>
+---
+ src/pcre2_compile_class.c | 25 ++++++++++++++--
+ testdata/testinput5       | 60 +++++++++++++++++++++++++++++++++++++++
+ testdata/testoutput5      | 60 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 143 insertions(+), 2 deletions(-)
+
+diff --git a/src/pcre2_compile_class.c b/src/pcre2_compile_class.c
+index 0a5478e5d..2896e3ca7 100644
+--- a/src/pcre2_compile_class.c
++++ b/src/pcre2_compile_class.c
+@@ -1790,6 +1790,7 @@ compile_class_operand(uint32_t options, uint32_t xoptions, uint32_t **pptr,
+ {
+ uint32_t *ptr = *pptr;
+ PCRE2_UCHAR *code = *pcode;
++PCRE2_UCHAR *code_start = code;
+ BOOL first = TRUE;
+ 
+ while (TRUE)
+@@ -1844,11 +1845,18 @@ while (TRUE)
+   /* Join second and subsequent leaves with an OR. */
+   if (!first) *code++ = OP_ECLASS_OR;
+ 
++  if (lengthptr != NULL)
++    {
++    *lengthptr += code - code_start;
++    code = code_start;
++    }
++
+   first = FALSE;
+   }
+ 
+ DONE:
+ PCRE2_ASSERT(!first);  /* Confirm that we found something. */
++PCRE2_ASSERT(lengthptr == NULL || (code == code_start));
+ 
+ *pptr = ptr;
+ *pcode = code;
+@@ -1879,6 +1887,9 @@ held by the OP_ECLASS. */
+ uint32_t *ptr = *pptr;
+ PCRE2_UCHAR *code = *pcode;
+ BOOL negated;
++#ifdef PCRE2_DEBUG
++PCRE2_UCHAR *start_code = *pcode;
++#endif
+ 
+ /* The CLASS_IS_ECLASS bit must be set since it is a nested class. */
+ PCRE2_ASSERT(*ptr == (META_CLASS | CLASS_IS_ECLASS) ||
+@@ -1904,12 +1915,22 @@ while (*ptr >= META_ECLASS_OR && *ptr <= META_ECLASS_SUB)
+     return FALSE;
+ 
+   /* Convert infix to postfix (RPN). */
+-  *code++ = op;
++  if (lengthptr != NULL)
++    (*lengthptr)++;
++  else
++    *code++ = op;
+   }
+ 
+-if (negated) *code++ = OP_ECLASS_NOT;
++if (negated)
++  {
++  if (lengthptr != NULL)
++    (*lengthptr)++;
++  else
++    *code++ = OP_ECLASS_NOT;
++  }
+ 
+ PCRE2_ASSERT(*ptr == META_CLASS_END);
++PCRE2_ASSERT(lengthptr == NULL || code == start_code);
+ 
+ *pptr = ptr;
+ *pcode = code;
+diff --git a/testdata/testinput5 b/testdata/testinput5
+index f3faeb8fb..503ffa654 100644
+--- a/testdata/testinput5
++++ b/testdata/testinput5
+@@ -3184,6 +3184,66 @@
+ \= Expect no match
+     C
+ 
++/[[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]]/utf,alt_extended_class
++
+ # --------------
+ 
+ /^([\h\x{9000}\x{9002}\x{9004}][\v\x{9000}\x{9002}\x{9004}\x{9006}\x{9008}][\h\v\x{9000}],){4}$/B,utf
+diff --git a/testdata/testoutput5 b/testdata/testoutput5
+index 0dba11c62..00743f193 100644
+--- a/testdata/testoutput5
++++ b/testdata/testoutput5
+@@ -7167,6 +7167,66 @@ No match
+     C
+ No match
+ 
++/[[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]
++&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]&&[\pN--[\pC||\x{9F5}]]]/utf,alt_extended_class
++
+ # --------------
+ 
+ /^([\h\x{9000}\x{9002}\x{9004}][\v\x{9000}\x{9002}\x{9004}\x{9006}\x{9008}][\h\v\x{9000}],){4}$/B,utf

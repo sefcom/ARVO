@@ -1,0 +1,386 @@
+diff --git a/gn/sksl.gni b/gn/sksl.gni
+index 4d33e8a..8e73c82 100644
+--- a/gn/sksl.gni
++++ b/gn/sksl.gni
+@@ -38,6 +38,8 @@
+   "$_src/sksl/SkSLMemoryLayout.h",
+   "$_src/sksl/SkSLParser.cpp",
+   "$_src/sksl/SkSLParser.h",
++  "$_src/sksl/SkSLPool.cpp",
++  "$_src/sksl/SkSLPool.h",
+   "$_src/sksl/SkSLPosition.h",
+   "$_src/sksl/SkSLRehydrator.cpp",
+   "$_src/sksl/SkSLRehydrator.h",
+diff --git a/src/sksl/SkSLCompiler.cpp b/src/sksl/SkSLCompiler.cpp
+index 22c7492..6c88308 100644
+--- a/src/sksl/SkSLCompiler.cpp
++++ b/src/sksl/SkSLCompiler.cpp
+@@ -1552,24 +1552,33 @@
+ 
+     const ParsedModule& baseModule = this->moduleForProgramKind(kind);
+ 
++    // Enable node pooling while converting and optimizing the program for a performance boost.
++    // The Program will take ownership of the pool.
++    std::unique_ptr<Pool> pool = Pool::CreatePoolOnThread(2000);
+     IRGenerator::IRBundle ir =
+             fIRGenerator->convertProgram(kind, &settings, baseModule, /*isBuiltinCode=*/false,
+                                          textPtr->c_str(), textPtr->size(), externalValues);
+-    auto result = std::make_unique<Program>(kind,
+-                                            std::move(textPtr),
+-                                            settings,
+-                                            fContext,
+-                                            std::move(ir.fElements),
+-                                            std::move(ir.fModifiers),
+-                                            std::move(ir.fSymbolTable),
+-                                            ir.fInputs);
++    auto program = std::make_unique<Program>(kind,
++                                             std::move(textPtr),
++                                             settings,
++                                             fContext,
++                                             std::move(ir.fElements),
++                                             std::move(ir.fModifiers),
++                                             std::move(ir.fSymbolTable),
++                                             std::move(pool),
++                                             ir.fInputs);
++    bool success = false;
+     if (fErrorCount) {
+-        return nullptr;
++        // Do not return programs that failed to compile.
++    } else if (settings.fOptimize && !this->optimize(*program)) {
++        // Do not return programs that failed to optimize.
++    } else {
++        // We have a successful program!
++        success = true;
+     }
+-    if (settings.fOptimize && !this->optimize(*result)) {
+-        return nullptr;
+-    }
+-    return result;
++
++    program->fPool->detachFromThread();
++    return success ? std::move(program) : nullptr;
+ }
+ 
+ bool Compiler::optimize(Program& program) {
+diff --git a/src/sksl/SkSLPool.cpp b/src/sksl/SkSLPool.cpp
+new file mode 100644
+index 0000000..7e47e02
+--- /dev/null
++++ b/src/sksl/SkSLPool.cpp
+@@ -0,0 +1,175 @@
++/*
++ * Copyright 2020 Google LLC
++ *
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file.
++ */
++
++#include "src/sksl/SkSLPool.h"
++
++#include "src/sksl/ir/SkSLIRNode.h"
++
++#define VLOG(...) // printf(__VA_ARGS__)
++
++namespace SkSL {
++
++#if defined(SK_BUILD_FOR_IOS) && \
++        (!defined(__IPHONE_9_0) || __IPHONE_OS_VERSION_MIN_REQUIRED < __IPHONE_9_0)
++
++// iOS did not support for C++11 `thread_local` variables until iOS 9.
++// Pooling is not supported here; we allocate all nodes directly.
++struct PoolData {};
++
++Pool::~Pool() {}
++void Pool* Pool::CreatePoolOnThread(int nodesInPool) { return new Pool; }
++void Pool::detachFromThread() {}
++void Pool::attachToThread() {}
++void* Pool::AllocIRNode() { return ::operator new(sizeof(IRNode)); }
++void Pool::FreeIRNode(void* node) { ::operator delete(node); }
++
++#else  // !defined(SK_BUILD_FOR_IOS)...
++
++namespace { struct IRNodeData {
++    union {
++        uint8_t fBuffer[sizeof(IRNode)];
++        IRNodeData* fFreeListNext;
++    };
++}; }
++
++struct PoolData {
++    // This holds the first free node in the pool. It will be null when the pool is exhausted.
++    IRNodeData* fFreeListHead = fNodes;
++
++    // This points to end of our pooled data, and implies the number of nodes.
++    IRNodeData* fNodesEnd = nullptr;
++
++    // Our pooled data lives here. (We allocate lots of nodes here, not just one.)
++    IRNodeData fNodes[1];
++
++    // Accessors.
++    ptrdiff_t nodeCount() { return fNodesEnd - fNodes; }
++
++    ptrdiff_t nodeIndex(IRNodeData* node) {
++        SkASSERT(node >= fNodes);
++        SkASSERT(node < fNodesEnd);
++        return node - fNodes;
++    }
++};
++
++static thread_local PoolData* sPoolData = nullptr;
++
++static PoolData* create_pool_data(int nodesInPool) {
++    // Create a PoolData structure with extra space at the end for additional IRNode data.
++    int numExtraIRNodes = nodesInPool - 1;
++    PoolData* poolData = static_cast<PoolData*>(malloc(sizeof(PoolData) +
++                                                       (sizeof(IRNodeData) * numExtraIRNodes)));
++
++    // Initialize each pool node as a free node. The free nodes form a singly-linked list, each
++    // pointing to the next free node in sequence.
++    for (int index = 0; index < nodesInPool - 1; ++index) {
++        poolData->fNodes[index].fFreeListNext = &poolData->fNodes[index + 1];
++    }
++    poolData->fNodes[nodesInPool - 1].fFreeListNext = nullptr;
++    poolData->fNodesEnd = &poolData->fNodes[nodesInPool];
++
++    return poolData;
++}
++
++
++Pool::~Pool() {
++    if (sPoolData == fData) {
++        SkDEBUGFAIL("SkSL pool is being destroyed while it is still attached to the thread");
++        sPoolData = nullptr;
++    }
++
++    // In debug mode, report any leaked nodes.
++#ifdef SK_DEBUG
++    ptrdiff_t nodeCount = fData->nodeCount();
++    std::vector<bool> freed(nodeCount);
++    for (IRNodeData* node = fData->fFreeListHead; node; node = node->fFreeListNext) {
++        ptrdiff_t nodeIndex = fData->nodeIndex(node);
++        freed[nodeIndex] = true;
++    }
++    bool foundLeaks = false;
++    for (int index = 0; index < nodeCount; ++index) {
++        if (!freed[index]) {
++            IRNode* leak = reinterpret_cast<IRNode*>(fData->fNodes[index].fBuffer);
++            SkDebugf("Node %d leaked: %s\n", index, leak->description().c_str());
++            foundLeaks = true;
++        }
++    }
++    if (foundLeaks) {
++        SkDEBUGFAIL("leaking SkSL pool nodes; if they are later freed, this will likely be fatal");
++    }
++#endif
++
++    VLOG("DELETE Pool:0x%016llX\n", (uint64_t)fData);
++    free(fData);
++}
++
++std::unique_ptr<Pool> Pool::CreatePoolOnThread(int nodesInPool) {
++    auto pool = std::unique_ptr<Pool>(new Pool);
++    pool->fData = create_pool_data(nodesInPool);
++    pool->fData->fFreeListHead = &pool->fData->fNodes[0];
++    VLOG("CREATE Pool:0x%016llX\n", (uint64_t)pool->fData);
++    pool->attachToThread();
++    return pool;
++}
++
++void Pool::detachFromThread() {
++    VLOG("DETACH Pool:0x%016llX\n", (uint64_t)sPoolData);
++    SkASSERT(sPoolData != nullptr);
++    sPoolData = nullptr;
++}
++
++void Pool::attachToThread() {
++    VLOG("ATTACH Pool:0x%016llX\n", (uint64_t)fData);
++    SkASSERT(sPoolData == nullptr);
++    sPoolData = fData;
++}
++
++void* Pool::AllocIRNode() {
++    // Is a pool attached?
++    if (sPoolData) {
++        // Does the pool contain a free node?
++        IRNodeData* node = sPoolData->fFreeListHead;
++        if (node) {
++            // Yes. Take a node from the freelist.
++            sPoolData->fFreeListHead = node->fFreeListNext;
++            VLOG("ALLOC  Pool:0x%016llX Index:%04d         0x%016llX\n",
++                 (uint64_t)sPoolData, (int)(node - &sPoolData->fNodes[0]), (uint64_t)node);
++            return node->fBuffer;
++        }
++    }
++
++    // The pool is detached or full; allocate nodes using malloc.
++    void* ptr = ::operator new(sizeof(IRNode));
++    VLOG("ALLOC  Pool:0x%016llX Index:____ malloc  0x%016llX\n",
++         (uint64_t)sPoolData, (uint64_t)ptr);
++    return ptr;
++}
++
++void Pool::FreeIRNode(void* node_v) {
++    // Is a pool attached?
++    if (sPoolData) {
++        // Did this node come from our pool?
++        auto* node = static_cast<IRNodeData*>(node_v);
++        if (node >= &sPoolData->fNodes[0] && node < sPoolData->fNodesEnd) {
++            // Yes. Push it back onto the freelist.
++            VLOG("FREE   Pool:0x%016llX Index:%04d         0x%016llX\n",
++                 (uint64_t)sPoolData, (int)(node - &sPoolData->fNodes[0]), (uint64_t)node);
++            node->fFreeListNext = sPoolData->fFreeListHead;
++            sPoolData->fFreeListHead = node;
++            return;
++        }
++    }
++
++    // No pool is attached or the node was malloced; it must be freed.
++    VLOG("FREE   Pool:0x%016llX Index:____ free    0x%016llX\n",
++         (uint64_t)sPoolData, (uint64_t)node_v);
++    ::operator delete(node_v);
++}
++
++#endif  // !defined(SK_BUILD_FOR_IOS)...
++
++}  // namespace SkSL
+diff --git a/src/sksl/SkSLPool.h b/src/sksl/SkSLPool.h
+new file mode 100644
+index 0000000..f7338ac
+--- /dev/null
++++ b/src/sksl/SkSLPool.h
+@@ -0,0 +1,51 @@
++/*
++ * Copyright 2020 Google LLC
++ *
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file.
++ */
++
++#ifndef SKSL_POOL
++#define SKSL_POOL
++
++#include <memory>
++
++namespace SkSL {
++
++class IRNode;
++struct PoolData;
++
++class Pool {
++public:
++    ~Pool();
++
++    // Creates a pool to store newly-created IRNodes during program creation and attaches it to the
++    // current thread. When your program is complete, call pool->detachFromThread() to transfer
++    // ownership of those nodes. Before destroying any of the program's nodes, reattach the pool via
++    // pool->attachToThread(). It is an error to call CreatePoolOnThread if a pool is already
++    // attached to the current thread.
++    static std::unique_ptr<Pool> CreatePoolOnThread(int nodesInPool);
++
++    // Once a pool has been created and the ephemeral work has completed, detach it from its thread.
++    // It is an error to call this while no pool is attached.
++    void detachFromThread();
++
++    // Reattaches a pool to the current thread. It is an error to call this while a pool is already
++    // attached.
++    void attachToThread();
++
++    // Retrieves a node from the thread pool. If the pool is exhausted, this will allocate a node.
++    static void* AllocIRNode();
++
++    // Releases a node that was created by AllocIRNode. This will return it to the pool, or free it,
++    // as appropriate. Make sure to free all nodes, since some of them may be real allocations.
++    static void FreeIRNode(void* node_v);
++
++private:
++    Pool() = default;  // use CreatePoolOnThread to make a pool
++    PoolData* fData = nullptr;
++};
++
++}  // namespace SkSL
++
++#endif
+diff --git a/src/sksl/ir/SkSLIRNode.h b/src/sksl/ir/SkSLIRNode.h
+index 982ed34..58241af 100644
+--- a/src/sksl/ir/SkSLIRNode.h
++++ b/src/sksl/ir/SkSLIRNode.h
+@@ -12,6 +12,7 @@
+ #include "src/sksl/SkSLASTNode.h"
+ #include "src/sksl/SkSLLexer.h"
+ #include "src/sksl/SkSLModifiersPool.h"
++#include "src/sksl/SkSLPool.h"
+ #include "src/sksl/SkSLString.h"
+ 
+ #include <algorithm>
+@@ -64,6 +65,20 @@
+     // purposes
+     int fOffset;
+ 
++    // Override operator new and delete to allow us to control allocation behavior.
++    static void* operator new(const size_t size) {
++        // TODO: once all IRNodes hold their data in fData, everything should come out of the pool,
++        // and this check should become an assertion.
++        if (size == sizeof(IRNode)) {
++            return Pool::AllocIRNode();
++        }
++        return ::operator new(size);
++    }
++
++    static void operator delete(void* ptr) {
++        Pool::FreeIRNode(ptr);
++    }
++
+ protected:
+     struct BlockData {
+         std::shared_ptr<SymbolTable> fSymbolTable;
+diff --git a/src/sksl/ir/SkSLProgram.h b/src/sksl/ir/SkSLProgram.h
+index d370353..b86c6f6 100644
+--- a/src/sksl/ir/SkSLProgram.h
++++ b/src/sksl/ir/SkSLProgram.h
+@@ -32,6 +32,7 @@
+ namespace SkSL {
+ 
+ class Context;
++class Pool;
+ 
+ /**
+  * Represents a fully-digested program, ready for code generation.
+@@ -165,16 +166,30 @@
+             std::vector<std::unique_ptr<ProgramElement>> elements,
+             std::unique_ptr<ModifiersPool> modifiers,
+             std::shared_ptr<SymbolTable> symbols,
++            std::unique_ptr<Pool> pool,
+             Inputs inputs)
+     : fKind(kind)
+     , fSource(std::move(source))
+     , fSettings(settings)
+     , fContext(context)
+     , fSymbols(symbols)
++    , fPool(std::move(pool))
+     , fInputs(inputs)
+     , fElements(std::move(elements))
+     , fModifiers(std::move(modifiers)) {}
+ 
++    ~Program() {
++        // Some or all of the program elements are in the pool. To free them safely, we must attach
++        // the pool before destroying any program elements. (Otherwise, we may accidentally call
++        // delete on a pooled node.)
++        fPool->attachToThread();
++        fElements.clear();
++        fContext.reset();
++        fSymbols.reset();
++        fModifiers.reset();
++        fPool->detachFromThread();
++    }
++
+     const std::vector<std::unique_ptr<ProgramElement>>& elements() const { return fElements; }
+ 
+     Kind fKind;
+@@ -184,6 +199,7 @@
+     // it's important to keep fElements defined after (and thus destroyed before) fSymbols,
+     // because destroying elements can modify reference counts in symbols
+     std::shared_ptr<SymbolTable> fSymbols;
++    std::unique_ptr<Pool> fPool;
+     Inputs fInputs;
+ 
+ private:

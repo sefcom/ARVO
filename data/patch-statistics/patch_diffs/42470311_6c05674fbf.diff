@@ -1,0 +1,133 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1536504552 18000
+#      Sun Sep 09 09:49:12 2018 -0500
+# Node ID dfe0ac275b84fe5eaa2db36bfd64f88265a9644c
+# Parent  a7cab7312da462d72a0e7706c2d0621b2d0e5567
+ReadSFWImage(): Enforce that file is read using the JPEG reader. (Credit to OSS-Fuzz)
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,5 +1,8 @@
+ 2018-09-09  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
++	* coders/sfw.c (ReadSFWImage): Enforce that file is read using the
++	JPEG reader. (Credit to OSS-Fuzz)
++
+ 	* coders/miff.c (ReadMIFFImage): Fix leak of 'values' buffer due
+ 	to change made yesterday.
+ 
+diff --git a/coders/dcm.c b/coders/dcm.c
+--- a/coders/dcm.c
++++ b/coders/dcm.c
+@@ -3038,12 +3038,13 @@
+   ARG_NOT_USED(image);
+   ARG_NOT_USED(exception);
+ 
+-  if ((dcm->data == (unsigned char *) NULL) || (dcm->length == 0))
++  if (dcm->data == (unsigned char *) NULL)
+     {
+       ThrowException(exception,CorruptImageError,ImproperImageHeader,image->filename);
+       return MagickFail;
+     }
+ 
++  (void) memset(photometric,0,sizeof(photometric));
+   for (i=0; i < Min(dcm->length, MaxTextExtent-1); i++)
+     photometric[i]=dcm->data[i];
+   photometric[i]='\0';
+@@ -4810,9 +4811,12 @@
+         status=pfunc(image,&dcm,exception);
+       MagickFreeMemory(dcm.data);
+       dcm.data = NULL;
++      dcm.length = 0;
+       if (status == MagickPass)
+         status=DCM_ReadElement(image,&dcm,exception);
+     }
++  if (status == MagickFail)
++    goto dcm_read_failure;
+ #if defined(IGNORE_WINDOW_FOR_UNSPECIFIED_SCALE_TYPE)
+   if (dcm.rescale_type == DCM_RT_UNSPECIFIED)
+     {
+@@ -4825,9 +4829,6 @@
+   /*
+     Now process the image data
+   */
+-  if (status == MagickFail)
+-    goto dcm_read_failure;
+-
+   if ((dcm.columns == 0) || (dcm.rows == 0))
+     {
+       ThrowException(exception,CorruptImageError,ImproperImageHeader,image->filename);
+diff --git a/coders/sfw.c b/coders/sfw.c
+--- a/coders/sfw.c
++++ b/coders/sfw.c
+@@ -1,5 +1,5 @@
+ /*
+-% Copyright (C) 2003 - 2017 GraphicsMagick Group
++% Copyright (C) 2003 - 2018 GraphicsMagick Group
+ % Copyright (C) 2002 ImageMagick Studio
+ % Copyright 1991-1999 E. I. du Pont de Nemours and Company
+ %
+@@ -210,7 +210,8 @@
+ 
+   char
+     original_filename[MaxTextExtent],
+-    original_magick[MaxTextExtent];
++    original_magick[MaxTextExtent],
++    temporary_filename[MaxTextExtent];
+ 
+   size_t
+     count;
+@@ -312,16 +313,12 @@
+   clone_info=CloneImageInfo(image_info);
+   clone_info->blob=(void *) NULL;
+   clone_info->length=0;
+-  file=AcquireTemporaryFileStream(clone_info->filename,BinaryFileIOMode);
++  file=AcquireTemporaryFileStream(temporary_filename,BinaryFileIOMode);
+   if (file == (FILE *) NULL)
+     {
+-      char
+-        filename[MaxTextExtent];
+-
+-      (void) strcpy(filename,clone_info->filename);
+       MagickFreeMemory(buffer);
+       DestroyImageInfo(clone_info);
+-      ThrowReaderTemporaryFileException(filename)
++      ThrowReaderTemporaryFileException(image_info->filename)
+     }
+   (void) fwrite(header,(size_t) (offset-header+1),1,file);
+   (void) fwrite(HuffmanTable,1,sizeof(HuffmanTable)/sizeof(*HuffmanTable),file);
+@@ -331,7 +328,7 @@
+   MagickFreeMemory(buffer);
+   if (status)
+     {
+-      (void) LiberateTemporaryFile(clone_info->filename);
++      (void) LiberateTemporaryFile(temporary_filename);
+       DestroyImageInfo(clone_info);
+       ThrowReaderException(FileOpenError,UnableToWriteFile,image)
+     }
+@@ -342,8 +339,10 @@
+   /*
+     Read JPEG image.
+   */
++  (void) strlcpy(clone_info->filename,"JPEG:",sizeof(clone_info->filename));
++  (void) strlcat(clone_info->filename,temporary_filename,sizeof(clone_info->filename));
+   image=ReadImage(clone_info,exception);
+-  (void) LiberateTemporaryFile(clone_info->filename);
++  (void) LiberateTemporaryFile(temporary_filename);
+   DestroyImageInfo(clone_info);
+   if (image == (Image *) NULL)
+     return(image);
+diff --git a/www/Changelog.html b/www/Changelog.html
+--- a/www/Changelog.html
++++ b/www/Changelog.html
+@@ -38,6 +38,8 @@
+ <p>2018-09-09  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
+ <blockquote>
+ <ul class="simple">
++<li>coders/sfw.c (ReadSFWImage): Enforce that file is read using the
++JPEG reader. (Credit to OSS-Fuzz)</li>
+ <li>coders/miff.c (ReadMIFFImage): Fix leak of 'values' buffer due
+ to change made yesterday.</li>
+ <li>coders/mpc.c (ReadMPCImage): Fix leak of 'values' buffer due to

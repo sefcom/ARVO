@@ -1,0 +1,194 @@
+From 839ef3e392240fc3994b8b73e5164ac5cad4d30a Mon Sep 17 00:00:00 2001
+From: Lode Vandevenne <lode@google.com>
+Date: Wed, 27 Oct 2021 16:30:03 +0200
+Subject: [PATCH] Fix issue when having both XML and Exif box
+
+The decoder was reusing the same position variable for JPEG reconstruction
+metadata, but not re-initializing it to 0 for the other type of box
+---
+ lib/jxl/box_content_decoder.cc                 |   1 -
+ lib/jxl/decode.cc                              |   4 +++-
+ lib/jxl/decode_test.cc                         |   8 ++++++++
+ lib/jxl/decode_to_jpeg.cc                      |  17 +++++++++++------
+ .../jxl/jpeg_reconstruction/1x1_exif_xmp.jpg   | Bin 0 -> 4290 bytes
+ .../jxl/jpeg_reconstruction/1x1_exif_xmp.jxl   | Bin 0 -> 4104 bytes
+ 6 files changed, 22 insertions(+), 8 deletions(-)
+ create mode 100644 third_party/testdata/jxl/jpeg_reconstruction/1x1_exif_xmp.jpg
+ create mode 100644 third_party/testdata/jxl/jpeg_reconstruction/1x1_exif_xmp.jxl
+
+diff --git a/lib/jxl/box_content_decoder.cc b/lib/jxl/box_content_decoder.cc
+index 262dac53944..c4cba3a31ae 100644
+--- a/lib/jxl/box_content_decoder.cc
++++ b/lib/jxl/box_content_decoder.cc
+@@ -83,7 +83,6 @@ JxlDecoderStatus JxlBoxContentDecoder::Process(const uint8_t* next_in,
+     size_t can_read = avail_in;
+     if (!box_until_eof_) can_read = std::min<size_t>(can_read, remaining_);
+     size_t to_write = std::min<size_t>(can_read, *avail_out);
+-
+     memcpy(*next_out, next_in, to_write);
+ 
+     *next_out += to_write;
+diff --git a/lib/jxl/decode.cc b/lib/jxl/decode.cc
+index f90ab0df1bd..74fbb64f7ce 100644
+--- a/lib/jxl/decode.cc
++++ b/lib/jxl/decode.cc
+@@ -1759,10 +1759,12 @@ JxlDecoderStatus JxlDecoderProcessInput(JxlDecoder* dec) {
+         if (dec->store_exif == 0 &&
+             memcmp(dec->box_decoded_type, "Exif", 4) == 0) {
+           dec->store_exif = 1;
++          dec->recon_out_buffer_pos = 0;
+         }
+         if (dec->store_xmp == 0 &&
+-            memcmp(dec->box_decoded_type, "XML ", 4) == 0) {
++            memcmp(dec->box_decoded_type, "xml ", 4) == 0) {
+           dec->store_xmp = 1;
++          dec->recon_out_buffer_pos = 0;
+         }
+       }
+ 
+diff --git a/lib/jxl/decode_test.cc b/lib/jxl/decode_test.cc
+index fb019e467e9..b74444bb3ce 100644
+--- a/lib/jxl/decode_test.cc
++++ b/lib/jxl/decode_test.cc
+@@ -3315,6 +3315,14 @@ TEST(DecodeTest, JXL_TRANSCODE_JPEG_TEST(JPEGReconstructionTest)) {
+   VerifyJPEGReconstruction(container, orig);
+ }
+ 
++TEST(DecodeTest, JXL_TRANSCODE_JPEG_TEST(JPEGReconstructionMetadataTest)) {
++  const std::string jpeg_path = "jxl/jpeg_reconstruction/1x1_exif_xmp.jpg";
++  const std::string jxl_path = "jxl/jpeg_reconstruction/1x1_exif_xmp.jxl";
++  const jxl::PaddedBytes jpeg = jxl::ReadTestData(jpeg_path);
++  const jxl::PaddedBytes jxl = jxl::ReadTestData(jxl_path);
++  VerifyJPEGReconstruction(jxl, jpeg);
++}
++
+ TEST(DecodeTest, ContinueFinalNonEssentialBoxTest) {
+   size_t xsize = 80, ysize = 90;
+   std::vector<uint8_t> pixels = jxl::test::GetSomeTestImage(xsize, ysize, 4, 0);
+diff --git a/lib/jxl/decode_to_jpeg.cc b/lib/jxl/decode_to_jpeg.cc
+index a3db5feacfb..4114d2905c6 100644
+--- a/lib/jxl/decode_to_jpeg.cc
++++ b/lib/jxl/decode_to_jpeg.cc
+@@ -95,7 +95,7 @@ size_t JxlToJpegDecoder::NumXmpMarkers(const jpeg::JPEGData& jpeg_data) {
+ size_t JxlToJpegDecoder::ExifBoxContentSize(const jpeg::JPEGData& jpeg_data) {
+   for (size_t i = 0; i < jpeg_data.app_data.size(); ++i) {
+     if (jpeg_data.app_marker_type[i] == jxl::jpeg::AppMarkerType::kExif) {
+-      return jpeg_data.app_data[i].size() + 4 - 9;
++      return jpeg_data.app_data[i].size() + 4 - 3 - sizeof(jpeg::kExifTag);
+     }
+   }
+   return 0;
+@@ -104,7 +104,7 @@ size_t JxlToJpegDecoder::ExifBoxContentSize(const jpeg::JPEGData& jpeg_data) {
+ size_t JxlToJpegDecoder::XmlBoxContentSize(const jpeg::JPEGData& jpeg_data) {
+   for (size_t i = 0; i < jpeg_data.app_data.size(); ++i) {
+     if (jpeg_data.app_marker_type[i] == jxl::jpeg::AppMarkerType::kXMP) {
+-      return jpeg_data.app_data[i].size() - 9;
++      return jpeg_data.app_data[i].size() - 3 - sizeof(jpeg::kXMPTag);
+     }
+   }
+   return 0;
+@@ -114,14 +114,17 @@ JxlDecoderStatus JxlToJpegDecoder::SetExif(const uint8_t* data, size_t size,
+                                            jpeg::JPEGData* jpeg_data) {
+   for (size_t i = 0; i < jpeg_data->app_data.size(); ++i) {
+     if (jpeg_data->app_marker_type[i] == jxl::jpeg::AppMarkerType::kExif) {
+-      if (jpeg_data->app_data[i].size() != size + 9 - 4) return JXL_DEC_ERROR;
++      if (jpeg_data->app_data[i].size() !=
++          size + 3 + sizeof(jpeg::kExifTag) - 4)
++        return JXL_DEC_ERROR;
+       // The first 9 bytes are used for JPEG marker header.
+       jpeg_data->app_data[i][0] = 0xE1;
+       // The second and third byte are already filled in correctly
+       memcpy(jpeg_data->app_data[i].data() + 3, jpeg::kExifTag,
+              sizeof(jpeg::kExifTag));
+       // The first 4
+-      memcpy(jpeg_data->app_data[i].data() + 9, data + 4, size - 4);
++      memcpy(jpeg_data->app_data[i].data() + 3 + sizeof(jpeg::kExifTag),
++             data + 4, size - 4);
+       return JXL_DEC_SUCCESS;
+     }
+   }
+@@ -131,13 +134,15 @@ JxlDecoderStatus JxlToJpegDecoder::SetXmp(const uint8_t* data, size_t size,
+                                           jpeg::JPEGData* jpeg_data) {
+   for (size_t i = 0; i < jpeg_data->app_data.size(); ++i) {
+     if (jpeg_data->app_marker_type[i] == jxl::jpeg::AppMarkerType::kXMP) {
+-      if (jpeg_data->app_data[i].size() != size + 9) return JXL_DEC_ERROR;
++      if (jpeg_data->app_data[i].size() != size + 3 + sizeof(jpeg::kXMPTag))
++        return JXL_DEC_ERROR;
+       // The first 9 bytes are used for JPEG marker header.
+       jpeg_data->app_data[i][0] = 0xE1;
+       // The second and third byte are already filled in correctly
+       memcpy(jpeg_data->app_data[i].data() + 3, jpeg::kXMPTag,
+              sizeof(jpeg::kXMPTag));
+-      memcpy(jpeg_data->app_data[i].data() + 5, data, size);
++      memcpy(jpeg_data->app_data[i].data() + 3 + sizeof(jpeg::kXMPTag), data,
++             size);
+       return JXL_DEC_SUCCESS;
+     }
+   }
+diff --git a/third_party/testdata/jxl/jpeg_reconstruction/1x1_exif_xmp.jpg b/third_party/testdata/jxl/jpeg_reconstruction/1x1_exif_xmp.jpg
+new file mode 100644
+index 0000000000000000000000000000000000000000..c057580dd6b94b42b9e7b60004518a4a273a892b
+GIT binary patch
+literal 4290
+zcmeHKO>g5w7#=6hHru8pDe1Dn#dw9ZKqvOtPW+*!Rn-qRh(fiEfa}Dbq^5}-Y^O<k
+zSx&G=#DOF58@O^nLi_-Zd|cQo7yiJC@Q(AbQMX&P;z%YQ`OV~cpZ9Y{nc*+PKT!Ui
+zgW3TSU~C8*2n`<zx&49HM5tDK6J-&Cxhka48c06OSA+}_;QcAgSI6>0knalVWIY8k
+z0sIQQzksQNT!i=6Ful(g63llXzy5F}{|Pc5yCI`7bH%<FpNMbQ4v)|VnBkTtZ@wt1
+zC8Cs66L=Ms*hH~aLnNkMwro;HDfHQwi|A$0`5C70?Z_j}F*}~NB%m8;6xHJypbPTw
+z(aKjRaon|K*^f%p4H~TE1RZ%myD}*$GTPi8bg6U7VzI$mo?n&z`u+z=^xUfSVfj!w
+z?C!D?@7_hojxXM;I~S*p<x1OI;^x2}bh;fDQ*qE~`;k4UN(s3QGGCS@F@eOVRp}!L
+zdp8J~sF(DTf}uEPsstRN+qCcR9gG>^TU8pn+VA&EeXSIPEty!BB`d0|su&PBI`?Bb
+zz<zXR!m!68C-l0p7x*G)q>Z2#S0%7Na;(!mJe(3=nS)M;dz+x6c>fHPugh3eKkqX6
+zK8u20=&=1W=Erv?>aH`@?e@ZU5`gQ-tj#(Aiy-4<YKnKm6wL!}d7W;e0hyhmK%RoG
+zbe@}r2<^SV>2V{qy{g2SY&UQ`*G@#DD3-<yhBb{*tXm4f)NmN4nxp6qvr*AaWx`YQ
+zqnP>*<2=Az@_@w93|&*28ZI|<7xbMbwoF6A4pAzmULmGMjEVmHp$Bb5+q3>~9v66;
+zhNh^LI+#_g2G*%-V(JhJmrZI^nA&voCh)k9eGr5l3U%;0w8i9)yR0Q8Tgu)!s#PVm
+z1m5!W*+*>}HvwCf-u3+6V7yxQI_x;6JaeR?mEmKREnU+p6<|;FK44)4{lck|-IzFU
+zC;KW0>p{@2O4H5C`)rirdtMX=;rY08kJ%?<sqKkL-`LdQU09VOdd6I7yy%=zzr|ob
+z$$Ve9G^UeZyem^(cJzj$V?r7X>&zh7q}0WV>$;ZWSQW*XGDkr(?$eO%w4m<bF;qP{
+zUc|deHr|-n>7OtjDx5c%C|EV>{Jb%3z4Df#+KM8{&l$&r_e%d2*CfQKU}6wx6|G_7
+zM#VHRVGUDpq5PT#MHr>)Klu;mr8VQf%(woiB=Y5IK|{q}+-Bo2ciQojfMMI)Z72{l
+zJ9b%<_S&(u6|*SbOc>i9Koe=CCC_jr%QL6X1PMnP7pEuWmN*~t49qhy&%itb^9;;0
+z@c+xelRFmk;g4V+ZcxMD(Jo4-Qv89j08b{H$t)~nmKGOpWOGZo-15@$^2+L3er2_=
+zy1bmfl`p(lTwh<$z3|fQTgBUJ#q}a55z?Tukhz)3+$^pvuN0qq4F5*Or*D+QA5kF-
+zw^t!86i})lqzl6EC%6Y+zKdr0s&IJ~4Sz$qw186ibRO=p^=~*Te-$bVx<V%PfCCCw
+x1JZ)9EnEjkO##m|abtUA;+X(p`?UuXr%@U%&iTaWYh23zn@c0WH5LKz>pw3TG~@sP
+
+literal 0
+HcmV?d00001
+
+diff --git a/third_party/testdata/jxl/jpeg_reconstruction/1x1_exif_xmp.jxl b/third_party/testdata/jxl/jpeg_reconstruction/1x1_exif_xmp.jxl
+new file mode 100644
+index 0000000000000000000000000000000000000000..7aadbded9ba6916674b8ed883cd929435ee81eb2
+GIT binary patch
+literal 4104
+zcmeHKTWl0n7(QECDcI5#Py`+v2OFw5JJ+3CSSqvyYN#SKN+c1_%$(g0%<e2R)9w~8
+zECi)S8?_ou3<2UL@xjEz2NPoq7-M2$Vo2~36Ezrp(L|94Nl6Ope`YT<+85)aJG*E9
+ze@_4Z`>*GuKSHSM-aR{*?xn|<B7|0Eqsij_vc~|AYBZ4?D!W<wK0JIE>IB+}mL=NI
+za^MQE)+9Pm0%!%++B!c4d|zTwyx#`A2=d)PUw|b6zY^$4Snl!mSmr(8d#7srufWr1
+zARss*4pVZYF=pHF$WC-On4y*$lx{LoN)%F(4!D9OnxbGz8YAjv+Azg5YC})YEJmwA
+z=NzoW>6%9rWB&6`O9^xXszo(7Ptb|^?!)E0$878`7qNYSM2tmpZXv^7{O}CRxK4(B
+zC_N&K6bHzdyZul=b|1QL)IM~;HXOEp6SJ{wmh;6ti7*2oh0rW#SnT)~F@dMsJj=u)
+z(SZ!R2cjGB1HvdNB_(iBg$aoTjKIm7y9T$`5#TMujzv+?<oQymlq$(7KgjW-VHmt1
+z@sh-W1Q$*gB3$MQ;kpLGAPMcjEk>?iU??KC{P8Hmg8iCf`Qpe(6SxqjVmDK^pXbZC
+z$crg~&*!PPv2+*>O@MOUjRmE{(a9p=cahK^4{S0tK?>2jhPq=nb&KPH7YE?jJn={#
+z#6qwpHcio@H>GL7IX7R7H6XK1Dd3wz3%Wy1Lxkp_Z;w+W!-E-?BAJeFyN(&Nq97PD
+z(FiBY1apcZh#b~z!eQAK6ic^MMHd=4!-X)y1)ESDKu);;qRE;f3t5><TZ#kvc9t`A
+zP3CM-P<2HWbwkt|`u7Jev=R2^`$KUYz{zT|AYp8CL^Ui<!H&*hTQs<|jy07?SzE~h
+zj$@l!{UDE_4sIUj2*1Bba%_BZ%*{K8Gpv*XZ)y6>ogR*|Ae&)#xP|d@eRtH&lid-f
+znG;nx4Id+ID6*`ofFA2TNP-ahg+j%LE_U9GkB=XW`o5Q8n`e^tSuMre-7xZl$$IDR
+zCI{=B=Q45MnAoOWm|;UaK^(TeX^-JTj=*{1>A7%lgd2Zx7ff~9RxDfLMA0IgLNt-n
+zF?Kk?aU4Ui4OP&Z$f2K&N;n{!b5M8i7^)uMB1~VLjXN85N@IkE3fBrJ3Y?^k(rZOG
+z6?KCknS#Lb|1ypS?t=acjxLIt%88l?ts+}GXQ{fziNw+c2g)zYP=s2#{*(W3EgJLu
+z=jqX}m4yF$wV<IQH}Xh5%*|eOJzzNYrUwOrX6GD|#p7PYZi+}4ZHy5;7er&Orp3?0
+zinr(8J`G8@(kR=!AvZCtr<H+L23i?tWuTRTRtElm8Mr=Ukplc9Sb_-(Ca_QUTY+;{
+z_)gu&bWWeEeU&Zilr5iEP;#Kct?ffwrk5w_kk?t=K&Q`2bp?GpTYVOO(S_;|C4U@d
+zDVgoRiITZ9bg)I&_O(+|U0+k{s32yB>1#)w*U+M){io4Ss}M6gfMA13GPAdLbv`-O
+zcJwwX4A0tLG}|%w(Jh|v@sf+*zO;VT*%g_N2i|(!+V;kuQ{SI|`<0GUCwh*2ed0!t
+zeHmtJySfx5lS?k_MM*T5=yK@iT6Gyhx59*7n^7y3-e;^&zI<XyTXNT<i=R_3ueo`(
+zeTUuk$n%L_GZ4F{u5PHTxTotYf8gZwu`BH_9-RAOmP9>|UtRswsn@>w`Q69f%zW|t
+p`O7{2=_5Utj=lfmmFda+2YV|I^Oq{`{PyZEi$05^MwOZNzW`N8S3&>)
+
+literal 0
+HcmV?d00001
+

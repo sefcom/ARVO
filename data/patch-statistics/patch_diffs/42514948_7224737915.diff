@@ -1,0 +1,148 @@
+From eb83e055b855d23802a25d5de6e3c8682f38fb9d Mon Sep 17 00:00:00 2001
+From: Guy Harris <gharris@sonic.net>
+Date: Sun, 4 Sep 2022 17:08:17 -0700
+Subject: [PATCH] AppleTalk, DSI: get rid of the "command" field.
+
+It's not needed.
+
+Instead, have get_transaction() return the request_val; the caller can
+fetch the command from its "value" member.
+
+While wee're at it, update some of the web reference information for
+DSI.
+---
+ epan/dissectors/packet-afp.h   |  2 --
+ epan/dissectors/packet-atalk.c | 24 ++++++++++++------------
+ epan/dissectors/packet-dsi.c   | 13 +++++++++----
+ 3 files changed, 21 insertions(+), 18 deletions(-)
+
+diff --git a/epan/dissectors/packet-afp.h b/epan/dissectors/packet-afp.h
+index 515718542e5..b5626a47cc4 100644
+--- a/epan/dissectors/packet-afp.h
++++ b/epan/dissectors/packet-afp.h
+@@ -97,14 +97,12 @@ extern value_string_ext afp_server_addr_type_vals_ext;
+  *                              DSI             ATP/ASP
+  * atp_asp_dsi_info.reply       dsi.flags       atp.function == 0x80
+  * atp_asp_dsi_info.release                     atp.function == 0xc0
+- * atp_asp_dsi_info.command     dsi.command     asp.function
+  * atp_asp_dsi_info.tid         dsi.requestid   atp.tid
+  * atp_asp_dsi_info.code        dsi.code
+  */
+ struct atp_asp_dsi_info {
+ 	guint8	reply;			/* 0 query  1 reply */
+ 	guint8  release;
+-	guint16	command;		/* 2  6 write */
+ 	guint16	tid;			/* request/transaction ID */
+ 	gint32  code;			/* error code/ offset NU */
+ };
+diff --git a/epan/dissectors/packet-atalk.c b/epan/dissectors/packet-atalk.c
+index 60e89222504..ed0fe434ecb 100644
+--- a/epan/dissectors/packet-atalk.c
++++ b/epan/dissectors/packet-atalk.c
+@@ -1000,7 +1000,7 @@ dissect_pap(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
+ /* -----------------------------
+    ASP protocol cf. inside appletalk chap. 11
+ */
+-static struct atp_asp_dsi_info *
++static asp_request_val *
+ get_transaction(tvbuff_t *tvb, packet_info *pinfo, struct atp_asp_dsi_info *atp_asp_dsi_info)
+ {
+   conversation_t  *conversation;
+@@ -1026,11 +1026,7 @@ get_transaction(tvbuff_t *tvb, packet_info *pinfo, struct atp_asp_dsi_info *atp_
+     wmem_map_insert(asp_request_hash, new_request_key, request_val);
+   }
+ 
+-  if (!request_val)
+-    return NULL;
+-
+-  atp_asp_dsi_info->command = request_val->value;
+-  return atp_asp_dsi_info;
++  return request_val;
+ }
+ 
+ 
+@@ -1038,6 +1034,7 @@ static int
+ dissect_asp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+ {
+   struct atp_asp_dsi_info *atp_asp_dsi_info;
++  asp_request_val *request_val;
+   int             offset   = 0;
+   proto_tree     *asp_tree = NULL;
+   proto_item     *ti;
+@@ -1050,11 +1047,12 @@ dissect_asp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+   col_set_str(pinfo->cinfo, COL_PROTOCOL, "ASP");
+   col_clear(pinfo->cinfo, COL_INFO);
+ 
+-  atp_asp_dsi_info = get_transaction(tvb, pinfo, (struct atp_asp_dsi_info *)data);
+-  if (!atp_asp_dsi_info)
++  atp_asp_dsi_info = (struct atp_asp_dsi_info *)data;
++  request_val = get_transaction(tvb, pinfo, atp_asp_dsi_info);
++  if (!request_val)
+      return 0;
+ 
+-  fn = (guint8) atp_asp_dsi_info->command;
++  fn = (guint8) request_val->value;
+ 
+   if (atp_asp_dsi_info->reply)
+     col_add_fstr(pinfo->cinfo, COL_INFO, "Reply tid %u",atp_asp_dsi_info->tid);
+@@ -1223,6 +1221,7 @@ static int
+ dissect_atp_zip(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data)
+ {
+   struct atp_asp_dsi_info *atp_asp_dsi_info;
++  asp_request_val *request_val;
+   int             offset = 0;
+   proto_tree     *zip_tree;
+   proto_tree     *sub_tree;
+@@ -1238,11 +1237,12 @@ dissect_atp_zip(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data)
+   col_set_str(pinfo->cinfo, COL_PROTOCOL, "ZIP");
+   col_clear(pinfo->cinfo, COL_INFO);
+ 
+-  atp_asp_dsi_info = get_transaction(tvb, pinfo, (struct atp_asp_dsi_info *)data);
+-  if (!atp_asp_dsi_info)
++  atp_asp_dsi_info = (struct atp_asp_dsi_info *)data;
++  request_val = get_transaction(tvb, pinfo, atp_asp_dsi_info);
++  if (!request_val)
+      return tvb_reported_length(tvb);
+ 
+-  fn = (guint8) atp_asp_dsi_info->command;
++  fn = (guint8) request_val->value;
+ 
+   if (atp_asp_dsi_info->reply)
+     col_add_fstr(pinfo->cinfo, COL_INFO, "Reply tid %u",atp_asp_dsi_info->tid);
+diff --git a/epan/dissectors/packet-dsi.c b/epan/dissectors/packet-dsi.c
+index b355b281898..962eee4fe92 100644
+--- a/epan/dissectors/packet-dsi.c
++++ b/epan/dissectors/packet-dsi.c
+@@ -25,15 +25,21 @@
+ 
+ http://developer.apple.com/DOCUMENTATION/macos8/pdf/ASAppleTalkFiling2.1_2.2.pdf
+ 
++  which is no longer available and does not appear to be in the Wayback Machine.
++
+   The netatalk source code by Wesley Craig & Adrian Sun
+ 
+   The Data Stream Interface description from
+-  http://developer.apple.com/documentation/Networking/Conceptual/AFPClient/AFPClient-6.html
+ 
+-(no longer available, apparently)
++http://developer.apple.com/documentation/Networking/Conceptual/AFPClient/AFPClient-6.html
++
++  which is no longer available, but is archived at
++
++https://web.archive.org/web/20040924082047/http://developer.apple.com/documentation/Networking/Conceptual/AFPClient/AFPClient-6.html
+ 
+   Also, AFP 3.3 documents parts of DSI at:
+-  http://developer.apple.com/mac/library/documentation/Networking/Conceptual/AFP/Introduction/Introduction.html
++
++http://developer.apple.com/mac/library/documentation/Networking/Conceptual/AFP/Introduction/Introduction.html
+ 
+  * What a Data Stream Interface packet looks like:
+  * 0                               32
+@@ -289,7 +295,6 @@ dissect_dsi_packet(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* da
+ 			tvbuff_t   *new_tvb;
+ 
+ 			atp_asp_dsi_info.reply = (dsi_flags == DSIFL_REPLY);
+-			atp_asp_dsi_info.command = dsi_command;
+ 			atp_asp_dsi_info.tid = dsi_requestid;
+ 			atp_asp_dsi_info.code = dsi_code;
+ 			proto_item_set_len(dsi_ti, DSI_BLOCKSIZ);

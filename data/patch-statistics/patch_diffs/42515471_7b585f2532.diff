@@ -1,0 +1,58 @@
+From 4d49d19e9d30a5173b9f375051a8f547319ffed9 Mon Sep 17 00:00:00 2001
+From: Yu Watanabe <watanabe.yu+github@gmail.com>
+Date: Sat, 3 Sep 2022 22:01:16 +0900
+Subject: [PATCH] bootspec: do not build two many json object at once
+
+This is a workaround for an issue in the memory sanitizer.
+If a function is called with too many arguments, then the sanitizer
+triggers the following false-positive warning:
+
+==349==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x7f8b247134a7 in json_buildv /work/build/../../src/systemd/src/shared/json.c:3213:17
+    #1 0x7f8b24714231 in json_build /work/build/../../src/systemd/src/shared/json.c:4117:13
+    #2 0x7f8b24487fa5 in show_boot_entries /work/build/../../src/systemd/src/shared/bootspec.c:1424:29
+    #3 0x4a6a1b in LLVMFuzzerTestOneInput /work/build/../../src/systemd/src/fuzz/fuzz-bootspec.c:119:16
+    #4 0x4c6693 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:611:15
+    #5 0x4c5e7a in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:514:3
+    #6 0x4c7ce4 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile> >&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:826:7
+    #7 0x4c7f19 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile> >&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:857:3
+    #8 0x4b757f in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:912:6
+    #9 0x4e0bd2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+    #10 0x7f8b23ead082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 1878e6b475720c7c51969e69ab2d276fae6d1dee)
+    #11 0x41f69d in _start (build-out/fuzz-bootspec+0x41f69d)
+
+Follow-up for #24541.
+Fixes #24551.
+---
+ src/shared/bootspec.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/shared/bootspec.c b/src/shared/bootspec.c
+index 332b5cfed3339..8927f750fdb9e 100644
+--- a/src/shared/bootspec.c
++++ b/src/shared/bootspec.c
+@@ -1421,7 +1421,7 @@ int show_boot_entries(const BootConfig *config, JsonFormatFlags json_format) {
+                                         return log_oom();
+                         }
+ 
+-                        r = json_build(&v, JSON_BUILD_OBJECT(
++                        r = json_append(&v, JSON_BUILD_OBJECT(
+                                                        JSON_BUILD_PAIR_CONDITION(e->id, "id", JSON_BUILD_STRING(e->id)),
+                                                        JSON_BUILD_PAIR_CONDITION(e->path, "path", JSON_BUILD_STRING(e->path)),
+                                                        JSON_BUILD_PAIR_CONDITION(e->root, "root", JSON_BUILD_STRING(e->root)),
+@@ -1436,7 +1436,14 @@ int show_boot_entries(const BootConfig *config, JsonFormatFlags json_format) {
+                                                        JSON_BUILD_PAIR_CONDITION(e->efi, "efi", JSON_BUILD_STRING(e->efi)),
+                                                        JSON_BUILD_PAIR_CONDITION(!strv_isempty(e->initrd), "initrd", JSON_BUILD_STRV(e->initrd)),
+                                                        JSON_BUILD_PAIR_CONDITION(e->device_tree, "devicetree", JSON_BUILD_STRING(e->device_tree)),
+-                                                       JSON_BUILD_PAIR_CONDITION(!strv_isempty(e->device_tree_overlay), "devicetreeOverlay", JSON_BUILD_STRV(e->device_tree_overlay)),
++                                                       JSON_BUILD_PAIR_CONDITION(!strv_isempty(e->device_tree_overlay), "devicetreeOverlay", JSON_BUILD_STRV(e->device_tree_overlay))));
++                        if (r < 0)
++                                return log_oom();
++
++                        /* Sanitizers (only memory sanitizer?) do not like function call with too many
++                         * arguments and trigger false positive warnings. Let's not add too many json objects
++                         * at once. */
++                        r = json_append(&v, JSON_BUILD_OBJECT(
+                                                        JSON_BUILD_PAIR_CONDITION(e->tries_left != UINT_MAX, "triesLeft", JSON_BUILD_UNSIGNED(e->tries_left)),
+                                                        JSON_BUILD_PAIR_CONDITION(e->tries_done != UINT_MAX, "triesDone", JSON_BUILD_UNSIGNED(e->tries_done))));
+                         if (r < 0)

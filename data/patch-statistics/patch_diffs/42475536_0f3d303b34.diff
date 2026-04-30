@@ -1,0 +1,523 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1561316567 18000
+#      Sun Jun 23 14:02:47 2019 -0500
+# Node ID c6ba17134dc332e90dbe832f3d4c114d55d9aef1
+# Parent  b71b463d87012957d5a19ea7b05d14eb2e8c59d7
+GenerateEXIFAttribute(): Added range checks and tracing.
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,5 +1,10 @@
+ 2019-06-23  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
++	* magick/attribute.c (GenerateEXIFAttribute): Added range checks
++	and tracing.  Fixes oss-fuzz 14998
++	"graphicsmagick/coder_JPEG_fuzzer: Heap-buffer-overflow in
++	Read32s".  This is a tiny read overflow.
++
+ 	* coders/miff.c (ReadMIFFImage): Similar fix as to mpc.c
+ 
+ 	* coders/mpc.c (ReadMPCImage): Fix faulty signed overflow logic
+diff --git a/doc/options.imdoc b/doc/options.imdoc
+--- a/doc/options.imdoc
++++ b/doc/options.imdoc
+@@ -1031,11 +1031,26 @@
+ <pp>
+ The <tt>events</tt> parameter specifies which events are to be logged.  It
+ can be either <tt>None</tt>, <tt>All</tt>, or a comma-separated list
+-consisting of one or more of the following domains: <tt>Annotate</tt>,
+-<tt>Blob</tt>, <tt>Cache</tt>, <tt>Coder</tt>, <tt>Configure</tt>,
+-<tt>Deprecate</tt>, <tt>Error</tt>, <tt>Exception</tt>, <tt>Locale</tt>,
+-<tt>Render</tt>,<tt>Resource</tt>, <tt>TemporaryFile</tt>,
+-<tt>Transform</tt>, <tt>Warning</tt>, <tt>X11</tt>, or <tt>User</tt>.
++consisting of one or more of the following domains:
++<tt>Annotate</tt>,
++<tt>Blob</tt>,
++<tt>Cache</tt>,
++<tt>Coder</tt>,
++<tt>Configure</tt>,
++<tt>Deprecate</tt>,
++<tt>Error</tt>,
++<tt>Exception</tt>,
++<tt>FatalError</tt>,
++<tt>Information</tt>,
++<tt>Locale</tt>,
++<tt>Option</tt>,
++<tt>Render</tt>,
++<tt>Resource</tt>,
++<tt>TemporaryFile</tt>,
++<tt>Transform</tt>,
++<tt>User</tt>.
++<tt>Warning</tt>, or
++<tt>X11</tt>,
+ For example, to log cache and blob events, use</pp>
+ 
+ <pp><pre>
+diff --git a/magick/attribute.c b/magick/attribute.c
+--- a/magick/attribute.c
++++ b/magick/attribute.c
+@@ -40,6 +40,7 @@
+ #include "magick/studio.h"
+ #include "magick/attribute.h"
+ #include "magick/blob.h"
++#include "magick/log.h"
+ #include "magick/profile.h"
+ #include "magick/render.h"
+ #include "magick/tempfile.h"
+@@ -1592,6 +1593,7 @@
+     profile_length;
+ 
+   MagickBool
++    logging,
+     gpsfoundstack[DE_STACK_SIZE],
+     gpsfound;
+ 
+@@ -1599,7 +1601,7 @@
+     debug=MagickFalse;
+ 
+   assert((ArraySize(format_bytes)-1) == EXIF_NUM_FORMATS);
+-
++  logging=IsEventLogging();;
+   {
+     const char *
+       env_value;
+@@ -1622,16 +1624,28 @@
+   final=AllocateString("");
+   profile_info=GetImageProfile(image,"EXIF",&profile_length);
+   if (profile_info == 0)
+-    goto generate_attribute_failure;
++    {
++      if (logging)
++        (void) LogMagickEvent(TransformEvent,GetMagickModule(),
++                                      "No EXIF profile present");
++      goto generate_attribute_failure;
++    }
+   /*
+     If EXIF data exists, then try to parse the request for a tag in
+     the form "EXIF:key".
+   */
+   key=(char *) NULL;
+   if (strlen(specification) > 5)
+-    key=(char *) &specification[5]; /* "EXIF:key" */
++    {
++      key=(char *) &specification[5]; /* "EXIF:key" */
++    }
+   else
+-    goto generate_attribute_failure;
++    {
++      if (logging)
++        (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                              "No EXIF:key found");
++      goto generate_attribute_failure;
++    }
+   while (isspace((int) (*key)))
+     key++;
+   all=0;
+@@ -1668,7 +1682,12 @@
+         key++;
+         n=strlen(key);
+         if (n != 4)
+-          goto generate_attribute_failure;
++          {
++            if (logging)
++              (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                    "EXIF: Hex tag not 4 bytes");
++            goto generate_attribute_failure;
++          }
+         else
+           {
+             /*
+@@ -1690,7 +1709,12 @@
+                         if ((c >= 'a') && (c <= 'f'))
+                           tag|=c-('a'-10);
+                         else
+-                          goto generate_attribute_failure;
++                          {
++                            if (logging)
++                              (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                    "EXIF: Failed to parse hex tag");
++                            goto generate_attribute_failure;
++                          }
+                   }
+               } while (*key != '\0');
+           }
+@@ -1702,13 +1726,19 @@
+           Try to match the text with a tag name instead.
+         */
+         tag=EXIFDescriptionToTag(key);
+-        if (debug)
+-          fprintf(stderr,"Found tag %d for key \"%s\"\n",tag,key);
++        if (logging && debug)
++          (void) LogMagickEvent(TransformEvent,GetMagickModule(),
++                                "EXIF: Found tag %d for key \"%s\"\n",tag,key);
+         break;
+       }
+     }
+   if (tag < 0)
+-    goto generate_attribute_failure;;
++    {
++      if (logging)
++        (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                              "EXIF: Negative tag value!");
++      goto generate_attribute_failure;;
++    }
+   length=profile_length;
+   info=(unsigned char *) profile_info;
+   while (length != 0)
+@@ -1728,7 +1758,13 @@
+       break;
+     }
+   if (length < 16)
+-    goto generate_attribute_failure;
++    {
++      if (logging)
++        (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                              "EXIF: Tag length length < 16 (have %"MAGICK_SIZE_T_F"u )",
++                              (MAGICK_SIZE_T)length);
++      goto generate_attribute_failure;
++    }
+   tiffp=info;
+   tiffp_max=tiffp+length;
+   id=Read16u(0,tiffp);
+@@ -1739,15 +1775,32 @@
+     if (id == 0x4D4D) /* MSB */
+       morder=1;
+     else
+-      goto generate_attribute_failure;
++      {
++        if (logging)
++          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                "EXIF: Unknown byte order (%04x)",
++                                morder);
++        goto generate_attribute_failure;
++      }
+   if (Read16u(morder,tiffp+2) != 0x002a)
+-    goto generate_attribute_failure;
++    {
++      if (logging)
++          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                "EXIF: Expected 0x002a!");
++      goto generate_attribute_failure;
++    }
+   /*
+     This is the offset to the first IFD.
+   */
+   offset=Read32u(morder,tiffp+4);
+   if (offset >= length)
+-    goto generate_attribute_failure;
++    {
++      if (logging)
++        (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                              "EXIF: Offset (%lu) is > length (%"MAGICK_SIZE_T_F"u)!",
++                              offset, length);
++      goto generate_attribute_failure;
++    }
+   /*
+     Set the pointer to the first IFD and follow it were it leads.
+   */
+@@ -1771,7 +1824,12 @@
+         Limit the number of entries parsed to MAX_TAGS_PER_IFD.
+       */
+       if ((ifdp < tiffp) || (ifdp+2 > tiffp_max))
+-        goto generate_attribute_failure;
++        {
++          if (logging)
++            (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                  "EXIF: ifdp out of range!");
++          goto generate_attribute_failure;
++        }
+       nde=Read16u(morder,ifdp);
+       if (nde > MAX_TAGS_PER_IFD)
+         nde=MAX_TAGS_PER_IFD;
+@@ -1792,8 +1850,9 @@
+           pde=(unsigned char *) (ifdp+2+(12*de));
+           if (pde + 12 > tiffp + length)
+             {
+-              if (debug)
+-                fprintf(stderr, "EXIF: Invalid Exif, entry is beyond metadata limit.\n");
++              if (logging)
++                (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                      "EXIF: Invalid Exif, entry is beyond metadata limit.");
+               goto generate_attribute_failure;
+             }
+           t=Read16u(morder,pde); /* get tag value */
+@@ -1804,8 +1863,9 @@
+           n=MagickArraySize(c,format_bytes[f]);
+           if ((n == 0) && (c != 0) && (format_bytes[f] != 0))
+             {
+-              if (debug)
+-                fprintf(stderr, "EXIF: Invalid Exif, too many components (%u).\n",c);
++              if (logging)
++                (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                      "EXIF: Invalid Exif, too many components (%u).",c);
+               goto generate_attribute_failure;
+             }
+           if (n <= 4)
+@@ -1874,7 +1934,7 @@
+                 case EXIF_FMT_SBYTE:
+                   {
+                     /* 8-bit signed integer */
+-                    FormatString(s,"%ld",(long) (*(char *) pval));
++                    FormatString(s,"%d",(int) (*(char *) pval));
+                     value=AllocateString(s);
+                     break;
+                   }
+@@ -1906,6 +1966,13 @@
+                 case EXIF_FMT_SSHORT:
+                   {
+                     /* 16-bit signed integer */
++                    if ((pval+sizeof(magick_uint16_t)) > tiffp_max)
++                      {
++                        if (logging)
++                          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                "EXIF: Offset out of address range!");
++                        goto generate_attribute_failure;
++                      }
+                     FormatString(s,"%hd",Read16u(morder,pval));
+                     value=AllocateString(s);
+                     break;
+@@ -1913,12 +1980,26 @@
+                 case EXIF_FMT_USHORT:
+                   {
+                     /* 16-bit unsigned integer */
++                    if ((pval+sizeof(magick_uint16_t)) > tiffp_max)
++                      {
++                        if (logging)
++                          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                "EXIF: Offset out of address range!");
++                        goto generate_attribute_failure;
++                      }
+                     FormatString(s,"%hu",Read16s(morder,pval));
+                     value=AllocateString(s);
+                     break;
+                   }
+                 case EXIF_FMT_ULONG:
+                   {
++                    if ((pval+sizeof(magick_uint32_t)) > tiffp_max)
++                      {
++                        if (logging)
++                          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                "EXIF: Offset out of address range!");
++                        goto generate_attribute_failure;
++                      }
+                     offset=Read32u(morder,pval);
+                     /*
+                       Only report value if this tag was requested.
+@@ -1934,6 +2015,13 @@
+                   }
+                 case EXIF_FMT_SLONG:
+                   {
++                    if ((pval+sizeof(magick_uint32_t)) > tiffp_max)
++                      {
++                        if (logging)
++                          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                "EXIF: Offset out of address range!");
++                        goto generate_attribute_failure;
++                      }
+                     FormatString(s,"%d",(int) Read32s(morder,pval));
+                     value=AllocateString(s);
+                     break;
+@@ -1945,6 +2033,13 @@
+                          t == GPS_LONGITUDE ||
+                          t == GPS_TIMESTAMP))
+                       {
++                        if ((pval+6*sizeof(magick_uint32_t)) > tiffp_max)
++                          {
++                            if (logging)
++                              (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                    "EXIF: Offset out of address range!");
++                            goto generate_attribute_failure;
++                          }
+                         FormatString(s,"%u/%u,%u/%u,%u/%u"
+                                      ,(unsigned) Read32u(morder,pval),
+                                      (unsigned) Read32u(morder,4+pval)
+@@ -1956,6 +2051,13 @@
+                       }
+                     else
+                       {
++                        if ((pval+2*sizeof(magick_uint32_t)) > tiffp_max)
++                          {
++                            if (logging)
++                              (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                    "EXIF: Offset out of address range!");
++                            goto generate_attribute_failure;
++                          }
+                         FormatString(s,"%u/%u"
+                                      ,(unsigned) Read32u(morder,pval),
+                                      (unsigned) Read32u(morder,4+pval)
+@@ -1966,6 +2068,13 @@
+                   }
+                 case EXIF_FMT_SRATIONAL:
+                   {
++                    if ((pval+2*sizeof(magick_uint32_t)) > tiffp_max)
++                      {
++                        if (logging)
++                          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                "EXIF: Offset out of address range!");
++                        goto generate_attribute_failure;
++                      }
+                     FormatString(s,"%d/%d",(int) Read32s(morder,pval),
+                                  (int) Read32s(morder,4+pval));
+                     value=AllocateString(s);
+@@ -1973,12 +2082,26 @@
+                   }
+                 case EXIF_FMT_SINGLE:
+                   {
++                    if ((pval+sizeof(float)) > tiffp_max)
++                      {
++                        if (logging)
++                          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                "EXIF: Offset out of address range!");
++                        goto generate_attribute_failure;
++                      }
+                     FormatString(s,"%f",(double) *(float *) pval);
+                     value=AllocateString(s);
+                     break;
+                   }
+                 case EXIF_FMT_DOUBLE:
+                   {
++                    if ((pval+sizeof(double)) > tiffp_max)
++                      {
++                        if (logging)
++                          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                "EXIF: Offset out of address range!");
++                        goto generate_attribute_failure;
++                      }
+                     FormatString(s,"%f",*(double *) pval);
+                     value=AllocateString(s);
+                     break;
+@@ -1996,6 +2119,13 @@
+                     MagickBool
+                       binary=MagickFalse;
+ 
++                    if ((pval+n) > tiffp_max)
++                      {
++                        if (logging)
++                          (void) LogMagickEvent(CorruptImageEvent,GetMagickModule(),
++                                                "EXIF: Offset out of address range!");
++                        goto generate_attribute_failure;
++                      }
+                     allocation_size=n+1;
+                     for (a=0; a < n; a++)
+                       if (!(isprint((int) pval[a])))
+diff --git a/utilities/gm.1 b/utilities/gm.1
+--- a/utilities/gm.1
++++ b/utilities/gm.1
+@@ -1135,11 +1135,26 @@
+ 
+ The events parameter specifies which events are to be logged.  It
+ can be either None, All, or a comma-separated list
+-consisting of one or more of the following domains: Annotate,
+-Blob, Cache, Coder, Configure,
+-Deprecate, Error, Exception, Locale,
+-Render,Resource, TemporaryFile,
+-Transform, Warning, X11, or User.
++consisting of one or more of the following domains:
++Annotate,
++Blob,
++Cache,
++Coder,
++Configure,
++Deprecate,
++Error,
++Exception,
++FatalError,
++Information,
++Locale,
++Option,
++Render,
++Resource,
++TemporaryFile,
++Transform,
++User.
++Warning, or
++X11,
+ For example, to log cache and blob events, use
+ 
+     gm convert -debug "Cache,Blob" rose: rose.png
+diff --git a/www/Changelog.html b/www/Changelog.html
+--- a/www/Changelog.html
++++ b/www/Changelog.html
+@@ -38,6 +38,10 @@
+ <p>2019-06-23  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
+ <blockquote>
+ <ul class="simple">
++<li>magick/attribute.c (GenerateEXIFAttribute): Added range checks
++and tracing.  Fixes oss-fuzz 14998
++&quot;graphicsmagick/coder_JPEG_fuzzer: Heap-buffer-overflow in
++Read32s&quot;.  This is a tiny read overflow.</li>
+ <li>coders/miff.c (ReadMIFFImage): Similar fix as to mpc.c</li>
+ <li>coders/mpc.c (ReadMPCImage): Fix faulty signed overflow logic
+ for profiles[i].length which still allowed overflow.  Fixes
+diff --git a/www/GraphicsMagick.html b/www/GraphicsMagick.html
+--- a/www/GraphicsMagick.html
++++ b/www/GraphicsMagick.html
+@@ -1414,11 +1414,26 @@
+ <table width="90%" border="0" cellspacing="0"             cellpadding="8">             <tr><td width="6%"><br></td><td><font size="-1">
+ The <tt>events</tt> parameter specifies which events are to be logged.  It
+ can be either <tt>None</tt>, <tt>All</tt>, or a comma-separated list
+-consisting of one or more of the following domains: <tt>Annotate</tt>,
+-<tt>Blob</tt>, <tt>Cache</tt>, <tt>Coder</tt>, <tt>Configure</tt>,
+-<tt>Deprecate</tt>, <tt>Error</tt>, <tt>Exception</tt>, <tt>Locale</tt>,
+-<tt>Render</tt>,<tt>Resource</tt>, <tt>TemporaryFile</tt>,
+-<tt>Transform</tt>, <tt>Warning</tt>, <tt>X11</tt>, or <tt>User</tt>.
++consisting of one or more of the following domains:
++<tt>Annotate</tt>,
++<tt>Blob</tt>,
++<tt>Cache</tt>,
++<tt>Coder</tt>,
++<tt>Configure</tt>,
++<tt>Deprecate</tt>,
++<tt>Error</tt>,
++<tt>Exception</tt>,
++<tt>FatalError</tt>,
++<tt>Information</tt>,
++<tt>Locale</tt>,
++<tt>Option</tt>,
++<tt>Render</tt>,
++<tt>Resource</tt>,
++<tt>TemporaryFile</tt>,
++<tt>Transform</tt>,
++<tt>User</tt>.
++<tt>Warning</tt>, or
++<tt>X11</tt>,
+ For example, to log cache and blob events, use</font></td></tr></table>
+ <table width="90%" border="0" cellspacing="0"             cellpadding="8">             <tr><td width="6%"><br></td><td><font size="-1"><pre>
+     gm convert -debug "Cache,Blob" rose: rose.png
+diff --git a/www/gm.html b/www/gm.html
+--- a/www/gm.html
++++ b/www/gm.html
+@@ -1377,11 +1377,26 @@
+ <table width="90%" border="0" cellspacing="0"             cellpadding="8">             <tr><td width="6%"><br></td><td><font size="-1">
+ The <tt>events</tt> parameter specifies which events are to be logged.  It
+ can be either <tt>None</tt>, <tt>All</tt>, or a comma-separated list
+-consisting of one or more of the following domains: <tt>Annotate</tt>,
+-<tt>Blob</tt>, <tt>Cache</tt>, <tt>Coder</tt>, <tt>Configure</tt>,
+-<tt>Deprecate</tt>, <tt>Error</tt>, <tt>Exception</tt>, <tt>Locale</tt>,
+-<tt>Render</tt>,<tt>Resource</tt>, <tt>TemporaryFile</tt>,
+-<tt>Transform</tt>, <tt>Warning</tt>, <tt>X11</tt>, or <tt>User</tt>.
++consisting of one or more of the following domains:
++<tt>Annotate</tt>,
++<tt>Blob</tt>,
++<tt>Cache</tt>,
++<tt>Coder</tt>,
++<tt>Configure</tt>,
++<tt>Deprecate</tt>,
++<tt>Error</tt>,
++<tt>Exception</tt>,
++<tt>FatalError</tt>,
++<tt>Information</tt>,
++<tt>Locale</tt>,
++<tt>Option</tt>,
++<tt>Render</tt>,
++<tt>Resource</tt>,
++<tt>TemporaryFile</tt>,
++<tt>Transform</tt>,
++<tt>User</tt>.
++<tt>Warning</tt>, or
++<tt>X11</tt>,
+ For example, to log cache and blob events, use</font></td></tr></table>
+ <table width="90%" border="0" cellspacing="0"             cellpadding="8">             <tr><td width="6%"><br></td><td><font size="-1"><pre>
+     gm convert -debug "Cache,Blob" rose: rose.png

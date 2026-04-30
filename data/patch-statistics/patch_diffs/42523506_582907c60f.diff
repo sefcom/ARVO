@@ -1,0 +1,754 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e37e0121c7..6e2520c095 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -97,6 +97,19 @@ plugin_option(AOM_DECODER AOM "aom" "AVIF decoder" OFF)
+ plugin_option(SvtEnc SvtEnc "Svt-av1" "AVIF encoder" ON)
+ plugin_option(RAV1E RAV1E "Rav1e" "AVIF encoder" ON)
+ 
++# Libsharpyuv
++option(WITH_LIBSHARPYUV "Build libsharpyuv" ON)
++if (WITH_LIBSHARPYUV)
++    find_package(libsharpyuv)
++endif ()
++if (LIBSHARPYUV_FOUND)
++    message("libsharpyuv: found")
++elseif (WITH_${variableName})
++    message("libsharpyuv: not found")
++else()
++    message("libsharpyuv: disabled")
++endif ()
++
+ 
+ # --- Create libheif pkgconfig file
+ 
+@@ -130,6 +143,9 @@ endif()
+ if (SvtEnc_FOUND AND NOT WITH_SvtEnc_PLUGIN)
+     list(APPEND REQUIRES_PRIVATE "SvtAv1Enc")
+ endif()
++if (LIBSHARPYUV_FOUND)
++    list(APPEND REQUIRES_PRIVATE "libsharpyuv")
++endif()
+ list(JOIN REQUIRES_PRIVATE " " REQUIRES_PRIVATE)
+ set(VERSION ${PROJECT_VERSION})
+ 
+diff --git a/cmake/modules/Findlibsharpyuv.cmake b/cmake/modules/Findlibsharpyuv.cmake
+new file mode 100644
+index 0000000000..cb9710dd7e
+--- /dev/null
++++ b/cmake/modules/Findlibsharpyuv.cmake
+@@ -0,0 +1,25 @@
++include(LibFindMacros)
++
++libfind_pkg_check_modules(LIBSHARPYUV_PKGCONF libsharpyuv)
++
++find_path(LIBSHARPYUV_INCLUDE_DIR
++    NAMES sharpyuv/sharpyuv.h
++    HINTS ${LIBSHARPYUV_PKGCONF_INCLUDE_DIRS} ${LIBSHARPYUV_PKGCONF_INCLUDEDIR}
++    PATH_SUFFIXES LIBSHARPYUV
++)
++
++find_library(LIBSHARPYUV_LIBRARY
++    NAMES sharpyuv
++    HINTS ${LIBSHARPYUV_PKGCONF_LIBRARY_DIRS} ${LIBSHARPYUV_PKGCONF_LIBDIR}
++)
++
++set(LIBSHARPYUV_PROCESS_LIBS LIBSHARPYUV_LIBRARY)
++set(LIBSHARPYUV_PROCESS_INCLUDES LIBSHARPYUV_INCLUDE_DIR)
++libfind_process(LIBSHARPYUV)
++
++include(FindPackageHandleStandardArgs)
++find_package_handle_standard_args(LIBSHARPYUV
++    REQUIRED_VARS
++        LIBSHARPYUV_INCLUDE_DIR
++        LIBSHARPYUV_LIBRARIES
++)
+diff --git a/configure.ac b/configure.ac
+index da22403d5d..c0e7bf5768 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -298,6 +298,23 @@ AC_SUBST([have_svt])
+ AC_SUBST(have_avif_decoder)
+ AC_SUBST(have_avif_encoder)
+ 
++AC_ARG_ENABLE([libsharpyuv], AS_HELP_STRING([--disable-libsharpyuv],
++    [Disable building with libsharpyuv.]))
++if eval "test x$enable_libsharpyuv = x" ; then enable_libsharpyuv=yes ; fi
++if eval "test x$enable_libsharpyuv != xno"; then
++    PKG_CHECK_MODULES([libsharpyuv], [libsharpyuv], [
++        AC_DEFINE([HAVE_LIBSHARPYUV], [1], [Whether libsharpyuv was found.])
++        AC_SUBST(libsharpyuv_CFLAGS)
++        AC_SUBST(libsharpyuv_LIBS)
++        REQUIRES_PRIVATE="$REQUIRES_PRIVATE libsharpyuv"
++        have_libsharpyuv="yes"
++    ], [have_libsharpyuv="no"])
++else
++    have_libsharpyuv="no"
++fi
++AM_CONDITIONAL([HAVE_LIBSHARPYUV], [test "x$have_libsharpyuv" = "xyes"])
++AC_SUBST([have_libsharpyuv])
++
+ AC_ARG_ENABLE([libfuzzer], AS_HELP_STRING([--enable-libfuzzer],
+     [Enable fuzzing with libFuzzer.]), [], [enable_libfuzzer=no])
+ if eval "test x$enable_libfuzzer != xno"; then
+@@ -344,6 +361,7 @@ AC_MSG_NOTICE([dav1d decoder: $have_dav1d])
+ AC_MSG_NOTICE([svt-av1 encoder: $have_svt])
+ AC_MSG_NOTICE([libde265 decoder: $have_libde265])
+ AC_MSG_NOTICE([libx265 encoder: $have_x265])
++AC_MSG_NOTICE([libsharpyuv: $have_libsharpyuv])
+ AC_MSG_NOTICE([JPEG output: $have_libjpeg])
+ AC_MSG_NOTICE([PNG output: $have_libpng])
+ AC_MSG_NOTICE([GdkPixbuf2 loader: $have_gdkpixbuf2])
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 240bf019df..8c0eccf571 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -39,6 +39,9 @@ add_executable(heif-enc ${getopt_sources}
+         benchmark.cc
+         encoder.cc)
+ target_link_libraries(heif-enc PRIVATE heif)
++if (LIBSHARPYUV_FOUND)
++    target_compile_definitions(heif-enc PRIVATE HAVE_LIBSHARPYUV=1)
++endif()
+ install(TARGETS heif-enc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+ install(FILES heif-enc.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+ 
+diff --git a/examples/heif_enc.cc b/examples/heif_enc.cc
+index f3211ce79a..1c8d2ab293 100644
+--- a/examples/heif_enc.cc
++++ b/examples/heif_enc.cc
+@@ -79,6 +79,7 @@ int two_colr_boxes = 0;
+ int premultiplied_alpha = 0;
+ int run_benchmark = 0;
+ int metadata_compression = 0;
++int sharp_yuv = 0;
+ const char* encoderId = nullptr;
+ 
+ uint16_t nclx_matrix_coefficients = 6;
+@@ -129,6 +130,9 @@ static struct option long_options[] = {
+     {(char* const) "plugin-directory",        required_argument, 0,              OPTION_PLUGIN_DIRECTORY},
+     {(char* const) "benchmark",               no_argument,       &run_benchmark,  1},
+     {(char* const) "enable-metadata-compression", no_argument,       &metadata_compression,  1},
++#ifdef HAVE_LIBSHARPYUV
++    {(char* const) "enable-sharp-yuv",        no_argument,       &sharp_yuv,      1},
++#endif
+     {0, 0,                                                       0,               0},
+ };
+ 
+@@ -169,6 +173,10 @@ void show_help(const char* argv0)
+             << "  --enable-two-colr-boxes   will write both an ICC and an nclx color profile if both are present\n"
+             << "  --premultiplied-alpha     input image has premultiplied alpha\n"
+             << "  --enable-metadata-compression   enable XMP metadata compression (experimental)\n"
++#ifdef HAVE_LIBSHARPYUV
++            << "  --enable-sharp-yuv        enable 'sharp' RGB to YUV420 conversion (makes edges look sharper \n"
++            << "                            when using YUV420 with bilinear chroma upsampling)\n"
++#endif
+             << "  --benchmark               measure encoding time, PSNR, and output file size\n"
+             << "\n"
+             << "Note: to get lossless encoding, you need this set of options:\n"
+@@ -1522,6 +1530,7 @@ int main(int argc, char** argv)
+     options->save_two_colr_boxes_when_ICC_and_nclx_available = (uint8_t)two_colr_boxes;
+     options->output_nclx_profile = &nclx;
+     options->image_orientation = input_image.orientation;
++    options->enable_sharp_yuv = (uint8_t) sharp_yuv;
+ 
+     if (crop_to_even_size) {
+       if (heif_image_get_primary_width(image.get()) == 1 ||
+diff --git a/libheif/CMakeLists.txt b/libheif/CMakeLists.txt
+index 9b379faa92..82688f9630 100644
+--- a/libheif/CMakeLists.txt
++++ b/libheif/CMakeLists.txt
+@@ -79,6 +79,15 @@ endif()
+ 
+ add_subdirectory(plugins)
+ 
++if (LIBSHARPYUV_FOUND)
++    message("Compiling in 'libhsharpyuv'")
++    target_compile_definitions(heif PRIVATE HAVE_LIBSHARPYUV=1)
++    target_include_directories(heif PRIVATE ${LIBSHARPYUV_INCLUDE_DIR})
++    target_link_libraries(heif PRIVATE ${LIBSHARPYUV_LIBRARIES} ${LIBSHARPYUV_LINKDIR})
++else()
++    message("Not compiling 'libhsharpyuv'")
++endif()
++
+ if (WITH_DEFLATE_HEADER_COMPRESSION)
+    find_package(ZLIB REQUIRED)
+    if (ZLIB_FOUND)
+diff --git a/libheif/Makefile.am b/libheif/Makefile.am
+index 113039ff80..9828fe30dc 100644
+--- a/libheif/Makefile.am
++++ b/libheif/Makefile.am
+@@ -33,6 +33,10 @@ if HAVE_SvtEnc
+ ADDITIONAL_LIBS += $(svt_LIBS)
+ endif
+ 
++if HAVE_LIBSHARPYUV
++ADDITIONAL_LIBS += $(libsharpyuv_LIBS)
++endif
++
+ libheif_la_CPPFLAGS =
+ libheif_la_CFLAGS = \
+   $(CFLAG_VISIBILITY) \
+@@ -45,6 +49,7 @@ libheif_la_CXXFLAGS = \
+   $(dav1d_CFLAGS) \
+   $(rav1e_CFLAGS) \
+   $(svt_CFLAGS) \
++  $(libsharpyuv_CFLAGS) \
+   -DLIBHEIF_EXPORTS -I$(top_srcdir)
+ libheif_la_LIBADD = $(ADDITIONAL_LIBS)
+ 
+diff --git a/libheif/heif.cc b/libheif/heif.cc
+index 31d5e504b1..fd3d888233 100644
+--- a/libheif/heif.cc
++++ b/libheif/heif.cc
+@@ -2479,7 +2479,7 @@ int heif_encoder_has_default(struct heif_encoder* encoder,
+ 
+ static void set_default_options(heif_encoding_options& options)
+ {
+-  options.version = 5;
++  options.version = 6;
+ 
+   options.save_alpha_channel = true;
+   options.macOS_compatibility_workaround = true;
+@@ -2487,6 +2487,7 @@ static void set_default_options(heif_encoding_options& options)
+   options.output_nclx_profile = nullptr;
+   options.macOS_compatibility_workaround_no_nclx_profile = true;
+   options.image_orientation = heif_orientation_normal;
++  options.enable_sharp_yuv = false;
+ }
+ 
+ static void copy_options(heif_encoding_options& options, const heif_encoding_options& input_options)
+@@ -2494,6 +2495,8 @@ static void copy_options(heif_encoding_options& options, const heif_encoding_opt
+   set_default_options(options);
+ 
+   switch (input_options.version) {
++    case 6:
++      options.enable_sharp_yuv = input_options.enable_sharp_yuv;
+     case 5:
+       options.image_orientation = input_options.image_orientation;
+     case 4:
+diff --git a/libheif/heif.h b/libheif/heif.h
+index ec88b3d3fa..7bbaab0c6d 100644
+--- a/libheif/heif.h
++++ b/libheif/heif.h
+@@ -1570,6 +1570,12 @@ struct heif_encoding_options
+ 
+   // libheif will generate irot/imir boxes to match these orientations
+   enum heif_orientation image_orientation;
++
++  // version 6 options
++
++  // Enable 'sharp' RGB to YUV420 conversion (if compiled in). Makes edges look
++  // sharper when using YUV 420 with bilinear chroma upsampling.
++  uint8_t enable_sharp_yuv; // default: false
+ };
+ 
+ LIBHEIF_API
+diff --git a/libheif/heif_colorconversion.cc b/libheif/heif_colorconversion.cc
+index 65f975612a..1b03295df0 100644
+--- a/libheif/heif_colorconversion.cc
++++ b/libheif/heif_colorconversion.cc
+@@ -30,6 +30,11 @@
+ #include <set>
+ #include <cmath>
+ 
++#ifdef HAVE_LIBSHARPYUV
++#include <sharpyuv/sharpyuv.h>
++#include <sharpyuv/sharpyuv_csp.h>
++#endif
++
+ using namespace heif;
+ 
+ #define DEBUG_ME 0
+@@ -1920,6 +1925,8 @@ Op_mono_to_RGB24_32::convert_colorspace(const std::shared_ptr<const HeifPixelIma
+ class Op_RGB24_32_to_YCbCr : public ColorConversionOperation
+ {
+ public:
++  Op_RGB24_32_to_YCbCr(bool enable_sharp_yuv): enable_sharp_yuv_(enable_sharp_yuv) {}
++
+   std::vector<ColorStateWithCost>
+   state_after_conversion(const ColorState& input_state,
+                          const ColorState& target_state,
+@@ -1929,6 +1936,16 @@ class Op_RGB24_32_to_YCbCr : public ColorConversionOperation
+   convert_colorspace(const std::shared_ptr<const HeifPixelImage>& input,
+                      const ColorState& target_state,
+                      const ColorConversionOptions& options) override;
++
++ private:
++  bool convert_sharp_yuv(const HeifPixelImage& input,
++                         const ColorState& target_state,
++                         HeifPixelImage* outimg);
++  void convert_yuv(const HeifPixelImage& input,
++                   const ColorState& target_state,
++                   HeifPixelImage* outimg);
++
++  bool enable_sharp_yuv_;
+ };
+ 
+ 
+@@ -2021,59 +2038,77 @@ inline void set_chroma_pixels(uint8_t* out_cb, uint8_t* out_cr,
+   }
+ }
+ 
++#ifdef HAVE_LIBSHARPYUV
++bool Op_RGB24_32_to_YCbCr::convert_sharp_yuv(const HeifPixelImage& input,
++                                             const ColorState& target_state,
++                                             HeifPixelImage* outimg) {
++  int in_stride = 0;
++  const uint8_t* in_p = input.get_plane(heif_channel_interleaved, &in_stride);
++  const uint8_t* in_r = &in_p[0];
++  const uint8_t* in_g = &in_p[1];
++  const uint8_t* in_b = &in_p[2];
+ 
+-std::shared_ptr<HeifPixelImage>
+-Op_RGB24_32_to_YCbCr::convert_colorspace(const std::shared_ptr<const HeifPixelImage>& input,
+-                                         const ColorState& target_state,
+-                                         const ColorConversionOptions& options)
+-{
+-  int width = input->get_width();
+-  int height = input->get_height();
++  int out_cb_stride = 0, out_cr_stride = 0, out_y_stride = 0;
++  uint8_t* out_y = outimg->get_plane(heif_channel_Y, &out_y_stride);
++  uint8_t* out_cb = outimg->get_plane(heif_channel_Cb, &out_cb_stride);
++  uint8_t* out_cr = outimg->get_plane(heif_channel_Cr, &out_cr_stride);
+ 
+-  auto outimg = std::make_shared<HeifPixelImage>();
++  bool full_range_flag = true;
++  Kr_Kb kr_kb = heif::Kr_Kb::defaults();
++  if (target_state.nclx_profile) {
++    full_range_flag = target_state.nclx_profile->get_full_range_flag();
++    kr_kb =
++        heif::get_Kr_Kb(target_state.nclx_profile->get_matrix_coefficients(),
++                        target_state.nclx_profile->get_colour_primaries());
++  }
++  int rgb_bit_depth = 8;
++  SharpYuvColorSpace color_space = {
++      kr_kb.Kr, kr_kb.Kb, rgb_bit_depth,
++      full_range_flag ? kSharpYuvRangeFull : kSharpYuvRangeLimited};
++  SharpYuvConversionMatrix yuv_matrix;
++  SharpYuvComputeConversionMatrix(&color_space, &yuv_matrix);
++
++  bool has_alpha = (input.get_chroma_format() == heif_chroma_interleaved_32bit);
++  int bytes_per_pixel = (has_alpha ? 4 : 3);
++
++  return SharpYuvConvert(in_r, in_g, in_b, bytes_per_pixel, in_stride,
++                         rgb_bit_depth, out_y, out_y_stride, out_cb,
++                         out_cb_stride, out_cr, out_cr_stride,
++                         target_state.bits_per_pixel, input.get_width(),
++                         input.get_height(), &yuv_matrix);
++}
++#else
++bool Op_RGB24_32_to_YCbCr::convert_sharp_yuv(const HeifPixelImage& input,
++                                             const ColorState& target_state,
++                                             HeifPixelImage* outimg) {
++  return false;
++}
++#endif
++
++void Op_RGB24_32_to_YCbCr::convert_yuv(const HeifPixelImage& input,
++                                       const ColorState& target_state,
++                                       HeifPixelImage* outimg) {
++  int width = input.get_width();
++  int height = input.get_height();
+ 
+   auto chroma = target_state.chroma;
+   uint8_t chromaSubH = chroma_h_subsampling(chroma);
+   uint8_t chromaSubV = chroma_v_subsampling(chroma);
+ 
+-  outimg->create(width, height, heif_colorspace_YCbCr, chroma);
+-
+-  int chroma_width = (width + chromaSubH - 1) / chromaSubH;
+-  int chroma_height = (height + chromaSubV - 1) / chromaSubV;
+-
+-  const bool has_alpha = (input->get_chroma_format() == heif_chroma_interleaved_32bit);
+-
+-  if (!outimg->add_plane(heif_channel_Y, width, height, 8) ||
+-      !outimg->add_plane(heif_channel_Cb, chroma_width, chroma_height, 8) ||
+-      !outimg->add_plane(heif_channel_Cr, chroma_width, chroma_height, 8)) {
+-    return nullptr;
+-  }
+-
+-  if (has_alpha) {
+-    if (!outimg->add_plane(heif_channel_Alpha, width, height, 8)) {
+-      return nullptr;
+-    }
+-  }
+-
+-  uint8_t* out_cb, * out_cr, * out_y, * out_a;
+-  int out_cb_stride = 0, out_cr_stride = 0, out_y_stride = 0, out_a_stride = 0;
++  uint8_t* out_cb, * out_cr, * out_y;
++  int out_cb_stride = 0, out_cr_stride = 0, out_y_stride = 0;
+ 
+   const uint8_t* in_p;
+   int in_stride = 0;
+ 
+-  in_p = input->get_plane(heif_channel_interleaved, &in_stride);
++  in_p = input.get_plane(heif_channel_interleaved, &in_stride);
+ 
+   out_y = outimg->get_plane(heif_channel_Y, &out_y_stride);
+   out_cb = outimg->get_plane(heif_channel_Cb, &out_cb_stride);
+   out_cr = outimg->get_plane(heif_channel_Cr, &out_cr_stride);
+ 
+-  if (has_alpha) {
+-    out_a = outimg->get_plane(heif_channel_Alpha, &out_a_stride);
+-  }
+-  else {
+-    out_a = nullptr;
+-  }
+-
++  bool has_alpha = (input.get_chroma_format() == heif_chroma_interleaved_32bit);
++  int bytes_per_pixel = (has_alpha ? 4 : 3);
+ 
+   RGB_to_YCbCr_coefficients coeffs = RGB_to_YCbCr_coefficients::defaults();
+   bool full_range_flag = true;
+@@ -2083,9 +2118,6 @@ Op_RGB24_32_to_YCbCr::convert_colorspace(const std::shared_ptr<const HeifPixelIm
+                                                  target_state.nclx_profile->get_colour_primaries());
+   }
+ 
+-
+-  int bytes_per_pixel = (has_alpha ? 4 : 3);
+-
+   for (int y = 0; y < height; y++) {
+     const uint8_t* p = &in_p[y * in_stride];
+ 
+@@ -2237,11 +2269,58 @@ Op_RGB24_32_to_YCbCr::convert_colorspace(const std::shared_ptr<const HeifPixelIm
+       }
+     }
+   }
++}
+ 
++std::shared_ptr<HeifPixelImage>
++Op_RGB24_32_to_YCbCr::convert_colorspace(const std::shared_ptr<const HeifPixelImage>& input,
++                                         const ColorState& target_state,
++                                         const ColorConversionOptions& options) {
++  int width = input->get_width();
++  int height = input->get_height();
++
++  auto outimg = std::make_shared<HeifPixelImage>();
++
++  auto chroma = target_state.chroma;
++  uint8_t chromaSubH = chroma_h_subsampling(chroma);
++  uint8_t chromaSubV = chroma_v_subsampling(chroma);
++
++  outimg->create(width, height, heif_colorspace_YCbCr, chroma);
++
++  int chroma_width = (width + chromaSubH - 1) / chromaSubH;
++  int chroma_height = (height + chromaSubV - 1) / chromaSubV;
++
++  const bool has_alpha = (input->get_chroma_format() == heif_chroma_interleaved_32bit);
++
++  if (!outimg->add_plane(heif_channel_Y, width, height, 8) ||
++      !outimg->add_plane(heif_channel_Cb, chroma_width, chroma_height, 8) ||
++      !outimg->add_plane(heif_channel_Cr, chroma_width, chroma_height, 8)) {
++    return nullptr;
++  }
+ 
+   if (has_alpha) {
+-    assert(bytes_per_pixel == 4);
++    if (!outimg->add_plane(heif_channel_Alpha, width, height, 8)) {
++      return nullptr;
++    }
++  }
++
++  int in_stride = 0;
++  const uint8_t* in_p = input->get_plane(heif_channel_interleaved, &in_stride);
+ 
++  bool converted = false;
++  if (enable_sharp_yuv_ && chroma == heif_chroma_420) {
++    int sharpyuv_ok = convert_sharp_yuv(*input, target_state, outimg.get());
++    if (sharpyuv_ok) {
++      converted = true;
++    }
++  }
++
++  if (!converted) {
++    convert_yuv(*input, target_state, outimg.get());
++  }
++
++  if (has_alpha) {
++    int out_a_stride;
++    uint8_t* out_a = outimg->get_plane(heif_channel_Alpha, &out_a_stride);
+     for (int y = 0; y < height; y++) {
+       for (int x = 0; x < width; x++) {
+         uint8_t a = in_p[y * in_stride + x * 4 + 3];
+@@ -3107,7 +3186,7 @@ bool ColorConversionPipeline::construct_pipeline(const ColorState& input_state,
+   ops.push_back(std::make_shared<Op_mono_to_RGB24_32>());
+   ops.push_back(std::make_shared<Op_RRGGBBaa_swap_endianness>());
+   ops.push_back(std::make_shared<Op_RRGGBBaa_BE_to_RGB_HDR>());
+-  ops.push_back(std::make_shared<Op_RGB24_32_to_YCbCr>());
++  ops.push_back(std::make_shared<Op_RGB24_32_to_YCbCr>(m_options.enable_sharp_yuv));
+   ops.push_back(std::make_shared<Op_RGB24_32_to_YCbCr444_GBR>());
+   ops.push_back(std::make_shared<Op_RGB_to_YCbCr<uint8_t>>());
+   ops.push_back(std::make_shared<Op_RGB_to_YCbCr<uint16_t>>());
+@@ -3306,7 +3385,8 @@ std::shared_ptr<HeifPixelImage> heif::convert_colorspace(const std::shared_ptr<H
+                                                          heif_colorspace target_colorspace,
+                                                          heif_chroma target_chroma,
+                                                          const std::shared_ptr<const color_profile_nclx>& target_profile,
+-                                                         int output_bpp)
++                                                         int output_bpp,
++                                                         const ColorConversionOptions& options)
+ {
+   // --- check that input image is valid
+ 
+@@ -3385,7 +3465,7 @@ std::shared_ptr<HeifPixelImage> heif::convert_colorspace(const std::shared_ptr<H
+   }
+ 
+   ColorConversionPipeline pipeline;
+-  bool success = pipeline.construct_pipeline(input_state, output_state);
++  bool success = pipeline.construct_pipeline(input_state, output_state, options);
+   if (!success) {
+     return nullptr;
+   }
+diff --git a/libheif/heif_colorconversion.h b/libheif/heif_colorconversion.h
+index 498c6d579a..ed69ff3b80 100644
+--- a/libheif/heif_colorconversion.h
++++ b/libheif/heif_colorconversion.h
+@@ -85,6 +85,8 @@ namespace heif {
+   struct ColorConversionOptions
+   {
+     ColorConversionCriterion criterion = ColorConversionCriterion::Balanced;
++    // Enable "sharp" RGB->YUV conversion (if compiled in).
++    bool enable_sharp_yuv = false;
+   };
+ 
+ 
+@@ -139,5 +141,6 @@ namespace heif {
+                                                      heif_colorspace colorspace,
+                                                      heif_chroma chroma,
+                                                      const std::shared_ptr<const color_profile_nclx>& target_profile,
+-                                                     int output_bpp = 0);
++                                                     int output_bpp = 0,
++                                                     const ColorConversionOptions& options = ColorConversionOptions());
+ }
+diff --git a/libheif/heif_context.cc b/libheif/heif_context.cc
+index 49ffc59f9e..c7b119ee1e 100644
+--- a/libheif/heif_context.cc
++++ b/libheif/heif_context.cc
+@@ -2160,7 +2160,11 @@ Error HeifContext::encode_image_as_hevc(const std::shared_ptr<HeifPixelImage>& i
+   if (colorspace != image->get_colorspace() ||
+       chroma != image->get_chroma_format()) {
+     // @TODO: use color profile when converting
+-    src_image = convert_colorspace(image, colorspace, chroma, nclx_profile);
++    int output_bpp = 0; // same as input
++    ColorConversionOptions color_conversion_options;
++    color_conversion_options.enable_sharp_yuv = options->enable_sharp_yuv;
++    src_image = convert_colorspace(image, colorspace, chroma, nclx_profile,
++                                   output_bpp, color_conversion_options);
+     if (!src_image) {
+       return Error(heif_error_Unsupported_feature, heif_suberror_Unsupported_color_conversion);
+     }
+@@ -2410,7 +2414,11 @@ Error HeifContext::encode_image_as_av1(const std::shared_ptr<HeifPixelImage>& im
+   if (colorspace != image->get_colorspace() ||
+       chroma != image->get_chroma_format()) {
+     // @TODO: use color profile when converting
+-    src_image = convert_colorspace(image, colorspace, chroma, nclx_profile);
++    int output_bpp = 0; // same as input
++    ColorConversionOptions color_conversion_options;
++    color_conversion_options.enable_sharp_yuv = options->enable_sharp_yuv;
++    src_image = convert_colorspace(image, colorspace, chroma, nclx_profile,
++                                   output_bpp, color_conversion_options);
+     if (!src_image) {
+       return Error(heif_error_Unsupported_feature, heif_suberror_Unsupported_color_conversion);
+     }
+diff --git a/libheif/nclx.cc b/libheif/nclx.cc
+index b81b7d7cd6..e43f6f1a94 100644
+--- a/libheif/nclx.cc
++++ b/libheif/nclx.cc
+@@ -65,6 +65,15 @@ heif::primaries heif::get_colour_primaries(uint16_t primaries_idx)
+   }
+ }
+ 
++heif::Kr_Kb heif::Kr_Kb::defaults()
++{
++  Kr_Kb kr_kb;
++  // Rec 601.
++  kr_kb.Kr = 0.2990f;
++  kr_kb.Kb = 0.1140f;
++  return kr_kb;
++}
++
+ 
+ heif::Kr_Kb heif::get_Kr_Kb(uint16_t matrix_coefficients_idx, uint16_t primaries_idx)
+ {
+@@ -186,7 +195,7 @@ heif::RGB_to_YCbCr_coefficients heif::RGB_to_YCbCr_coefficients::defaults()
+ {
+   RGB_to_YCbCr_coefficients coeffs;
+   coeffs.defined = true;
+-
++  // Rec 601 full. Kr=0.2990f Kb=0.1140f.
+   coeffs.c[0][0] = 0.299f;
+   coeffs.c[0][1] = 0.587f;
+   coeffs.c[0][2] = 0.114f;
+diff --git a/libheif/nclx.h b/libheif/nclx.h
+index edcaa1d338..51f6b1e0b6 100644
+--- a/libheif/nclx.h
++++ b/libheif/nclx.h
+@@ -45,6 +45,8 @@ namespace heif {
+   struct Kr_Kb
+   {
+     float Kr = 0, Kb = 0;
++
++    static Kr_Kb defaults();
+   };
+ 
+   Kr_Kb get_Kr_Kb(uint16_t matrix_coefficients_idx, uint16_t primaries_idx);
+diff --git a/tests/conversion.cc b/tests/conversion.cc
+index a5435334b0..2cc72f0ef7 100644
+--- a/tests/conversion.cc
++++ b/tests/conversion.cc
+@@ -37,105 +37,109 @@ TEST_CASE( "Color conversion", "[heif_image]" ) {
+ 
+   printf("--- color conversions ---\n");
+ 
++  printf("--- RGB planes -> interleaved\n");
++
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_444, false, 8 },
+                                          { heif_colorspace_RGB, heif_chroma_interleaved_RGB, false, 8 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- YCbCr420 -> RGB\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_YCbCr, heif_chroma_420, false, 8 },
+                                          { heif_colorspace_RGB, heif_chroma_interleaved_RGB, false, 8 } );
+ 
+-  printf("---\n");
++  printf("--- YCbCr420 -> RGBA\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_YCbCr, heif_chroma_420, false, 8 },
+                                          { heif_colorspace_RGB, heif_chroma_interleaved_RGBA, true, 8 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- YCbCr420 10bit -> RGB 10bit\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_YCbCr, heif_chroma_420, false, 10 },
+                                          { heif_colorspace_RGB, heif_chroma_444, false, 10 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- RGB planes 10bit -> interleaved big endian\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_444, false, 10 },
+                                          { heif_colorspace_RGB, heif_chroma_interleaved_RRGGBBAA_BE, true, 10 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- RGB planes 10 bit -> interleaved little endian\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_444, false, 10 },
+                                          { heif_colorspace_RGB, heif_chroma_interleaved_RRGGBBAA_LE, true, 10 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- monochrome colorspace -> interleaved RGB\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_monochrome, heif_chroma_monochrome, false, 8 },
+                                          { heif_colorspace_RGB, heif_chroma_interleaved_RGB, false, 8 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- monochrome colorspace -> RGBA\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_monochrome, heif_chroma_monochrome, false, 8 },
+                                          { heif_colorspace_RGB, heif_chroma_interleaved_RGBA, true, 8 } );
+ 
+-  printf("---\n");
++  printf("--- interleaved RGBA -> YCbCr 420\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_interleaved_RGBA, true, 8 },
+                                          { heif_colorspace_YCbCr, heif_chroma_420, false, 8 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- interleaved RGBA -> YCbCr 420 with sharp yuv\n");
++
++  ColorConversionOptions sharp_yuv_options{.enable_sharp_yuv = true};
++  success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_interleaved_RGBA, true, 8 },
++                                         { heif_colorspace_YCbCr, heif_chroma_420, false, 8 },
++                                         sharp_yuv_options);
++
++  REQUIRE( success );
++
++  printf("--- RGB planes 10bit -> interleaved RGB 10 bitlittle endain\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_444, false, 10 },
+                                          { heif_colorspace_RGB, heif_chroma_interleaved_RRGGBB_LE, false, 10 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- interleaved RGB 12bit little endian -> RGB planes 12 bit\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_interleaved_RRGGBB_LE, false, 12 },
+                                          { heif_colorspace_RGB, heif_chroma_444, false, 12 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- RGB planes 12bit -> YCbCr 420 12bit\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_444, false, 12 },
+                                          { heif_colorspace_YCbCr, heif_chroma_420, false, 12 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- interleaved RGB 12bit big endian -> YCbCr 420 12bit\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_interleaved_RRGGBB_BE, false, 12 },
+                                          { heif_colorspace_YCbCr, heif_chroma_420, false, 12 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("---\n");
++  printf("--- interleaved RGB 12bit little endian -> YCbCr 420 12bit\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_RGB, heif_chroma_interleaved_RRGGBB_LE, false, 12 },
+                                          { heif_colorspace_YCbCr, heif_chroma_420, false, 12 } );
+ 
+   REQUIRE( success );
+ 
+-  printf("--- monochrome colorspace -> interleaved RGB\n");
+-
+-  success = pipeline.construct_pipeline( { heif_colorspace_monochrome, heif_chroma_monochrome, false, 8 },
+-                                         { heif_colorspace_RGB, heif_chroma_interleaved_RGB, false, 8 } );
+-
+-  REQUIRE( success );
+-
+   printf("--- monochrome YCbCr -> interleaved RGB\n");
+ 
+   success = pipeline.construct_pipeline( { heif_colorspace_YCbCr, heif_chroma_monochrome, false, 8 },
+diff --git a/third-party/libsharpyuv.cmd b/third-party/libsharpyuv.cmd
+new file mode 100644
+index 0000000000..e5e28d21ff
+--- /dev/null
++++ b/third-party/libsharpyuv.cmd
+@@ -0,0 +1,20 @@
++: # This install script was originally taken from libavif but might have been modified.
++
++: # If you want to enable the libsharpyuv decoder, please check that the WITH_LIBSHARPYUV CMake variable is set correctly.
++: # You will also have to set the PKG_CONFIG_PATH to "third-party/libwebp/build/dist/lib/pkgconfig" so that the local libsharpyuv library is found.
++
++: # The odd choice of comment style in this file is to try to share this script between *nix and win32.
++
++: # meson and ninja must be in your PATH.
++
++: # If you're running this on Windows, be sure you've already run this (from your VC2019 install dir):
++: #     "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat"
++git clone --single-branch https://chromium.googlesource.com/webm/libwebp
++
++cd libwebp
++mkdir build
++cd build
++cmake -G Ninja -DCMAKE_INSTALL_PREFIX="$(pwd)/dist" -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release ..
++ninja sharpyuv
++ninja install
++cd ../..

@@ -1,0 +1,312 @@
+diff --git a/common/x86/ihevc_intra_pred_filters_sse42_intr.c b/common/x86/ihevc_intra_pred_filters_sse42_intr.c
+index 6488de6..e72f042 100644
+--- a/common/x86/ihevc_intra_pred_filters_sse42_intr.c
++++ b/common/x86/ihevc_intra_pred_filters_sse42_intr.c
+@@ -1969,7 +1969,7 @@
+     __m128i row_4x32b, two_nt_4x32b, ref_main_idx_4x32b, res_temp5_4x32b, sm3;
+ 
+ 
+-    UWORD8 ref_tmp[2 * MAX_CU_SIZE + 2];
++    UWORD8 ref_tmp[2 * MAX_CU_SIZE + 2] = {0};
+     UWORD8 *ref_main;
+     UWORD8 *ref_temp;
+     UNUSED(src_strd);
+@@ -2799,7 +2799,7 @@
+     WORD32 inv_ang, inv_ang_sum;
+     //WORD32 ref_main_idx, pos, fract, idx;
+     WORD32 ref_idx;
+-    UWORD8 ref_tmp[(2 * MAX_CU_SIZE) + 2];
++    UWORD8 ref_tmp[(2 * MAX_CU_SIZE) + 2] = {0};
+     UWORD8 *ref_main, *ref_temp;
+ 
+     __m128i  /*fract_8x16b,*/ const_temp_8x16b, sm3;
+diff --git a/decoder/ihevcd_decode.c b/decoder/ihevcd_decode.c
+index 16ed36b..9f634b7 100644
+--- a/decoder/ihevcd_decode.c
++++ b/decoder/ihevcd_decode.c
+@@ -626,6 +626,13 @@
+ 
+         nal_ofst = ihevcd_nal_search_start_code(ps_codec->pu1_inp_bitsbuf,
+                                                 ps_codec->i4_bytes_remaining);
++        /* If there is no start code found, consume the data and break */
++        if(nal_ofst == ps_codec->i4_bytes_remaining)
++        {
++            ps_codec->pu1_inp_bitsbuf += nal_ofst;
++            ps_codec->i4_bytes_remaining -= nal_ofst;
++            break;
++        }
+ 
+         ps_codec->i4_nal_ofst = nal_ofst;
+         {
+diff --git a/decoder/ihevcd_fmt_conv.c b/decoder/ihevcd_fmt_conv.c
+index 4e0e4f7..4637fe8 100644
+--- a/decoder/ihevcd_fmt_conv.c
++++ b/decoder/ihevcd_fmt_conv.c
+@@ -65,6 +65,8 @@
+ #include "ihevcd_fmt_conv.h"
+ #include "ihevcd_profile.h"
+ 
++/* SIMD variants of format conversion modules do not support width less than 32 */
++#define MIN_FMT_CONV_SIMD_WIDTH 32
+ /**
+ *******************************************************************************
+ *
+@@ -830,18 +832,35 @@
+ 
+         if((IV_YUV_420SP_UV == ps_codec->e_chroma_fmt) || (IV_YUV_420SP_VU == ps_codec->e_chroma_fmt))
+         {
+-
+-            ps_codec->s_func_selector.ihevcd_fmt_conv_420sp_to_420sp_fptr(pu1_y_src, pu1_uv_src,
+-                                                                          pu1_y_dst_tmp, pu1_uv_dst_tmp,
+-                                                                          ps_codec->i4_disp_wd,
+-                                                                          num_rows,
+-                                                                          ps_codec->i4_strd,
+-                                                                          ps_codec->i4_strd,
+-                                                                          ps_codec->i4_disp_strd,
+-                                                                          ps_codec->i4_disp_strd);
++            ihevcd_fmt_conv_420sp_to_420sp_ft *fmt_conv_fptr;
++            if(ps_codec->i4_disp_wd >= MIN_FMT_CONV_SIMD_WIDTH)
++            {
++                fmt_conv_fptr = ps_codec->s_func_selector.ihevcd_fmt_conv_420sp_to_420sp_fptr;
++            }
++            else
++            {
++                fmt_conv_fptr = ihevcd_fmt_conv_420sp_to_420sp;
++            }
++            fmt_conv_fptr(pu1_y_src, pu1_uv_src,
++                          pu1_y_dst_tmp, pu1_uv_dst_tmp,
++                          ps_codec->i4_disp_wd,
++                          num_rows,
++                          ps_codec->i4_strd,
++                          ps_codec->i4_strd,
++                          ps_codec->i4_disp_strd,
++                          ps_codec->i4_disp_strd);
+         }
+         else if(IV_YUV_420P == ps_codec->e_chroma_fmt)
+         {
++            ihevcd_fmt_conv_420sp_to_420p_ft *fmt_conv_fptr;
++            if(ps_codec->i4_disp_wd >= MIN_FMT_CONV_SIMD_WIDTH)
++            {
++                fmt_conv_fptr = ps_codec->s_func_selector.ihevcd_fmt_conv_420sp_to_420p_fptr;
++            }
++            else
++            {
++                fmt_conv_fptr = ihevcd_fmt_conv_420sp_to_420p;
++            }
+ 
+             if(0 == disable_luma_copy)
+             {
+@@ -858,46 +877,60 @@
+ 
+                 disable_luma_copy = 1;
+             }
+-
+-            ps_codec->s_func_selector.ihevcd_fmt_conv_420sp_to_420p_fptr(pu1_y_src, pu1_uv_src,
+-                                                                         pu1_y_dst_tmp, pu1_u_dst_tmp, pu1_v_dst_tmp,
+-                                                                         ps_codec->i4_disp_wd,
+-                                                                         num_rows,
+-                                                                         ps_codec->i4_strd,
+-                                                                         ps_codec->i4_strd,
+-                                                                         ps_codec->i4_disp_strd,
+-                                                                         (ps_codec->i4_disp_strd / 2),
+-                                                                         is_u_first,
+-                                                                         disable_luma_copy);
+-
++            fmt_conv_fptr(pu1_y_src, pu1_uv_src,
++                          pu1_y_dst_tmp, pu1_u_dst_tmp, pu1_v_dst_tmp,
++                          ps_codec->i4_disp_wd,
++                          num_rows,
++                          ps_codec->i4_strd,
++                          ps_codec->i4_strd,
++                          ps_codec->i4_disp_strd,
++                          (ps_codec->i4_disp_strd / 2),
++                          is_u_first,
++                          disable_luma_copy);
+         }
+         else if(IV_RGB_565 == ps_codec->e_chroma_fmt)
+         {
++            ihevcd_fmt_conv_420sp_to_rgb565_ft *fmt_conv_fptr;
++            if(ps_codec->i4_disp_wd >= MIN_FMT_CONV_SIMD_WIDTH)
++            {
++                fmt_conv_fptr = ps_codec->s_func_selector.ihevcd_fmt_conv_420sp_to_rgb565_fptr;
++            }
++            else
++            {
++                fmt_conv_fptr = ihevcd_fmt_conv_420sp_to_rgb565;
++            }
+ 
+-            ps_codec->s_func_selector.ihevcd_fmt_conv_420sp_to_rgb565_fptr(pu1_y_src, pu1_uv_src,
+-                                                                           pu2_rgb_dst_tmp,
+-                                                                           ps_codec->i4_disp_wd,
+-                                                                           num_rows,
+-                                                                           ps_codec->i4_strd,
+-                                                                           ps_codec->i4_strd,
+-                                                                           ps_codec->i4_disp_strd,
+-                                                                           is_u_first);
+-
++            fmt_conv_fptr(pu1_y_src, pu1_uv_src,
++                          pu2_rgb_dst_tmp,
++                          ps_codec->i4_disp_wd,
++                          num_rows,
++                          ps_codec->i4_strd,
++                          ps_codec->i4_strd,
++                          ps_codec->i4_disp_strd,
++                          is_u_first);
+         }
+         else if(IV_RGBA_8888 == ps_codec->e_chroma_fmt)
+         {
++            ihevcd_fmt_conv_420sp_to_rgba8888_ft *fmt_conv_fptr;
++            if(ps_codec->i4_disp_wd >= MIN_FMT_CONV_SIMD_WIDTH)
++            {
++                fmt_conv_fptr = ps_codec->s_func_selector.ihevcd_fmt_conv_420sp_to_rgba8888_fptr;
++            }
++            else
++            {
++                fmt_conv_fptr = ihevcd_fmt_conv_420sp_to_rgba8888;
++            }
++
+             ASSERT(is_u_first == 1);
+-
+-            ps_codec->s_func_selector.ihevcd_fmt_conv_420sp_to_rgba8888_fptr(pu1_y_src,
+-                                                                             pu1_uv_src,
+-                                                                             pu4_rgb_dst_tmp,
+-                                                                             ps_codec->i4_disp_wd,
+-                                                                             num_rows,
+-                                                                             ps_codec->i4_strd,
+-                                                                             ps_codec->i4_strd,
+-                                                                             ps_codec->i4_disp_strd,
+-                                                                             is_u_first);
+-
++            fmt_conv_fptr(pu1_y_src,
++                          pu1_uv_src,
++                          pu4_rgb_dst_tmp,
++                          ps_codec->i4_disp_wd,
++                          num_rows,
++                          ps_codec->i4_strd,
++                          ps_codec->i4_strd,
++                          ps_codec->i4_disp_strd,
++                          is_u_first);
+         }
+ 
+ 
+diff --git a/decoder/ihevcd_iquant_itrans_recon_ctb.c b/decoder/ihevcd_iquant_itrans_recon_ctb.c
+index 8425506..504271c 100644
+--- a/decoder/ihevcd_iquant_itrans_recon_ctb.c
++++ b/decoder/ihevcd_iquant_itrans_recon_ctb.c
+@@ -946,7 +946,7 @@
+                     /* While (MAX_TU_SIZE * 2 * 2) + 1 is the actaul size needed,
+                        au1_ref_sub_out size is kept as multiple of 8,
+                        so that SIMD functions can load 64 bits */
+-                    UWORD8 au1_ref_sub_out[(MAX_TU_SIZE * 2 * 2) + 8];
++                    UWORD8 au1_ref_sub_out[(MAX_TU_SIZE * 2 * 2) + 8] = {0};
+                     UWORD8 *pu1_top_left, *pu1_top, *pu1_left;
+                     WORD32 luma_pred_func_idx, chroma_pred_func_idx;
+ 
+diff --git a/decoder/ihevcd_parse_slice_header.c b/decoder/ihevcd_parse_slice_header.c
+index c161fc4..23d5030 100644
+--- a/decoder/ihevcd_parse_slice_header.c
++++ b/decoder/ihevcd_parse_slice_header.c
+@@ -325,6 +325,12 @@
+     {
+         BITS_PARSE("dependent_slice_flag", value, ps_bitstrm, 1);
+ 
++        /* First slice to be decoded in the current picture can't be dependent slice */
++        if (value && 0 == ps_codec->i4_pic_present)
++        {
++             return IHEVCD_IGNORE_SLICE;
++        }
++
+         /* If dependendent slice, copy slice header from previous slice */
+         if(value && (ps_codec->s_parse.i4_cur_slice_idx > 0))
+         {
+@@ -471,7 +477,8 @@
+                     ps_slice_hdr->i1_num_long_term_sps = value;
+                 }
+                 UEV_PARSE("num_long_term_pics", value, ps_bitstrm);
+-                if((value + ps_slice_hdr->i1_num_long_term_sps + num_neg_pics + num_pos_pics) > (MAX_DPB_SIZE - 1))
++                if(((ULWORD64)value + ps_slice_hdr->i1_num_long_term_sps + num_neg_pics +
++                    num_pos_pics) > (MAX_DPB_SIZE - 1))
+                 {
+                     return IHEVCD_INVALID_PARAMETER;
+                 }
+@@ -487,6 +494,10 @@
+                         {
+                             WORD32 num_bits = 32 - CLZ(ps_sps->i1_num_long_term_ref_pics_sps - 1);
+                             BITS_PARSE("lt_idx_sps[ i ]", value, ps_bitstrm, num_bits);
++                            if(value >= ps_sps->i1_num_long_term_ref_pics_sps)
++                            {
++                                return IHEVCD_INVALID_PARAMETER;
++                            }
+                         }
+                         else
+                         {
+diff --git a/encoder/ihevce_enc_loop_pass.c b/encoder/ihevce_enc_loop_pass.c
+index 16f2280..c73c7ff 100644
+--- a/encoder/ihevce_enc_loop_pass.c
++++ b/encoder/ihevce_enc_loop_pass.c
+@@ -141,6 +141,8 @@
+ /* Constant Macros                                                           */
+ /*****************************************************************************/
+ #define UPDATE_QP_AT_CTB 6
++#define INTRAPRED_SIMD_LEFT_PADDING 16
++#define INTRAPRED_SIMD_RIGHT_PADDING 8
+ 
+ /*****************************************************************************/
+ /* Function Definitions                                                      */
+@@ -3731,8 +3733,12 @@
+     ps_mem_tab[ENC_LOOP_CHROMA_PRED_INTRA].i4_mem_alignment = 8;
+ 
+     /* Memory required to store pred for reference substitution output */
++    /* While (MAX_TU_SIZE * 2 * 2) + 1 is the actual size needed,
++       allocate 16 bytes to the left and 7 bytes to the right to facilitate
++       SIMD access */
+     ps_mem_tab[ENC_LOOP_REF_SUB_OUT].i4_mem_size =
+-        i4_num_proc_thrds * ((MAX_TU_SIZE * 2 * 2) + 4) *
++        i4_num_proc_thrds * (((MAX_TU_SIZE * 2 * 2) + INTRAPRED_SIMD_RIGHT_PADDING)
++        + INTRAPRED_SIMD_LEFT_PADDING)*
+         ((ps_init_prms->s_tgt_lyr_prms.i4_internal_bit_depth > 8) ? 2 : 1) * sizeof(UWORD8);
+ 
+     ps_mem_tab[ENC_LOOP_REF_SUB_OUT].e_mem_type = (IV_MEM_TYPE_T)i4_mem_space;
+@@ -3740,8 +3746,12 @@
+     ps_mem_tab[ENC_LOOP_REF_SUB_OUT].i4_mem_alignment = 8;
+ 
+     /* Memory required to store pred for reference filtering output */
++    /* While (MAX_TU_SIZE * 2 * 2) + 1 is the actual size needed,
++       allocate 16 bytes to the left and 7 bytes to the right to facilitate
++       SIMD access */
+     ps_mem_tab[ENC_LOOP_REF_FILT_OUT].i4_mem_size =
+-        i4_num_proc_thrds * ((MAX_TU_SIZE * 2 * 2) + 4) *
++        i4_num_proc_thrds * (((MAX_TU_SIZE * 2 * 2) + INTRAPRED_SIMD_RIGHT_PADDING)
++        + INTRAPRED_SIMD_LEFT_PADDING)*
+         ((ps_init_prms->s_tgt_lyr_prms.i4_internal_bit_depth > 8) ? 2 : 1) * sizeof(UWORD8);
+ 
+     ps_mem_tab[ENC_LOOP_REF_FILT_OUT].e_mem_type = (IV_MEM_TYPE_T)i4_mem_space;
+@@ -4670,22 +4680,24 @@
+ 
+             /* Memory assignments for reference substitution output */
+             {
+-                WORD32 pred_buf_size = ((MAX_TU_SIZE * 2 * 2) + 4);
++                WORD32 pred_buf_size = ((MAX_TU_SIZE * 2 * 2) + INTRAPRED_SIMD_RIGHT_PADDING
++                                       + INTRAPRED_SIMD_LEFT_PADDING);
+                 WORD32 pred_buf_size_per_thread = pred_buf_size;
+                 UWORD8 *pu1_base = (UWORD8 *)ps_mem_tab[ENC_LOOP_REF_SUB_OUT].pv_base +
+                                    (ctr * pred_buf_size_per_thread);
+ 
+-                ps_ctxt->pv_ref_sub_out = pu1_base;
++                ps_ctxt->pv_ref_sub_out = pu1_base + INTRAPRED_SIMD_LEFT_PADDING;
+             }
+ 
+             /* Memory assignments for reference filtering output */
+             {
+-                WORD32 pred_buf_size = ((MAX_TU_SIZE * 2 * 2) + 4);
++                WORD32 pred_buf_size = ((MAX_TU_SIZE * 2 * 2) + INTRAPRED_SIMD_RIGHT_PADDING
++                                       + INTRAPRED_SIMD_LEFT_PADDING);
+                 WORD32 pred_buf_size_per_thread = pred_buf_size;
+                 UWORD8 *pu1_base = (UWORD8 *)ps_mem_tab[ENC_LOOP_REF_FILT_OUT].pv_base +
+                                    (ctr * pred_buf_size_per_thread);
+ 
+-                ps_ctxt->pv_ref_filt_out = pu1_base;
++                ps_ctxt->pv_ref_filt_out = pu1_base + INTRAPRED_SIMD_LEFT_PADDING;
+             }
+ 
+             /* Memory assignments for recon storage during CU Recursion */

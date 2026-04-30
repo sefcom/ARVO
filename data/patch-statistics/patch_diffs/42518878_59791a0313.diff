@@ -1,0 +1,372 @@
+From cf8d63c23d68754eb50762b45e58ab9a13b8d470 Mon Sep 17 00:00:00 2001
+From: Francesc Alted <francesc@blosc.org>
+Date: Tue, 18 Feb 2025 08:02:41 +0100
+Subject: [PATCH] Some fixes and new b2nd_copy_buffer2 API func
+
+---
+ RELEASE_NOTES.md                   | 11 +++++++--
+ blosc/b2nd.c                       | 22 +++++++++--------
+ blosc/b2nd_utils.c                 | 33 +++++++++++++++++++------
+ blosc/blosc2.c                     | 26 +++++++++++++-------
+ doc/reference/b2nd.rst             |  1 +
+ include/b2nd.h                     | 37 ++++++++++++++++++++++++++++
+ tests/b2nd/test_b2nd_copy_buffer.c | 14 +++++++++++
+ tests/b2nd/test_b2nd_full.c        | 39 +++++++++++++++++-------------
+ 8 files changed, 138 insertions(+), 45 deletions(-)
+
+diff --git a/RELEASE_NOTES.md b/RELEASE_NOTES.md
+index 9280f27f7..81bdc7e9b 100644
+--- a/RELEASE_NOTES.md
++++ b/RELEASE_NOTES.md
+@@ -1,10 +1,17 @@
+ Release notes for C-Blosc2
+ ==========================
+ 
+-Changes from 2.16.0 to 2.16.1
++Changes from 2.16.0 to 2.17.0
+ =============================
+ 
+-#XXX version-specific blurb XXX#
++* New b2nd_copy_buffer2() function for copying buffers with typesizes
++  larger than 255.  The previous b2nd_copy_buffer() function is now
++  deprecated and will be removed in a future release.
++
++### Deprecated Functions
++
++- `int b2nd_copy_buffer(...)` is deprecated and will be removed in
++  a future release. Please use `b2nd_copy_buffer2(...)` instead.
+ 
+ 
+ Changes from 2.15.2 to 2.16.0
+diff --git a/blosc/b2nd.c b/blosc/b2nd.c
+index 31d25b712..4dfb9f668 100644
+--- a/blosc/b2nd.c
++++ b/blosc/b2nd.c
+@@ -775,7 +775,7 @@ int get_set_slice(void *buffer, int64_t buffersize, const int64_t *start, const
+     BLOSC_ERROR(BLOSC2_ERROR_INVALID_PARAM);
+   }
+ 
+-  uint8_t *buffer_b = (uint8_t *) buffer;
++  uint8_t *buffer_b = buffer;
+   const int64_t *buffer_start = start;
+   const int64_t *buffer_stop = stop;
+   const int64_t *buffer_shape = shape;
+@@ -1069,13 +1069,13 @@ int get_set_slice(void *buffer, int64_t buffersize, const int64_t *start, const
+       }
+ 
+       if (set_slice) {
+-        b2nd_copy_buffer(ndim, array->sc->typesize,
+-                         src, src_pad_shape, src_start, src_stop,
+-                         dst, dst_pad_shape, dst_start);
++        b2nd_copy_buffer2(ndim, array->sc->typesize,
++                          src, src_pad_shape, src_start, src_stop,
++                          dst, dst_pad_shape, dst_start);
+       } else {
+-        b2nd_copy_buffer(ndim, array->sc->typesize,
+-                         dst, dst_pad_shape, dst_start, dst_stop,
+-                         src, src_pad_shape, src_start);
++        b2nd_copy_buffer2(ndim, array->sc->typesize,
++                          dst, dst_pad_shape, dst_start, dst_stop,
++                          src, src_pad_shape, src_start);
+       }
+     }
+ 
+@@ -2103,13 +2103,15 @@ b2nd_create_ctx(const blosc2_storage *b2_storage, int8_t ndim, const int64_t *sh
+   }
+ 
+   if (dtype == NULL) {
+-    ctx->dtype = strdup(B2ND_DEFAULT_DTYPE);
+-    ctx->dtype_format = 0;  // The default is NumPy format
++    // ctx->dtype = strdup(B2ND_DEFAULT_DTYPE);
++    char buf[16] = {0};
++    snprintf(buf, sizeof(buf), "|S%d", cparams->typesize);
++    ctx->dtype = strdup(buf);
+   }
+   else {
+     ctx->dtype = strdup(dtype);
+-    ctx->dtype_format = dtype_format;
+   }
++  ctx->dtype_format = dtype_format;
+ 
+   params_b2_storage->cparams = cparams;
+   ctx->b2_storage = params_b2_storage;
+diff --git a/blosc/b2nd_utils.c b/blosc/b2nd_utils.c
+index 285e9f0d9..dc0ecde97 100644
+--- a/blosc/b2nd_utils.c
++++ b/blosc/b2nd_utils.c
+@@ -11,7 +11,6 @@
+ #include "b2nd.h"
+ 
+ #include <stdint.h>
+-#include <string.h>
+ 
+ // copyNdim where N = {2-8} - specializations of copy loops to be used by b2nd_copy_buffer
+ // since we don't have c++ templates, substitute manual specializations for up to known B2ND_MAX_DIM (8)
+@@ -253,12 +252,12 @@ void copy_ndim_fallback(const int8_t ndim,
+   }
+ }
+ 
+-int b2nd_copy_buffer(int8_t ndim,
+-                     uint8_t itemsize,
+-                     const void *src, const int64_t *src_pad_shape,
+-                     const int64_t *src_start, const int64_t *src_stop,
+-                     void *dst, const int64_t *dst_pad_shape,
+-                     const int64_t *dst_start) {
++int b2nd_copy_buffer2(int8_t ndim,
++                      int32_t itemsize,
++                      const void *src, const int64_t *src_pad_shape,
++                      const int64_t *src_start, const int64_t *src_stop,
++                      void *dst, const int64_t *dst_pad_shape,
++                      const int64_t *dst_start) {
+   // Compute the shape of the copy
+   int64_t copy_shape[B2ND_MAX_DIM] = {0};
+   for (int i = 0; i < ndim; ++i) {
+@@ -325,3 +324,23 @@ int b2nd_copy_buffer(int8_t ndim,
+ 
+   return BLOSC2_ERROR_SUCCESS;
+ }
++
++
++// Keep the old signature for API compatibility
++int b2nd_copy_buffer(int8_t ndim,
++                     uint8_t itemsize,
++                     const void *src, const int64_t *src_pad_shape,
++                     const int64_t *src_start, const int64_t *src_stop,
++                     void *dst, const int64_t *dst_pad_shape,
++                     const int64_t *dst_start) __attribute__((deprecated("Use b2nd_copy_buffer2 instead")));
++
++int b2nd_copy_buffer(int8_t ndim,
++                     uint8_t itemsize,
++                     const void *src, const int64_t *src_pad_shape,
++                     const int64_t *src_start, const int64_t *src_stop,
++                     void *dst, const int64_t *dst_pad_shape,
++                     const int64_t *dst_start) {
++  // Simply cast itemsize to int32_t and delegate
++  return b2nd_copy_buffer2(ndim, (int32_t)itemsize, src, src_pad_shape,
++                          src_start, src_stop, dst, dst_pad_shape, dst_start);
++}
+diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+index 818e04274..b08900217 100644
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -725,14 +725,18 @@ int read_chunk_header(const uint8_t* src, int32_t srcsize, bool extended_header,
+ 
+     int32_t special_type = (header->blosc2_flags >> 4) & BLOSC2_SPECIAL_MASK;
+     if (special_type != 0) {
+-      if (header->nbytes % header->typesize != 0) {
+-        BLOSC_TRACE_ERROR("`nbytes` is not a multiple of typesize");
+-        return BLOSC2_ERROR_INVALID_HEADER;
+-      }
+       if (special_type == BLOSC2_SPECIAL_VALUE) {
+-        if (header->cbytes < BLOSC_EXTENDED_HEADER_LENGTH + header->typesize) {
+-          BLOSC_TRACE_ERROR("`cbytes` is too small for run length encoding");
+-          return BLOSC2_ERROR_READ_BUFFER;
++        // In this case, the actual type size must be derived from the cbytes
++        int32_t typesize = header->cbytes - BLOSC_EXTENDED_HEADER_LENGTH;
++        if (header->nbytes % typesize != 0) {
++          BLOSC_TRACE_ERROR("`nbytes` is not a multiple of typesize");
++          return BLOSC2_ERROR_INVALID_HEADER;
++        }
++      }
++      else {
++        if (header->nbytes % header->typesize != 0) {
++          BLOSC_TRACE_ERROR("`nbytes` is not a multiple of typesize");
++          return BLOSC2_ERROR_INVALID_HEADER;
+         }
+       }
+     }
+@@ -1581,6 +1585,10 @@ static int blosc_d(
+   if (rc < 0) {
+     return rc;
+   }
++  if (context->special_type == BLOSC2_SPECIAL_VALUE) {
++    // We need the actual typesize in this case, but it cannot be encoded in the header, so derive it from cbytes
++    typesize = chunk_cbytes - context->header_overhead;
++  }
+ 
+   // In some situations (lazychunks) the context can arrive uninitialized
+   // (but BITSHUFFLE needs it for accessing the format of the chunk)
+@@ -1674,7 +1682,7 @@ static int blosc_d(
+     switch (context->special_type) {
+       case BLOSC2_SPECIAL_VALUE:
+         // All repeated values
+-        rc = set_values(context->typesize, context->src, _dest, bsize_);
++        rc = set_values(typesize, context->src, _dest, bsize_);
+         if (rc < 0) {
+           BLOSC_TRACE_ERROR("set_values failed");
+           return BLOSC2_ERROR_DATA;
+@@ -1749,7 +1757,7 @@ static int blosc_d(
+ 
+   /* The number of compressed data streams for this block */
+   if (!dont_split && !leftoverblock) {
+-    nstreams = (int32_t)typesize;
++    nstreams = context->typesize;
+   }
+   else {
+     nstreams = 1;
+diff --git a/doc/reference/b2nd.rst b/doc/reference/b2nd.rst
+index 2b90dd1c2..97a88b577 100644
+--- a/doc/reference/b2nd.rst
++++ b/doc/reference/b2nd.rst
+@@ -109,3 +109,4 @@ Utilities
+ These functions may be used for working with plain C buffers representing multidimensional arrays.
+ 
+ .. doxygenfunction:: b2nd_copy_buffer
++.. doxygenfunction:: b2nd_copy_buffer2
+diff --git a/include/b2nd.h b/include/b2nd.h
+index d3a5f0713..354cfaf6e 100644
+--- a/include/b2nd.h
++++ b/include/b2nd.h
+@@ -562,6 +562,9 @@ BLOSC_EXPORT int b2nd_deserialize_meta(const uint8_t *smeta, int32_t smeta_len,
+  *
+  * @return An error code.
+  *
++ * @note This is kept for backward compatibility with existing code out there.  New code should use
++ * b2nd_copy_buffer2 instead.
++ *
+  * @note Please make sure that slice boundaries fit within the source and
+  * destination arrays before using this function, as it does not perform these
+  * checks itself.
+@@ -574,6 +577,40 @@ BLOSC_EXPORT int b2nd_copy_buffer(int8_t ndim,
+                                   const int64_t *dst_start);
+ 
+ 
++/**
++ * @brief Copy a slice of a source array into another array. The arrays have
++ * the same number of dimensions (though their shapes may differ), the same
++ * item size, and they are stored as C buffers with contiguous data (any
++ * padding is considered part of the array).
++ *
++ * @param ndim The number of dimensions in both arrays.
++ * @param itemsize The size of the individual data item in both arrays.
++ * @param src The buffer for getting the data from the source array.
++ * @param src_pad_shape The shape of the source array, including padding.
++ * @param src_start The source coordinates where the slice will begin.
++ * @param src_stop The source coordinates where the slice will end.
++ * @param dst The buffer for setting the data into the destination array.
++ * @param dst_pad_shape The shape of the destination array, including padding.
++ * @param dst_start The destination coordinates where the slice will be placed.
++ *
++ * @return An error code.
++ *
++ * @note This is a version of b2nd_copy_buffer that uses signed 32-bit integers for
++ * copying data. This is useful when the data is stored in a buffer that uses
++ * itemsizes that are larger than 255 bytes.
++ *
++ * @note Please make sure that slice boundaries fit within the source and
++ * destination arrays before using this function, as it does not perform these
++ * checks itself.
++ */
++BLOSC_EXPORT int b2nd_copy_buffer2(int8_t ndim,
++                                   int32_t itemsize,
++                                   const void *src, const int64_t *src_pad_shape,
++                                   const int64_t *src_start, const int64_t *src_stop,
++                                   void *dst, const int64_t *dst_pad_shape,
++                                   const int64_t *dst_start);
++
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/tests/b2nd/test_b2nd_copy_buffer.c b/tests/b2nd/test_b2nd_copy_buffer.c
+index a1a59cc7d..6958a3bc5 100644
+--- a/tests/b2nd/test_b2nd_copy_buffer.c
++++ b/tests/b2nd/test_b2nd_copy_buffer.c
+@@ -64,6 +64,20 @@ CUTEST_TEST_TEST(copy_buffer) {
+     CUTEST_ASSERT("Elements are not equal!", a == b);
+   }
+ 
++  int32_t itemsize2 = itemsize;
++  B2ND_TEST_ASSERT(b2nd_copy_buffer2(ndim, itemsize2,
++                                     chunk0x, chunk_shape, chunk0s_start, chunk0s_stop,
++                                     dest, dest_shape, chunk0s_dest));
++  B2ND_TEST_ASSERT(b2nd_copy_buffer2(ndim, itemsize2,
++                                     chunk1x, chunk_shape, chunk1s_start, chunk1s_stop,
++                                     dest, dest_shape, chunk1s_dest));
++
++  for (int i = 0; i < result_length; ++i) {
++    uint8_t a = dest[i];
++    uint8_t b = result[i];
++    CUTEST_ASSERT("Elements are not equal!", a == b);
++  }
++
+   return 0;
+ }
+ 
+diff --git a/tests/b2nd/test_b2nd_full.c b/tests/b2nd/test_b2nd_full.c
+index 2129278e6..ecb319ec5 100644
+--- a/tests/b2nd/test_b2nd_full.c
++++ b/tests/b2nd/test_b2nd_full.c
+@@ -18,18 +18,23 @@ CUTEST_TEST_SETUP(full) {
+   // Add parametrizations
+   CUTEST_PARAMETRIZE(typesize, int32_t, CUTEST_DATA(
+       //1, 2, 4, 8,
+-      256, // 256, 257, 256 * 256,
+-      // 256*256*256, 256*256*256*8  # these should work for small shapes as well, but are too slow
++      256, //257, 256 * 256,
++      // 256*256*256, 256*256*256*8,  // these should work for small shapes as well, but are too slow
+   ));
+   CUTEST_PARAMETRIZE(shapes, _test_shapes, CUTEST_DATA(
+-      {1, {3}, {3}, {3}}, // 1-idim
+-      // {0, {0}, {0}, {0}}, // 0-dim
+-      //{1, {5}, {3}, {2}}, // 1-idim
+-      // {2, {20, 0}, {7, 0}, {3, 0}}, // 0-shape
+-      // {2, {20, 10}, {7, 5}, {3, 5}}, // 0-shape
+-      // {2, {14, 10}, {8, 5}, {2, 2}}, // general,
+-      // {3, {12, 10, 14}, {3, 5, 9}, {3, 4, 4}}, // general
+-      // {3, {10, 21, 20, 5}, {8, 7, 15, 3}, {5, 5, 10, 1}}, // general,
++    // {0, {0}, {0}, {0}}, // 0-dim
++    // {1, {5}, {3}, {2}}, // 1-idim
++    // {2, {20, 0}, {7, 0}, {3, 0}}, // 0-shape
++    //{2, {20, 10}, {20, 10}, {10, 10}}, // funciona sempre
++    //{2, {20, 10}, {10, 5}, {10, 5}}, // falla
++    //{2, {4, 1}, {2, 1}, {2, 1}}, // falla
++    {2, {1, 3}, {1, 2}, {1, 2}}, // falla
++    //{1, {4}, {2}, {2}}, // funciona sempre
++    //{2, {20, 10}, {8, 6}, {7, 5}}, // falla
++    //{2, {20, 10}, {7, 5}, {3, 5}}, // falla
++    //{2, {14, 10}, {8, 5}, {2, 2}}, // general,
++    //{3, {12, 10, 14}, {3, 5, 9}, {3, 4, 4}}, // general
++    //{3, {10, 21, 20, 5}, {8, 7, 15, 3}, {5, 5, 10, 1}}, // general,
+   ));
+   CUTEST_PARAMETRIZE(backend, _test_backend, CUTEST_DATA(
+       {false, false},
+@@ -47,14 +52,14 @@ CUTEST_TEST_SETUP(full) {
+ CUTEST_TEST_TEST(full) {
+   CUTEST_GET_PARAMETER(backend, _test_backend);
+   CUTEST_GET_PARAMETER(shapes, _test_shapes);
+-  CUTEST_GET_PARAMETER(typesize, uint32_t);
++  CUTEST_GET_PARAMETER(typesize, int32_t);
+   CUTEST_GET_PARAMETER(fill_value, int8_t);
+ 
+   char *urlpath = "test_full.b2frame";
+   blosc2_remove_urlpath(urlpath);
+ 
+   blosc2_cparams cparams = BLOSC2_CPARAMS_DEFAULTS;
+-  cparams.nthreads = 2;
++  cparams.nthreads = 1;
+   cparams.typesize = typesize;
+   blosc2_storage b2_storage = {.cparams=&cparams};
+ 
+@@ -121,16 +126,16 @@ CUTEST_TEST_TEST(full) {
+         break;
+       default:
+         // Fill a buffer with fill_value and compare with buffer_dest
+-        for (int j = 0; j < typesize; ++j) {
++        for (uint32_t j = 0; j < typesize; ++j) {
+           buffer_fill[j] = fill_value;
+         }
+         // Compare buffer_fill with buffer_dest
+         is_true = memcmp(buffer_fill, buffer_dest, typesize) == 0;
+         // print the 10 first bytes of buffer_fill and buffer_dest
+-        printf("buffer_fill: ");
+-        for (int j = 0; j < 10; ++j) {
+-          printf("%d vs %d ", buffer_fill[j], buffer_dest[j]);
+-        }
++        // printf("buffer_fill: ");
++        // for (int j = 0; j < 10; ++j) {
++        //   printf("%d vs %d ", buffer_fill[j], buffer_dest[j]);
++        // }
+         free(buffer_fill);
+         break;
+     }

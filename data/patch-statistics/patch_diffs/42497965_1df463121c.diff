@@ -1,0 +1,129 @@
+From 1c3811ba12bf924a96c916e2409a0d41c336debf Mon Sep 17 00:00:00 2001
+From: David Korczynski <david@adalogics.com>
+Date: Wed, 24 Nov 2021 20:25:03 +0000
+Subject: [PATCH] tests: internal: fuzzer: extend config fuzzer
+
+Splits config fuzzer in two and adds multi-line parser in config template.
+
+Signed-off-by: David Korczynski <david@adalogics.com>
+---
+ tests/internal/fuzzers/CMakeLists.txt         |  1 +
+ tests/internal/fuzzers/config_fuzzer.c        | 26 +++------
+ tests/internal/fuzzers/config_random_fuzzer.c | 53 +++++++++++++++++++
+ 3 files changed, 61 insertions(+), 19 deletions(-)
+ create mode 100644 tests/internal/fuzzers/config_random_fuzzer.c
+
+diff --git a/tests/internal/fuzzers/CMakeLists.txt b/tests/internal/fuzzers/CMakeLists.txt
+index af8eb16a506..3a44b816264 100644
+--- a/tests/internal/fuzzers/CMakeLists.txt
++++ b/tests/internal/fuzzers/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ set(UNIT_TESTS_FILES
+   engine_fuzzer.c
+   config_fuzzer.c
++  config_random_fuzzer.c
+   signv4_fuzzer.c
+   flb_json_fuzzer.c
+   parser_fuzzer.c
+diff --git a/tests/internal/fuzzers/config_fuzzer.c b/tests/internal/fuzzers/config_fuzzer.c
+index bf6fc061258..300fe8581c8 100644
+--- a/tests/internal/fuzzers/config_fuzzer.c
++++ b/tests/internal/fuzzers/config_fuzzer.c
+@@ -308,8 +308,13 @@ char conf_file[] = "# Parser: no_year\n"
+ "    Time_Format %Y-%M-%S %H:%M:%S\n"
+ "    Time_Keep   On\n"
+ "    Decode_Field_As   json key001\n"
+-"    Types A1:integer A2:string A3:bool A4:float A5:hex\n";
+-
++"    Types A1:integer A2:string A3:bool A4:float A5:hex\n"
++"[MULTILINE_PARSER]\n"
++"    name          exception_test\n"
++"    type          regex\n"
++"    flush_timeout 1000\n"
++"    rule          \"start_state\"  \"/(Dec \d+ \d+\:\d+\:\d+)(.*)/\" \"cont\"\n"
++"    rule          \"cont\" \"/^\s+at.*/\" \"cont\"\n";
+ 
+ 
+ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+@@ -403,22 +408,5 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+     /* clean up the file */
+     unlink(filename);
+ 
+-    /* finally try to parser a random file */
+-    fp = fopen(filename, "wb");
+-    if (!fp) {
+-        return 0;
+-    }
+-    fwrite(data, size, 1, fp);
+-    fclose(fp);
+-
+-    config = NULL;
+-    config = flb_config_init();
+-    flb_parser_conf_file(filename, config);
+-    flb_parser_exit(config);
+-    flb_config_exit(config);
+-
+-    /* Cleanup written config file */
+-    unlink(filename);
+-
+     return 0;
+ }
+diff --git a/tests/internal/fuzzers/config_random_fuzzer.c b/tests/internal/fuzzers/config_random_fuzzer.c
+new file mode 100644
+index 00000000000..df635b6bfe6
+--- /dev/null
++++ b/tests/internal/fuzzers/config_random_fuzzer.c
+@@ -0,0 +1,53 @@
++/*  Fluent Bit
++ *  ==========
++ *  Copyright (C) 2019-2021 The Fluent Bit Authors
++ *  Copyright (C) 2015-2018 Treasure Data Inc.
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++#include <stdint.h>
++#include <string.h>
++#include <stdlib.h>
++#include <fluent-bit/flb_parser.h>
++#include <fluent-bit/flb_slist.h>
++#include "flb_fuzz_header.h"
++
++int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
++{
++    /* Limit the size of the config files to 32KB. */
++    if (size > 32768) {
++        return 0;
++    }
++
++    /* Write the config file to a location we know OSS-Fuzz has */
++    char filename[256];
++    sprintf(filename, "/tmp/libfuzzer.%d", getpid());
++    FILE *fp = fopen(filename, "wb");
++    if (!fp) {
++        return 0;
++    }
++    fwrite(data, size, 1, fp);
++    fclose(fp);
++
++    /* Now parse a random config file */
++    struct flb_config *config = NULL;
++    config = flb_config_init();
++    flb_parser_conf_file(filename, config);
++    flb_parser_exit(config);
++    flb_config_exit(config);
++
++    /* Cleanup written config file */
++    unlink(filename);
++
++    return 0;
++}

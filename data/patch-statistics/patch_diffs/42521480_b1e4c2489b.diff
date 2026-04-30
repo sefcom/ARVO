@@ -1,0 +1,124 @@
+From 117c8cb448c1f43ce2e9027e8ac155283d68062f Mon Sep 17 00:00:00 2001
+From: Sebastian Rasmussen <sebras@gmail.com>
+Date: Sun, 18 Mar 2018 14:09:16 +0800
+Subject: [PATCH] Fix 699127: JBIG2 adaptive pixels restricted to field.
+
+When decoding generic regions the adaptive pixels must be
+restricted to a field, previously this was not validated,
+leading to out of buffer accesses.
+
+This is now validated and may generate a fatal error.
+---
+ jbig2_generic.c | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/jbig2_generic.c b/jbig2_generic.c
+index 5d7fd95..8d4a3c2 100644
+--- a/jbig2_generic.c
++++ b/jbig2_generic.c
+@@ -61,6 +61,7 @@ jbig2_generic_stats_size(Jbig2Ctx *ctx, int template)
+     byte *gbreg_line = (byte *) image->data;
+ 
+     /* todo: currently we only handle the nominal gbat location */
++    /* when resolved make sure to call jbig2_check_adaptive_pixel_in_field() */
+ 
+ #ifdef OUTPUT_PBM
+     printf("P4\n%d %d\n", GBW, GBH);
+@@ -110,6 +111,9 @@ jbig2_generic_stats_size(Jbig2Ctx *ctx, int template)
+     return 0;
+ }
+ 
++#define pixel_outside_field(x, y) \
++    ((y) < -128 || (y) > 0 || (x) < -128 || ((y) < 0 && (x) > 127) || ((y) == 0 && (x) > 0))
++
+ static int
+ jbig2_decode_generic_template0_unopt(Jbig2Ctx *ctx,
+                                      Jbig2Segment *segment,
+@@ -121,6 +125,13 @@ jbig2_decode_generic_template0_unopt(Jbig2Ctx *ctx,
+     int x, y;
+     bool bit;
+ 
++    if (pixel_outside_field(params->gbat[0], params->gbat[1]) ||
++        pixel_outside_field(params->gbat[2], params->gbat[3]) ||
++        pixel_outside_field(params->gbat[4], params->gbat[5]) ||
++        pixel_outside_field(params->gbat[6], params->gbat[7]))
++        return jbig2_error(ctx, JBIG2_SEVERITY_FATAL, segment->number,
++                           "adaptive template pixel is out of field");
++
+     /* this version is generic and easy to understand, but very slow */
+ 
+     for (y = 0; y < GBH; y++) {
+@@ -161,6 +172,7 @@ jbig2_decode_generic_template1(Jbig2Ctx *ctx,
+     byte *gbreg_line = (byte *) image->data;
+ 
+     /* todo: currently we only handle the nominal gbat location */
++    /* when resolved make sure to call jbig2_check_adaptive_pixel_in_field() */
+ 
+ #ifdef OUTPUT_PBM
+     printf("P4\n%d %d\n", GBW, GBH);
+@@ -222,6 +234,7 @@ jbig2_decode_generic_template2(Jbig2Ctx *ctx,
+     byte *gbreg_line = (byte *) image->data;
+ 
+     /* todo: currently we only handle the nominal gbat location */
++    /* when resolved make sure to call jbig2_check_adaptive_pixel_in_field() */
+ 
+ #ifdef OUTPUT_PBM
+     printf("P4\n%d %d\n", GBW, GBH);
+@@ -402,6 +415,10 @@ jbig2_decode_generic_template3_unopt(Jbig2Ctx *ctx,
+     int x, y;
+     bool bit;
+ 
++    if (pixel_outside_field(params->gbat[0], params->gbat[1]))
++        return jbig2_error(ctx, JBIG2_SEVERITY_FATAL, segment->number,
++                           "adaptive template pixel is out of field");
++
+     /* this version is generic and easy to understand, but very slow */
+ 
+     for (y = 0; y < GBH; y++) {
+@@ -450,6 +467,13 @@ jbig2_decode_generic_template0_TPGDON(Jbig2Ctx *ctx,
+     bool bit;
+     int LTP = 0;
+ 
++    if (pixel_outside_field(params->gbat[0], params->gbat[1]) ||
++        pixel_outside_field(params->gbat[2], params->gbat[3]) ||
++        pixel_outside_field(params->gbat[4], params->gbat[5]) ||
++        pixel_outside_field(params->gbat[6], params->gbat[7]))
++        return jbig2_error(ctx, JBIG2_SEVERITY_FATAL, segment->number,
++                           "adaptive template pixel is out of field");
++
+     for (y = 0; y < GBH; y++) {
+         LTP ^= jbig2_arith_decode(as, &GB_stats[0x9B25]);
+         if (!LTP) {
+@@ -493,6 +517,10 @@ jbig2_decode_generic_template1_TPGDON(Jbig2Ctx *ctx,
+     bool bit;
+     int LTP = 0;
+ 
++    if (pixel_outside_field(params->gbat[0], params->gbat[1]))
++        return jbig2_error(ctx, JBIG2_SEVERITY_FATAL, segment->number,
++                           "adaptive template pixel is out of field");
++
+     for (y = 0; y < GBH; y++) {
+         LTP ^= jbig2_arith_decode(as, &GB_stats[0x0795]);
+         if (!LTP) {
+@@ -533,6 +561,10 @@ jbig2_decode_generic_template2_TPGDON(Jbig2Ctx *ctx,
+     bool bit;
+     int LTP = 0;
+ 
++    if (pixel_outside_field(params->gbat[0], params->gbat[1]))
++        return jbig2_error(ctx, JBIG2_SEVERITY_FATAL, segment->number,
++                           "adaptive template pixel is out of field");
++
+     for (y = 0; y < GBH; y++) {
+         LTP ^= jbig2_arith_decode(as, &GB_stats[0xE5]);
+         if (!LTP) {
+@@ -570,6 +602,10 @@ jbig2_decode_generic_template3_TPGDON(Jbig2Ctx *ctx,
+     bool bit;
+     int LTP = 0;
+ 
++    if (pixel_outside_field(params->gbat[0], params->gbat[1]))
++        return jbig2_error(ctx, JBIG2_SEVERITY_FATAL, segment->number,
++                           "adaptive template pixel is out of field");
++
+     for (y = 0; y < GBH; y++) {
+         LTP ^= jbig2_arith_decode(as, &GB_stats[0x0195]);
+         if (!LTP) {

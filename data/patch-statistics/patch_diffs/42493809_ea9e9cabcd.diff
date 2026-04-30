@@ -1,0 +1,1706 @@
+From 756d922ee52bf0b53f05efefae1cb5069fbf2580 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 15:45:30 +0100
+Subject: [PATCH 01/10] codec plugin implementation for Windows
+
+---
+ CMakeLists.txt                          |   2 +-
+ libheif/common_utils.h                  |   7 +
+ libheif/heif_init.cc                    | 217 ++++++++++++++++++++++--
+ libheif/plugins/heif_decoder_aom.h      |   4 +-
+ libheif/plugins/heif_decoder_dav1d.h    |   4 +-
+ libheif/plugins/heif_decoder_libde265.h |   4 +-
+ libheif/plugins/heif_encoder_aom.h      |   3 +-
+ libheif/plugins/heif_encoder_rav1e.h    |   3 +-
+ libheif/plugins/heif_encoder_svt.h      |   3 +-
+ libheif/plugins/heif_encoder_x265.h     |   3 +-
+ 10 files changed, 232 insertions(+), 18 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b29a61591..42187bd2d1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -60,7 +60,7 @@ LIST (APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/modules")
+ option(ENABLE_PLUGIN_LOADING "Support loading of plugins" ON)
+ set(PLUGIN_DIRECTORY "${CMAKE_INSTALL_FULL_LIBDIR}/libheif" CACHE STRING "Plugin install directory")
+ 
+-if (ENABLE_PLUGIN_LOADING AND UNIX)
++if (ENABLE_PLUGIN_LOADING)
+     set(PLUGIN_LOADING_SUPPORTED_AND_ENABLED TRUE)
+     install(DIRECTORY DESTINATION ${PLUGIN_DIRECTORY} DIRECTORY_PERMISSIONS 
+         OWNER_WRITE OWNER_READ OWNER_EXECUTE
+diff --git a/libheif/common_utils.h b/libheif/common_utils.h
+index 95c33158b0..96edc44326 100644
+--- a/libheif/common_utils.h
++++ b/libheif/common_utils.h
+@@ -24,6 +24,13 @@
+ #include <cinttypes>
+ #include <libheif/heif.h>
+ 
++#ifdef _MSC_VER
++#define MAYBE_UNUSED
++#else
++#define MAYBE_UNUSED __attribute__((unused))
++#endif
++
++
+ // Functions for common use in libheif and the plugins.
+ 
+ uint8_t chroma_h_subsampling(heif_chroma c);
+diff --git a/libheif/heif_init.cc b/libheif/heif_init.cc
+index 6f0df64f2d..701017dbe4 100644
+--- a/libheif/heif_init.cc
++++ b/libheif/heif_init.cc
+@@ -22,11 +22,16 @@
+ #include "heif.h"
+ #include "error.h"
+ #include "heif_plugin_registry.h"
++#include "common_utils.h"
+ 
+ #if ENABLE_MULTITHREADING_SUPPORT
+ #include <mutex>
+ #endif
+ 
++#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
++#include <windows.h>
++#endif
++
+ using namespace heif;
+ 
+ void heif_unload_all_plugins();
+@@ -115,9 +120,7 @@ static void heif_unregister_encoder_plugins()
+   heif::s_encoder_descriptors.clear();
+ }
+ 
+-#if defined(__linux__) && ENABLE_PLUGIN_LOADING
+-
+-// Currently only linux, as we don't have dynamic plugins for other systems yet.
++#if ENABLE_PLUGIN_LOADING
+ void heif_unregister_encoder_plugin(const heif_encoder_plugin* plugin)
+ {
+   if (plugin->cleanup_plugin) {
+@@ -131,7 +134,6 @@ void heif_unregister_encoder_plugin(const heif_encoder_plugin* plugin)
+     }
+   }
+ }
+-
+ #endif
+ 
+ void heif_deinit()
+@@ -162,24 +164,31 @@ void heif_deinit()
+ #include <string>
+ 
+ #if ENABLE_PLUGIN_LOADING
++
++#if __linux__
++typedef void* library_handle;
++#else
++typedef HMODULE library_handle;
++#endif
++
+ struct loaded_plugin
+ {
+-  void* plugin_library_handle = nullptr;
++  library_handle plugin_library_handle{};
+   struct heif_plugin_info* info = nullptr;
+   int openCnt = 0;
+ };
+ 
+ static std::vector<loaded_plugin> sLoadedPlugins;
+ 
+-__attribute__((unused)) static heif_error error_dlopen{heif_error_Plugin_loading_error, heif_suberror_Plugin_loading_error, "Cannot open plugin (dlopen)."};
+-__attribute__((unused)) static heif_error error_plugin_not_loaded{heif_error_Plugin_loading_error, heif_suberror_Plugin_is_not_loaded, "Trying to remove a plugin that is not loaded."};
+-__attribute__((unused)) static heif_error error_cannot_read_plugin_directory{heif_error_Plugin_loading_error, heif_suberror_Cannot_read_plugin_directory, "Cannot read plugin directory."};
++MAYBE_UNUSED static heif_error error_dlopen{heif_error_Plugin_loading_error, heif_suberror_Plugin_loading_error, "Cannot open plugin (dlopen)."};
++MAYBE_UNUSED static heif_error error_plugin_not_loaded{heif_error_Plugin_loading_error, heif_suberror_Plugin_is_not_loaded, "Trying to remove a plugin that is not loaded."};
++MAYBE_UNUSED static heif_error error_cannot_read_plugin_directory{heif_error_Plugin_loading_error, heif_suberror_Cannot_read_plugin_directory, "Cannot read plugin directory."};
+ #endif
+ 
+ 
+ #if ENABLE_PLUGIN_LOADING
+ 
+-__attribute__((unused)) static void unregister_plugin(const heif_plugin_info* info)
++MAYBE_UNUSED static void unregister_plugin(const heif_plugin_info* info)
+ {
+   switch (info->type) {
+     case heif_plugin_type_encoder: {
+@@ -196,8 +205,9 @@ __attribute__((unused)) static void unregister_plugin(const heif_plugin_info* in
+ #endif
+ 
+ 
+-#if ENABLE_PLUGIN_LOADING && defined(__linux__)
++#if ENABLE_PLUGIN_LOADING
+ 
++#if defined(__linux__)
+ #include <dlfcn.h>
+ #include <dirent.h>
+ #include <cstring>
+@@ -263,8 +273,71 @@ struct heif_error heif_load_plugin(const char* filename, struct heif_plugin_info
+ 
+   return heif_error_ok;
+ }
++#else
++struct heif_error heif_load_plugin(const char* filename, struct heif_plugin_info const** out_plugin)
++{
++#if ENABLE_MULTITHREADING_SUPPORT
++  std::lock_guard<std::recursive_mutex> lock(heif_init_mutex());
++#endif
++
++  library_handle plugin_handle = LoadLibraryA(filename);
++  if (!plugin_handle) {
++    fprintf(stderr, "LoadLibraryA error: %lu\n", GetLastError());
++    return error_dlopen;
++  }
++
++  auto* plugin_info = (heif_plugin_info*) GetProcAddress(plugin_handle, "plugin_info");
++  if (!plugin_info) {
++    fprintf(stderr, "GetProcAddress error for dll '%s': %lu\n", filename, GetLastError());
++    return error_dlopen;
++  }
++
++  // --- check whether the plugin is already loaded
++  // If yes, return pointer to existing plugin.
++
++  for (auto& p : sLoadedPlugins) {
++    if (p.plugin_library_handle == plugin_handle) {
++      if (out_plugin) {
++        *out_plugin = p.info;
++        p.openCnt++;
++        return heif_error_ok;
++      }
++    }
++  }
++
++  loaded_plugin loadedPlugin;
++  loadedPlugin.plugin_library_handle = plugin_handle;
++  loadedPlugin.openCnt = 1;
++  loadedPlugin.info = plugin_info;
++  sLoadedPlugins.push_back(loadedPlugin);
++
++  *out_plugin = plugin_info;
++
++  switch (plugin_info->type) {
++    case heif_plugin_type_encoder: {
++      auto* encoder_plugin = static_cast<const heif_encoder_plugin*>(plugin_info->plugin);
++      struct heif_error err = heif_register_encoder_plugin(encoder_plugin);
++      if (err.code) {
++        return err;
++      }
++      break;
++    }
+ 
++    case heif_plugin_type_decoder: {
++      auto* decoder_plugin = static_cast<const heif_decoder_plugin*>(plugin_info->plugin);
++      struct heif_error err = heif_register_decoder_plugin(decoder_plugin);
++      if (err.code) {
++        return err;
++      }
++      break;
++    }
++  }
++
++  return heif_error_ok;
++}
++#endif
+ 
++#if defined(__linux__)
+ struct heif_error heif_unload_plugin(const struct heif_plugin_info* plugin)
+ {
+ #if ENABLE_MULTITHREADING_SUPPORT
+@@ -291,8 +364,36 @@ struct heif_error heif_unload_plugin(const struct heif_plugin_info* plugin)
+ 
+   return error_plugin_not_loaded;
+ }
++#else
++struct heif_error heif_unload_plugin(const struct heif_plugin_info* plugin)
++{
++#if ENABLE_MULTITHREADING_SUPPORT
++  std::lock_guard<std::recursive_mutex> lock(heif_init_mutex());
++#endif
++
++  for (size_t i = 0; i < sLoadedPlugins.size(); i++) {
++    auto& p = sLoadedPlugins[i];
++
++    if (p.info == plugin) {
++      FreeLibrary(p.plugin_library_handle);
++      p.openCnt--;
++
++      if (p.openCnt == 0) {
++        unregister_plugin(plugin);
++
++        sLoadedPlugins[i] = sLoadedPlugins.back();
++        sLoadedPlugins.pop_back();
++      }
++
++      return heif_error_ok;
++    }
++  }
+ 
++  return error_plugin_not_loaded;
++}
++#endif
+ 
++#if defined(__linux__)
+ void heif_unload_all_plugins()
+ {
+ #if ENABLE_MULTITHREADING_SUPPORT
+@@ -309,8 +410,26 @@ void heif_unload_all_plugins()
+ 
+   sLoadedPlugins.clear();
+ }
++#else
++void heif_unload_all_plugins()
++{
++#if ENABLE_MULTITHREADING_SUPPORT
++  std::lock_guard<std::recursive_mutex> lock(heif_init_mutex());
++#endif
++
++  for (auto& p : sLoadedPlugins) {
++    unregister_plugin(p.info);
+ 
++    for (int i = 0; i < p.openCnt; i++) {
++      FreeLibrary(p.plugin_library_handle);
++    }
++  }
++
++  sLoadedPlugins.clear();
++}
++#endif
+ 
++#if defined(__linux__)
+ struct heif_error heif_load_plugins(const char* directory,
+                                     const struct heif_plugin_info** out_plugins,
+                                     int* out_nPluginsLoaded,
+@@ -365,8 +484,65 @@ struct heif_error heif_load_plugins(const char* directory,
+ 
+   return heif_error_ok;
+ }
++#else
++struct heif_error heif_load_plugins(const char* directory,
++                                    const struct heif_plugin_info** out_plugins,
++                                    int* out_nPluginsLoaded,
++                                    int output_array_size)
++{
++  HANDLE hFind;
++  WIN32_FIND_DATA FindFileData;
++
++  std::string findPattern{directory};
++  findPattern += "\\*.dll";
++
++#if 0
++  DIR* dir = opendir(directory);
++  if (dir == nullptr) {
++    return error_cannot_read_plugin_directory;
++  }
++#endif
++
++  int nPlugins = 0;
++
++  if ((hFind = FindFirstFile(findPattern.c_str(), &FindFileData)) != INVALID_HANDLE_VALUE) {
++    do {
++      std::string filename = directory;
++      filename += '/';
++      filename += FindFileData.cFileName;
++
++      const struct heif_plugin_info* info = nullptr;
++      auto err = heif_load_plugin(filename.c_str(), &info);
++      if (err.code == 0) {
++        if (out_plugins) {
++          if (nPlugins == output_array_size) {
++            break;
++          }
++
++          out_plugins[nPlugins] = info;
++        }
++
++        nPlugins++;
++      }
++
++    } while (FindNextFile(hFind, &FindFileData));
+ 
++    FindClose(hFind);
++  }
++
++  if (nPlugins < output_array_size && out_plugins) {
++    out_plugins[nPlugins] = nullptr;
++  }
++
++  if (out_nPluginsLoaded) {
++    *out_nPluginsLoaded = nPlugins;
++  }
++
++  return heif_error_ok;
++}
++#endif
+ 
++#if defined(__linux__)
+ std::vector<std::string> get_plugin_paths()
+ {
+   char* path_variable = getenv("LIBHEIF_PLUGIN_PATH");
+@@ -386,6 +562,27 @@ std::vector<std::string> get_plugin_paths()
+ 
+   return plugin_paths;
+ }
++#else
++std::vector<std::string> get_plugin_paths()
++{
++  char* path_variable = getenv("LIBHEIF_PLUGIN_PATH");
++  if (path_variable == nullptr) {
++    return {};
++  }
++
++  // --- split LIBHEIF_PLUGIN_PATH value at ':' into separate directories
++
++  std::vector<std::string> plugin_paths;
++
++  std::istringstream paths(path_variable);
++  std::string dir;
++  while (getline(paths, dir, ';')) {
++    plugin_paths.push_back(dir);
++  }
++
++  return plugin_paths;
++}
++#endif
+ 
+ #else
+ static heif_error heif_error_plugins_unsupported{heif_error_Unsupported_feature, heif_suberror_Unspecified, "Plugins are not supported"};
+diff --git a/libheif/plugins/heif_decoder_aom.h b/libheif/plugins/heif_decoder_aom.h
+index de1e9c5a84..e570c75729 100644
+--- a/libheif/plugins/heif_decoder_aom.h
++++ b/libheif/plugins/heif_decoder_aom.h
+@@ -21,11 +21,13 @@
+ #ifndef LIBHEIF_HEIF_DECODER_AOM_H
+ #define LIBHEIF_HEIF_DECODER_AOM_H
+ 
++#include "libheif/common_utils.h"
++
+ const struct heif_decoder_plugin* get_decoder_plugin_aom();
+ 
+ #if PLUGIN_AOM_DECODER
+ extern "C" {
+-__attribute__((unused)) LIBHEIF_API extern heif_plugin_info plugin_info;
++MAYBE_UNUSED LIBHEIF_API extern heif_plugin_info plugin_info;
+ }
+ #endif
+ 
+diff --git a/libheif/plugins/heif_decoder_dav1d.h b/libheif/plugins/heif_decoder_dav1d.h
+index 9beff47149..5ea2958f51 100644
+--- a/libheif/plugins/heif_decoder_dav1d.h
++++ b/libheif/plugins/heif_decoder_dav1d.h
+@@ -21,11 +21,13 @@
+ #ifndef LIBHEIF_HEIF_DECODER_DAV1D_H
+ #define LIBHEIF_HEIF_DECODER_DAV1D_H
+ 
++#include "libheif/common_utils.h"
++
+ const struct heif_decoder_plugin* get_decoder_plugin_dav1d();
+ 
+ #if PLUGIN_DAV1D
+ extern "C" {
+-__attribute__((unused)) LIBHEIF_API extern heif_plugin_info plugin_info;
++MAYBE_UNUSED LIBHEIF_API extern heif_plugin_info plugin_info;
+ }
+ #endif
+ 
+diff --git a/libheif/plugins/heif_decoder_libde265.h b/libheif/plugins/heif_decoder_libde265.h
+index d023062b0b..5e59da9283 100644
+--- a/libheif/plugins/heif_decoder_libde265.h
++++ b/libheif/plugins/heif_decoder_libde265.h
+@@ -21,11 +21,13 @@
+ #ifndef LIBHEIF_HEIF_DECODER_DE265_H
+ #define LIBHEIF_HEIF_DECODER_DE265_H
+ 
++#include "libheif/common_utils.h"
++
+ const struct heif_decoder_plugin* get_decoder_plugin_libde265();
+ 
+ #if PLUGIN_LIBDE265
+ extern "C" {
+-__attribute__((unused)) LIBHEIF_API extern heif_plugin_info plugin_info;
++MAYBE_UNUSED LIBHEIF_API extern heif_plugin_info plugin_info;
+ }
+ #endif
+ 
+diff --git a/libheif/plugins/heif_encoder_aom.h b/libheif/plugins/heif_encoder_aom.h
+index 0215ec7af6..86ae9f928b 100644
+--- a/libheif/plugins/heif_encoder_aom.h
++++ b/libheif/plugins/heif_encoder_aom.h
+@@ -21,12 +21,13 @@
+ #ifndef LIBHEIF_HEIF_ENCODER_AOM_H
+ #define LIBHEIF_HEIF_ENCODER_AOM_H
+ 
++#include "libheif/common_utils.h"
+ 
+ const struct heif_encoder_plugin* get_encoder_plugin_aom();
+ 
+ #if PLUGIN_AOM_ENCODER
+ extern "C" {
+-__attribute__((unused)) LIBHEIF_API extern heif_plugin_info plugin_info;
++MAYBE_UNUSED LIBHEIF_API extern heif_plugin_info plugin_info;
+ }
+ #endif
+ 
+diff --git a/libheif/plugins/heif_encoder_rav1e.h b/libheif/plugins/heif_encoder_rav1e.h
+index 42648a9a4d..63be47c5e2 100644
+--- a/libheif/plugins/heif_encoder_rav1e.h
++++ b/libheif/plugins/heif_encoder_rav1e.h
+@@ -21,12 +21,13 @@
+ #ifndef LIBHEIF_HEIF_ENCODER_RAV1E_H
+ #define LIBHEIF_HEIF_ENCODER_RAV1E_H
+ 
++#include "libheif/common_utils.h"
+ 
+ const struct heif_encoder_plugin* get_encoder_plugin_rav1e();
+ 
+ #if PLUGIN_RAV1E
+ extern "C" {
+-__attribute__((unused)) LIBHEIF_API extern heif_plugin_info plugin_info;
++MAYBE_UNUSED LIBHEIF_API extern heif_plugin_info plugin_info;
+ }
+ #endif
+ 
+diff --git a/libheif/plugins/heif_encoder_svt.h b/libheif/plugins/heif_encoder_svt.h
+index 2db1662567..769c358760 100644
+--- a/libheif/plugins/heif_encoder_svt.h
++++ b/libheif/plugins/heif_encoder_svt.h
+@@ -21,12 +21,13 @@
+ #ifndef LIBHEIF_HEIF_ENCODER_SVT_H
+ #define LIBHEIF_HEIF_ENCODER_SVT_H
+ 
++#include "libheif/common_utils.h"
+ 
+ const struct heif_encoder_plugin* get_encoder_plugin_svt();
+ 
+ #if PLUGIN_SvtEnc
+ extern "C" {
+-__attribute__((unused)) LIBHEIF_API extern heif_plugin_info plugin_info;
++MAYBE_UNUSED LIBHEIF_API extern heif_plugin_info plugin_info;
+ }
+ #endif
+ 
+diff --git a/libheif/plugins/heif_encoder_x265.h b/libheif/plugins/heif_encoder_x265.h
+index b997a14c0b..c7a6eaef20 100644
+--- a/libheif/plugins/heif_encoder_x265.h
++++ b/libheif/plugins/heif_encoder_x265.h
+@@ -21,6 +21,7 @@
+ #ifndef LIBHEIF_HEIF_ENCODER_X265_H
+ #define LIBHEIF_HEIF_ENCODER_X265_H
+ 
++#include "libheif/common_utils.h"
+ 
+ /* Image sizes in HEVC: since HEVC does not allow for odd image dimensions when
+    using chroma 4:2:0, our strategy is as follows.
+@@ -37,7 +38,7 @@ const struct heif_encoder_plugin* get_encoder_plugin_x265();
+ 
+ #if PLUGIN_X265
+ extern "C" {
+-__attribute__((unused)) LIBHEIF_API extern heif_plugin_info plugin_info;
++MAYBE_UNUSED LIBHEIF_API extern heif_plugin_info plugin_info;
+ }
+ #endif
+ 
+
+From 2907ff77e87ceb16acc80e765257611d1f45706b Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 16:10:56 +0100
+Subject: [PATCH 02/10] separate system-specific code into their own files
+ (WIP)
+
+---
+ libheif/CMakeLists.txt     |  6 ++++
+ libheif/heif_init.cc       | 59 +++++++-------------------------------
+ libheif/heif_init.h        | 15 ++++++++++
+ libheif/plugins_unix.cc    | 43 +++++++++++++++++++++++++++
+ libheif/plugins_unix.h     | 29 +++++++++++++++++++
+ libheif/plugins_windows.cc | 43 +++++++++++++++++++++++++++
+ libheif/plugins_windows.h  | 30 +++++++++++++++++++
+ 7 files changed, 177 insertions(+), 48 deletions(-)
+ create mode 100644 libheif/plugins_unix.cc
+ create mode 100644 libheif/plugins_unix.h
+ create mode 100644 libheif/plugins_windows.cc
+ create mode 100644 libheif/plugins_windows.h
+
+diff --git a/libheif/CMakeLists.txt b/libheif/CMakeLists.txt
+index 4c00991480..02b185826e 100644
+--- a/libheif/CMakeLists.txt
++++ b/libheif/CMakeLists.txt
+@@ -44,6 +44,12 @@ add_library(heif
+     ${libheif_headers}
+     )
+ 
++if (UNIX OR MINGW)
++    target_sources(heif PRIVATE plugins_unix.cc plugins_unix.h)
++else ()
++    target_sources(heif PRIVATE plugins_windows.cc plugins_windows.h)
++endif ()
++
+ # Needed to find libheif/heif_version.h while compiling the library
+ target_include_directories(heif PRIVATE ${libheif_BINARY_DIR} ${libheif_SOURCE_DIR})
+ 
+diff --git a/libheif/heif_init.cc b/libheif/heif_init.cc
+index 701017dbe4..c7911c22ea 100644
+--- a/libheif/heif_init.cc
++++ b/libheif/heif_init.cc
+@@ -30,6 +30,9 @@
+ 
+ #if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
+ #include <windows.h>
++#include "plugins_windows.h"
++#else
++#include "plugins_unix.h"
+ #endif
+ 
+ using namespace heif;
+@@ -40,7 +43,14 @@ void heif_unload_all_plugins();
+ 
+ void heif_unregister_encoder_plugin(const heif_encoder_plugin* plugin);
+ 
+-std::vector<std::string> get_plugin_paths();
++std::vector<std::string> get_plugin_paths()
++{
++#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
++  return get_plugin_directories_from_environment_variable_windows();
++#else
++  return get_plugin_directories_from_environment_variable_unix();
++#endif
++}
+ 
+ #endif
+ 
+@@ -542,48 +552,6 @@ struct heif_error heif_load_plugins(const char* directory,
+ }
+ #endif
+ 
+-#if defined(__linux__)
+-std::vector<std::string> get_plugin_paths()
+-{
+-  char* path_variable = getenv("LIBHEIF_PLUGIN_PATH");
+-  if (path_variable == nullptr) {
+-    return {};
+-  }
+-
+-  // --- split LIBHEIF_PLUGIN_PATH value at ':' into separate directories
+-
+-  std::vector<std::string> plugin_paths;
+-
+-  std::istringstream paths(path_variable);
+-  std::string dir;
+-  while (getline(paths, dir, ':')) {
+-    plugin_paths.push_back(dir);
+-  }
+-
+-  return plugin_paths;
+-}
+-#else
+-std::vector<std::string> get_plugin_paths()
+-{
+-  char* path_variable = getenv("LIBHEIF_PLUGIN_PATH");
+-  if (path_variable == nullptr) {
+-    return {};
+-  }
+-
+-  // --- split LIBHEIF_PLUGIN_PATH value at ':' into separate directories
+-
+-  std::vector<std::string> plugin_paths;
+-
+-  std::istringstream paths(path_variable);
+-  std::string dir;
+-  while (getline(paths, dir, ';')) {
+-    plugin_paths.push_back(dir);
+-  }
+-
+-  return plugin_paths;
+-}
+-#endif
+-
+ #else
+ static heif_error heif_error_plugins_unsupported{heif_error_Unsupported_feature, heif_suberror_Unspecified, "Plugins are not supported"};
+ 
+@@ -609,9 +577,4 @@ struct heif_error heif_load_plugins(const char* directory,
+   return heif_error_plugins_unsupported;
+ }
+ 
+-std::vector<std::string> get_plugin_paths()
+-{
+-  return {};
+-}
+-
+ #endif
+diff --git a/libheif/heif_init.h b/libheif/heif_init.h
+index dfb07d592e..d94353a534 100644
+--- a/libheif/heif_init.h
++++ b/libheif/heif_init.h
+@@ -22,10 +22,25 @@
+ #ifndef LIBHEIF_HEIF_INIT_H
+ #define LIBHEIF_HEIF_INIT_H
+ 
++#include "libheif/heif.h"
++
++
+ namespace heif {
+   // TODO: later, we might defer the default plugin initialization to when they are actually used for the first time.
+   // That would prevent them from being initialized every time at program start, even when the application software uses heif_init() later on.
+ 
++  class PluginLibrary
++  {
++  public:
++    virtual ~PluginLibrary() = default;
++
++    virtual struct heif_error load_from_file(const char*) = 0;
++
++    virtual void release() = 0;
++
++    virtual struct heif_plugin_info* get_plugin_info() = 0;
++  };
++
+   // void implicit_plugin_registration();
+ }
+ 
+diff --git a/libheif/plugins_unix.cc b/libheif/plugins_unix.cc
+new file mode 100644
+index 0000000000..f64584d5c8
+--- /dev/null
++++ b/libheif/plugins_unix.cc
+@@ -0,0 +1,43 @@
++/*
++ * HEIF codec.
++ * Copyright (c) 2023 Dirk Farin <dirk.farin@gmail.com>
++ *
++ * This file is part of libheif.
++ *
++ * libheif is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation, either version 3 of
++ * the License, or (at your option) any later version.
++ *
++ * libheif is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with libheif.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++
++#include "plugins_unix.h"
++#include <sstream>
++
++std::vector<std::string> get_plugin_directories_from_environment_variable_unix()
++{
++  char* path_variable = getenv("LIBHEIF_PLUGIN_PATH");
++  if (path_variable == nullptr) {
++    return {};
++  }
++
++  // --- split LIBHEIF_PLUGIN_PATH value at ':' into separate directories
++
++  std::vector<std::string> plugin_paths;
++
++  std::istringstream paths(path_variable);
++  std::string dir;
++  while (getline(paths, dir, ':')) {
++    plugin_paths.push_back(dir);
++  }
++
++  return plugin_paths;
++}
+diff --git a/libheif/plugins_unix.h b/libheif/plugins_unix.h
+new file mode 100644
+index 0000000000..3fdb167212
+--- /dev/null
++++ b/libheif/plugins_unix.h
+@@ -0,0 +1,29 @@
++/*
++ * HEIF codec.
++ * Copyright (c) 2023 Dirk Farin <dirk.farin@gmail.com>
++ *
++ * This file is part of libheif.
++ *
++ * libheif is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation, either version 3 of
++ * the License, or (at your option) any later version.
++ *
++ * libheif is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with libheif.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef LIBHEIF_PLUGINS_UNIX_H
++#define LIBHEIF_PLUGINS_UNIX_H
++
++#include <vector>
++#include <string>
++
++std::vector<std::string> get_plugin_directories_from_environment_variable_unix();
++
++#endif //LIBHEIF_PLUGINS_UNIX_H
+diff --git a/libheif/plugins_windows.cc b/libheif/plugins_windows.cc
+new file mode 100644
+index 0000000000..b3488eee64
+--- /dev/null
++++ b/libheif/plugins_windows.cc
+@@ -0,0 +1,43 @@
++/*
++ * HEIF codec.
++ * Copyright (c) 2023 Dirk Farin <dirk.farin@gmail.com>
++ *
++ * This file is part of libheif.
++ *
++ * libheif is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation, either version 3 of
++ * the License, or (at your option) any later version.
++ *
++ * libheif is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with libheif.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++
++#include "plugins_windows.h"
++#include <sstream>
++
++std::vector<std::string> get_plugin_directories_from_environment_variable_windows()
++{
++  char* path_variable = getenv("LIBHEIF_PLUGIN_PATH");
++  if (path_variable == nullptr) {
++    return {};
++  }
++
++  // --- split LIBHEIF_PLUGIN_PATH value at ';' into separate directories
++
++  std::vector<std::string> plugin_paths;
++
++  std::istringstream paths(path_variable);
++  std::string dir;
++  while (getline(paths, dir, ';')) {
++    plugin_paths.push_back(dir);
++  }
++
++  return plugin_paths;
++}
+diff --git a/libheif/plugins_windows.h b/libheif/plugins_windows.h
+new file mode 100644
+index 0000000000..6980d75dd1
+--- /dev/null
++++ b/libheif/plugins_windows.h
+@@ -0,0 +1,30 @@
++/*
++ * HEIF codec.
++ * Copyright (c) 2023 Dirk Farin <dirk.farin@gmail.com>
++ *
++ * This file is part of libheif.
++ *
++ * libheif is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation, either version 3 of
++ * the License, or (at your option) any later version.
++ *
++ * libheif is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with libheif.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++
++#ifndef LIBHEIF_PLUGINS_WINDOWS_H
++#define LIBHEIF_PLUGINS_WINDOWS_H
++
++#include <vector>
++#include <string>
++
++std::vector<std::string> get_plugin_directories_from_environment_variable_windows();
++
++#endif //LIBHEIF_PLUGINS_WINDOWS_H
+
+From ff8f185b7c1a7d085d99ebc07b9e0dab64cb24f9 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 16:53:51 +0100
+Subject: [PATCH 03/10] avoid duplicate code by factoring out the
+ system-dependent parts
+
+---
+ libheif/heif_init.cc       | 271 ++++++-------------------------------
+ libheif/heif_init.h        |   7 +-
+ libheif/plugins_unix.cc    |  66 +++++++++
+ libheif/plugins_unix.h     |  23 ++++
+ libheif/plugins_windows.cc |  68 ++++++++++
+ libheif/plugins_windows.h  |  26 ++++
+ 6 files changed, 227 insertions(+), 234 deletions(-)
+
+diff --git a/libheif/heif_init.cc b/libheif/heif_init.cc
+index c7911c22ea..1429f7ab7b 100644
+--- a/libheif/heif_init.cc
++++ b/libheif/heif_init.cc
+@@ -52,6 +52,15 @@ std::vector<std::string> get_plugin_paths()
+ #endif
+ }
+ 
++std::vector<std::string> list_all_potential_plugins_in_directory(const char* directory)
++{
++#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
++  return list_all_potential_plugins_in_directory_windows(directory);
++#else
++  return list_all_potential_plugins_in_directory_unix(directory);
++#endif
++}
++
+ #endif
+ 
+ 
+@@ -175,28 +184,26 @@ void heif_deinit()
+ 
+ #if ENABLE_PLUGIN_LOADING
+ 
+-#if __linux__
+-typedef void* library_handle;
++#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
++typedef PluginLibrary_Windows PluginLibrary_SysDep;
+ #else
+-typedef HMODULE library_handle;
++typedef PluginLibrary_Unix PluginLibrary_SysDep;
+ #endif
+ 
++
++
+ struct loaded_plugin
+ {
+-  library_handle plugin_library_handle{};
++  PluginLibrary_SysDep plugin_library_handle;
+   struct heif_plugin_info* info = nullptr;
+   int openCnt = 0;
+ };
+ 
+ static std::vector<loaded_plugin> sLoadedPlugins;
+ 
+-MAYBE_UNUSED static heif_error error_dlopen{heif_error_Plugin_loading_error, heif_suberror_Plugin_loading_error, "Cannot open plugin (dlopen)."};
+-MAYBE_UNUSED static heif_error error_plugin_not_loaded{heif_error_Plugin_loading_error, heif_suberror_Plugin_is_not_loaded, "Trying to remove a plugin that is not loaded."};
+-MAYBE_UNUSED static heif_error error_cannot_read_plugin_directory{heif_error_Plugin_loading_error, heif_suberror_Cannot_read_plugin_directory, "Cannot read plugin directory."};
+-#endif
+-
+-
+-#if ENABLE_PLUGIN_LOADING
++MAYBE_UNUSED heif_error error_dlopen{heif_error_Plugin_loading_error, heif_suberror_Plugin_loading_error, "Cannot open plugin (dlopen)."};
++MAYBE_UNUSED heif_error error_plugin_not_loaded{heif_error_Plugin_loading_error, heif_suberror_Plugin_is_not_loaded, "Trying to remove a plugin that is not loaded."};
++MAYBE_UNUSED heif_error error_cannot_read_plugin_directory{heif_error_Plugin_loading_error, heif_suberror_Cannot_read_plugin_directory, "Cannot read plugin directory."};
+ 
+ MAYBE_UNUSED static void unregister_plugin(const heif_plugin_info* info)
+ {
+@@ -212,101 +219,26 @@ MAYBE_UNUSED static void unregister_plugin(const heif_plugin_info* info)
+   }
+ }
+ 
+-#endif
+-
+-
+-#if ENABLE_PLUGIN_LOADING
+-
+-#if defined(__linux__)
+-#include <dlfcn.h>
+-#include <dirent.h>
+-#include <cstring>
+-
+-struct heif_error heif_load_plugin(const char* filename, struct heif_plugin_info const** out_plugin)
+-{
+-#if ENABLE_MULTITHREADING_SUPPORT
+-  std::lock_guard<std::recursive_mutex> lock(heif_init_mutex());
+-#endif
+-
+-  void* plugin_handle = dlopen(filename, RTLD_LAZY);
+-  if (!plugin_handle) {
+-    fprintf(stderr, "dlopen: %s\n", dlerror());
+-    return error_dlopen;
+-  }
+-
+-  auto* plugin_info = (heif_plugin_info*) dlsym(plugin_handle, "plugin_info");
+-  if (!plugin_info) {
+-    fprintf(stderr, "dlsym: %s\n", dlerror());
+-    return error_dlopen;
+-  }
+-
+-  // --- check whether the plugin is already loaded
+-  // If yes, return pointer to existing plugin.
+-
+-  for (auto& p : sLoadedPlugins) {
+-    if (p.plugin_library_handle == plugin_handle) {
+-      if (out_plugin) {
+-        *out_plugin = p.info;
+-        p.openCnt++;
+-        return heif_error_ok;
+-      }
+-    }
+-  }
+-
+-  loaded_plugin loadedPlugin;
+-  loadedPlugin.plugin_library_handle = plugin_handle;
+-  loadedPlugin.openCnt = 1;
+-  loadedPlugin.info = plugin_info;
+-  sLoadedPlugins.push_back(loadedPlugin);
+-
+-  *out_plugin = plugin_info;
+-
+-  switch (plugin_info->type) {
+-    case heif_plugin_type_encoder: {
+-      auto* encoder_plugin = static_cast<const heif_encoder_plugin*>(plugin_info->plugin);
+-      struct heif_error err = heif_register_encoder_plugin(encoder_plugin);
+-      if (err.code) {
+-        return err;
+-      }
+-      break;
+-    }
+-
+-    case heif_plugin_type_decoder: {
+-      auto* decoder_plugin = static_cast<const heif_decoder_plugin*>(plugin_info->plugin);
+-      struct heif_error err = heif_register_decoder_plugin(decoder_plugin);
+-      if (err.code) {
+-        return err;
+-      }
+-      break;
+-    }
+-  }
+ 
+-  return heif_error_ok;
+-}
+-#else
+ struct heif_error heif_load_plugin(const char* filename, struct heif_plugin_info const** out_plugin)
+ {
+ #if ENABLE_MULTITHREADING_SUPPORT
+   std::lock_guard<std::recursive_mutex> lock(heif_init_mutex());
+ #endif
+ 
+-  library_handle plugin_handle = LoadLibraryA(filename);
+-  if (!plugin_handle) {
+-    fprintf(stderr, "LoadLibraryA error: %lu\n", GetLastError());
+-    return error_dlopen;
++  PluginLibrary_SysDep plugin;
++  auto err = plugin.load_from_file(filename);
++  if (err.code) {
++    return err;
+   }
+ 
+-  auto* plugin_info = (heif_plugin_info*) GetProcAddress(plugin_handle, "plugin_info");
+-  if (!plugin_info) {
+-    fprintf(stderr, "GetProcAddress error for dll '%s': %lu\n", filename, GetLastError());
+-    return error_dlopen;
+-  }
++  heif_plugin_info* plugin_info = plugin.get_plugin_info();
+ 
+   // --- check whether the plugin is already loaded
+   // If yes, return pointer to existing plugin.
+ 
+   for (auto& p : sLoadedPlugins) {
+-    if (p.plugin_library_handle == plugin_handle) {
++    if (p.plugin_library_handle == plugin) {
+       if (out_plugin) {
+         *out_plugin = p.info;
+         p.openCnt++;
+@@ -316,14 +248,14 @@ struct heif_error heif_load_plugin(const char* filename, struct heif_plugin_info
+   }
+ 
+   loaded_plugin loadedPlugin;
+-  loadedPlugin.plugin_library_handle = plugin_handle;
++  loadedPlugin.plugin_library_handle = plugin;
+   loadedPlugin.openCnt = 1;
+   loadedPlugin.info = plugin_info;
+   sLoadedPlugins.push_back(loadedPlugin);
+ 
+   *out_plugin = plugin_info;
+ 
+-  switch (plugin_info->type) {
++  switch (loadedPlugin.info->type) {
+     case heif_plugin_type_encoder: {
+       auto* encoder_plugin = static_cast<const heif_encoder_plugin*>(plugin_info->plugin);
+       struct heif_error err = heif_register_encoder_plugin(encoder_plugin);
+@@ -345,9 +277,7 @@ struct heif_error heif_load_plugin(const char* filename, struct heif_plugin_info
+ 
+   return heif_error_ok;
+ }
+-#endif
+ 
+-#if defined(__linux__)
+ struct heif_error heif_unload_plugin(const struct heif_plugin_info* plugin)
+ {
+ #if ENABLE_MULTITHREADING_SUPPORT
+@@ -358,7 +288,7 @@ struct heif_error heif_unload_plugin(const struct heif_plugin_info* plugin)
+     auto& p = sLoadedPlugins[i];
+ 
+     if (p.info == plugin) {
+-      dlclose(p.plugin_library_handle);
++      p.plugin_library_handle.release();
+       p.openCnt--;
+ 
+       if (p.openCnt == 0) {
+@@ -374,36 +304,7 @@ struct heif_error heif_unload_plugin(const struct heif_plugin_info* plugin)
+ 
+   return error_plugin_not_loaded;
+ }
+-#else
+-struct heif_error heif_unload_plugin(const struct heif_plugin_info* plugin)
+-{
+-#if ENABLE_MULTITHREADING_SUPPORT
+-  std::lock_guard<std::recursive_mutex> lock(heif_init_mutex());
+-#endif
+-
+-  for (size_t i = 0; i < sLoadedPlugins.size(); i++) {
+-    auto& p = sLoadedPlugins[i];
+-
+-    if (p.info == plugin) {
+-      FreeLibrary(p.plugin_library_handle);
+-      p.openCnt--;
+-
+-      if (p.openCnt == 0) {
+-        unregister_plugin(plugin);
+-
+-        sLoadedPlugins[i] = sLoadedPlugins.back();
+-        sLoadedPlugins.pop_back();
+-      }
+-
+-      return heif_error_ok;
+-    }
+-  }
+-
+-  return error_plugin_not_loaded;
+-}
+-#endif
+ 
+-#if defined(__linux__)
+ void heif_unload_all_plugins()
+ {
+ #if ENABLE_MULTITHREADING_SUPPORT
+@@ -414,130 +315,37 @@ void heif_unload_all_plugins()
+     unregister_plugin(p.info);
+ 
+     for (int i = 0; i < p.openCnt; i++) {
+-      dlclose(p.plugin_library_handle);
++      p.plugin_library_handle.release();
+     }
+   }
+ 
+   sLoadedPlugins.clear();
+ }
+-#else
+-void heif_unload_all_plugins()
+-{
+-#if ENABLE_MULTITHREADING_SUPPORT
+-  std::lock_guard<std::recursive_mutex> lock(heif_init_mutex());
+-#endif
+ 
+-  for (auto& p : sLoadedPlugins) {
+-    unregister_plugin(p.info);
+-
+-    for (int i = 0; i < p.openCnt; i++) {
+-      FreeLibrary(p.plugin_library_handle);
+-    }
+-  }
+-
+-  sLoadedPlugins.clear();
+-}
+-#endif
+-
+-#if defined(__linux__)
+ struct heif_error heif_load_plugins(const char* directory,
+                                     const struct heif_plugin_info** out_plugins,
+                                     int* out_nPluginsLoaded,
+                                     int output_array_size)
+ {
+-  DIR* dir = opendir(directory);
+-  if (dir == nullptr) {
+-    return error_cannot_read_plugin_directory;
+-  }
++  auto libraryFiles = list_all_potential_plugins_in_directory(directory);
+ 
+   int nPlugins = 0;
+ 
+-  struct dirent* d;
+-  for (;;) {
+-    d = readdir(dir);
+-    if (d == nullptr) {
+-      break;
+-    }
++  for (const auto& filename : libraryFiles) {
+ 
+-    if ((d->d_type == DT_REG || d->d_type == DT_LNK) && strlen(d->d_name) > 3 &&
+-        strcmp(d->d_name + strlen(d->d_name) - 3, ".so") == 0) {
+-      std::string filename = directory;
+-      filename += '/';
+-      filename += d->d_name;
+-      //printf("load %s\n", filename.c_str());
+-
+-      const struct heif_plugin_info* info = nullptr;
+-      auto err = heif_load_plugin(filename.c_str(), &info);
+-      if (err.code == 0) {
+-        if (out_plugins) {
+-          if (nPlugins == output_array_size) {
+-            break;
+-          }
+-
+-          out_plugins[nPlugins] = info;
++    const struct heif_plugin_info* info = nullptr;
++    auto err = heif_load_plugin(filename.c_str(), &info);
++    if (err.code == 0) {
++      if (out_plugins) {
++        if (nPlugins == output_array_size) {
++          break;
+         }
+ 
+-        nPlugins++;
++        out_plugins[nPlugins] = info;
+       }
+-    }
+-  }
+-
+-  if (nPlugins < output_array_size && out_plugins) {
+-    out_plugins[nPlugins] = nullptr;
+-  }
+ 
+-  if (out_nPluginsLoaded) {
+-    *out_nPluginsLoaded = nPlugins;
+-  }
+-
+-  closedir(dir);
+-
+-  return heif_error_ok;
+-}
+-#else
+-struct heif_error heif_load_plugins(const char* directory,
+-                                    const struct heif_plugin_info** out_plugins,
+-                                    int* out_nPluginsLoaded,
+-                                    int output_array_size)
+-{
+-  HANDLE hFind;
+-  WIN32_FIND_DATA FindFileData;
+-
+-  std::string findPattern{directory};
+-  findPattern += "\\*.dll";
+-
+-#if 0
+-  DIR* dir = opendir(directory);
+-  if (dir == nullptr) {
+-    return error_cannot_read_plugin_directory;
+-  }
+-#endif
+-
+-  int nPlugins = 0;
+-
+-  if ((hFind = FindFirstFile(findPattern.c_str(), &FindFileData)) != INVALID_HANDLE_VALUE) {
+-    do {
+-      std::string filename = directory;
+-      filename += '/';
+-      filename += FindFileData.cFileName;
+-
+-      const struct heif_plugin_info* info = nullptr;
+-      auto err = heif_load_plugin(filename.c_str(), &info);
+-      if (err.code == 0) {
+-        if (out_plugins) {
+-          if (nPlugins == output_array_size) {
+-            break;
+-          }
+-
+-          out_plugins[nPlugins] = info;
+-        }
+-
+-        nPlugins++;
+-      }
+-
+-    } while (FindNextFile(hFind, &FindFileData));
+-
+-    FindClose(hFind);
++      nPlugins++;
++    }
+   }
+ 
+   if (nPlugins < output_array_size && out_plugins) {
+@@ -550,7 +358,6 @@ struct heif_error heif_load_plugins(const char* directory,
+ 
+   return heif_error_ok;
+ }
+-#endif
+ 
+ #else
+ static heif_error heif_error_plugins_unsupported{heif_error_Unsupported_feature, heif_suberror_Unspecified, "Plugins are not supported"};
+diff --git a/libheif/heif_init.h b/libheif/heif_init.h
+index d94353a534..8f41542fc5 100644
+--- a/libheif/heif_init.h
++++ b/libheif/heif_init.h
+@@ -24,16 +24,19 @@
+ 
+ #include "libheif/heif.h"
+ 
++extern heif_error error_dlopen;
++extern heif_error error_plugin_not_loaded;
++extern heif_error error_cannot_read_plugin_directory;
+ 
+ namespace heif {
+   // TODO: later, we might defer the default plugin initialization to when they are actually used for the first time.
+   // That would prevent them from being initialized every time at program start, even when the application software uses heif_init() later on.
+ 
++  // Note: the loaded plugin is not released automatically then the class is released, because this would require that
++  // we reference-count the handle. We do not really need this since releasing the library explicitly with release() is simple enough.
+   class PluginLibrary
+   {
+   public:
+-    virtual ~PluginLibrary() = default;
+-
+     virtual struct heif_error load_from_file(const char*) = 0;
+ 
+     virtual void release() = 0;
+diff --git a/libheif/plugins_unix.cc b/libheif/plugins_unix.cc
+index f64584d5c8..1b2dd07ce1 100644
+--- a/libheif/plugins_unix.cc
++++ b/libheif/plugins_unix.cc
+@@ -22,6 +22,10 @@
+ #include "plugins_unix.h"
+ #include <sstream>
+ 
++#include <dlfcn.h>
++#include <dirent.h>
++#include <cstring>
++
+ std::vector<std::string> get_plugin_directories_from_environment_variable_unix()
+ {
+   char* path_variable = getenv("LIBHEIF_PLUGIN_PATH");
+@@ -41,3 +45,65 @@ std::vector<std::string> get_plugin_directories_from_environment_variable_unix()
+ 
+   return plugin_paths;
+ }
++
++
++std::vector<std::string> list_all_potential_plugins_in_directory_unix(const char* directory)
++{
++  std::vector<std::string> result;
++
++  DIR* dir = opendir(directory);
++  if (dir == nullptr) {
++    return {}; // TODO: return error_cannot_read_plugin_directory;
++  }
++
++  int nPlugins = 0;
++
++  struct dirent* d;
++  for (;;) {
++    d = readdir(dir);
++    if (d == nullptr) {
++      break;
++    }
++
++    if ((d->d_type == DT_REG || d->d_type == DT_LNK) && strlen(d->d_name) > 3 &&
++        strcmp(d->d_name + strlen(d->d_name) - 3, ".so") == 0) {
++      std::string filename = directory;
++      filename += '/';
++      filename += d->d_name;
++      //printf("load %s\n", filename.c_str());
++
++      result.push_back(filename);
++    }
++  }
++
++  closedir(dir);
++
++  return result;
++}
++
++
++heif_error heif::PluginLibrary_Unix::load_from_file(const char* filename)
++{
++  m_library_handle = dlopen(filename, RTLD_LAZY);
++  if (!m_library_handle) {
++    fprintf(stderr, "dlopen: %s\n", dlerror());
++    return error_dlopen;
++  }
++
++  m_plugin_info = (heif_plugin_info*) dlsym(m_library_handle, "plugin_info");
++  if (!m_plugin_info) {
++    fprintf(stderr, "dlsym: %s\n", dlerror());
++    return error_dlopen;
++  }
++
++  return heif_error_ok;
++}
++
++void heif::PluginLibrary_Unix::release()
++{
++  if (m_library_handle) {
++    dlclose(m_library_handle);
++    m_library_handle = nullptr;
++  }
++}
++
+diff --git a/libheif/plugins_unix.h b/libheif/plugins_unix.h
+index 3fdb167212..f5049d9cf4 100644
+--- a/libheif/plugins_unix.h
++++ b/libheif/plugins_unix.h
+@@ -23,7 +23,30 @@
+ 
+ #include <vector>
+ #include <string>
++#include "heif_init.h"
+ 
+ std::vector<std::string> get_plugin_directories_from_environment_variable_unix();
+ 
++std::vector<std::string> list_all_potential_plugins_in_directory_unix(const char*);
++
++namespace heif {
++  class PluginLibrary_Unix : public PluginLibrary
++  {
++  public:
++    heif_error load_from_file(const char* filename) override;
++
++    void release() override;
++
++    heif_plugin_info* get_plugin_info() override
++    { return m_plugin_info; }
++
++    bool operator==(const PluginLibrary_Unix& b) const {
++      return m_library_handle == b.m_library_handle;
++    }
++
++  private:
++    void* m_library_handle = nullptr;
++    heif_plugin_info* m_plugin_info = nullptr;
++  };
++}
+ #endif //LIBHEIF_PLUGINS_UNIX_H
+diff --git a/libheif/plugins_windows.cc b/libheif/plugins_windows.cc
+index b3488eee64..0a831ab281 100644
+--- a/libheif/plugins_windows.cc
++++ b/libheif/plugins_windows.cc
+@@ -20,8 +20,10 @@
+ 
+ 
+ #include "plugins_windows.h"
++#include "heif_plugin.h"
+ #include <sstream>
+ 
++
+ std::vector<std::string> get_plugin_directories_from_environment_variable_windows()
+ {
+   char* path_variable = getenv("LIBHEIF_PLUGIN_PATH");
+@@ -41,3 +43,69 @@ std::vector<std::string> get_plugin_directories_from_environment_variable_window
+ 
+   return plugin_paths;
+ }
++
++
++std::vector<std::string> list_all_potential_plugins_in_directory_windows(const char* directory)
++{
++  std::vector<std::string> result;
++
++  HANDLE hFind;
++  WIN32_FIND_DATA FindFileData;
++
++  std::string findPattern{directory};
++  findPattern += "\\*.dll";
++
++#if 0
++  DIR* dir = opendir(directory);
++  if (dir == nullptr) {
++    return error_cannot_read_plugin_directory;
++  }
++#endif
++
++  int nPlugins = 0;
++
++  if ((hFind = FindFirstFile(findPattern.c_str(), &FindFileData)) != INVALID_HANDLE_VALUE) {
++    do {
++      std::string filename = directory;
++      filename += '/';
++      filename += FindFileData.cFileName;
++
++      result.push_back(filename);
++    } while (FindNextFile(hFind, &FindFileData));
++
++    FindClose(hFind);
++  }
++
++  return result;
++}
++
++
++
++heif_error heif::PluginLibrary_Windows::load_from_file(const char* filename)
++{
++  m_library_handle = LoadLibraryA(filename);
++  if (!m_library_handle) {
++    fprintf(stderr, "LoadLibraryA error: %lu\n", GetLastError());
++    return error_dlopen;
++  }
++
++  m_plugin_info = (heif_plugin_info*) GetProcAddress(m_library_handle, "plugin_info");
++  if (!m_plugin_info) {
++    fprintf(stderr, "GetProcAddress error for dll '%s': %lu\n", filename, GetLastError());
++    return error_dlopen;
++  }
++
++  // Remember filename for comparison whether the plugin was already loaded.
++  // We need this since LoadLibraryA() returns a separate instance if we load the same DLL twice.
++  m_filename = filename;
++
++  return heif_error_ok;
++}
++
++void heif::PluginLibrary_Windows::release()
++{
++  if (m_library_handle) {
++    FreeLibrary(m_library_handle);
++    m_library_handle = nullptr;
++  }
++}
+diff --git a/libheif/plugins_windows.h b/libheif/plugins_windows.h
+index 6980d75dd1..99636842b8 100644
+--- a/libheif/plugins_windows.h
++++ b/libheif/plugins_windows.h
+@@ -24,7 +24,33 @@
+ 
+ #include <vector>
+ #include <string>
++#include "heif_init.h"
++#include <windows.h>
+ 
+ std::vector<std::string> get_plugin_directories_from_environment_variable_windows();
+ 
++std::vector<std::string> list_all_potential_plugins_in_directory_windows(const char*);
++
++namespace heif {
++  class PluginLibrary_Windows : public PluginLibrary
++  {
++  public:
++    heif_error load_from_file(const char* filename) override;
++
++    void release() override;
++
++    heif_plugin_info* get_plugin_info() override
++    { return m_plugin_info; }
++
++    bool operator==(const PluginLibrary_Windows& b) const {
++      return m_filename == b.m_filename;
++    }
++
++  private:
++    std::string m_filename;
++    HMODULE m_library_handle = nullptr;
++    heif_plugin_info* m_plugin_info = nullptr;
++  };
++}
++
+ #endif //LIBHEIF_PLUGINS_WINDOWS_H
+
+From 3feaa9825c493b594bddeb2e003812f3ebb99540 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 16:57:26 +0100
+Subject: [PATCH 04/10] fix Linux compilation
+
+---
+ libheif/plugins_unix.cc | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/libheif/plugins_unix.cc b/libheif/plugins_unix.cc
+index 1b2dd07ce1..9ead31c02f 100644
+--- a/libheif/plugins_unix.cc
++++ b/libheif/plugins_unix.cc
+@@ -20,6 +20,7 @@
+ 
+ 
+ #include "plugins_unix.h"
++#include "heif_plugin.h"
+ #include <sstream>
+ 
+ #include <dlfcn.h>
+@@ -56,8 +57,6 @@ std::vector<std::string> list_all_potential_plugins_in_directory_unix(const char
+     return {}; // TODO: return error_cannot_read_plugin_directory;
+   }
+ 
+-  int nPlugins = 0;
+-
+   struct dirent* d;
+   for (;;) {
+     d = readdir(dir);
+
+From 80641526d5a6aa9e903c0386b8bafa54c3107c80 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 17:35:44 +0100
+Subject: [PATCH 05/10] remove unnecessary windows.h
+
+---
+ libheif/heif_init.cc | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/libheif/heif_init.cc b/libheif/heif_init.cc
+index 1429f7ab7b..8cb904413e 100644
+--- a/libheif/heif_init.cc
++++ b/libheif/heif_init.cc
+@@ -29,7 +29,6 @@
+ #endif
+ 
+ #if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
+-#include <windows.h>
+ #include "plugins_windows.h"
+ #else
+ #include "plugins_unix.h"
+
+From f1dad2b6453ea0a28a47f356673dc8592c82f2b4 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 17:58:25 +0100
+Subject: [PATCH 06/10] simplify Windows/Unix distinction
+
+---
+ libheif/CMakeLists.txt | 6 +++---
+ libheif/heif_init.cc   | 6 +++---
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/libheif/CMakeLists.txt b/libheif/CMakeLists.txt
+index 02b185826e..9da6a7b95a 100644
+--- a/libheif/CMakeLists.txt
++++ b/libheif/CMakeLists.txt
+@@ -44,10 +44,10 @@ add_library(heif
+     ${libheif_headers}
+     )
+ 
+-if (UNIX OR MINGW)
+-    target_sources(heif PRIVATE plugins_unix.cc plugins_unix.h)
+-else ()
++if (WIN32)
+     target_sources(heif PRIVATE plugins_windows.cc plugins_windows.h)
++else ()
++    target_sources(heif PRIVATE plugins_unix.cc plugins_unix.h)
+ endif ()
+ 
+ # Needed to find libheif/heif_version.h while compiling the library
+diff --git a/libheif/heif_init.cc b/libheif/heif_init.cc
+index 8cb904413e..f815ffe3ba 100644
+--- a/libheif/heif_init.cc
++++ b/libheif/heif_init.cc
+@@ -44,7 +44,7 @@ void heif_unregister_encoder_plugin(const heif_encoder_plugin* plugin);
+ 
+ std::vector<std::string> get_plugin_paths()
+ {
+-#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
++#if defined(_WIN32)
+   return get_plugin_directories_from_environment_variable_windows();
+ #else
+   return get_plugin_directories_from_environment_variable_unix();
+@@ -53,7 +53,7 @@ std::vector<std::string> get_plugin_paths()
+ 
+ std::vector<std::string> list_all_potential_plugins_in_directory(const char* directory)
+ {
+-#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
++#if defined(_WIN32)
+   return list_all_potential_plugins_in_directory_windows(directory);
+ #else
+   return list_all_potential_plugins_in_directory_unix(directory);
+@@ -183,7 +183,7 @@ void heif_deinit()
+ 
+ #if ENABLE_PLUGIN_LOADING
+ 
+-#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
++#if defined(_WIN32)
+ typedef PluginLibrary_Windows PluginLibrary_SysDep;
+ #else
+ typedef PluginLibrary_Unix PluginLibrary_SysDep;
+
+From 509b66cea42b45a48cca349ebeb816b23f9868a2 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 18:10:13 +0100
+Subject: [PATCH 07/10] add new header files to Makefile.am to fix CI
+
+---
+ libheif/Makefile.am | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/libheif/Makefile.am b/libheif/Makefile.am
+index 722578ce68..7dba3b20d7 100644
+--- a/libheif/Makefile.am
++++ b/libheif/Makefile.am
+@@ -189,6 +189,9 @@ file_fuzzer_LDFLAGS = $(FUZZING_ENGINE)
+ file_fuzzer_LDADD = $(ADDITIONAL_LIBS)
+ file_fuzzer_SOURCES = $(libheif_la_SOURCES) file_fuzzer.cc
+ 
++# hack, plugin_*.h files are not used by autotools, because our autotools build scripts don't support plugins, but we need it anyways
+ EXTRA_DIST = \
+   CMakeLists.txt \
+-  plugins/CMakeLists.txt
++  plugins/CMakeLists.txt \
++  plugin_unix.h \
++  plugin_windows.h
+
+From 1012899d73a78d8d2e5f2245504e78d912904ecf Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 18:15:04 +0100
+Subject: [PATCH 08/10] simplify Windows/Unix distinction
+
+---
+ libheif/heif_init.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libheif/heif_init.cc b/libheif/heif_init.cc
+index f815ffe3ba..a476c64e55 100644
+--- a/libheif/heif_init.cc
++++ b/libheif/heif_init.cc
+@@ -28,7 +28,7 @@
+ #include <mutex>
+ #endif
+ 
+-#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
++#if defined(_WIN32)
+ #include "plugins_windows.h"
+ #else
+ #include "plugins_unix.h"
+
+From e7182b9fd2b5575bfd7f01010af1bc307593d5d2 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 18:17:43 +0100
+Subject: [PATCH 09/10] README: different LIBHEIF_PLUGIN_PATH format for
+ Windows
+
+---
+ README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/README.md b/README.md
+index abc23d90e1..9339abd321 100644
+--- a/README.md
++++ b/README.md
+@@ -213,7 +213,7 @@ You can choose this individually for each codec backend in the CMake settings.
+ Compiling a codec backend as dynamic plugin will generate a shared library that is installed in the system together with libheif.
+ The advantage is that only the required plugins have to be installed and libheif has fewer dependencies.
+ 
+-The plugins are loaded from the colon-separated list of directories stored in the environment variable `LIBHEIF_PLUGIN_PATH`.
++The plugins are loaded from the colon-separated (semicolon-separated on Windows) list of directories stored in the environment variable `LIBHEIF_PLUGIN_PATH`.
+ If this variable is empty, they are loaded from a directory specified in the CMake configuration.
+ You can also add plugin directories programmatically.
+ 
+
+From 99f6b5d0f0a9ec2476aba5f0209fb66664c3faf0 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Mon, 23 Jan 2023 18:28:15 +0100
+Subject: [PATCH 10/10] fix typo
+
+---
+ libheif/Makefile.am | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/libheif/Makefile.am b/libheif/Makefile.am
+index 7dba3b20d7..521447d001 100644
+--- a/libheif/Makefile.am
++++ b/libheif/Makefile.am
+@@ -193,5 +193,5 @@ file_fuzzer_SOURCES = $(libheif_la_SOURCES) file_fuzzer.cc
+ EXTRA_DIST = \
+   CMakeLists.txt \
+   plugins/CMakeLists.txt \
+-  plugin_unix.h \
+-  plugin_windows.h
++  plugins_unix.h \
++  plugins_windows.h

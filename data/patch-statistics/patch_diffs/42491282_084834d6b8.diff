@@ -1,0 +1,35 @@
+From 5e95d62ffef98eec2164157174d182d8d8b538a4 Mon Sep 17 00:00:00 2001
+From: Andreas Kling <kling@serenityos.org>
+Date: Tue, 5 Jan 2021 14:49:09 +0100
+Subject: [PATCH] LibTTF: Guard against unsigned overflow in TTF table parsing
+
+Found by oss-fuzz: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=29170
+---
+ Libraries/LibTTF/Font.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/Libraries/LibTTF/Font.cpp b/Libraries/LibTTF/Font.cpp
+index 69b3d1ee07b725..0e514b7be14c8a 100644
+--- a/Libraries/LibTTF/Font.cpp
++++ b/Libraries/LibTTF/Font.cpp
+@@ -25,6 +25,7 @@
+  */
+ 
+ #include "AK/ByteBuffer.h"
++#include <AK/Checked.h>
+ #include <AK/LogStream.h>
+ #include <AK/Utf32View.h>
+ #include <AK/Utf8View.h>
+@@ -271,6 +272,12 @@ RefPtr<Font> Font::load_from_offset(ByteBuffer&& buffer, u32 offset)
+         u32 tag = be_u32(buffer.offset_pointer(record_offset));
+         u32 table_offset = be_u32(buffer.offset_pointer(record_offset + (u32)Offsets::TableRecord_Offset));
+         u32 table_length = be_u32(buffer.offset_pointer(record_offset + (u32)Offsets::TableRecord_Length));
++
++        if (Checked<u32>::addition_would_overflow(table_offset, table_length)) {
++            dbgln("Invalid table offset/length in font.");
++            return nullptr;
++        }
++
+         if (buffer.size() < table_offset + table_length) {
+             dbg() << "Font file too small";
+             return nullptr;

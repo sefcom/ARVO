@@ -1,0 +1,2500 @@
+From 3494218d98a7df76eb310feb7012db5e38d76bd4 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Wed, 16 Sep 2020 11:39:27 +0200
+Subject: [PATCH 01/13] Implement missing functionality for OpenVPN 2.5
+
+---
+ src/ssl.c             | 20 ++++++++++++++++++++
+ tests/api.c           |  1 +
+ wolfcrypt/src/evp.c   | 12 ++++++++----
+ wolfssl/openssl/evp.h |  3 +++
+ wolfssl/openssl/ssl.h |  5 +++++
+ wolfssl/ssl.h         |  1 +
+ 6 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/src/ssl.c b/src/ssl.c
+index 284dad50b0b..aec840450a9 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -20843,6 +20843,26 @@ WOLFSSL_X509* wolfSSL_get_certificate(WOLFSSL* ssl)
+ 
+     return NULL;
+ }
++
++WOLFSSL_X509* wolfSSL_CTX_get0_certificate(WOLFSSL_CTX* ctx)
++{
++    if (ctx) {
++        if (ctx->ourCert == NULL) {
++            if (ctx->certificate == NULL) {
++                WOLFSSL_MSG("Ctx Certificate buffer not set!");
++                return NULL;
++            }
++            #ifndef WOLFSSL_X509_STORE_CERTS
++            ctx->ourCert = wolfSSL_X509_d2i(NULL,
++                                           ctx->certificate->buffer,
++                                           ctx->certificate->length);
++            #endif
++            ctx->ownOurCert = 1;
++        }
++        return ctx->ourCert;
++    }
++    return NULL;
++}
+ #endif /* OPENSSL_EXTRA && KEEP_OUR_CERT */
+ #endif /* NO_CERTS */
+ 
+diff --git a/tests/api.c b/tests/api.c
+index e51b7434d80..879293a501c 100644
+--- a/tests/api.c
++++ b/tests/api.c
+@@ -5031,6 +5031,7 @@ static void test_wolfSSL_PKCS12(void)
+     AssertNotNull(tmp_ca);
+     AssertIntEQ(sk_X509_num(tmp_ca), sk_X509_num(ca));
+     /* Check that the main cert is also set */
++    AssertNotNull(SSL_CTX_get0_certificate(ctx));
+     AssertNotNull(ssl = SSL_new(ctx));
+     AssertNotNull(SSL_get_certificate(ssl));
+     SSL_free(ssl);
+diff --git a/wolfcrypt/src/evp.c b/wolfcrypt/src/evp.c
+index e485315d728..59a6ecf03f3 100644
+--- a/wolfcrypt/src/evp.c
++++ b/wolfcrypt/src/evp.c
+@@ -1229,7 +1229,8 @@ unsigned long WOLFSSL_CIPHER_mode(const WOLFSSL_EVP_CIPHER *cipher)
+         case AES_128_GCM_TYPE:
+         case AES_192_GCM_TYPE:
+         case AES_256_GCM_TYPE:
+-            return WOLFSSL_EVP_CIPH_GCM_MODE;
++            return WOLFSSL_EVP_CIPH_GCM_MODE &
++                    WOLFSSL_EVP_CIPH_FLAG_AEAD_CIPHER;
+     #endif
+     #if defined(WOLFSSL_AES_COUNTER)
+         case AES_128_CTR_TYPE:
+@@ -4387,7 +4388,8 @@ int wolfSSL_EVP_MD_type(const WOLFSSL_EVP_MD *md)
+             WOLFSSL_MSG("EVP_AES_128_GCM");
+             ctx->cipherType = AES_128_GCM_TYPE;
+             ctx->flags     &= ~WOLFSSL_EVP_CIPH_MODE;
+-            ctx->flags     |= WOLFSSL_EVP_CIPH_GCM_MODE;
++            ctx->flags     |= WOLFSSL_EVP_CIPH_GCM_MODE |
++                    WOLFSSL_EVP_CIPH_FLAG_AEAD_CIPHER;
+             ctx->keyLen     = 16;
+             ctx->block_size = AES_BLOCK_SIZE;
+             ctx->authTagSz  = AES_BLOCK_SIZE;
+@@ -4411,7 +4413,8 @@ int wolfSSL_EVP_MD_type(const WOLFSSL_EVP_MD *md)
+             WOLFSSL_MSG("EVP_AES_192_GCM");
+             ctx->cipherType = AES_192_GCM_TYPE;
+             ctx->flags     &= ~WOLFSSL_EVP_CIPH_MODE;
+-            ctx->flags     |= WOLFSSL_EVP_CIPH_GCM_MODE;
++            ctx->flags     |= WOLFSSL_EVP_CIPH_GCM_MODE |
++                    WOLFSSL_EVP_CIPH_FLAG_AEAD_CIPHER;
+             ctx->keyLen     = 24;
+             ctx->block_size = AES_BLOCK_SIZE;
+             ctx->authTagSz  = AES_BLOCK_SIZE;
+@@ -4435,7 +4438,8 @@ int wolfSSL_EVP_MD_type(const WOLFSSL_EVP_MD *md)
+             WOLFSSL_MSG("EVP_AES_256_GCM");
+             ctx->cipherType = AES_256_GCM_TYPE;
+             ctx->flags     &= ~WOLFSSL_EVP_CIPH_MODE;
+-            ctx->flags     |= WOLFSSL_EVP_CIPH_GCM_MODE;
++            ctx->flags     |= WOLFSSL_EVP_CIPH_GCM_MODE |
++                    WOLFSSL_EVP_CIPH_FLAG_AEAD_CIPHER;
+             ctx->keyLen     = 32;
+             ctx->block_size = AES_BLOCK_SIZE;
+             ctx->authTagSz  = AES_BLOCK_SIZE;
+diff --git a/wolfssl/openssl/evp.h b/wolfssl/openssl/evp.h
+index b84058b03e0..9a26b6d728d 100644
+--- a/wolfssl/openssl/evp.h
++++ b/wolfssl/openssl/evp.h
+@@ -645,6 +645,8 @@ WOLFSSL_LOCAL int wolfSSL_EVP_get_hashinfo(const WOLFSSL_EVP_MD* evp,
+ #define EVP_CIPH_CCM_MODE WOLFSSL_EVP_CIPH_CCM_MODE
+ #define EVP_CIPH_XTS_MODE WOLFSSL_EVP_CIPH_XTS_MODE
+ 
++#define EVP_CIPH_FLAG_AEAD_CIPHER WOLFSSL_EVP_CIPH_FLAG_AEAD_CIPHER
++
+ #define WOLFSSL_EVP_CIPH_MODE           0x0007
+ #define WOLFSSL_EVP_CIPH_STREAM_CIPHER      0x0
+ #define WOLFSSL_EVP_CIPH_ECB_MODE           0x1
+@@ -655,6 +657,7 @@ WOLFSSL_LOCAL int wolfSSL_EVP_get_hashinfo(const WOLFSSL_EVP_MD* evp,
+ #define WOLFSSL_EVP_CIPH_GCM_MODE           0x6
+ #define WOLFSSL_EVP_CIPH_CCM_MODE           0x7
+ #define WOLFSSL_EVP_CIPH_XTS_MODE          0x10
++#define WOLFSSL_EVP_CIPH_FLAG_AEAD_CIPHER  0x20
+ #define WOLFSSL_EVP_CIPH_NO_PADDING       0x100
+ #define EVP_CIPH_VARIABLE_LENGTH          0x200
+ #define WOLFSSL_EVP_CIPH_TYPE_INIT         0xff
+diff --git a/wolfssl/openssl/ssl.h b/wolfssl/openssl/ssl.h
+index 95c0fdb5771..f869c261972 100644
+--- a/wolfssl/openssl/ssl.h
++++ b/wolfssl/openssl/ssl.h
+@@ -178,6 +178,7 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
+ #define SSL_CTX_get_verify_mode         wolfSSL_CTX_get_verify_mode
+ #define SSL_CTX_get_verify_depth        wolfSSL_CTX_get_verify_depth
+ #define SSL_get_certificate             wolfSSL_get_certificate
++#define SSL_CTX_get0_certificate        wolfSSL_CTX_get0_certificate
+ #define SSL_use_certificate             wolfSSL_use_certificate
+ #define SSL_use_certificate_ASN1        wolfSSL_use_certificate_ASN1
+ #define d2i_PKCS8_PRIV_KEY_INFO_bio     wolfSSL_d2i_PKCS8_PKEY_bio
+@@ -302,6 +303,9 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
+ /* wolfSSL does not support exporting keying material */
+ #define SSL_export_keying_material(...) 0
+ 
++#define SSL_CTX_set1_groups             wolfSSL_CTX_set_groups
++#define SSL_set1_groups                 wolfSSL_set_groups
++
+ #define SSL_CTX_set1_groups_list        wolfSSL_CTX_set1_groups_list
+ #define SSL_set1_groups_list            wolfSSL_set1_groups_list
+ 
+@@ -1246,6 +1250,7 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
+ #define OPENSSL_cleanse                 wolfSSL_OPENSSL_cleanse
+ #define SSL_CTX_get_timeout             wolfSSL_SSL_CTX_get_timeout
+ #define SSL_CTX_set_tmp_ecdh            wolfSSL_SSL_CTX_set_tmp_ecdh
++#define SSL_CTX_set_ecdh_auto(...)
+ #define SSL_CTX_remove_session          wolfSSL_SSL_CTX_remove_session
+ #define SSL_get_rbio                    wolfSSL_SSL_get_rbio
+ #define SSL_get_wbio                    wolfSSL_SSL_get_wbio
+diff --git a/wolfssl/ssl.h b/wolfssl/ssl.h
+index b32aaf7d9cc..19fa46d3c47 100644
+--- a/wolfssl/ssl.h
++++ b/wolfssl/ssl.h
+@@ -2400,6 +2400,7 @@ WOLFSSL_API int wolfSSL_make_eap_keys(WOLFSSL*, void* key, unsigned int len,
+     #if (defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)) && \
+         defined(KEEP_OUR_CERT)
+         WOLFSSL_API WOLFSSL_X509* wolfSSL_get_certificate(WOLFSSL* ssl);
++        WOLFSSL_API WOLFSSL_X509* wolfSSL_CTX_get0_certificate(WOLFSSL_CTX* ctx);
+     #endif
+ #endif
+ 
+
+From 294e46e21aa18abd6f2f1112ee5b8c9ff8130100 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Thu, 17 Sep 2020 17:44:07 +0200
+Subject: [PATCH 02/13] Set options when creating SSL
+
+---
+ src/internal.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/internal.c b/src/internal.c
+index 5702513cee6..dd63fdd366d 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -5339,6 +5339,13 @@ int SetSSL_CTX(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
+ #if defined(HAVE_ECC) || defined(HAVE_ED25519) || defined(HAVE_ED448)
+     ssl->pkCurveOID = ctx->pkCurveOID;
+ #endif
++
++#if defined(OPENSSL_EXTRA) || defined(WOLFSSL_WPAS_SMALL)
++    if (wolfSSL_set_options(ssl, ctx->mask) == 0) {
++        WOLFSSL_MSG("wolfSSL_set_options error");
++        return BAD_FUNC_ARG;
++    }
++#endif
+ #ifdef OPENSSL_EXTRA
+     ssl->CBIS         = ctx->CBIS;
+ #endif
+
+From 6ed45a23d9063a3597a8e9402ed113ada64776b9 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Thu, 5 Nov 2020 18:27:37 +0100
+Subject: [PATCH 03/13] Fix getting cipher suites in compat layer
+
+---
+ src/internal.c |  2 +-
+ src/ssl.c      | 50 +++++++++++++++++++++++++++++++++++++++++---------
+ wolfssl/ssl.h  |  2 +-
+ 3 files changed, 43 insertions(+), 11 deletions(-)
+
+diff --git a/src/internal.c b/src/internal.c
+index dd63fdd366d..5f521452c31 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -5341,7 +5341,7 @@ int SetSSL_CTX(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
+ #endif
+ 
+ #if defined(OPENSSL_EXTRA) || defined(WOLFSSL_WPAS_SMALL)
+-    if (wolfSSL_set_options(ssl, ctx->mask) == 0) {
++    if (ctx->mask != 0 && wolfSSL_set_options(ssl, ctx->mask) == 0) {
+         WOLFSSL_MSG("wolfSSL_set_options error");
+         return BAD_FUNC_ARG;
+     }
+diff --git a/src/ssl.c b/src/ssl.c
+index aec840450a9..fd95f80ca9c 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -28207,16 +28207,11 @@ WOLFSSL_API int wolfSSL_X509_STORE_load_locations(WOLFSSL_X509_STORE *str,
+ }
+ #endif /* !NO_FILESYSTEM && !NO_WOLFSSL_DIR */
+ 
+-#ifndef NO_WOLFSSL_STUB
+-/*** TBD ***/
+-WOLFSSL_API WOLFSSL_CIPHER* wolfSSL_sk_SSL_CIPHER_value(void *ciphers, int idx)
++WOLFSSL_API WOLFSSL_CIPHER* wolfSSL_sk_SSL_CIPHER_value(WOLFSSL_STACK* sk, int i)
+ {
+-    (void)ciphers;
+-    (void)idx;
+-    WOLFSSL_STUB("wolfSSL_sk_SSL_CIPHER_value");
+-    return NULL;
++    WOLFSSL_ENTER("wolfSSL_sk_SSL_CIPHER_value");
++    return wolfSSL_sk_value(sk, i);
+ }
+-#endif
+ 
+ WOLFSSL_API void ERR_load_SSL_strings(void)
+ {
+@@ -46601,6 +46596,36 @@ static WC_INLINE int SCSV_Check(byte suite0, byte suite)
+     return 0;
+ }
+ 
++static WC_INLINE int sslCipherMinMaxCheck(const WOLFSSL *ssl, byte suite0,
++        byte suite)
++{
++    const CipherSuiteInfo* cipher_names = GetCipherNames();
++    int cipherSz = GetCipherNamesSize();
++    int i;
++    for (i = 0; i < cipherSz; i++)
++        if (cipher_names[i].cipherSuite0 == suite0 &&
++                cipher_names[i].cipherSuite == suite)
++            break;
++    if (i == cipherSz)
++        return 1;
++    if (cipher_names[i].minor < ssl->options.minDowngrade)
++        return 1;
++    switch (cipher_names[i].minor) {
++    case SSLv3_MINOR :
++        return ssl->options.mask & WOLFSSL_OP_NO_SSLv3;
++    case TLSv1_MINOR :
++        return ssl->options.mask & WOLFSSL_OP_NO_TLSv1;
++    case TLSv1_1_MINOR :
++        return ssl->options.mask & WOLFSSL_OP_NO_TLSv1_1;
++    case TLSv1_2_MINOR :
++        return ssl->options.mask & WOLFSSL_OP_NO_TLSv1_2;
++    case TLSv1_3_MINOR :
++        return ssl->options.mask & WOLFSSL_OP_NO_TLSv1_3;
++    default:
++        WOLFSSL_MSG("Unrecognized minor version");
++        return 1;
++    }
++}
+ 
+ /* returns a pointer to internal cipher suite list. Should not be free'd by
+  * caller.
+@@ -46620,6 +46645,11 @@ WOLF_STACK_OF(WOLFSSL_CIPHER) *wolfSSL_get_ciphers_compat(const WOLFSSL *ssl)
+     }
+ 
+     if (ssl->suites != NULL) {
++        if (ssl->suites->suiteSz == 0 &&
++                InitSSL_Suites((WOLFSSL*)ssl) != WOLFSSL_SUCCESS) {
++            WOLFSSL_MSG("Suite initialization failure");
++            return NULL;
++        }
+         suites = ssl->suites;
+     }
+     else {
+@@ -46637,7 +46667,9 @@ WOLF_STACK_OF(WOLFSSL_CIPHER) *wolfSSL_get_ciphers_compat(const WOLFSSL *ssl)
+ 
+             /* A couple of suites are placeholders for special options,
+              * skip those. */
+-            if (SCSV_Check(suites->suites[i], suites->suites[i+1])) {
++            if (SCSV_Check(suites->suites[i], suites->suites[i+1])
++                    || sslCipherMinMaxCheck(ssl, suites->suites[i],
++                                            suites->suites[i+1])) {
+                 continue;
+             }
+ 
+diff --git a/wolfssl/ssl.h b/wolfssl/ssl.h
+index 19fa46d3c47..1487897f806 100644
+--- a/wolfssl/ssl.h
++++ b/wolfssl/ssl.h
+@@ -4046,7 +4046,7 @@ WOLFSSL_API int wolfSSL_sk_SSL_CIPHER_find(
+ WOLFSSL_API void wolfSSL_sk_SSL_CIPHER_free(WOLF_STACK_OF(WOLFSSL_CIPHER)* sk);
+ WOLFSSL_API int wolfSSL_sk_SSL_COMP_zero(WOLFSSL_STACK* st);
+ WOLFSSL_API int wolfSSL_sk_SSL_COMP_num(WOLF_STACK_OF(WOLFSSL_COMP)* sk);
+-WOLFSSL_API WOLFSSL_CIPHER* wolfSSL_sk_SSL_CIPHER_value(void *ciphers, int idx);
++WOLFSSL_API WOLFSSL_CIPHER* wolfSSL_sk_SSL_CIPHER_value(WOLFSSL_STACK* sk, int i);
+ WOLFSSL_API void ERR_load_SSL_strings(void);
+ WOLFSSL_API void wolfSSL_EC_POINT_dump(const char *msg, const WOLFSSL_EC_POINT *p);
+ 
+
+From fdde2337a42465ceb83d55efc150ebab2f47676c Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Fri, 6 Nov 2020 19:11:39 +0100
+Subject: [PATCH 04/13] Add static buffer to wolfSSL_ERR_error_string
+
+Add ED448 and ED25519 to wolfssl_object_info
+Add more error messages
+---
+ src/ssl.c            | 29 ++++++++++++++++++++++++++---
+ wolfssl/openssl/ec.h |  8 ++++++++
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/src/ssl.c b/src/ssl.c
+index fd95f80ca9c..c8bf9fcf741 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -3163,15 +3163,17 @@ int wolfSSL_want_write(WOLFSSL* ssl)
+ 
+ char* wolfSSL_ERR_error_string(unsigned long errNumber, char* data)
+ {
+-    static wcchar msg = "Please supply a buffer for error string";
++    static char tmp[WOLFSSL_MAX_ERROR_SZ] = {0};
+ 
+     WOLFSSL_ENTER("ERR_error_string");
+     if (data) {
+         SetErrorString((int)errNumber, data);
+         return data;
+     }
+-
+-    return (char*)msg;
++    else {
++        SetErrorString((int)errNumber, tmp);
++        return tmp;
++    }
+ }
+ 
+ 
+@@ -7667,6 +7669,9 @@ WOLFSSL_EVP_PKEY* wolfSSL_d2i_PUBKEY(WOLFSSL_EVP_PKEY** out,
+ 
+                 return pkey;
+             }
++            else {
++                WOLFSSL_MSG("RSA wolfSSL_EVP_PKEY_new error");
++            }
+         }
+         wc_FreeRsaKey(&rsa);
+     }
+@@ -7711,6 +7716,9 @@ WOLFSSL_EVP_PKEY* wolfSSL_d2i_PUBKEY(WOLFSSL_EVP_PKEY** out,
+ 
+                 return pkey;
+             }
++            else {
++                WOLFSSL_MSG("ECC wolfSSL_EVP_PKEY_new error");
++            }
+         }
+         wc_ecc_free(&ecc);
+     }
+@@ -7758,6 +7766,9 @@ WOLFSSL_EVP_PKEY* wolfSSL_d2i_PUBKEY(WOLFSSL_EVP_PKEY** out,
+ 
+                 return pkey;
+             }
++            else {
++                WOLFSSL_MSG("DSA wolfSSL_EVP_PKEY_new error");
++            }
+         }
+         wc_FreeDsaKey(&dsa);
+     }
+@@ -7806,12 +7817,18 @@ WOLFSSL_EVP_PKEY* wolfSSL_d2i_PUBKEY(WOLFSSL_EVP_PKEY** out,
+ 
+                 return pkey;
+             }
++            else {
++                WOLFSSL_MSG("DH wolfSSL_EVP_PKEY_new error");
++            }
+         }
+         wc_FreeDhKey(&dh);
+     }
+     #endif /* !HAVE_FIPS || HAVE_FIPS_VERSION > 2 */
+     #endif /* !NO_DH && (WOLFSSL_QT || OPENSSL_ALL) */
+ 
++    if (pkey == NULL)
++        WOLFSSL_MSG("wolfSSL_d2i_PUBKEY couldn't determine key type");
++
+     return pkey;
+ }
+ 
+@@ -30434,6 +30451,12 @@ const WOLFSSL_ObjectInfo wolfssl_object_info[] = {
+     #ifndef NO_DH
+         { NID_dhKeyAgreement, DHk, oidKeyType, "dhKeyAgreement", "dhKeyAgreement"},
+     #endif
++    #ifdef HAVE_ED448
++        { NID_ED448, ED448k,  oidKeyType, "ED448", "ED448"},
++    #endif
++    #ifdef HAVE_ED25519
++        { NID_ED25519, ED25519k,  oidKeyType, "ED25519", "ED25519"},
++    #endif
+ 
+         /* oidCurveType */
+     #ifdef HAVE_ECC
+diff --git a/wolfssl/openssl/ec.h b/wolfssl/openssl/ec.h
+index 83a413639c7..80cebb5fce4 100644
+--- a/wolfssl/openssl/ec.h
++++ b/wolfssl/openssl/ec.h
+@@ -25,6 +25,7 @@
+ #define WOLFSSL_EC_H_
+ 
+ #include <wolfssl/openssl/bn.h>
++#include <wolfssl/wolfcrypt/asn.h>
+ #include <wolfssl/wolfcrypt/ecc.h>
+ 
+ #ifdef __cplusplus
+@@ -68,6 +69,13 @@ enum {
+     NID_brainpoolP512r1 = 933,
+ #endif
+ 
++#ifdef HAVE_ED448
++    NID_ED448 = ED448k,
++#endif
++#ifdef HAVE_ED25519
++    NID_ED25519 = ED25519k,
++#endif
++
+     OPENSSL_EC_NAMED_CURVE  = 0x001
+ };
+ 
+
+From c18701ebe76e5a1496bbfef71be1f32e78046bdf Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Tue, 10 Nov 2020 17:50:45 +0100
+Subject: [PATCH 05/13] Implement RFC 5705: Keying Material Exporters for TLS
+
+---
+ configure.ac          |  13 +++++
+ src/internal.c        |   4 ++
+ src/ssl.c             | 104 ++++++++++++++++++++++++++++++++++++
+ src/tls13.c           | 121 +++++++++++++++++++++++++++++++++++++++---
+ tests/api.c           |  86 +++++++++++++++++++++++++++++-
+ wolfssl/internal.h    |   7 +++
+ wolfssl/openssl/ssl.h |   2 +-
+ wolfssl/ssl.h         |  14 +++++
+ 8 files changed, 342 insertions(+), 9 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index 054a7b4e3ed..894a35461cc 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3514,6 +3514,18 @@ then
+     AM_CFLAGS="$AM_CFLAGS -DHAVE_FALLBACK_SCSV"
+ fi
+ 
++# Exporting Keying Material
++AC_ARG_ENABLE([keying-material],
++    [AS_HELP_STRING([--enable-keying-material],[Enable Keying Material Exporters (default: disabled)])],
++    [ ENABLED_KEYING_MATERIAL=$enableval ],
++    [ ENABLED_KEYING_MATERIAL=no ]
++    )
++
++if test "x$ENABLED_KEYING_MATERIAL" = "xyes"
++then
++    AM_CFLAGS="$AM_CFLAGS -DHAVE_KEYING_MATERIAL"
++fi
++
+ # Supported Elliptic Curves Extensions
+ AC_ARG_ENABLE([supportedcurves],
+     [AS_HELP_STRING([--enable-supportedcurves],[Enable Supported Elliptic Curves (default: enabled)])],
+@@ -6415,6 +6427,7 @@ echo "   * Extended Master Secret:     $ENABLED_EXTENDED_MASTER"
+ echo "   * Renegotiation Indication:   $ENABLED_RENEGOTIATION_INDICATION"
+ echo "   * Secure Renegotiation:       $ENABLED_SECURE_RENEGOTIATION"
+ echo "   * Fallback SCSV:              $ENABLED_FALLBACK_SCSV"
++echo "   * Keying Material Exporter:   $ENABLED_KEYING_MATERIAL"
+ echo "   * All TLS Extensions:         $ENABLED_TLSX"
+ echo "   * PKCS#7                      $ENABLED_PKCS7"
+ echo "   * wolfSSH                     $ENABLED_WOLFSSH"
+diff --git a/src/internal.c b/src/internal.c
+index 5f521452c31..0f6bdca4583 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -5766,6 +5766,10 @@ int InitSSL(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
+     #endif
+ #endif
+ 
++#if defined(WOLFSSL_OPENVPN) && defined(HAVE_KEYING_MATERIAL)
++    /* Save arrays by default for OpenVPN */
++    ssl->options.saveArrays = 1;
++#endif
+ 
+     ssl->cipher.ssl = ssl;
+ 
+diff --git a/src/ssl.c b/src/ssl.c
+index c8bf9fcf741..b8d4135de29 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -11879,6 +11879,110 @@ int wolfSSL_set_cipher_list(WOLFSSL* ssl, const char* list)
+ #endif
+ }
+ 
++#ifdef HAVE_KEYING_MATERIAL
++static const struct ForbiddenLabels {
++    const char* label;
++    size_t labelLen;
++} forbiddenLabels[] = {
++    {TLS_PRF_LABEL_CLIENT_FINISHED, XSTR_SIZEOF(TLS_PRF_LABEL_CLIENT_FINISHED)},
++    {TLS_PRF_LABEL_SERVER_FINISHED, XSTR_SIZEOF(TLS_PRF_LABEL_SERVER_FINISHED)},
++    {TLS_PRF_LABEL_MASTER_SECRET, XSTR_SIZEOF(TLS_PRF_LABEL_MASTER_SECRET)},
++    {TLS_PRF_LABEL_EXT_MASTER_SECRET, XSTR_SIZEOF(TLS_PRF_LABEL_EXT_MASTER_SECRET)},
++    {TLS_PRF_LABEL_KEY_EXPANSION, XSTR_SIZEOF(TLS_PRF_LABEL_KEY_EXPANSION)},
++    {NULL, 0},
++};
++
++/**
++ * Implement RFC 5705
++ * TLS 1.3 uses a different exporter definition (section 7.5 of RFC 8446)
++ * @return WOLFSSL_SUCCESS on success and WOLFSSL_FAILURE on error
++ */
++int wolfSSL_export_keying_material(WOLFSSL *ssl,
++        unsigned char *out, size_t outLen,
++        const char *label, size_t labelLen,
++        const unsigned char *context, size_t contextLen,
++        int use_context)
++{
++    byte* seed = NULL;
++    /* clientRandom + serverRandom
++     * OR
++     * clientRandom + serverRandom + ctx len encoding + ctx */
++    word32 seedLen = !use_context ? SEED_LEN : SEED_LEN + 2 + contextLen;
++    const struct ForbiddenLabels* fl;
++
++    WOLFSSL_ENTER("wolfSSL_export_keying_material");
++
++    if (ssl == NULL || out == NULL || label == NULL ||
++            (use_context && contextLen && context == NULL)) {
++        WOLFSSL_MSG("Bad argument");
++        return WOLFSSL_FAILURE;
++    }
++
++    if (ssl->options.saveArrays == 0 || ssl->arrays == NULL) {
++        WOLFSSL_MSG("To export keying material wolfSSL needs to keep handshake "
++                    "data. Call wolfSSL_KeepArrays before attempting to "
++                    "export keyig material.");
++        return WOLFSSL_FAILURE;
++    }
++
++    /* check forbidden labels */
++    for (fl = &forbiddenLabels[0]; fl->label != NULL; fl++) {
++        if (labelLen >= fl->labelLen &&
++                XMEMCMP(label, fl->label, fl->labelLen) == 0) {
++            WOLFSSL_MSG("Forbidden label");
++            return WOLFSSL_FAILURE;
++        }
++    }
++
++#ifdef WOLFSSL_TLS13
++    if (IsAtLeastTLSv1_3(ssl->version)) {
++        /* Path for TLS 1.3 */
++        if (!use_context) {
++            contextLen = 0;
++            context = (byte*)""; /* Give valid pointer for 0 length memcpy */
++        }
++
++        if (Tls13_Exporter(ssl, out, outLen, label, labelLen,
++                context, contextLen) != 0) {
++            WOLFSSL_MSG("Tls13_Exporter error");
++            return WOLFSSL_FAILURE;
++        }
++        return WOLFSSL_SUCCESS;
++    }
++#endif
++
++    /* Path for <=TLS 1.2 */
++    seed = (byte*)XMALLOC(seedLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
++    if (seed == NULL) {
++        WOLFSSL_MSG("malloc error");
++        return WOLFSSL_FAILURE;
++    }
++
++    XMEMCPY(seed,           ssl->arrays->clientRandom, RAN_LEN);
++    XMEMCPY(seed + RAN_LEN, ssl->arrays->serverRandom, RAN_LEN);
++
++    if (use_context) {
++        /* Encode len in big endian */
++        seed[SEED_LEN    ] = (contextLen >> 8) & 0xFF;
++        seed[SEED_LEN + 1] = (contextLen) & 0xFF;
++        if (contextLen) {
++            /* 0 length context is allowed */
++            XMEMCPY(seed + SEED_LEN + 2, context, contextLen);
++        }
++    }
++
++    if (wc_PRF_TLS(out, outLen, ssl->arrays->masterSecret, SECRET_LEN,
++            (byte*)label, labelLen, seed, seedLen, IsAtLeastTLSv1_2(ssl),
++            ssl->specs.mac_algorithm, ssl->heap, ssl->devId) != 0) {
++        WOLFSSL_MSG("wc_PRF_TLS error");
++        XFREE(seed, NULL, DYNAMIC_TYPE_TMP_BUFFER);
++        return WOLFSSL_FAILURE;
++    }
++
++    XFREE(seed, NULL, DYNAMIC_TYPE_TMP_BUFFER);
++    return WOLFSSL_SUCCESS;
++}
++#endif /* HAVE_KEYING_MATERIAL */
+ 
+ int wolfSSL_dtls_get_using_nonblock(WOLFSSL* ssl)
+ {
+diff --git a/src/tls13.c b/src/tls13.c
+index 199189d3d1f..1ec927efe27 100644
+--- a/src/tls13.c
++++ b/src/tls13.c
+@@ -29,9 +29,8 @@
+  *    Enables session tickets - required for TLS 1.3 resumption.
+  * NO_PSK
+  *    Do not enable Pre-Shared Keys.
+- * TLS13_SUPPORTS_EXPORTERS
+- *    Guard to compile out any code for exporter keys.
+- *    Feature not supported yet.
++ * HAVE_KEYING_MATERIAL
++ *    Enables exporting keying material based on section 7.5 of RFC 8446.
+  * WOLFSSL_ASYNC_CRYPT
+  *    Enables the use of asynchronous cryptographic operations.
+  *    This is available for ciphers and certificates.
+@@ -515,7 +514,7 @@ static int DeriveEarlyTrafficSecret(WOLFSSL* ssl, byte* key)
+     return ret;
+ }
+ 
+-#ifdef TLS13_SUPPORTS_EXPORTERS
++#ifdef HAVE_KEYING_MATERIAL
+ /* The length of the early exporter label. */
+ #define EARLY_EXPORTER_LABEL_SZ     12
+ /* The early exporter label. */
+@@ -688,7 +687,7 @@ static int DeriveServerTrafficSecret(WOLFSSL* ssl, byte* key)
+     return ret;
+ }
+ 
+-#ifdef TLS13_SUPPORTS_EXPORTERS
++#ifdef HAVE_KEYING_MATERIAL
+ /* The length of the exporter master secret label. */
+ #define EXPORTER_MASTER_LABEL_SZ    10
+ /* The exporter master secret label. */
+@@ -704,7 +703,7 @@ static const byte exporterMasterLabel[EXPORTER_MASTER_LABEL_SZ + 1] =
+ static int DeriveExporterSecret(WOLFSSL* ssl, byte* key)
+ {
+     int ret;
+-    WOLFSSL_MSG("Derive Exporter Secret");
++    WOLFSSL_ENTER("Derive Exporter Secret");
+     if (ssl == NULL || ssl->arrays == NULL) {
+         return BAD_FUNC_ARG;
+     }
+@@ -722,6 +721,104 @@ static int DeriveExporterSecret(WOLFSSL* ssl, byte* key)
+ #endif /* HAVE_SECRET_CALLBACK */
+     return ret;
+ }
++
++/* The length of the exporter label. */
++#define EXPORTER_LABEL_SZ    8
++/* The exporter label. */
++static const byte exporterLabel[EXPORTER_LABEL_SZ + 1] =
++    "exporter";
++/* Hash("") */
++#ifndef NO_SHA256
++static const byte emptySHA256Hash[] = {
++    0xE3, 0xB0, 0xC4, 0x42, 0x98, 0xFC, 0x1C, 0x14, 0x9A, 0xFB, 0xF4, 0xC8,
++    0x99, 0x6F, 0xB9, 0x24, 0x27, 0xAE, 0x41, 0xE4, 0x64, 0x9B, 0x93, 0x4C,
++    0xA4, 0x95, 0x99, 0x1B, 0x78, 0x52, 0xB8, 0x55
++};
++#endif
++#ifdef WOLFSSL_SHA384
++static const byte emptySHA384Hash[] = {
++    0x38, 0xB0, 0x60, 0xA7, 0x51, 0xAC, 0x96, 0x38, 0x4C, 0xD9, 0x32, 0x7E,
++    0xB1, 0xB1, 0xE3, 0x6A, 0x21, 0xFD, 0xB7, 0x11, 0x14, 0xBE, 0x07, 0x43,
++    0x4C, 0x0C, 0xC7, 0xBF, 0x63, 0xF6, 0xE1, 0xDA, 0x27, 0x4E, 0xDE, 0xBF,
++    0xE7, 0x6F, 0x65, 0xFB, 0xD5, 0x1A, 0xD2, 0xF1, 0x48, 0x98, 0xB9, 0x5B
++};
++#endif
++#ifdef WOLFSSL_TLS13_SHA512
++static const byte emptySHA512Hash[] = {
++    0xCF, 0x83, 0xE1, 0x35, 0x7E, 0xEF, 0xB8, 0xBD, 0xF1, 0x54, 0x28, 0x50,
++    0xD6, 0x6D, 0x80, 0x07, 0xD6, 0x20, 0xE4, 0x05, 0x0B, 0x57, 0x15, 0xDC,
++    0x83, 0xF4, 0xA9, 0x21, 0xD3, 0x6C, 0xE9, 0xCE, 0x47, 0xD0, 0xD1, 0x3C,
++    0x5D, 0x85, 0xF2, 0xB0, 0xFF, 0x83, 0x18, 0xD2, 0x87, 0x7E, 0xEC, 0x2F,
++    0x63, 0xB9, 0x31, 0xBD, 0x47, 0x41, 0x7A, 0x81, 0xA5, 0x38, 0x32, 0x7A,
++    0xF9, 0x27, 0xDA, 0x3E
++};
++#endif
++/**
++ * Implement section 7.5 of RFC 8446
++ * @return  0 on success
++ *         <0 on failure
++ */
++int Tls13_Exporter(WOLFSSL* ssl, unsigned char *out, size_t outLen,
++        const char *label, size_t labelLen,
++        const unsigned char *context, size_t contextLen)
++{
++    int                 ret;
++    enum wc_HashType    hashType = WC_HASH_TYPE_NONE;
++    int                 hashLen = 0;
++    byte                hashOut[WC_MAX_DIGEST_SIZE];
++    const byte*         emptyHash = NULL;
++    byte                firstExpand[WC_MAX_DIGEST_SIZE];
++    const byte*         protocol = tls13ProtocolLabel;
++    word32              protocolLen = TLS13_PROTOCOL_LABEL_SZ;
++
++    if (ssl->version.minor != TLSv1_3_MINOR)
++        return VERSION_ERROR;
++
++    switch (ssl->specs.mac_algorithm) {
++        #ifndef NO_SHA256
++        case sha256_mac:
++            hashType = WC_SHA256;
++            hashLen = WC_SHA256_DIGEST_SIZE;
++            emptyHash = emptySHA256Hash;
++            break;
++        #endif
++
++        #ifdef WOLFSSL_SHA384
++        case sha384_mac:
++            hashType = WC_SHA384;
++            hashLen = WC_SHA384_DIGEST_SIZE;
++            emptyHash = emptySHA384Hash;
++            break;
++        #endif
++
++        #ifdef WOLFSSL_TLS13_SHA512
++        case sha512_mac:
++            hashType = WC_SHA512;
++            hashLen = WC_SHA512_DIGEST_SIZE;
++            emptyHash = emptySHA512Hash;
++            break;
++        #endif
++    }
++
++    /* Derive-Secret(Secret, label, "") */
++    ret = HKDF_Expand_Label(firstExpand, hashLen,
++            ssl->arrays->exporterSecret, hashLen,
++            protocol, protocolLen, (byte*)label, labelLen,
++            emptyHash, hashLen, hashType);
++    if (ret != 0)
++        return ret;
++
++    /* Hash(context_value) */
++    ret = wc_Hash(hashType, context, contextLen, hashOut, WC_MAX_DIGEST_SIZE);
++    if (ret != 0)
++        return ret;
++
++    ret = HKDF_Expand_Label(out, outLen, firstExpand, hashLen,
++            protocol, protocolLen, exporterLabel, EXPORTER_LABEL_SZ,
++            hashOut, hashLen, hashType);
++
++    return ret;
++}
+ #endif
+ 
+ #if defined(HAVE_SESSION_TICKET) || !defined(NO_PSK)
+@@ -862,9 +959,19 @@ int DeriveMasterSecret(WOLFSSL* ssl)
+     if (ret != 0)
+         return ret;
+ 
+-    return Tls13_HKDF_Extract(ssl->arrays->masterSecret,
++    ret = Tls13_HKDF_Extract(ssl->arrays->masterSecret,
+             key, ssl->specs.hash_size,
+             ssl->arrays->masterSecret, 0, ssl->specs.mac_algorithm);
++
++#ifdef HAVE_KEYING_MATERIAL
++    if (ret != 0)
++        return ret;
++    /* Calculate exporter secret only when saving arrays */
++    if (ssl->options.saveArrays)
++        ret = DeriveExporterSecret(ssl, ssl->arrays->exporterSecret);
++#endif
++
++    return ret;
+ }
+ 
+ #if defined(HAVE_SESSION_TICKET)
+diff --git a/tests/api.c b/tests/api.c
+index 879293a501c..dc80978bbba 100644
+--- a/tests/api.c
++++ b/tests/api.c
+@@ -39948,6 +39948,86 @@ static int test_various_pathlen_chains(void)
+ }
+ #endif /* !NO_RSA && !NO_SHA && !NO_FILESYSTEM && !NO_CERTS */
+ 
++#ifdef HAVE_KEYING_MATERIAL
++static int test_export_keying_material_cb(WOLFSSL_CTX *ctx, WOLFSSL *ssl)
++{
++    byte ekm[100] = {0};
++
++    (void)ctx;
++
++    /* Succes Cases */
++    AssertIntEQ(wolfSSL_export_keying_material(ssl, ekm, sizeof(ekm),
++            "Test label", XSTR_SIZEOF("Test label"), NULL, 0, 0), 1);
++    AssertIntEQ(wolfSSL_export_keying_material(ssl, ekm, sizeof(ekm),
++            "Test label", XSTR_SIZEOF("Test label"), NULL, 0, 1), 1);
++    /* Use some random context */
++    AssertIntEQ(wolfSSL_export_keying_material(ssl, ekm, sizeof(ekm),
++            "Test label", XSTR_SIZEOF("Test label"), ekm, 10, 1), 1);
++    /* Failure cases */
++    AssertIntEQ(wolfSSL_export_keying_material(ssl, ekm, sizeof(ekm),
++            "client finished", XSTR_SIZEOF("client finished"), NULL, 0, 0), 0);
++    AssertIntEQ(wolfSSL_export_keying_material(ssl, ekm, sizeof(ekm),
++            "server finished", XSTR_SIZEOF("server finished"), NULL, 0, 0), 0);
++    AssertIntEQ(wolfSSL_export_keying_material(ssl, ekm, sizeof(ekm),
++            "master secret", XSTR_SIZEOF("master secret"), NULL, 0, 0), 0);
++    AssertIntEQ(wolfSSL_export_keying_material(ssl, ekm, sizeof(ekm),
++            "extended master secret", XSTR_SIZEOF("extended master secret"), NULL, 0, 0), 0);
++    AssertIntEQ(wolfSSL_export_keying_material(ssl, ekm, sizeof(ekm),
++            "key expansion", XSTR_SIZEOF("key expansion"), NULL, 0, 0), 0);
++    return 0;
++}
++
++static void test_export_keying_material_ssl_cb(WOLFSSL* ssl)
++{
++    wolfSSL_KeepArrays(ssl);
++}
++
++static void test_export_keying_material(void)
++{
++#ifndef SINGLE_THREADED
++    tcp_ready ready;
++    callback_functions clientCb;
++    func_args client_args;
++    func_args server_args;
++    THREAD_TYPE serverThread;
++
++    XMEMSET(&client_args, 0, sizeof(func_args));
++    XMEMSET(&server_args, 0, sizeof(func_args));
++    XMEMSET(&clientCb, 0, sizeof(callback_functions));
++#ifdef WOLFSSL_TIRTOS
++    fdOpenSession(Task_self());
++#endif
++
++    StartTCP();
++    InitTcpReady(&ready);
++
++#if defined(USE_WINDOWS_API)
++    /* use RNG to get random port if using windows */
++    ready.port = GetRandomPort();
++#endif
++
++    server_args.signal = &ready;
++    client_args.signal = &ready;
++    clientCb.ssl_ready = test_export_keying_material_ssl_cb;
++    client_args.callbacks = &clientCb;
++
++    start_thread(test_server_nofail, &server_args, &serverThread);
++    wait_tcp_ready(&server_args);
++    test_client_nofail(&client_args, test_export_keying_material_cb);
++    join_thread(serverThread);
++
++    AssertTrue(client_args.return_code);
++    AssertTrue(server_args.return_code);
++
++    FreeTcpReady(&ready);
++
++#ifdef WOLFSSL_TIRTOS
++    fdOpenSession(Task_self());
++#endif
++#endif /* !SINGLE_THREADED */
++}
++#endif /* HAVE_KEYING_MATERIAL */
++
+ /*----------------------------------------------------------------------------*
+  | Main
+  *----------------------------------------------------------------------------*/
+@@ -40351,6 +40431,11 @@ void ApiTest(void)
+     test_DhCallbacks();
+ #endif
+ 
++
++#ifdef HAVE_KEYING_MATERIAL
++    test_export_keying_material();
++#endif /* HAVE_KEYING_MATERIAL */
++
+     /*wolfcrypt */
+     printf("\n-----------------wolfcrypt unit tests------------------\n");
+     AssertFalse(test_wolfCrypt_Init());
+@@ -40653,7 +40738,6 @@ void ApiTest(void)
+     test_wc_PKCS7_SetOriDecryptCtx();
+     test_wc_PKCS7_DecodeCompressedData();
+ 
+-
+     test_wc_i2d_PKCS12();
+ 
+     test_wolfSSL_CTX_LoadCRL();
+diff --git a/wolfssl/internal.h b/wolfssl/internal.h
+index f953a143c35..c7874e35459 100644
+--- a/wolfssl/internal.h
++++ b/wolfssl/internal.h
+@@ -2625,6 +2625,10 @@ WOLFSSL_LOCAL int DeriveMasterSecret(WOLFSSL* ssl);
+ WOLFSSL_LOCAL int DeriveResumptionPSK(WOLFSSL* ssl, byte* nonce, byte nonceLen, byte* secret);
+ WOLFSSL_LOCAL int DeriveResumptionSecret(WOLFSSL* ssl, byte* key);
+ 
++WOLFSSL_LOCAL int Tls13_Exporter(WOLFSSL* ssl, unsigned char *out, size_t outLen,
++        const char *label, size_t labelLen,
++        const unsigned char *context, size_t contextLen);
++
+ /* The key update request values for KeyUpdate message. */
+ enum KeyUpdateRequest {
+     update_not_requested,
+@@ -3591,6 +3595,9 @@ typedef struct Arrays {
+     byte            sessionIDSz;
+ #ifdef WOLFSSL_TLS13
+     byte            secret[SECRET_LEN];
++#endif
++#ifdef HAVE_KEYING_MATERIAL
++    byte            exporterSecret[WC_MAX_DIGEST_SIZE];
+ #endif
+     byte            masterSecret[SECRET_LEN];
+ #if defined(WOLFSSL_RENESAS_TSIP_TLS) && \
+diff --git a/wolfssl/openssl/ssl.h b/wolfssl/openssl/ssl.h
+index f869c261972..6475f705ac4 100644
+--- a/wolfssl/openssl/ssl.h
++++ b/wolfssl/openssl/ssl.h
+@@ -301,7 +301,7 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
+ /* wolfSSL does not support security levels */
+ #define SSL_CTX_set_security_level(...)
+ /* wolfSSL does not support exporting keying material */
+-#define SSL_export_keying_material(...) 0
++#define SSL_export_keying_material      wolfSSL_export_keying_material
+ 
+ #define SSL_CTX_set1_groups             wolfSSL_CTX_set_groups
+ #define SSL_set1_groups                 wolfSSL_set_groups
+diff --git a/wolfssl/ssl.h b/wolfssl/ssl.h
+index 1487897f806..c02f5d9f13d 100644
+--- a/wolfssl/ssl.h
++++ b/wolfssl/ssl.h
+@@ -1057,6 +1057,20 @@ WOLFSSL_API int  wolfSSL_CTX_get_cert_cache_memsize(WOLFSSL_CTX*);
+ WOLFSSL_API int  wolfSSL_CTX_set_cipher_list(WOLFSSL_CTX*, const char*);
+ WOLFSSL_API int  wolfSSL_set_cipher_list(WOLFSSL*, const char*);
+ 
++#ifdef HAVE_KEYING_MATERIAL
++#define TLS_PRF_LABEL_CLIENT_FINISHED     "client finished"
++#define TLS_PRF_LABEL_SERVER_FINISHED     "server finished"
++#define TLS_PRF_LABEL_MASTER_SECRET       "master secret"
++#define TLS_PRF_LABEL_EXT_MASTER_SECRET   "extended master secret"
++#define TLS_PRF_LABEL_KEY_EXPANSION       "key expansion"
++/* Keying Material Exporter for TLS */
++WOLFSSL_API int wolfSSL_export_keying_material(WOLFSSL *ssl,
++        unsigned char *out, size_t outLen,
++        const char *label, size_t labelLen,
++        const unsigned char *context, size_t contextLen,
++        int use_context);
++#endif /* HAVE_KEYING_MATERIAL */
++
+ /* Nonblocking DTLS helper functions */
+ WOLFSSL_API void wolfSSL_dtls_set_using_nonblock(WOLFSSL*, int);
+ WOLFSSL_API int  wolfSSL_dtls_get_using_nonblock(WOLFSSL*);
+
+From 5d5d2e1f0265f590fb33dd354f8c603cd4fe6572 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Wed, 18 Nov 2020 18:16:22 +0100
+Subject: [PATCH 06/13] Check that curves in set_groups functions are valid
+
+---
+ src/ssl.c             | 433 ++++++++++++++++++++++++++++++++++++++----
+ src/tls13.c           |  36 +++-
+ wolfcrypt/src/asn.c   |  12 +-
+ wolfssl/openssl/ssl.h |   4 +-
+ wolfssl/ssl.h         |   6 +
+ 5 files changed, 444 insertions(+), 47 deletions(-)
+
+diff --git a/src/ssl.c b/src/ssl.c
+index b8d4135de29..68187a0b60d 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -133,6 +133,7 @@
+     int SetIndividualInternal(WOLFSSL_BIGNUM* bn, mp_int* mpi);
+     int SetIndividualExternal(WOLFSSL_BIGNUM** bn, mp_int* mpi);
+     int oid2nid(word32 oid, int grp);
++    word32 nid2oid(int nid, int grp);
+ #endif
+ 
+ #if defined(WOLFSSL_QT)
+@@ -2377,11 +2378,8 @@ int wolfSSL_CTX_UseOCSPStaplingV2(WOLFSSL_CTX* ctx, byte status_type,
+ /* Elliptic Curves */
+ #if defined(HAVE_SUPPORTED_CURVES) && !defined(NO_WOLFSSL_CLIENT)
+ 
+-int wolfSSL_UseSupportedCurve(WOLFSSL* ssl, word16 name)
++static int isValidCurveGroup(word16 name)
+ {
+-    if (ssl == NULL)
+-        return BAD_FUNC_ARG;
+-
+     switch (name) {
+         case WOLFSSL_ECC_SECP160K1:
+         case WOLFSSL_ECC_SECP160R1:
+@@ -2405,11 +2403,17 @@ int wolfSSL_UseSupportedCurve(WOLFSSL* ssl, word16 name)
+         case WOLFSSL_FFDHE_4096:
+         case WOLFSSL_FFDHE_6144:
+         case WOLFSSL_FFDHE_8192:
+-            break;
++            return 0;
+ 
+         default:
+             return BAD_FUNC_ARG;
+     }
++}
++
++int wolfSSL_UseSupportedCurve(WOLFSSL* ssl, word16 name)
++{
++    if (ssl == NULL || isValidCurveGroup(name) != 0)
++        return BAD_FUNC_ARG;
+ 
+     ssl->options.userCurves = 1;
+ 
+@@ -2419,42 +2423,72 @@ int wolfSSL_UseSupportedCurve(WOLFSSL* ssl, word16 name)
+ 
+ int wolfSSL_CTX_UseSupportedCurve(WOLFSSL_CTX* ctx, word16 name)
+ {
+-    if (ctx == NULL)
++    if (ctx == NULL || isValidCurveGroup(name) != 0)
+         return BAD_FUNC_ARG;
+ 
+-    switch (name) {
+-        case WOLFSSL_ECC_SECP160K1:
+-        case WOLFSSL_ECC_SECP160R1:
+-        case WOLFSSL_ECC_SECP160R2:
+-        case WOLFSSL_ECC_SECP192K1:
+-        case WOLFSSL_ECC_SECP192R1:
+-        case WOLFSSL_ECC_SECP224K1:
+-        case WOLFSSL_ECC_SECP224R1:
+-        case WOLFSSL_ECC_SECP256K1:
+-        case WOLFSSL_ECC_SECP256R1:
+-        case WOLFSSL_ECC_SECP384R1:
+-        case WOLFSSL_ECC_SECP521R1:
+-        case WOLFSSL_ECC_BRAINPOOLP256R1:
+-        case WOLFSSL_ECC_BRAINPOOLP384R1:
+-        case WOLFSSL_ECC_BRAINPOOLP512R1:
+-        case WOLFSSL_ECC_X25519:
+-        case WOLFSSL_ECC_X448:
+-        case WOLFSSL_FFDHE_2048:
+-        case WOLFSSL_FFDHE_3072:
+-        case WOLFSSL_FFDHE_4096:
+-        case WOLFSSL_FFDHE_6144:
+-        case WOLFSSL_FFDHE_8192:
+-            break;
+-
+-        default:
+-            return BAD_FUNC_ARG;
+-    }
+-
+     ctx->userCurves = 1;
+ 
+     return TLSX_UseSupportedCurve(&ctx->extensions, name, ctx->heap);
+ }
+ 
++#ifdef OPENSSL_EXTRA
++int  wolfSSL_CTX_set1_groups(WOLFSSL_CTX* ctx, int* groups,
++                                        int count)
++{
++    int i;
++    int _groups[WOLFSSL_MAX_GROUP_COUNT];
++    WOLFSSL_ENTER("wolfSSL_CTX_set1_groups");
++    if (count == 0) {
++        WOLFSSL_MSG("Group count is zero");
++        return WOLFSSL_FAILURE;
++    }
++    for (i = 0; i < count; i++) {
++        if (isValidCurveGroup(groups[i]) == 0) {
++            _groups[i] = groups[i];
++        }
++        else {
++            /* groups may be populated with curve NIDs */
++            int oid = nid2oid(groups[i], oidCurveType);
++            int name = (int)GetCurveByOID(oid);
++            if (name == 0) {
++                WOLFSSL_MSG("Invalid group name");
++                return WOLFSSL_FAILURE;
++            }
++            _groups[i] = name;
++        }
++    }
++    return wolfSSL_CTX_set_groups(ctx, _groups, count) == WOLFSSL_SUCCESS ?
++            WOLFSSL_SUCCESS : WOLFSSL_FAILURE;
++}
++
++int  wolfSSL_set1_groups(WOLFSSL* ssl, int* groups, int count)
++{
++    int i;
++    int _groups[WOLFSSL_MAX_GROUP_COUNT];
++    WOLFSSL_ENTER("wolfSSL_CTX_set1_groups");
++    if (count == 0) {
++        WOLFSSL_MSG("Group count is zero");
++        return WOLFSSL_FAILURE;
++    }
++    for (i = 0; i < count; i++) {
++        if (isValidCurveGroup(groups[i]) == 0) {
++            _groups[i] = groups[i];
++        }
++        else {
++            /* groups may be populated with curve NIDs */
++            int oid = nid2oid(groups[i], oidCurveType);
++            int name = (int)GetCurveByOID(oid);
++            if (name == 0) {
++                WOLFSSL_MSG("Invalid group name");
++                return WOLFSSL_FAILURE;
++            }
++            _groups[i] = name;
++        }
++    }
++    return wolfSSL_set_groups(ssl, _groups, count) == WOLFSSL_SUCCESS ?
++            WOLFSSL_SUCCESS : WOLFSSL_FAILURE;
++}
++#endif
+ #endif /* HAVE_SUPPORTED_CURVES && !NO_WOLFSSL_CLIENT */
+ 
+ /* QSH quantum safe handshake */
+@@ -48151,6 +48185,337 @@ int wolfSSL_set_alpn_protos(WOLFSSL* ssl,
+ #include "src/bio.c"
+ #endif
+ 
++word32 nid2oid(int nid, int grp)
++{
++    /* get OID type */
++    switch (grp) {
++        /* oidHashType */
++        case oidHashType:
++            switch (nid) {
++            #ifdef WOLFSSL_MD2
++                case NID_md2:
++                    return MD2h;
++            #endif
++            #ifndef NO_MD5
++                case NID_md5:
++                    return MD5h;
++            #endif
++            #ifndef NO_SHA
++                case NID_sha1:
++                    return SHAh;
++            #endif
++                case NID_sha224:
++                    return SHA224h;
++            #ifndef NO_SHA256
++                case NID_sha256:
++                    return SHA256h;
++            #endif
++            #ifdef WOLFSSL_SHA384
++                case NID_sha384:
++                    return SHA384h;
++            #endif
++            #ifdef WOLFSSL_SHA512
++                case NID_sha512:
++                    return SHA512h;
++            #endif
++            }
++            break;
++
++        /*  oidSigType */
++        case oidSigType:
++            switch (nid) {
++            #ifndef NO_DSA
++                case CTC_SHAwDSA:
++                    return CTC_SHAwDSA;
++            #endif /* NO_DSA */
++            #ifndef NO_RSA
++                case CTC_MD2wRSA:
++                    return CTC_MD2wRSA;
++                case CTC_MD5wRSA:
++                    return CTC_MD5wRSA;
++                case CTC_SHAwRSA:
++                    return CTC_SHAwRSA;
++                case CTC_SHA224wRSA:
++                    return CTC_SHA224wRSA;
++                case CTC_SHA256wRSA:
++                    return CTC_SHA256wRSA;
++                case CTC_SHA384wRSA:
++                    return CTC_SHA384wRSA;
++                case CTC_SHA512wRSA:
++                    return CTC_SHA512wRSA;
++            #endif /* NO_RSA */
++            #ifdef HAVE_ECC
++                case CTC_SHAwECDSA:
++                    return CTC_SHAwECDSA;
++                case CTC_SHA224wECDSA:
++                    return CTC_SHA224wECDSA;
++                case CTC_SHA256wECDSA:
++                    return CTC_SHA256wECDSA;
++                case CTC_SHA384wECDSA:
++                    return CTC_SHA384wECDSA;
++                case CTC_SHA512wECDSA:
++                    return CTC_SHA512wECDSA;
++            #endif /* HAVE_ECC */
++            }
++            break;
++
++        /* oidKeyType */
++        case oidKeyType:
++            switch (nid) {
++            #ifndef NO_DSA
++                case DSAk:
++                    return DSAk;
++            #endif /* NO_DSA */
++            #ifndef NO_RSA
++                case RSAk:
++                    return RSAk;
++            #endif /* NO_RSA */
++            #ifdef HAVE_NTRU
++                case NTRUk:
++                    return NTRUk;
++            #endif /* HAVE_NTRU */
++            #ifdef HAVE_ECC
++                case ECDSAk:
++                    return ECDSAk;
++            #endif /* HAVE_ECC */
++            }
++            break;
++
++
++    #ifdef HAVE_ECC
++        case oidCurveType:
++            switch (nid) {
++            case NID_X9_62_prime192v1:
++                return ECC_SECP192R1_OID;
++            case NID_X9_62_prime192v2:
++                return ECC_PRIME192V2_OID;
++            case NID_X9_62_prime192v3:
++                return ECC_PRIME192V3_OID;
++            case NID_X9_62_prime239v1:
++                return ECC_PRIME239V1_OID;
++            case NID_X9_62_prime239v2:
++                return ECC_PRIME239V2_OID;
++            case NID_X9_62_prime239v3:
++                return ECC_PRIME239V3_OID;
++            case NID_X9_62_prime256v1:
++                return ECC_SECP256R1_OID;
++            case NID_secp112r1:
++                return ECC_SECP112R1_OID;
++            case NID_secp112r2:
++                return ECC_SECP112R2_OID;
++            case NID_secp128r1:
++                return ECC_SECP128R1_OID;
++            case NID_secp128r2:
++                return ECC_SECP128R2_OID;
++            case NID_secp160r1:
++                return ECC_SECP160R1_OID;
++            case NID_secp160r2:
++                return ECC_SECP160R2_OID;
++            case NID_secp224r1:
++                return ECC_SECP224R1_OID;
++            case NID_secp384r1:
++                return ECC_SECP384R1_OID;
++            case NID_secp521r1:
++                return ECC_SECP521R1_OID;
++            case NID_secp160k1:
++                return ECC_SECP160K1_OID;
++            case NID_secp192k1:
++                return ECC_SECP192K1_OID;
++            case NID_secp224k1:
++                return ECC_SECP224K1_OID;
++            case NID_secp256k1:
++                return ECC_SECP256K1_OID;
++            case NID_brainpoolP160r1:
++                return ECC_BRAINPOOLP160R1_OID;
++            case NID_brainpoolP192r1:
++                return ECC_BRAINPOOLP192R1_OID;
++            case NID_brainpoolP224r1:
++                return ECC_BRAINPOOLP224R1_OID;
++            case NID_brainpoolP256r1:
++                return ECC_BRAINPOOLP256R1_OID;
++            case NID_brainpoolP320r1:
++                return ECC_BRAINPOOLP320R1_OID;
++            case NID_brainpoolP384r1:
++                return ECC_BRAINPOOLP384R1_OID;
++            case NID_brainpoolP512r1:
++                return ECC_BRAINPOOLP512R1_OID;
++            }
++            break;
++    #endif /* HAVE_ECC */
++
++        /* oidBlkType */
++        case oidBlkType:
++            switch (nid) {
++            #ifdef WOLFSSL_AES_128
++                case AES128CBCb:
++                    return AES128CBCb;
++            #endif
++            #ifdef WOLFSSL_AES_192
++                case AES192CBCb:
++                    return AES192CBCb;
++            #endif
++            #ifdef WOLFSSL_AES_256
++                case AES256CBCb:
++                    return AES256CBCb;
++            #endif
++            #ifndef NO_DES3
++                case NID_des:
++                    return DESb;
++                case NID_des3:
++                    return DES3b;
++            #endif
++            }
++            break;
++
++    #ifdef HAVE_OCSP
++        case oidOcspType:
++            switch (nid) {
++                case NID_id_pkix_OCSP_basic:
++                    return OCSP_BASIC_OID;
++                case OCSP_NONCE_OID:
++                    return OCSP_NONCE_OID;
++            }
++            break;
++    #endif /* HAVE_OCSP */
++
++        /* oidCertExtType */
++        case oidCertExtType:
++            switch (nid) {
++                case BASIC_CA_OID:
++                    return BASIC_CA_OID;
++                case ALT_NAMES_OID:
++                    return ALT_NAMES_OID;
++                case CRL_DIST_OID:
++                    return CRL_DIST_OID;
++                case AUTH_INFO_OID:
++                    return AUTH_INFO_OID;
++                case AUTH_KEY_OID:
++                    return AUTH_KEY_OID;
++                case SUBJ_KEY_OID:
++                    return SUBJ_KEY_OID;
++                case INHIBIT_ANY_OID:
++                    return INHIBIT_ANY_OID;
++                case NID_key_usage:
++                    return KEY_USAGE_OID;
++                case NID_name_constraints:
++                    return NAME_CONS_OID;
++                case NID_certificate_policies:
++                    return CERT_POLICY_OID;
++            }
++            break;
++
++        /* oidCertAuthInfoType */
++        case oidCertAuthInfoType:
++            switch (nid) {
++                case AIA_OCSP_OID:
++                    return AIA_OCSP_OID;
++                case AIA_CA_ISSUER_OID:
++                    return AIA_CA_ISSUER_OID;
++            }
++            break;
++
++        /* oidCertPolicyType */
++        case oidCertPolicyType:
++            switch (nid) {
++                case NID_any_policy:
++                    return CP_ANY_OID;
++            }
++            break;
++
++        /* oidCertAltNameType */
++        case oidCertAltNameType:
++            switch (nid) {
++                case NID_hw_name_oid:
++                    return HW_NAME_OID;
++            }
++            break;
++
++        /* oidCertKeyUseType */
++        case oidCertKeyUseType:
++            switch (nid) {
++                case NID_anyExtendedKeyUsage:
++                    return EKU_ANY_OID;
++                case EKU_SERVER_AUTH_OID:
++                    return EKU_SERVER_AUTH_OID;
++                case EKU_CLIENT_AUTH_OID:
++                    return EKU_CLIENT_AUTH_OID;
++                case EKU_OCSP_SIGN_OID:
++                    return EKU_OCSP_SIGN_OID;
++            }
++            break;
++
++        /* oidKdfType */
++        case oidKdfType:
++            switch (nid) {
++                case PBKDF2_OID:
++                    return PBKDF2_OID;
++            }
++            break;
++
++        /* oidPBEType */
++        case oidPBEType:
++            switch (nid) {
++                case PBE_SHA1_RC4_128:
++                    return PBE_SHA1_RC4_128;
++                case PBE_SHA1_DES:
++                    return PBE_SHA1_DES;
++                case PBE_SHA1_DES3:
++                    return PBE_SHA1_DES3;
++            }
++            break;
++
++        /* oidKeyWrapType */
++        case oidKeyWrapType:
++            switch (nid) {
++            #ifdef WOLFSSL_AES_128
++                case AES128_WRAP:
++                    return AES128_WRAP;
++            #endif
++            #ifdef WOLFSSL_AES_192
++                case AES192_WRAP:
++                    return AES192_WRAP;
++            #endif
++            #ifdef WOLFSSL_AES_256
++                case AES256_WRAP:
++                    return AES256_WRAP;
++            #endif
++            }
++            break;
++
++        /* oidCmsKeyAgreeType */
++        case oidCmsKeyAgreeType:
++            switch (nid) {
++                #ifndef NO_SHA
++                case dhSinglePass_stdDH_sha1kdf_scheme:
++                    return dhSinglePass_stdDH_sha1kdf_scheme;
++                #endif
++                #ifdef WOLFSSL_SHA224
++                case dhSinglePass_stdDH_sha224kdf_scheme:
++                    return dhSinglePass_stdDH_sha224kdf_scheme;
++                #endif
++                #ifndef NO_SHA256
++                case dhSinglePass_stdDH_sha256kdf_scheme:
++                    return dhSinglePass_stdDH_sha256kdf_scheme;
++                #endif
++                #ifdef WOLFSSL_SHA384
++                case dhSinglePass_stdDH_sha384kdf_scheme:
++                    return dhSinglePass_stdDH_sha384kdf_scheme;
++                #endif
++                #ifdef WOLFSSL_SHA512
++                case dhSinglePass_stdDH_sha512kdf_scheme:
++                    return dhSinglePass_stdDH_sha512kdf_scheme;
++                #endif
++            }
++            break;
++
++        default:
++            WOLFSSL_MSG("NID not in table");
++            return -1;
++    }
++
++    return -1;
++}
++
+ int oid2nid(word32 oid, int grp)
+ {
+     size_t i;
+diff --git a/src/tls13.c b/src/tls13.c
+index 1ec927efe27..027be809fd4 100644
+--- a/src/tls13.c
++++ b/src/tls13.c
+@@ -8063,15 +8063,26 @@ int wolfSSL_preferred_group(WOLFSSL* ssl)
+  */
+ int wolfSSL_CTX_set_groups(WOLFSSL_CTX* ctx, int* groups, int count)
+ {
+-    int i;
++    int ret, i;
+ 
++    WOLFSSL_ENTER("wolfSSL_CTX_set_groups");
+     if (ctx == NULL || groups == NULL || count > WOLFSSL_MAX_GROUP_COUNT)
+         return BAD_FUNC_ARG;
+     if (!IsAtLeastTLSv1_3(ctx->method->version))
+         return BAD_FUNC_ARG;
+ 
+-    for (i = 0; i < count; i++)
+-        ctx->group[i] = (word16)groups[i];
++    ctx->numGroups = 0;
++    TLSX_Remove(&ctx->extensions, TLSX_SUPPORTED_GROUPS, ctx->heap);
++    for (i = 0; i < count; i++) {
++        /* Call to wolfSSL_CTX_UseSupportedCurve also checks if input groups
++         * are valid */
++        if ((ret = wolfSSL_CTX_UseSupportedCurve(ctx, groups[i]))
++                != WOLFSSL_SUCCESS) {
++            TLSX_Remove(&ctx->extensions, TLSX_SUPPORTED_GROUPS, ctx->heap);
++            return ret;
++        }
++        ctx->group[i] = groups[i];
++    }
+     ctx->numGroups = (byte)count;
+ 
+     return WOLFSSL_SUCCESS;
+@@ -8087,20 +8098,31 @@ int wolfSSL_CTX_set_groups(WOLFSSL_CTX* ctx, int* groups, int count)
+  */
+ int wolfSSL_set_groups(WOLFSSL* ssl, int* groups, int count)
+ {
+-    int i;
++    int ret, i;
+ 
++    WOLFSSL_ENTER("wolfSSL_set_groups");
+     if (ssl == NULL || groups == NULL || count > WOLFSSL_MAX_GROUP_COUNT)
+         return BAD_FUNC_ARG;
+     if (!IsAtLeastTLSv1_3(ssl->version))
+         return BAD_FUNC_ARG;
+ 
+-    for (i = 0; i < count; i++)
+-        ssl->group[i] = (word16)groups[i];
++    ssl->numGroups = 0;
++    TLSX_Remove(&ssl->extensions, TLSX_SUPPORTED_GROUPS, ssl->heap);
++    for (i = 0; i < count; i++) {
++        /* Call to wolfSSL_UseSupportedCurve also checks if input groups
++                 * are valid */
++        if ((ret = wolfSSL_UseSupportedCurve(ssl, groups[i]))
++                != WOLFSSL_SUCCESS) {
++            TLSX_Remove(&ssl->extensions, TLSX_SUPPORTED_GROUPS, ssl->heap);
++            return ret;
++        }
++        ssl->group[i] = groups[i];
++    }
+     ssl->numGroups = (byte)count;
+ 
+     return WOLFSSL_SUCCESS;
+ }
+-#endif
++#endif /* HAVE_SUPPORTED_CURVES */
+ 
+ #ifndef NO_PSK
+ void wolfSSL_CTX_set_psk_client_tls13_callback(WOLFSSL_CTX* ctx,
+diff --git a/wolfcrypt/src/asn.c b/wolfcrypt/src/asn.c
+index be73518e24f..32dfd58963f 100644
+--- a/wolfcrypt/src/asn.c
++++ b/wolfcrypt/src/asn.c
+@@ -5603,9 +5603,10 @@ int wc_OBJ_sn2nid(const char *sn)
+         {WOLFSSL_ORGUNIT_NAME, NID_organizationalUnitName},
+         {WOLFSSL_EMAIL_ADDR, NID_emailAddress},
+         {NULL, -1}};
+-
+     int i;
+     #ifdef HAVE_ECC
++    char curveName[16]; /* Same as MAX_CURVE_NAME_SZ but can't include that
++                         * symbol in this file */
+     int eccEnum;
+     #endif
+     WOLFSSL_ENTER("OBJ_sn2nid");
+@@ -5618,8 +5619,11 @@ int wc_OBJ_sn2nid(const char *sn)
+     /* Nginx uses this OpenSSL string. */
+     if (XSTRNCMP(sn, "prime256v1", 10) == 0)
+         sn = "SECP256R1";
+-    if (XSTRNCMP(sn, "secp384r1", 10) == 0)
+-        sn = "SECP384R1";
++    /* OpenSSL allows lowercase curve names */
++    for (i = 0; i < (int)(sizeof(curveName) - 1) && *sn; i++) {
++        curveName[i] = XTOUPPER(*sn++);
++    }
++    curveName[i] = '\0';
+     /* find based on name and return NID */
+     for (i = 0;
+ #ifndef WOLFSSL_ECC_CURVE_STATIC
+@@ -5628,7 +5632,7 @@ int wc_OBJ_sn2nid(const char *sn)
+          ecc_sets[i].size != 0;
+ #endif
+          i++) {
+-        if (XSTRNCMP(sn, ecc_sets[i].name, ECC_MAXNAME) == 0) {
++        if (XSTRNCMP(curveName, ecc_sets[i].name, ECC_MAXNAME) == 0) {
+             eccEnum = ecc_sets[i].id;
+             /* Convert enum value in ecc_curve_id to OpenSSL NID */
+             return EccEnumToNID(eccEnum);
+diff --git a/wolfssl/openssl/ssl.h b/wolfssl/openssl/ssl.h
+index 6475f705ac4..564263cdb1e 100644
+--- a/wolfssl/openssl/ssl.h
++++ b/wolfssl/openssl/ssl.h
+@@ -303,8 +303,8 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
+ /* wolfSSL does not support exporting keying material */
+ #define SSL_export_keying_material      wolfSSL_export_keying_material
+ 
+-#define SSL_CTX_set1_groups             wolfSSL_CTX_set_groups
+-#define SSL_set1_groups                 wolfSSL_set_groups
++#define SSL_CTX_set1_groups             wolfSSL_CTX_set1_groups
++#define SSL_set1_groups                 wolfSSL_set1_groups
+ 
+ #define SSL_CTX_set1_groups_list        wolfSSL_CTX_set1_groups_list
+ #define SSL_set1_groups_list            wolfSSL_set1_groups_list
+diff --git a/wolfssl/ssl.h b/wolfssl/ssl.h
+index c02f5d9f13d..cab58bc2e93 100644
+--- a/wolfssl/ssl.h
++++ b/wolfssl/ssl.h
+@@ -921,6 +921,12 @@ WOLFSSL_API int  wolfSSL_CTX_set_groups(WOLFSSL_CTX* ctx, int* groups,
+                                         int count);
+ WOLFSSL_API int  wolfSSL_set_groups(WOLFSSL* ssl, int* groups, int count);
+ 
++#ifdef OPENSSL_EXTRA
++WOLFSSL_API int  wolfSSL_CTX_set1_groups(WOLFSSL_CTX* ctx, int* groups,
++                                        int count);
++WOLFSSL_API int  wolfSSL_set1_groups(WOLFSSL* ssl, int* groups, int count);
++#endif
++
+ WOLFSSL_API int  wolfSSL_connect_TLSv13(WOLFSSL*);
+ WOLFSSL_API int  wolfSSL_accept_TLSv13(WOLFSSL*);
+ 
+
+From f5cf24dbdc2de61b562db78360c24dd156160b15 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Thu, 19 Nov 2020 13:00:54 +0100
+Subject: [PATCH 07/13] SHA1 should not be called SHA. Leave alias for
+ compatibility.
+
+---
+ wolfcrypt/src/evp.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/wolfcrypt/src/evp.c b/wolfcrypt/src/evp.c
+index 59a6ecf03f3..c1d2cee3578 100644
+--- a/wolfcrypt/src/evp.c
++++ b/wolfcrypt/src/evp.c
+@@ -2106,7 +2106,7 @@ static const struct s_ent {
+ #endif /* NO_MD5 */
+ 
+ #ifndef NO_SHA
+-    {WC_HASH_TYPE_SHA, NID_sha1, "SHA"},
++    {WC_HASH_TYPE_SHA, NID_sha1, "SHA1"},
+ #endif /* NO_SHA */
+ 
+ #ifdef WOLFSSL_SHA224
+@@ -3279,8 +3279,8 @@ const WOLFSSL_EVP_MD *wolfSSL_EVP_get_digestbyname(const char *name)
+     {
+         {"MD4", "ssl3-md4"},
+         {"MD5", "ssl3-md5"},
+-        {"SHA", "ssl3-sha1"},
+-        {"SHA", "SHA1"},
++        {"SHA1", "ssl3-sha1"},
++        {"SHA1", "SHA"},
+         { NULL, NULL}
+     };
+     char nameUpper[15]; /* 15 bytes should be enough for any name */
+@@ -3358,7 +3358,7 @@ int wolfSSL_EVP_MD_type(const WOLFSSL_EVP_MD *md)
+     const WOLFSSL_EVP_MD* wolfSSL_EVP_sha1(void)
+     {
+         WOLFSSL_ENTER("EVP_sha1");
+-        return EVP_get_digestbyname("SHA");
++        return EVP_get_digestbyname("SHA1");
+     }
+ #endif /* NO_SHA */
+ 
+
+From ff43d39015b094efb2d23d54f09d6c9f9c05e817 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Thu, 3 Dec 2020 14:29:19 +0100
+Subject: [PATCH 08/13] GCC complains about empty if
+
+---
+ src/ssl.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/ssl.c b/src/ssl.c
+index 68187a0b60d..e3c2b939870 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -7860,8 +7860,9 @@ WOLFSSL_EVP_PKEY* wolfSSL_d2i_PUBKEY(WOLFSSL_EVP_PKEY** out,
+     #endif /* !HAVE_FIPS || HAVE_FIPS_VERSION > 2 */
+     #endif /* !NO_DH && (WOLFSSL_QT || OPENSSL_ALL) */
+ 
+-    if (pkey == NULL)
++    if (pkey == NULL) {
+         WOLFSSL_MSG("wolfSSL_d2i_PUBKEY couldn't determine key type");
++    }
+ 
+     return pkey;
+ }
+
+From 46821196abd9631f2afe4292e53614f80a69d179 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Tue, 22 Dec 2020 16:11:08 +0100
+Subject: [PATCH 09/13] Fix call to wolfSSL_connect when in
+ wolfSSL_connect_TLSv13
+
+If a client is:
+- TLS 1.3 capable
+- calls connect with wolfSSL_connect_TLSv13
+- on an WOLFSSL object that allows downgrading
+then the call to wolfSSL_connect should happen before changing state to HELLO_AGAIN. Otherwise wolfSSL_connect will assume that messages up to ServerHelloDone have been read (when in reality only ServerHello had been read).
+
+Enable keying material for OpenVPN
+---
+ configure.ac |  4 +++-
+ src/tls13.c  | 17 ++++++++---------
+ 2 files changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index 894a35461cc..50920d74369 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -4051,7 +4051,9 @@ fi
+ 
+ if test "$ENABLED_OPENVPN" = "yes"
+ then
+-    AM_CFLAGS="$AM_CFLAGS -DWOLFSSL_DES_ECB -DHAVE_EX_DATA -DWOLFSSL_KEY_GEN -DWOLFSSL_OPENVPN"
++    ENABLED_SUPPORTED_CURVES="yes"
++    AM_CFLAGS="$AM_CFLAGS -DWOLFSSL_OPENVPN -DHAVE_KEYING_MATERIAL"
++    AM_CFLAGS="$AM_CFLAGS -DWOLFSSL_DES_ECB -DHAVE_EX_DATA -DWOLFSSL_KEY_GEN"
+ fi
+ 
+ 
+diff --git a/src/tls13.c b/src/tls13.c
+index 027be809fd4..c6008d8b1ae 100644
+--- a/src/tls13.c
++++ b/src/tls13.c
+@@ -7565,24 +7565,23 @@ int wolfSSL_connect_TLSv13(WOLFSSL* ssl)
+                 }
+             }
+ 
+-            ssl->options.connectState = HELLO_AGAIN;
+-            WOLFSSL_MSG("connect state: HELLO_AGAIN");
+-            FALL_THROUGH;
+-
+-        case HELLO_AGAIN:
+-            if (ssl->options.certOnly)
+-                return WOLFSSL_SUCCESS;
+-
+             if (!ssl->options.tls1_3) {
+     #ifndef WOLFSSL_NO_TLS12
+                 if (ssl->options.downgrade)
+                     return wolfSSL_connect(ssl);
+     #endif
+-
+                 WOLFSSL_MSG("Client using higher version, fatal error");
+                 return VERSION_ERROR;
+             }
+ 
++            ssl->options.connectState = HELLO_AGAIN;
++            WOLFSSL_MSG("connect state: HELLO_AGAIN");
++            FALL_THROUGH;
++
++        case HELLO_AGAIN:
++            if (ssl->options.certOnly)
++                return WOLFSSL_SUCCESS;
++
+             if (ssl->options.serverState ==
+                                           SERVER_HELLO_RETRY_REQUEST_COMPLETE) {
+         #if defined(WOLFSSL_TLS13_MIDDLEBOX_COMPAT)
+
+From 69dca4fd08d732f89c61f2846b7985aa3e5f688d Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Tue, 22 Dec 2020 17:16:47 +0100
+Subject: [PATCH 10/13] Rebase fixes
+
+- wolfSSL_CTX_set1_groups_list and wolfSSL_set1_groups_list should use wolfSSL_CTX_set1_groups and wolfSSL_set1_groups respectively because it converts to correct groups representation
+- Change to using "SHA1" as main name for SHA1
+---
+ src/ssl.c           | 6 ++----
+ tests/api.c         | 6 ++++++
+ wolfcrypt/src/evp.c | 6 +++++-
+ 3 files changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/ssl.c b/src/ssl.c
+index e3c2b939870..fc554eeed59 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -35155,8 +35155,7 @@ int wolfSSL_CTX_set1_groups_list(WOLFSSL_CTX *ctx, char *list)
+         return WOLFSSL_FAILURE;
+     }
+ 
+-    return wolfSSL_CTX_set_groups(ctx, groups, count) == WOLFSSL_SUCCESS ?
+-            WOLFSSL_SUCCESS : WOLFSSL_FAILURE;
++    return wolfSSL_CTX_set1_groups(ctx, groups, count);
+ }
+ 
+ int wolfSSL_set1_groups_list(WOLFSSL *ssl, char *list)
+@@ -35173,8 +35172,7 @@ int wolfSSL_set1_groups_list(WOLFSSL *ssl, char *list)
+         return WOLFSSL_FAILURE;
+     }
+ 
+-    return wolfSSL_set_groups(ssl, groups, count) == WOLFSSL_SUCCESS ?
+-            WOLFSSL_SUCCESS : WOLFSSL_FAILURE;
++    return wolfSSL_set1_groups(ssl, groups, count);
+ }
+ #endif /* WOLFSSL_TLS13 */
+ 
+diff --git a/tests/api.c b/tests/api.c
+index dc80978bbba..8dbd871b797 100644
+--- a/tests/api.c
++++ b/tests/api.c
+@@ -27060,6 +27060,12 @@ static void test_wolfSSL_EVP_MD_size(void)
+     AssertIntEQ(wolfSSL_EVP_MD_CTX_block_size(&mdCtx), WC_SHA_BLOCK_SIZE);
+     AssertIntEQ(wolfSSL_EVP_MD_CTX_cleanup(&mdCtx), 1);
+ 
++    wolfSSL_EVP_MD_CTX_init(&mdCtx);
++
++    AssertIntEQ(wolfSSL_EVP_DigestInit(&mdCtx, "SHA1"), 1);
++    AssertIntEQ(wolfSSL_EVP_MD_CTX_size(&mdCtx), WC_SHA_DIGEST_SIZE);
++    AssertIntEQ(wolfSSL_EVP_MD_CTX_block_size(&mdCtx), WC_SHA_BLOCK_SIZE);
++    AssertIntEQ(wolfSSL_EVP_MD_CTX_cleanup(&mdCtx), 1);
+ #endif
+     /* error case */
+     wolfSSL_EVP_MD_CTX_init(&mdCtx);
+diff --git a/wolfcrypt/src/evp.c b/wolfcrypt/src/evp.c
+index c1d2cee3578..326802646ee 100644
+--- a/wolfcrypt/src/evp.c
++++ b/wolfcrypt/src/evp.c
+@@ -2107,6 +2107,7 @@ static const struct s_ent {
+ 
+ #ifndef NO_SHA
+     {WC_HASH_TYPE_SHA, NID_sha1, "SHA1"},
++    {WC_HASH_TYPE_SHA, NID_sha1, "SHA"}, /* Leave for backwards compatibility */
+ #endif /* NO_SHA */
+ 
+ #ifdef WOLFSSL_SHA224
+@@ -6883,7 +6884,10 @@ int wolfSSL_EVP_get_hashinfo(const WOLFSSL_EVP_MD* evp,
+             }
+             else
+         #endif
+-            {
++            if (XSTRNCMP("SHA1", evp, 4) == 0) {
++                hash = WC_HASH_TYPE_SHA;
++            }
++            else {
+                 WOLFSSL_MSG("Unknown SHA hash");
+             }
+         }
+
+From 921fd34876544181dda2dbb5206ecb72a6b6b193 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Wed, 27 Jan 2021 18:01:49 +0100
+Subject: [PATCH 11/13] Detect version even if not compiled in
+
+---
+ src/ssl.c | 12 ------------
+ 1 file changed, 12 deletions(-)
+
+diff --git a/src/ssl.c b/src/ssl.c
+index fc554eeed59..62f957b12e1 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -16464,33 +16464,21 @@ int wolfSSL_CTX_set_min_proto_version(WOLFSSL_CTX* ctx, int version)
+     }
+ 
+     switch (version) {
+-#if defined(WOLFSSL_ALLOW_SSLV3) && !defined(NO_OLD_TLS)
+         case SSL3_VERSION:
+             ctx->minDowngrade = SSLv3_MINOR;
+             break;
+-#endif
+-#ifndef NO_TLS
+-    #ifndef NO_OLD_TLS
+-        #ifdef WOLFSSL_ALLOW_TLSV10
+         case TLS1_VERSION:
+             ctx->minDowngrade = TLSv1_MINOR;
+             break;
+-        #endif
+         case TLS1_1_VERSION:
+             ctx->minDowngrade = TLSv1_1_MINOR;
+             break;
+-    #endif
+-    #ifndef WOLFSSL_NO_TLS12
+         case TLS1_2_VERSION:
+             ctx->minDowngrade = TLSv1_2_MINOR;
+             break;
+-    #endif
+-    #ifdef WOLFSSL_TLS13
+         case TLS1_3_VERSION:
+             ctx->minDowngrade = TLSv1_3_MINOR;
+             break;
+-    #endif
+-#endif
+ #ifdef WOLFSSL_DTLS
+     #ifndef NO_OLD_TLS
+         case DTLS1_VERSION:
+
+From 8a669615f88e9ecce6c97ecd8f070a8e31ba481d Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Wed, 27 Jan 2021 18:02:37 +0100
+Subject: [PATCH 12/13] Generate correct GCM tag
+
+---
+ wolfcrypt/src/evp.c | 84 ++++++++++-----------------------------------
+ 1 file changed, 18 insertions(+), 66 deletions(-)
+
+diff --git a/wolfcrypt/src/evp.c b/wolfcrypt/src/evp.c
+index 326802646ee..8f4471e8049 100644
+--- a/wolfcrypt/src/evp.c
++++ b/wolfcrypt/src/evp.c
+@@ -772,39 +772,16 @@ int  wolfSSL_EVP_CipherFinal(WOLFSSL_EVP_CIPHER_CTX *ctx,
+         case AES_256_GCM_TYPE:
+             if ((ctx->gcmBuffer && ctx->gcmBufferLen > 0)
+              || (ctx->gcmBufferLen == 0)) {
+-                ret = 0;
+-                if (ctx->gcmAuthIn) {
+-                    /* authenticated, non-confidential data*/
+-                    if (ctx->enc) {
+-                        XMEMSET(ctx->authTag, 0, ctx->authTagSz);
+-                        ret = wc_AesGcmEncrypt(&ctx->cipher.aes, NULL, NULL, 0,
+-                                  ctx->iv, ctx->ivSz, ctx->authTag, ctx->authTagSz,
+-                                  ctx->gcmAuthIn, ctx->gcmAuthInSz);
+-                    }
+-                    else {
+-                        ret = wc_AesGcmDecrypt(&ctx->cipher.aes, NULL, NULL, 0,
+-                                  ctx->iv, ctx->ivSz, ctx->authTag, ctx->authTagSz,
+-                                  ctx->gcmAuthIn, ctx->gcmAuthInSz);
+-                        /* Reset partial authTag error for AAD*/
+-                        if (ret == AES_GCM_AUTH_E)
+-                            ret = 0;
+-                    }
+-                }
+-
+-                if (ret == 0) {
+-                    if (ctx->enc)
+-                        /* encrypt confidential data*/
+-                        ret = wc_AesGcmEncrypt(&ctx->cipher.aes, out,
+-                                ctx->gcmBuffer, ctx->gcmBufferLen,
+-                                ctx->iv, ctx->ivSz, ctx->authTag, ctx->authTagSz,
+-                                NULL, 0);
+-                    else
+-                        /* decrypt confidential data*/
+-                        ret = wc_AesGcmDecrypt(&ctx->cipher.aes, out,
+-                                ctx->gcmBuffer, ctx->gcmBufferLen,
+-                                ctx->iv, ctx->ivSz, ctx->authTag, ctx->authTagSz,
+-                                NULL, 0);
+-                }
++                if (ctx->enc)
++                    ret = wc_AesGcmEncrypt(&ctx->cipher.aes, out,
++                            ctx->gcmBuffer, ctx->gcmBufferLen,
++                            ctx->iv, ctx->ivSz, ctx->authTag, ctx->authTagSz,
++                            ctx->gcmAuthIn, ctx->gcmAuthInSz);
++                else
++                    ret = wc_AesGcmDecrypt(&ctx->cipher.aes, out,
++                            ctx->gcmBuffer, ctx->gcmBufferLen,
++                            ctx->iv, ctx->ivSz, ctx->authTag, ctx->authTagSz,
++                            ctx->gcmAuthIn, ctx->gcmAuthInSz);
+ 
+                 if (ret == 0) {
+                     ret = WOLFSSL_SUCCESS;
+@@ -5289,39 +5266,14 @@ int wolfSSL_EVP_MD_type(const WOLFSSL_EVP_MD *md)
+                     ret = wolfSSL_EVP_CipherUpdate_GCM_AAD(ctx, src, len);
+                 }
+                 else {
+-                    ret = 0;
+-                    if (ctx->gcmAuthIn) {
+-                        /* authenticated, non-confidential data*/
+-                        if (ctx->enc) {
+-                            XMEMSET(ctx->authTag, 0, ctx->authTagSz);
+-                            ret = wc_AesGcmEncrypt(&ctx->cipher.aes, NULL,
+-                                    NULL, 0, ctx->iv, ctx->ivSz, ctx->authTag,
+-                                    ctx->authTagSz, ctx->gcmAuthIn,
+-                                    ctx->gcmAuthInSz);
+-                        }
+-                        else {
+-                            ret = wc_AesGcmDecrypt(&ctx->cipher.aes, NULL,
+-                                    NULL, 0, ctx->iv, ctx->ivSz, ctx->authTag,
+-                                    ctx->authTagSz, ctx->gcmAuthIn,
+-                                    ctx->gcmAuthInSz);
+-                            /* Reset partial authTag error for AAD*/
+-                            if (ret == AES_GCM_AUTH_E)
+-                                ret = 0;
+-                        }
+-                    }
+-
+-                    if (ret == 0) {
+-                        if (ctx->enc)
+-                            /* encrypt confidential data*/
+-                            ret = wc_AesGcmEncrypt(&ctx->cipher.aes, dst, src,
+-                                    len, ctx->iv, ctx->ivSz, ctx->authTag,
+-                                    ctx->authTagSz, NULL, 0);
+-                        else
+-                            /* decrypt confidential data*/
+-                            ret = wc_AesGcmDecrypt(&ctx->cipher.aes, dst, src,
+-                                    len, ctx->iv, ctx->ivSz, ctx->authTag,
+-                                    ctx->authTagSz, NULL, 0);
+-                    }
++                    if (ctx->enc)
++                        ret = wc_AesGcmEncrypt(&ctx->cipher.aes, dst, src,
++                                len, ctx->iv, ctx->ivSz, ctx->authTag,
++                                ctx->authTagSz, ctx->gcmAuthIn, ctx->gcmAuthInSz);
++                    else
++                        ret = wc_AesGcmDecrypt(&ctx->cipher.aes, dst, src,
++                                len, ctx->iv, ctx->ivSz, ctx->authTag,
++                                ctx->authTagSz, ctx->gcmAuthIn, ctx->gcmAuthInSz);
+                 }
+                 if (ret == 0)
+                     ret = len;
+
+From 542e0d79ecc4c24c40823f1f9e257c76ef40b99a Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Mon, 1 Feb 2021 14:59:57 +0100
+Subject: [PATCH 13/13] Jenkins Fixes
+
+- explicit conversions
+- not all curves available for wolfSSL_CTX_set1_groups_list
+- group funcs depend on HAVE_ECC
+- `InitSuites` after `ssl->suites` has been set
+---
+ examples/server/server.c |   2 +-
+ src/internal.c           |  13 ++---
+ src/ssl.c                | 109 +++++++++++++++++++++++++++------------
+ src/tls13.c              |   8 +--
+ tests/api.c              |  22 ++++++--
+ wolfcrypt/src/asn.c      |   2 +-
+ wolfssl/ssl.h            |   9 ----
+ 7 files changed, 107 insertions(+), 58 deletions(-)
+
+diff --git a/examples/server/server.c b/examples/server/server.c
+index 2c4f81609c3..0d476392aab 100644
+--- a/examples/server/server.c
++++ b/examples/server/server.c
+@@ -1107,7 +1107,7 @@ THREAD_RETURN WOLFSSL_THREAD server_test(void* args)
+         WOLFSSL_MEM_STATS mem_stats;
+     #endif
+ #endif
+-#ifdef WOLFSSL_TLS13
++#if defined(WOLFSSL_TLS13)
+     int onlyKeyShare = 0;
+ #endif
+ #if defined(HAVE_SESSION_TICKET)
+diff --git a/src/internal.c b/src/internal.c
+index 0f6bdca4583..fe428309b86 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -5340,12 +5340,6 @@ int SetSSL_CTX(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
+     ssl->pkCurveOID = ctx->pkCurveOID;
+ #endif
+ 
+-#if defined(OPENSSL_EXTRA) || defined(WOLFSSL_WPAS_SMALL)
+-    if (ctx->mask != 0 && wolfSSL_set_options(ssl, ctx->mask) == 0) {
+-        WOLFSSL_MSG("wolfSSL_set_options error");
+-        return BAD_FUNC_ARG;
+-    }
+-#endif
+ #ifdef OPENSSL_EXTRA
+     ssl->CBIS         = ctx->CBIS;
+ #endif
+@@ -5471,6 +5465,13 @@ int SetSSL_CTX(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
+         }
+     }  /* writeDup check */
+ 
++#if defined(OPENSSL_EXTRA) || defined(WOLFSSL_WPAS_SMALL)
++    if (ctx->mask != 0 && wolfSSL_set_options(ssl, ctx->mask) == 0) {
++        WOLFSSL_MSG("wolfSSL_set_options error");
++        return BAD_FUNC_ARG;
++    }
++#endif
++
+ #ifdef WOLFSSL_SESSION_EXPORT
+     #ifdef WOLFSSL_DTLS
+     ssl->dtls_export = ctx->dtls_export; /* export function for session */
+diff --git a/src/ssl.c b/src/ssl.c
+index 62f957b12e1..1c26f0f7dc4 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -2376,7 +2376,7 @@ int wolfSSL_CTX_UseOCSPStaplingV2(WOLFSSL_CTX* ctx, byte status_type,
+ #endif /* HAVE_CERTIFICATE_STATUS_REQUEST_V2 */
+ 
+ /* Elliptic Curves */
+-#if defined(HAVE_SUPPORTED_CURVES) && !defined(NO_WOLFSSL_CLIENT)
++#if defined(HAVE_SUPPORTED_CURVES)
+ 
+ static int isValidCurveGroup(word16 name)
+ {
+@@ -2403,16 +2403,16 @@ static int isValidCurveGroup(word16 name)
+         case WOLFSSL_FFDHE_4096:
+         case WOLFSSL_FFDHE_6144:
+         case WOLFSSL_FFDHE_8192:
+-            return 0;
++            return 1;
+ 
+         default:
+-            return BAD_FUNC_ARG;
++            return 0;
+     }
+ }
+ 
+ int wolfSSL_UseSupportedCurve(WOLFSSL* ssl, word16 name)
+ {
+-    if (ssl == NULL || isValidCurveGroup(name) != 0)
++    if (ssl == NULL || !isValidCurveGroup(name))
+         return BAD_FUNC_ARG;
+ 
+     ssl->options.userCurves = 1;
+@@ -2423,7 +2423,7 @@ int wolfSSL_UseSupportedCurve(WOLFSSL* ssl, word16 name)
+ 
+ int wolfSSL_CTX_UseSupportedCurve(WOLFSSL_CTX* ctx, word16 name)
+ {
+-    if (ctx == NULL || isValidCurveGroup(name) != 0)
++    if (ctx == NULL || !isValidCurveGroup(name))
+         return BAD_FUNC_ARG;
+ 
+     ctx->userCurves = 1;
+@@ -2431,7 +2431,7 @@ int wolfSSL_CTX_UseSupportedCurve(WOLFSSL_CTX* ctx, word16 name)
+     return TLSX_UseSupportedCurve(&ctx->extensions, name, ctx->heap);
+ }
+ 
+-#ifdef OPENSSL_EXTRA
++#if defined(OPENSSL_EXTRA) && defined(WOLFSSL_TLS13)
+ int  wolfSSL_CTX_set1_groups(WOLFSSL_CTX* ctx, int* groups,
+                                         int count)
+ {
+@@ -2443,9 +2443,10 @@ int  wolfSSL_CTX_set1_groups(WOLFSSL_CTX* ctx, int* groups,
+         return WOLFSSL_FAILURE;
+     }
+     for (i = 0; i < count; i++) {
+-        if (isValidCurveGroup(groups[i]) == 0) {
++        if (isValidCurveGroup((word16)groups[i])) {
+             _groups[i] = groups[i];
+         }
++#ifdef HAVE_ECC
+         else {
+             /* groups may be populated with curve NIDs */
+             int oid = nid2oid(groups[i], oidCurveType);
+@@ -2456,6 +2457,12 @@ int  wolfSSL_CTX_set1_groups(WOLFSSL_CTX* ctx, int* groups,
+             }
+             _groups[i] = name;
+         }
++#else
++        else {
++            WOLFSSL_MSG("Invalid group name");
++            return WOLFSSL_FAILURE;
++        }
++#endif
+     }
+     return wolfSSL_CTX_set_groups(ctx, _groups, count) == WOLFSSL_SUCCESS ?
+             WOLFSSL_SUCCESS : WOLFSSL_FAILURE;
+@@ -2471,9 +2478,10 @@ int  wolfSSL_set1_groups(WOLFSSL* ssl, int* groups, int count)
+         return WOLFSSL_FAILURE;
+     }
+     for (i = 0; i < count; i++) {
+-        if (isValidCurveGroup(groups[i]) == 0) {
++        if (isValidCurveGroup((word16)groups[i])) {
+             _groups[i] = groups[i];
+         }
++#ifdef HAVE_ECC
+         else {
+             /* groups may be populated with curve NIDs */
+             int oid = nid2oid(groups[i], oidCurveType);
+@@ -2484,12 +2492,18 @@ int  wolfSSL_set1_groups(WOLFSSL* ssl, int* groups, int count)
+             }
+             _groups[i] = name;
+         }
++#else
++        else {
++            WOLFSSL_MSG("Invalid group name");
++            return WOLFSSL_FAILURE;
++        }
++#endif
+     }
+     return wolfSSL_set_groups(ssl, _groups, count) == WOLFSSL_SUCCESS ?
+             WOLFSSL_SUCCESS : WOLFSSL_FAILURE;
+ }
+-#endif
+-#endif /* HAVE_SUPPORTED_CURVES && !NO_WOLFSSL_CLIENT */
++#endif /* OPENSSL_EXTRA && WOLFSSL_TLS13 */
++#endif /* HAVE_SUPPORTED_CURVES */
+ 
+ /* QSH quantum safe handshake */
+ #ifdef HAVE_QSH
+@@ -11915,6 +11929,13 @@ int wolfSSL_set_cipher_list(WOLFSSL* ssl, const char* list)
+ }
+ 
+ #ifdef HAVE_KEYING_MATERIAL
++
++#define TLS_PRF_LABEL_CLIENT_FINISHED     "client finished"
++#define TLS_PRF_LABEL_SERVER_FINISHED     "server finished"
++#define TLS_PRF_LABEL_MASTER_SECRET       "master secret"
++#define TLS_PRF_LABEL_EXT_MASTER_SECRET   "extended master secret"
++#define TLS_PRF_LABEL_KEY_EXPANSION       "key expansion"
++
+ static const struct ForbiddenLabels {
+     const char* label;
+     size_t labelLen;
+@@ -11942,7 +11963,7 @@ int wolfSSL_export_keying_material(WOLFSSL *ssl,
+     /* clientRandom + serverRandom
+      * OR
+      * clientRandom + serverRandom + ctx len encoding + ctx */
+-    word32 seedLen = !use_context ? SEED_LEN : SEED_LEN + 2 + contextLen;
++    word32 seedLen = !use_context ? SEED_LEN : SEED_LEN + 2 + (word32)contextLen;
+     const struct ForbiddenLabels* fl;
+ 
+     WOLFSSL_ENTER("wolfSSL_export_keying_material");
+@@ -11977,7 +11998,7 @@ int wolfSSL_export_keying_material(WOLFSSL *ssl,
+             context = (byte*)""; /* Give valid pointer for 0 length memcpy */
+         }
+ 
+-        if (Tls13_Exporter(ssl, out, outLen, label, labelLen,
++        if (Tls13_Exporter(ssl, out, (word32)outLen, label, labelLen,
+                 context, contextLen) != 0) {
+             WOLFSSL_MSG("Tls13_Exporter error");
+             return WOLFSSL_FAILURE;
+@@ -12006,8 +12027,8 @@ int wolfSSL_export_keying_material(WOLFSSL *ssl,
+         }
+     }
+ 
+-    if (wc_PRF_TLS(out, outLen, ssl->arrays->masterSecret, SECRET_LEN,
+-            (byte*)label, labelLen, seed, seedLen, IsAtLeastTLSv1_2(ssl),
++    if (wc_PRF_TLS(out, (word32)outLen, ssl->arrays->masterSecret, SECRET_LEN,
++            (byte*)label, (word32)labelLen, seed, seedLen, IsAtLeastTLSv1_2(ssl),
+             ssl->specs.mac_algorithm, ssl->heap, ssl->devId) != 0) {
+         WOLFSSL_MSG("wc_PRF_TLS error");
+         XFREE(seed, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+@@ -16464,21 +16485,33 @@ int wolfSSL_CTX_set_min_proto_version(WOLFSSL_CTX* ctx, int version)
+     }
+ 
+     switch (version) {
++#if defined(WOLFSSL_ALLOW_SSLV3) && !defined(NO_OLD_TLS)
+         case SSL3_VERSION:
+             ctx->minDowngrade = SSLv3_MINOR;
+             break;
++#endif
++#ifndef NO_TLS
++    #ifndef NO_OLD_TLS
++        #ifdef WOLFSSL_ALLOW_TLSV10
+         case TLS1_VERSION:
+             ctx->minDowngrade = TLSv1_MINOR;
+             break;
++        #endif
+         case TLS1_1_VERSION:
+             ctx->minDowngrade = TLSv1_1_MINOR;
+             break;
++    #endif
++    #ifndef WOLFSSL_NO_TLS12
+         case TLS1_2_VERSION:
+             ctx->minDowngrade = TLSv1_2_MINOR;
+             break;
++    #endif
++    #ifdef WOLFSSL_TLS13
+         case TLS1_3_VERSION:
+             ctx->minDowngrade = TLSv1_3_MINOR;
+             break;
++    #endif
++#endif
+ #ifdef WOLFSSL_DTLS
+     #ifndef NO_OLD_TLS
+         case DTLS1_VERSION:
+@@ -16490,18 +16523,15 @@ int wolfSSL_CTX_set_min_proto_version(WOLFSSL_CTX* ctx, int version)
+             break;
+ #endif
+         default:
++            WOLFSSL_MSG("Unrecognized protocol version or not compiled in");
+             return WOLFSSL_FAILURE;
+     }
+ 
+     switch (version) {
++#ifndef NO_TLS
+     case TLS1_3_VERSION:
+-#ifdef WOLFSSL_TLS13
+         wolfSSL_CTX_set_options(ctx, WOLFSSL_OP_NO_TLSv1_2);
+         FALL_THROUGH;
+-#else
+-        WOLFSSL_MSG("wolfSSL TLS1.3 support not compiled in");
+-        return WOLFSSL_FAILURE;
+-#endif
+     case TLS1_2_VERSION:
+         wolfSSL_CTX_set_options(ctx, WOLFSSL_OP_NO_TLSv1_1);
+         FALL_THROUGH;
+@@ -16510,11 +16540,13 @@ int wolfSSL_CTX_set_min_proto_version(WOLFSSL_CTX* ctx, int version)
+         FALL_THROUGH;
+     case TLS1_VERSION:
+         wolfSSL_CTX_set_options(ctx, WOLFSSL_OP_NO_SSLv3);
+-        FALL_THROUGH;
++        break;
++#endif
++#if defined(WOLFSSL_ALLOW_SSLV3) && !defined(NO_OLD_TLS)
+     case SSL3_VERSION:
+-        FALL_THROUGH;
+     case SSL2_VERSION:
+         /* Nothing to do here */
++#endif
+         break;
+ #ifdef WOLFSSL_DTLS
+ #ifndef NO_OLD_TLS
+@@ -16524,7 +16556,7 @@ int wolfSSL_CTX_set_min_proto_version(WOLFSSL_CTX* ctx, int version)
+         break;
+ #endif
+     default:
+-        WOLFSSL_MSG("Unrecognized protocol version");
++        WOLFSSL_MSG("Unrecognized protocol version or not compiled in");
+         return WOLFSSL_FAILURE;
+     }
+ 
+@@ -16544,6 +16576,7 @@ int wolfSSL_CTX_set_max_proto_version(WOLFSSL_CTX* ctx, int ver)
+     case SSL2_VERSION:
+         WOLFSSL_MSG("wolfSSL does not support SSLv2");
+         return WOLFSSL_FAILURE;
++#if (defined(WOLFSSL_ALLOW_SSLV3) && !defined(NO_OLD_TLS)) || !defined(NO_TLS)
+     case SSL3_VERSION:
+         wolfSSL_CTX_set_options(ctx, WOLFSSL_OP_NO_TLSv1);
+         FALL_THROUGH;
+@@ -16555,12 +16588,11 @@ int wolfSSL_CTX_set_max_proto_version(WOLFSSL_CTX* ctx, int ver)
+         FALL_THROUGH;
+     case TLS1_2_VERSION:
+         wolfSSL_CTX_set_options(ctx, WOLFSSL_OP_NO_TLSv1_3);
+-#ifdef WOLFSSL_TLS13
+         FALL_THROUGH;
+     case TLS1_3_VERSION:
+         /* Nothing to do here */
+-#endif
+         break;
++#endif
+ #ifdef WOLFSSL_DTLS
+ #ifndef NO_OLD_TLS
+     case DTLS1_VERSION:
+@@ -16569,7 +16601,7 @@ int wolfSSL_CTX_set_max_proto_version(WOLFSSL_CTX* ctx, int ver)
+         break;
+ #endif
+     default:
+-        WOLFSSL_MSG("Unrecognized protocol version");
++        WOLFSSL_MSG("Unrecognized protocol version or not compiled in");
+         return WOLFSSL_FAILURE;
+     }
+ 
+@@ -27373,10 +27405,11 @@ long wolfSSL_set_options(WOLFSSL* ssl, long op)
+     keySz = ssl->buffers.keySz;
+ #endif
+ 
+-    InitSuites(ssl->suites, ssl->version, keySz, haveRSA, havePSK,
+-                       ssl->options.haveDH, ssl->options.haveNTRU,
+-                       ssl->options.haveECDSAsig, ssl->options.haveECC,
+-                       ssl->options.haveStaticECC, ssl->options.side);
++    if (ssl->suites != NULL && ssl->options.side != WOLFSSL_NEITHER_END)
++        InitSuites(ssl->suites, ssl->version, keySz, haveRSA, havePSK,
++                           ssl->options.haveDH, ssl->options.haveNTRU,
++                           ssl->options.haveECDSAsig, ssl->options.haveECC,
++                           ssl->options.haveStaticECC, ssl->options.side);
+ 
+     return ssl->options.mask;
+ }
+@@ -28354,7 +28387,7 @@ WOLFSSL_API int wolfSSL_X509_STORE_load_locations(WOLFSSL_X509_STORE *str,
+ WOLFSSL_API WOLFSSL_CIPHER* wolfSSL_sk_SSL_CIPHER_value(WOLFSSL_STACK* sk, int i)
+ {
+     WOLFSSL_ENTER("wolfSSL_sk_SSL_CIPHER_value");
+-    return wolfSSL_sk_value(sk, i);
++    return (WOLFSSL_CIPHER*)wolfSSL_sk_value(sk, i);
+ }
+ 
+ WOLFSSL_API void ERR_load_SSL_strings(void)
+@@ -46756,8 +46789,16 @@ static WC_INLINE int sslCipherMinMaxCheck(const WOLFSSL *ssl, byte suite0,
+             break;
+     if (i == cipherSz)
+         return 1;
+-    if (cipher_names[i].minor < ssl->options.minDowngrade)
++    /* Check min version */
++    if (cipher_names[i].minor < ssl->options.minDowngrade) {
++        if (ssl->options.minDowngrade <= TLSv1_2_MINOR &&
++                cipher_names[i].minor >= TLSv1_MINOR)
++            /* 1.0 ciphersuites are in general available in 1.1 and
++             * 1.1 ciphersuites are in general available in 1.2 */
++            return 0;
+         return 1;
++    }
++    /* Check max version */
+     switch (cipher_names[i].minor) {
+     case SSLv3_MINOR :
+         return ssl->options.mask & WOLFSSL_OP_NO_SSLv3;
+@@ -48497,10 +48538,12 @@ word32 nid2oid(int nid, int grp)
+ 
+         default:
+             WOLFSSL_MSG("NID not in table");
+-            return -1;
++            /* MSVC warns without the cast */
++            return (word32)-1;
+     }
+ 
+-    return -1;
++    /* MSVC warns without the cast */
++    return (word32)-1;
+ }
+ 
+ int oid2nid(word32 oid, int grp)
+diff --git a/src/tls13.c b/src/tls13.c
+index c6008d8b1ae..03720f15771 100644
+--- a/src/tls13.c
++++ b/src/tls13.c
+@@ -803,17 +803,17 @@ int Tls13_Exporter(WOLFSSL* ssl, unsigned char *out, size_t outLen,
+     /* Derive-Secret(Secret, label, "") */
+     ret = HKDF_Expand_Label(firstExpand, hashLen,
+             ssl->arrays->exporterSecret, hashLen,
+-            protocol, protocolLen, (byte*)label, labelLen,
++            protocol, protocolLen, (byte*)label, (word32)labelLen,
+             emptyHash, hashLen, hashType);
+     if (ret != 0)
+         return ret;
+ 
+     /* Hash(context_value) */
+-    ret = wc_Hash(hashType, context, contextLen, hashOut, WC_MAX_DIGEST_SIZE);
++    ret = wc_Hash(hashType, context, (word32)contextLen, hashOut, WC_MAX_DIGEST_SIZE);
+     if (ret != 0)
+         return ret;
+ 
+-    ret = HKDF_Expand_Label(out, outLen, firstExpand, hashLen,
++    ret = HKDF_Expand_Label(out, (word32)outLen, firstExpand, hashLen,
+             protocol, protocolLen, exporterLabel, EXPORTER_LABEL_SZ,
+             hashOut, hashLen, hashType);
+ 
+@@ -8051,7 +8051,7 @@ int wolfSSL_preferred_group(WOLFSSL* ssl)
+ }
+ #endif
+ 
+-#ifdef HAVE_SUPPORTED_CURVES
++#if defined(HAVE_SUPPORTED_CURVES)
+ /* Sets the key exchange groups in rank order on a context.
+  *
+  * ctx     SSL/TLS context object.
+diff --git a/tests/api.c b/tests/api.c
+index 8dbd871b797..dc64c57377d 100644
+--- a/tests/api.c
++++ b/tests/api.c
+@@ -37221,12 +37221,24 @@ static int test_tls13_apis(void)
+ #ifdef WOLFSSL_EARLY_DATA
+     int          outSz;
+ #endif
+-#ifdef HAVE_SUPPORTED_CURVES
++#if defined(HAVE_ECC) && defined(HAVE_SUPPORTED_CURVES)
+     int          groups[2] = { WOLFSSL_ECC_X25519, WOLFSSL_ECC_X448 };
+     int          numGroups = 2;
+ #endif
+ #if defined(OPENSSL_EXTRA) && defined(HAVE_ECC)
+-    char         groupList[] = "P-521:P-384:P-256";
++    char         groupList[] =
++#ifndef NO_ECC_SECP
++#if (defined(HAVE_ECC521) || defined(HAVE_ALL_CURVES)) && ECC_MIN_KEY_SZ <= 521
++            "P-521:"
++#endif
++#if (defined(HAVE_ECC384) || defined(HAVE_ALL_CURVES)) && ECC_MIN_KEY_SZ <= 384
++            "P-384:"
++#endif
++#if (!defined(NO_ECC256)  || defined(HAVE_ALL_CURVES)) && ECC_MIN_KEY_SZ <= 256
++            "P-256"
++#endif
++            "";
++#endif /* !defined(NO_ECC_SECP) */
+ #endif /* defined(OPENSSL_EXTRA) && defined(HAVE_ECC) */
+ 
+ #ifndef WOLFSSL_NO_TLS12
+@@ -37433,6 +37445,7 @@ static int test_tls13_apis(void)
+ #endif
+ #endif
+ 
++#ifdef HAVE_ECC
+ #ifndef WOLFSSL_NO_SERVER_GROUPS_EXT
+     AssertIntEQ(wolfSSL_preferred_group(NULL), BAD_FUNC_ARG);
+ #ifndef NO_WOLFSSL_SERVER
+@@ -37488,7 +37501,7 @@ static int test_tls13_apis(void)
+                 WOLFSSL_SUCCESS);
+ #endif
+ 
+-#if defined(OPENSSL_EXTRA) && defined(HAVE_ECC)
++#ifdef OPENSSL_EXTRA
+     AssertIntEQ(wolfSSL_CTX_set1_groups_list(NULL, NULL), WOLFSSL_FAILURE);
+ #ifndef NO_WOLFSSL_CLIENT
+     AssertIntEQ(wolfSSL_CTX_set1_groups_list(clientCtx, NULL), WOLFSSL_FAILURE);
+@@ -37524,8 +37537,9 @@ static int test_tls13_apis(void)
+     AssertIntEQ(wolfSSL_set1_groups_list(serverSsl, groupList),
+                 WOLFSSL_SUCCESS);
+ #endif
+-#endif /* defined(OPENSSL_EXTRA) && defined(HAVE_ECC) */
++#endif /* OPENSSL_EXTRA */
+ #endif /* HAVE_SUPPORTED_CURVES */
++#endif /* HAVE_ECC */
+ 
+ #ifdef WOLFSSL_EARLY_DATA
+     AssertIntEQ(wolfSSL_CTX_set_max_early_data(NULL, 0), BAD_FUNC_ARG);
+diff --git a/wolfcrypt/src/asn.c b/wolfcrypt/src/asn.c
+index 32dfd58963f..fd45d44faec 100644
+--- a/wolfcrypt/src/asn.c
++++ b/wolfcrypt/src/asn.c
+@@ -5621,7 +5621,7 @@ int wc_OBJ_sn2nid(const char *sn)
+         sn = "SECP256R1";
+     /* OpenSSL allows lowercase curve names */
+     for (i = 0; i < (int)(sizeof(curveName) - 1) && *sn; i++) {
+-        curveName[i] = XTOUPPER(*sn++);
++        curveName[i] = (char)XTOUPPER(*sn++);
+     }
+     curveName[i] = '\0';
+     /* find based on name and return NID */
+diff --git a/wolfssl/ssl.h b/wolfssl/ssl.h
+index cab58bc2e93..77c3c63b275 100644
+--- a/wolfssl/ssl.h
++++ b/wolfssl/ssl.h
+@@ -1064,11 +1064,6 @@ WOLFSSL_API int  wolfSSL_CTX_set_cipher_list(WOLFSSL_CTX*, const char*);
+ WOLFSSL_API int  wolfSSL_set_cipher_list(WOLFSSL*, const char*);
+ 
+ #ifdef HAVE_KEYING_MATERIAL
+-#define TLS_PRF_LABEL_CLIENT_FINISHED     "client finished"
+-#define TLS_PRF_LABEL_SERVER_FINISHED     "server finished"
+-#define TLS_PRF_LABEL_MASTER_SECRET       "master secret"
+-#define TLS_PRF_LABEL_EXT_MASTER_SECRET   "extended master secret"
+-#define TLS_PRF_LABEL_KEY_EXPANSION       "key expansion"
+ /* Keying Material Exporter for TLS */
+ WOLFSSL_API int wolfSSL_export_keying_material(WOLFSSL *ssl,
+         unsigned char *out, size_t outLen,
+@@ -3168,13 +3163,9 @@ enum {
+ };
+ 
+ #ifdef HAVE_SUPPORTED_CURVES
+-#ifndef NO_WOLFSSL_CLIENT
+-
+ WOLFSSL_API int wolfSSL_UseSupportedCurve(WOLFSSL* ssl, word16 name);
+ WOLFSSL_API int wolfSSL_CTX_UseSupportedCurve(WOLFSSL_CTX* ctx,
+                                                            word16 name);
+-
+-#endif
+ #endif
+ 
+ #ifdef WOLFSSL_TLS13

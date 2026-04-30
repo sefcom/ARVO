@@ -1,0 +1,68 @@
+From 68a61daa959c03f4c624d73802d98730c35ad3da Mon Sep 17 00:00:00 2001
+From: Frank Tang <ftang@chromium.org>
+Date: Mon, 11 Sep 2023 18:21:26 -0700
+Subject: [PATCH] ICU-22497 Fix buffer-overflow READ for toLanguateTag
+
+---
+ icu4c/source/common/uloc_tag.cpp       | 5 +++--
+ icu4c/source/test/intltest/loctest.cpp | 8 ++++++++
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/icu4c/source/common/uloc_tag.cpp b/icu4c/source/common/uloc_tag.cpp
+index 8f3778be565a..7a2b86735860 100644
+--- a/icu4c/source/common/uloc_tag.cpp
++++ b/icu4c/source/common/uloc_tag.cpp
+@@ -1952,8 +1952,8 @@ _appendPrivateuseToLanguageTag(const char* localeID, icu::ByteSink& sink, UBool
+                             len = (int32_t)uprv_strlen(PRIVUSE_VARIANT_PREFIX);
+                             if (reslen < capacity) {
+                                 uprv_memcpy(tmpAppend + reslen, PRIVUSE_VARIANT_PREFIX, uprv_min(len, capacity - reslen));
++                                reslen += uprv_min(len, capacity - reslen);
+                             }
+-                            reslen += len;
+ 
+                             if (reslen < capacity) {
+                                 tmpAppend[reslen++] = SEP;
+@@ -1965,8 +1965,8 @@ _appendPrivateuseToLanguageTag(const char* localeID, icu::ByteSink& sink, UBool
+                         len = (int32_t)uprv_strlen(pPriv);
+                         if (reslen < capacity) {
+                             uprv_memcpy(tmpAppend + reslen, pPriv, uprv_min(len, capacity - reslen));
++                            reslen += uprv_min(len, capacity - reslen);
+                         }
+-                        reslen += len;
+                     }
+                 }
+                 /* reset private use starting position */
+@@ -1984,6 +1984,7 @@ _appendPrivateuseToLanguageTag(const char* localeID, icu::ByteSink& sink, UBool
+ 
+     if (U_SUCCESS(*status)) {
+         len = reslen;
++        U_ASSERT(reslen <= capacity);
+         sink.Append(tmpAppend, len);
+     }
+ }
+diff --git a/icu4c/source/test/intltest/loctest.cpp b/icu4c/source/test/intltest/loctest.cpp
+index 5c2f949260ed..1c88f77fe638 100644
+--- a/icu4c/source/test/intltest/loctest.cpp
++++ b/icu4c/source/test/intltest/loctest.cpp
+@@ -5980,6 +5980,8 @@ void LocaleTest::TestToLanguageTag() {
+       {"und-Latn-x-private", "und-Latn-x-private"},
+       {"und-1994-biske-rozaj", "und-1994-biske-rozaj"},
+       {"und-1994-biske-rozaj-x-private", "und-1994-biske-rozaj-x-private"},
++      // ICU-22497
++      {"-ins0-ins17Rz-yqyq-UWLF-uRyq-UWLF-uRRyq-UWLF-uR-UWLF-uRns0-ins17Rz-yq-UWLF-uRyq-UWLF-uRRyq-LF-uRyq-UWLF-uRRyq-UWLF-uRq-UWLF-uRyq-UWLF-uRRyq-UWLF-uR", ""},
+     };
+     int32_t i;
+     for (i=0; i < UPRV_LENGTHOF(testCases); i++) {
+@@ -5993,6 +5995,12 @@ void LocaleTest::TestToLanguageTag() {
+                        tag.c_str(),
+                        u_errorName(status));
+         }
++        // Test ICU-22497
++        status = U_ZERO_ERROR;
++        icu::Locale locale(otag.c_str());
++        char buf[245];
++        icu::CheckedArrayByteSink sink(buf, sizeof(buf));
++        locale.toLanguageTag(sink, status);
+     }
+ }
+ 

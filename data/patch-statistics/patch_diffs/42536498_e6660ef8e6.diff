@@ -1,0 +1,110 @@
+From 959fbed58acaf922199d2940ed365033e290cdef Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Sat, 17 Mar 2018 11:12:47 +0000
+Subject: [PATCH] VRTRawLink: fix recent use-after-free error (plus another
+ older memory leak). Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=6987. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@41840 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ autotest/gdrivers/vrtrawlink.py     | 57 +++++++++++++++++++++++++++++
+ gdal/frmts/vrt/vrtrawrasterband.cpp |  3 +-
+ 2 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/autotest/gdrivers/vrtrawlink.py b/autotest/gdrivers/vrtrawlink.py
+index 516f0edc600d..0503c99b80b5 100755
+--- a/autotest/gdrivers/vrtrawlink.py
++++ b/autotest/gdrivers/vrtrawlink.py
+@@ -305,6 +305,60 @@ def vrtrawlink_7():
+ 
+     return 'success'
+ 
++###############################################################################
++# Test error case (too much memory allocation)
++
++def vrtrawlink_8():
++
++    for i in range(2):
++        with gdaltest.error_handler():
++            ds = gdal.Open("""<VRTDataset rasterXSize="200000" rasterYSize="1">
++        <VRTRasterBand dataType="Byte" band="1" subClass="VRTRawRasterBand">
++            <SourceFilename relativetoVRT="0">data/small.raw</SourceFilename>
++            <ImageOffset>0</ImageOffset>
++            <PixelOffset>200000</PixelOffset>
++            <LineOffset>1</LineOffset>
++            <ByteOrder>LSB</ByteOrder>
++        </VRTRasterBand>
++        </VRTDataset>""")
++        if ds:
++            return 'fail'
++
++    return 'success'
++
++###############################################################################
++# Test error case (inexisting file)
++
++def vrtrawlink_9():
++
++    with gdaltest.error_handler():
++        ds = gdal.Open("""<VRTDataset rasterXSize="1 rasterYSize="1">
++    <VRTRasterBand dataType="Byte" band="1" subClass="VRTRawRasterBand">
++        <SourceFilename relativetoVRT="0">i/do/not/exist</SourceFilename>
++    </VRTRasterBand>
++    </VRTDataset>""")
++    if ds:
++        return 'fail'
++
++    return 'success'
++
++###############################################################################
++# Test error case (invalid byte order)
++
++def vrtrawlink_10():
++
++    with gdaltest.error_handler():
++        ds = gdal.Open("""<VRTDataset rasterXSize="1 rasterYSize="1">
++    <VRTRasterBand dataType="Byte" band="1" subClass="VRTRawRasterBand">
++        <SourceFilename relativetoVRT="0">data/small.raw</SourceFilename>
++        <ByteOrder>invalid</ByteOrder>
++    </VRTRasterBand>
++    </VRTDataset>""")
++    if ds:
++        return 'fail'
++
++    return 'success'
++
+ ###############################################################################
+ # Cleanup.
+ 
+@@ -329,6 +383,9 @@ def vrtrawlink_cleanup():
+     vrtrawlink_5,
+     vrtrawlink_6,
+     vrtrawlink_7,
++    vrtrawlink_8,
++    vrtrawlink_9,
++    vrtrawlink_10,
+     vrtrawlink_cleanup ]
+ 
+ if __name__ == '__main__':
+diff --git a/gdal/frmts/vrt/vrtrawrasterband.cpp b/gdal/frmts/vrt/vrtrawrasterband.cpp
+index 9c959f4b09cb..74f39ec92f65 100644
+--- a/gdal/frmts/vrt/vrtrawrasterband.cpp
++++ b/gdal/frmts/vrt/vrtrawrasterband.cpp
+@@ -246,7 +246,7 @@ CPLErr VRTRawRasterBand::SetRawLink( const char *pszFilename,
+                         nPixelOffset, nLineOffset, nImageOffset, 0,
+                         reinterpret_cast<VSILFILE*>(fp)) )
+     {
+-        VSIFCloseL(reinterpret_cast<VSILFILE*>(fp));
++        CPLCloseShared(fp);
+         return CE_Failure;
+     }
+ 
+@@ -269,6 +269,7 @@ CPLErr VRTRawRasterBand::SetRawLink( const char *pszFilename,
+             CPLError( CE_Failure, CPLE_AppDefined,
+                       "Illegal ByteOrder value '%s', should be LSB or MSB.",
+                       pszByteOrder );
++            CPLCloseShared(fp);
+             return CE_Failure;
+         }
+     }

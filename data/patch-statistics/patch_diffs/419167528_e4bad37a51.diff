@@ -1,0 +1,57 @@
+From 75ef803092e64587449743cacf2ae6e22a515f70 Mon Sep 17 00:00:00 2001
+From: Tobias Stoeckmann <tobias@stoeckmann.org>
+Date: Thu, 5 Jun 2025 21:36:23 +0200
+Subject: [PATCH 1/2] 7zip: Increase minimum ELF header length
+
+The 64 bit format requires at least 63 bytes, so increase this limit.
+Such small binaries most likely don't contain 7zip data anyway.
+
+Signed-off-by: Tobias Stoeckmann <tobias@stoeckmann.org>
+---
+ libarchive/archive_read_support_format_7zip.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libarchive/archive_read_support_format_7zip.c b/libarchive/archive_read_support_format_7zip.c
+index f273f84be..b20aa5e6d 100644
+--- a/libarchive/archive_read_support_format_7zip.c
++++ b/libarchive/archive_read_support_format_7zip.c
+@@ -80,7 +80,7 @@
+ /*
+  * ELF format
+  */
+-#define ELF_HDR_MIN_LEN 0x34
++#define ELF_HDR_MIN_LEN 0x3f
+ #define ELF_HDR_EI_CLASS_OFFSET 0x04
+ #define ELF_HDR_EI_DATA_OFFSET 0x05
+ 
+
+From c0691458a0644f3d5bc4d1dc6da61766a6a00b81 Mon Sep 17 00:00:00 2001
+From: Tobias Stoeckmann <tobias@stoeckmann.org>
+Date: Thu, 5 Jun 2025 21:38:43 +0200
+Subject: [PATCH 2/2] 7zip: Fix out ouf boundary read in ELF detection
+
+Make sure that the string table size is not smaller than 6 (and also
+not larger than SIZE_MAX for better 32 bit support).
+
+Such small values would lead to a large loop limit which either leads to
+a crash or wrong detection of a ".data" string in possibly uninitialized
+memory.
+
+Signed-off-by: Tobias Stoeckmann <tobias@stoeckmann.org>
+---
+ libarchive/archive_read_support_format_7zip.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/libarchive/archive_read_support_format_7zip.c b/libarchive/archive_read_support_format_7zip.c
+index b20aa5e6d..846261287 100644
+--- a/libarchive/archive_read_support_format_7zip.c
++++ b/libarchive/archive_read_support_format_7zip.c
+@@ -811,6 +811,8 @@ find_elf_data_sec(struct archive_read *a)
+ 			strtab_size = (*dec32)(
+ 			    h + e_shstrndx * e_shentsize + 0x14);
+ 		}
++		if (strtab_size < 6 || strtab_size > SIZE_MAX)
++			break;
+ 
+ 		/*
+ 		 * Read the STRTAB section to find the .data offset

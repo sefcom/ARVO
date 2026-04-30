@@ -1,0 +1,54 @@
+From a62679952c4fe51fead86f38c76eee8fbdd1f694 Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Mon, 22 Apr 2024 18:39:23 +0200
+Subject: [PATCH] fuzz: fix shoco fuzzer (#2405)
+
+```
+==22779==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7f0900701020 at pc 0x555bcd2a6f02 bp 0x7ffe3ba5e790 sp 0x7ffe3ba5e788
+READ of size 1 at 0x7f0900701020 thread T0
+    #0 0x555bcd2a6f01 in shoco_decompress /home/ivan/svnrepos/nDPI/src/lib/third_party/src/shoco.c:184:26
+    #1 0x555bcd2a4018 in LLVMFuzzerTestOneInput /home/ivan/svnrepos/nDPI/fuzz/fuzz_alg_shoco.cpp:18:3
+    #2 0x555bcd1aa816 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_alg_shoco+0x4f816) (BuildId: c54d1c32163c9937e06f62127348ae6bd26d9309)
+    #3 0x555bcd193be8 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_alg_shoco+0x38be8) (BuildId: c54d1c32163c9937e06f62127348ae6bd26d9309)
+    #4 0x555bcd1996fa in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_alg_shoco+0x3e6fa) (BuildId: c54d1c32163c9937e06f62127348ae6bd26d9309)
+    #5 0x555bcd1c3c92 in main (/home/ivan/svnrepos/nDPI/fuzz/fuzz_alg_shoco+0x68c92) (BuildId: c54d1c32163c9937e06f62127348ae6bd26d9309)
+    #6 0x7f090257a082 in __libc_start_main /build/glibc-e2p3jK/glibc-2.31/csu/../csu/libc-start.c:308:16
+    #7 0x555bcd18e96d in _start (/home/ivan/svnrepos/nDPI/fuzz/fuzz_alg_shoco+0x3396d) (BuildId: c54d1c32163c9937e06f62127348ae6bd26d9309)
+
+Address 0x7f0900701020 is located in stack of thread T0 at offset 4128 in frame
+    #0 0x555bcd2a3d97 in LLVMFuzzerTestOneInput /home/ivan/svnrepos/nDPI/fuzz/fuzz_alg_shoco.cpp:5
+
+  This frame has 4 object(s):
+    [32, 4128) 'out' (line 9) <== Memory access at offset 4128 overflows this variable
+    [4256, 8352) 'orig' (line 9)
+```
+
+Found by oss-fuzzer.
+See: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=68211
+---
+ fuzz/fuzz_alg_shoco.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/fuzz/fuzz_alg_shoco.cpp b/fuzz/fuzz_alg_shoco.cpp
+index cf8d31bb3dd..40fe0f0f454 100644
+--- a/fuzz/fuzz_alg_shoco.cpp
++++ b/fuzz/fuzz_alg_shoco.cpp
+@@ -6,7 +6,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+   FuzzedDataProvider fuzzed_data(data, size);
+   const char *in;
+   size_t in_len, out_len;
+-  char out[4096], orig[4096];
++  char out[8192], orig[8192];
+ 
+   /* No memory allocations involved */
+ 
+@@ -15,7 +15,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+   in_len = strlen(in);
+ 
+   out_len = shoco_compress(in, in_len, out, sizeof(out));
+-  shoco_decompress(out, out_len, orig, sizeof(orig));
++  if(out_len <= sizeof(out)) /* No error */
++    shoco_decompress(out, out_len, orig, sizeof(orig));
+ 
+   return 0;
+ }

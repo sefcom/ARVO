@@ -1,0 +1,108 @@
+diff --git a/include/core/SkTypes.h b/include/core/SkTypes.h
+index 50efbae..afab728 100644
+--- a/include/core/SkTypes.h
++++ b/include/core/SkTypes.h
+@@ -212,6 +212,8 @@
+ #define SK_MinU32   0
+ #define SK_NaN32    ((int) (1U << 31))
+ #define SK_MaxSizeT SIZE_MAX
++static constexpr int64_t SK_MaxS64 = 0x7FFFFFFFFFFFFFFF;
++static constexpr int64_t SK_MinS64 = -SK_MaxS64;
+ 
+ static inline int32_t SkLeftShift(int32_t value, int32_t shift) {
+     return (int32_t) ((uint32_t) value << shift);
+diff --git a/include/private/SkFixed.h b/include/private/SkFixed.h
+index 05e1de4..75514d8 100644
+--- a/include/private/SkFixed.h
++++ b/include/private/SkFixed.h
+@@ -124,14 +124,14 @@
+ 
+ typedef int64_t SkFixed3232;   // 32.32
+ 
+-#define SkFixed3232Max            (0x7FFFFFFFFFFFFFFFLL)
++#define SkFixed3232Max            SK_MaxS64
+ #define SkFixed3232Min            (-SkFixed3232Max)
+ 
+ #define SkIntToFixed3232(x)       (SkLeftShift((SkFixed3232)(x), 32))
+ #define SkFixed3232ToInt(x)       ((int)((x) >> 32))
+ #define SkFixedToFixed3232(x)     (SkLeftShift((SkFixed3232)(x), 16))
+ #define SkFixed3232ToFixed(x)     ((SkFixed)((x) >> 16))
+-#define SkFloatToFixed3232(x)     ((SkFixed3232)((x) * (65536.0f * 65536.0f)))
++#define SkFloatToFixed3232(x)     sk_float_saturate2int64((x) * (65536.0f * 65536.0f))
+ #define SkFixed3232ToFloat(x)     (x * (1 / (65536.0f * 65536.0f)))
+ 
+ #define SkScalarToFixed3232(x)    SkFloatToFixed3232(x)
+diff --git a/include/private/SkFloatingPoint.h b/include/private/SkFloatingPoint.h
+index 05191e6..bbb1179 100644
+--- a/include/private/SkFloatingPoint.h
++++ b/include/private/SkFloatingPoint.h
+@@ -81,6 +81,9 @@
+ #define SK_MaxS32FitsInFloat    2147483520
+ #define SK_MinS32FitsInFloat    -SK_MaxS32FitsInFloat
+ 
++#define SK_MaxS64FitsInFloat    (SK_MaxS64 >> (63-24) << (63-24))   // 0x7fffff8000000000
++#define SK_MinS64FitsInFloat    -SK_MaxS64FitsInFloat
++
+ /**
+  *  Return the closest int for the given float. Returns SK_MaxS32FitsInFloat for NaN.
+  */
+@@ -99,6 +102,15 @@
+     return (int)x;
+ }
+ 
++/**
++ *  Return the closest int64_t for the given float. Returns SK_MaxS64FitsInFloat for NaN.
++ */
++static inline int64_t sk_float_saturate2int64(float x) {
++    x = SkTMin<float>(x, SK_MaxS64FitsInFloat);
++    x = SkTMax<float>(x, SK_MinS64FitsInFloat);
++    return (int64_t)x;
++}
++
+ #define sk_float_floor2int(x)   sk_float_saturate2int(sk_float_floor(x))
+ #define sk_float_round2int(x)   sk_float_saturate2int(sk_float_floor((x) + 0.5f))
+ #define sk_float_ceil2int(x)    sk_float_saturate2int(sk_float_ceil(x))
+diff --git a/tests/MathTest.cpp b/tests/MathTest.cpp
+index 0d0bdce..31bb453 100644
+--- a/tests/MathTest.cpp
++++ b/tests/MathTest.cpp
+@@ -672,7 +672,7 @@
+     test_nextsizepow2(reporter, SIZE_MAX, SIZE_MAX);
+ }
+ 
+-DEF_TEST(FloatSaturate, reporter) {
++DEF_TEST(FloatSaturate32, reporter) {
+     const struct {
+         float   fFloat;
+         int     fExpectedInt;
+@@ -694,7 +694,29 @@
+     }
+ }
+ 
+-DEF_TEST(DoubleSaturate, reporter) {
++DEF_TEST(FloatSaturate64, reporter) {
++    const struct {
++        float   fFloat;
++        int64_t fExpected64;
++    } recs[] = {
++        { 0, 0 },
++        { 100.5f, 100 },
++        { (float)SK_MaxS64, SK_MaxS64FitsInFloat },
++        { (float)SK_MinS64, SK_MinS64FitsInFloat },
++        { SK_MaxS64 * 100.0f, SK_MaxS64FitsInFloat },
++        { SK_MinS64 * 100.0f, SK_MinS64FitsInFloat },
++        { SK_ScalarInfinity, SK_MaxS64FitsInFloat },
++        { SK_ScalarNegativeInfinity, SK_MinS64FitsInFloat },
++        { SK_ScalarNaN, SK_MaxS64FitsInFloat },
++    };
++
++    for (auto r : recs) {
++        int64_t i = sk_float_saturate2int64(r.fFloat);
++        REPORTER_ASSERT(reporter, r.fExpected64 == i);
++    }
++}
++
++DEF_TEST(DoubleSaturate32, reporter) {
+     const struct {
+         double  fDouble;
+         int     fExpectedInt;

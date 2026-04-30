@@ -1,0 +1,660 @@
+diff --git a/officecfg/registry/data/org/openoffice/Office/UI/WriterCommands.xcu b/officecfg/registry/data/org/openoffice/Office/UI/WriterCommands.xcu
+index 2070483..cf0e0cb 100644
+--- a/officecfg/registry/data/org/openoffice/Office/UI/WriterCommands.xcu
++++ b/officecfg/registry/data/org/openoffice/Office/UI/WriterCommands.xcu
+@@ -2078,6 +2078,11 @@
+           <value xml:lang="en-US">In ~Background</value>
+         </prop>
+       </node>
++      <node oor:name=".uno:WrapThroughTransparencyToggle" oor:op="replace">
++        <prop oor:name="Label" oor:type="xs:string">
++          <value xml:lang="en-US">In ~Background</value>
++        </prop>
++      </node>
+       <node oor:name=".uno:GoToStartOfPrevColumn" oor:op="replace">
+         <prop oor:name="Label" oor:type="xs:string">
+           <value xml:lang="en-US">To Begin of Previous Column</value>
+diff --git a/sw/inc/cmdid.h b/sw/inc/cmdid.h
+index e7dd58b..2e84ed3 100644
+--- a/sw/inc/cmdid.h
++++ b/sw/inc/cmdid.h
+@@ -370,7 +370,8 @@
+ #define FN_FORMULA_APPLY            (FN_FORMAT + 158)  /* apply formula */
+ #define FN_TABLE_UNSET_READ_ONLY    (FN_FORMAT + 159)  /* undo cell protection for table */
+ 
+-#define FN_FRAME_WRAP_IDEAL         (FN_FORMAT + 163)  /* frame ideal wrapping */
++#define FN_FRAME_WRAP_IDEAL         (FN_FORMAT + 162)  /* frame ideal wrapping */
++#define FN_FRAME_WRAPTHRU_TOGGLE    (FN_FORMAT + 163)  /* toggle frame transparent wrapping */
+ #define FN_FRAME_WRAPTHRU_TRANSP    (FN_FORMAT + 164)  /* frame transparent wrapping */
+ 
+ #define FN_FRAME_ALIGN_VERT_ROW_TOP     (FN_FORMAT + 165)  /* */
+diff --git a/sw/sdi/_basesh.sdi b/sw/sdi/_basesh.sdi
+index 52b3a03..5a113a5 100644
+--- a/sw/sdi/_basesh.sdi
++++ b/sw/sdi/_basesh.sdi
+@@ -486,6 +486,14 @@
+         Export = FALSE;
+     ]
+ 
++    FN_FRAME_WRAPTHRU_TOGGLE // status()
++    [
++        ExecMethod = Execute ;
++        StateMethod = GetState ;
++        DisableFlags="SfxDisableFlags::SwOnProtectedCursor";
++        Export = FALSE;
++    ]
++
+     FN_FRAME_WRAP_CONTOUR // status()
+     [
+         ExecMethod = Execute ;
+diff --git a/sw/sdi/swriter.sdi b/sw/sdi/swriter.sdi
+index efcf9a9..58e6aed 100644
+--- a/sw/sdi/swriter.sdi
++++ b/sw/sdi/swriter.sdi
+@@ -6395,6 +6395,23 @@
+     GroupId = GID_FRAME;
+ ]
+ 
++SfxVoidItem WrapThroughTransparencyToggle FN_FRAME_WRAPTHRU_TOGGLE
++()
++[
++    AutoUpdate = TRUE,
++    FastCall = FALSE,
++    ReadOnlyDoc = FALSE,
++    Toggle = FALSE,
++    Container = FALSE,
++    RecordAbsolute = FALSE,
++    RecordPerSet;
++
++    AccelConfig = TRUE,
++    MenuConfig = TRUE,
++    ToolBoxConfig = TRUE,
++    GroupId = GID_FRAME;
++]
++
+ SfxVoidItem InsertText FN_INSERT_STRING
+ (SfxStringItem Text FN_INSERT_STRING)
+ [
+diff --git a/sw/source/uibase/shells/basesh.cxx b/sw/source/uibase/shells/basesh.cxx
+index ba6113e..5ef7c73 100644
+--- a/sw/source/uibase/shells/basesh.cxx
++++ b/sw/source/uibase/shells/basesh.cxx
+@@ -1149,6 +1149,7 @@
+         case FN_FRAME_WRAP_IDEAL:
+         case FN_FRAME_WRAPTHRU:
+         case FN_FRAME_WRAPTHRU_TRANSP:
++        case FN_FRAME_WRAPTHRU_TOGGLE:
+         case FN_FRAME_WRAP_CONTOUR:
+         case FN_WRAP_ANCHOR_ONLY:
+         case FN_FRAME_WRAP_LEFT:
+@@ -1646,6 +1647,7 @@
+             case FN_FRAME_WRAP_IDEAL:
+             case FN_FRAME_WRAPTHRU:
+             case FN_FRAME_WRAPTHRU_TRANSP:
++            case FN_FRAME_WRAPTHRU_TOGGLE:
+             case FN_FRAME_WRAP_CONTOUR:
+             case FN_WRAP_ANCHOR_ONLY:
+             case FN_FRAME_WRAP_LEFT:
+@@ -1708,6 +1710,7 @@
+                                 bSet = nSurround == css::text::WrapTextMode_THROUGH && bOpaque;
+                         break;
+                         case FN_FRAME_WRAPTHRU_TRANSP:
++                        case FN_FRAME_WRAPTHRU_TOGGLE:
+                             bDisable |= bHtmlMode;
+                             if(bObj)
+                                 bSet = nSurround == css::text::WrapTextMode_THROUGH && !rSh.GetLayerId();
+@@ -1864,6 +1867,7 @@
+                 aWrap.SetContour(!aWrap.IsContour());
+                 break;
+             case FN_FRAME_WRAPTHRU_TRANSP:
++            case FN_FRAME_WRAPTHRU_TOGGLE:
+                 if (aWrap.IsContour())
+                     aWrap.SetContour(false);
+                 SAL_FALLTHROUGH;
+@@ -1895,11 +1899,24 @@
+         }
+ 
+         aSet.Put( aWrap );
+-        aSet.Put(SvxOpaqueItem(RES_OPAQUE, nSlot != FN_FRAME_WRAPTHRU_TRANSP));
++
++        bool bOpaque = nSlot != FN_FRAME_WRAPTHRU_TRANSP && nSlot != FN_FRAME_WRAPTHRU_TOGGLE;
++        if( nSlot == FN_FRAME_WRAPTHRU_TOGGLE )
++        {
++            if( bObj )
++                bOpaque = !rSh.GetLayerId();
++            else
++            {
++                const SvxOpaqueItem aOpaque( static_cast<const SvxOpaqueItem&>(aSet.Get(RES_OPAQUE)) );
++                bOpaque = !aOpaque.GetValue();
++            }
++        }
++        aSet.Put(SvxOpaqueItem(RES_OPAQUE, bOpaque ));
++
+         if(bObj)
+         {
+             rSh.SetObjAttr(aSet);
+-            if (nSlot != FN_FRAME_WRAPTHRU_TRANSP)
++            if ( bOpaque )
+                 rSh.SelectionToHeaven();
+             else
+                 rSh.SelectionToHell();
+diff --git a/sw/uiconfig/sglobal/menubar/menubar.xml b/sw/uiconfig/sglobal/menubar/menubar.xml
+index 2c5e690b..fe24c28 100644
+--- a/sw/uiconfig/sglobal/menubar/menubar.xml
++++ b/sw/uiconfig/sglobal/menubar/menubar.xml
+@@ -286,7 +286,7 @@
+           <menu:menuitem menu:id=".uno:WrapOn"/>
+           <menu:menuitem menu:id=".uno:WrapIdeal"/>
+           <menu:menuitem menu:id=".uno:WrapThrough"/>
+-          <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++          <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+           <menu:menuseparator/>
+           <menu:menuitem menu:id=".uno:WrapContour"/>
+           <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/sglobal/popupmenu/draw.xml b/sw/uiconfig/sglobal/popupmenu/draw.xml
+index fc12e15..0f2c33c 100644
+--- a/sw/uiconfig/sglobal/popupmenu/draw.xml
++++ b/sw/uiconfig/sglobal/popupmenu/draw.xml
+@@ -26,7 +26,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/sglobal/popupmenu/form.xml b/sw/uiconfig/sglobal/popupmenu/form.xml
+index 6c2cf9e..af77788 100644
+--- a/sw/uiconfig/sglobal/popupmenu/form.xml
++++ b/sw/uiconfig/sglobal/popupmenu/form.xml
+@@ -45,7 +45,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/sglobal/popupmenu/frame.xml b/sw/uiconfig/sglobal/popupmenu/frame.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/sglobal/popupmenu/frame.xml
++++ b/sw/uiconfig/sglobal/popupmenu/frame.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/sglobal/popupmenu/graphic.xml b/sw/uiconfig/sglobal/popupmenu/graphic.xml
+index ae7bad9..689b6a3 100644
+--- a/sw/uiconfig/sglobal/popupmenu/graphic.xml
++++ b/sw/uiconfig/sglobal/popupmenu/graphic.xml
+@@ -28,7 +28,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/sglobal/popupmenu/media.xml b/sw/uiconfig/sglobal/popupmenu/media.xml
+index 30b6baa..92da6ab 100644
+--- a/sw/uiconfig/sglobal/popupmenu/media.xml
++++ b/sw/uiconfig/sglobal/popupmenu/media.xml
+@@ -41,7 +41,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/sglobal/popupmenu/oleobject.xml b/sw/uiconfig/sglobal/popupmenu/oleobject.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/sglobal/popupmenu/oleobject.xml
++++ b/sw/uiconfig/sglobal/popupmenu/oleobject.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/sweb/menubar/menubar.xml b/sw/uiconfig/sweb/menubar/menubar.xml
+index 0b28a1f..25ff1af 100644
+--- a/sw/uiconfig/sweb/menubar/menubar.xml
++++ b/sw/uiconfig/sweb/menubar/menubar.xml
+@@ -231,7 +231,7 @@
+           <menu:menuitem menu:id=".uno:WrapOn"/>
+           <menu:menuitem menu:id=".uno:WrapIdeal"/>
+           <menu:menuitem menu:id=".uno:WrapThrough"/>
+-          <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++          <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+           <menu:menuseparator/>
+           <menu:menuitem menu:id=".uno:WrapContour"/>
+           <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/sweb/popupmenu/form.xml b/sw/uiconfig/sweb/popupmenu/form.xml
+index 6c2cf9e..af77788 100644
+--- a/sw/uiconfig/sweb/popupmenu/form.xml
++++ b/sw/uiconfig/sweb/popupmenu/form.xml
+@@ -45,7 +45,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/sweb/popupmenu/frame.xml b/sw/uiconfig/sweb/popupmenu/frame.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/sweb/popupmenu/frame.xml
++++ b/sw/uiconfig/sweb/popupmenu/frame.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/sweb/popupmenu/graphic.xml b/sw/uiconfig/sweb/popupmenu/graphic.xml
+index ae7bad9..689b6a3 100644
+--- a/sw/uiconfig/sweb/popupmenu/graphic.xml
++++ b/sw/uiconfig/sweb/popupmenu/graphic.xml
+@@ -28,7 +28,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/sweb/popupmenu/oleobject.xml b/sw/uiconfig/sweb/popupmenu/oleobject.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/sweb/popupmenu/oleobject.xml
++++ b/sw/uiconfig/sweb/popupmenu/oleobject.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swform/menubar/menubar.xml b/sw/uiconfig/swform/menubar/menubar.xml
+index 6f85776d..3f61b2e 100644
+--- a/sw/uiconfig/swform/menubar/menubar.xml
++++ b/sw/uiconfig/swform/menubar/menubar.xml
+@@ -285,7 +285,7 @@
+           <menu:menuitem menu:id=".uno:WrapOn"/>
+           <menu:menuitem menu:id=".uno:WrapIdeal"/>
+           <menu:menuitem menu:id=".uno:WrapThrough"/>
+-          <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++          <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+           <menu:menuseparator/>
+           <menu:menuitem menu:id=".uno:WrapContour"/>
+           <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swform/popupmenu/draw.xml b/sw/uiconfig/swform/popupmenu/draw.xml
+index fc12e15..0f2c33c 100644
+--- a/sw/uiconfig/swform/popupmenu/draw.xml
++++ b/sw/uiconfig/swform/popupmenu/draw.xml
+@@ -26,7 +26,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swform/popupmenu/form.xml b/sw/uiconfig/swform/popupmenu/form.xml
+index 6c2cf9e..af77788 100644
+--- a/sw/uiconfig/swform/popupmenu/form.xml
++++ b/sw/uiconfig/swform/popupmenu/form.xml
+@@ -45,7 +45,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swform/popupmenu/frame.xml b/sw/uiconfig/swform/popupmenu/frame.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/swform/popupmenu/frame.xml
++++ b/sw/uiconfig/swform/popupmenu/frame.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swform/popupmenu/graphic.xml b/sw/uiconfig/swform/popupmenu/graphic.xml
+index ae7bad9..689b6a3 100644
+--- a/sw/uiconfig/swform/popupmenu/graphic.xml
++++ b/sw/uiconfig/swform/popupmenu/graphic.xml
+@@ -28,7 +28,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swform/popupmenu/media.xml b/sw/uiconfig/swform/popupmenu/media.xml
+index 30b6baa..92da6ab 100644
+--- a/sw/uiconfig/swform/popupmenu/media.xml
++++ b/sw/uiconfig/swform/popupmenu/media.xml
+@@ -41,7 +41,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swform/popupmenu/oleobject.xml b/sw/uiconfig/swform/popupmenu/oleobject.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/swform/popupmenu/oleobject.xml
++++ b/sw/uiconfig/swform/popupmenu/oleobject.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swreport/menubar/menubar.xml b/sw/uiconfig/swreport/menubar/menubar.xml
+index 9807628..41e438c 100644
+--- a/sw/uiconfig/swreport/menubar/menubar.xml
++++ b/sw/uiconfig/swreport/menubar/menubar.xml
+@@ -287,7 +287,7 @@
+           <menu:menuitem menu:id=".uno:WrapOn"/>
+           <menu:menuitem menu:id=".uno:WrapIdeal"/>
+           <menu:menuitem menu:id=".uno:WrapThrough"/>
+-          <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++          <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+           <menu:menuseparator/>
+           <menu:menuitem menu:id=".uno:WrapContour"/>
+           <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swreport/popupmenu/draw.xml b/sw/uiconfig/swreport/popupmenu/draw.xml
+index fc12e15..0f2c33c 100644
+--- a/sw/uiconfig/swreport/popupmenu/draw.xml
++++ b/sw/uiconfig/swreport/popupmenu/draw.xml
+@@ -26,7 +26,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swreport/popupmenu/form.xml b/sw/uiconfig/swreport/popupmenu/form.xml
+index 6c2cf9e..af77788 100644
+--- a/sw/uiconfig/swreport/popupmenu/form.xml
++++ b/sw/uiconfig/swreport/popupmenu/form.xml
+@@ -45,7 +45,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swreport/popupmenu/frame.xml b/sw/uiconfig/swreport/popupmenu/frame.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/swreport/popupmenu/frame.xml
++++ b/sw/uiconfig/swreport/popupmenu/frame.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swreport/popupmenu/graphic.xml b/sw/uiconfig/swreport/popupmenu/graphic.xml
+index ae7bad9..689b6a3 100644
+--- a/sw/uiconfig/swreport/popupmenu/graphic.xml
++++ b/sw/uiconfig/swreport/popupmenu/graphic.xml
+@@ -28,7 +28,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swreport/popupmenu/media.xml b/sw/uiconfig/swreport/popupmenu/media.xml
+index 30b6baa..92da6ab 100644
+--- a/sw/uiconfig/swreport/popupmenu/media.xml
++++ b/sw/uiconfig/swreport/popupmenu/media.xml
+@@ -41,7 +41,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swreport/popupmenu/oleobject.xml b/sw/uiconfig/swreport/popupmenu/oleobject.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/swreport/popupmenu/oleobject.xml
++++ b/sw/uiconfig/swreport/popupmenu/oleobject.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swriter/menubar/menubar.xml b/sw/uiconfig/swriter/menubar/menubar.xml
+index 3739588..9cf2a60 100644
+--- a/sw/uiconfig/swriter/menubar/menubar.xml
++++ b/sw/uiconfig/swriter/menubar/menubar.xml
+@@ -519,7 +519,7 @@
+           <menu:menuitem menu:id=".uno:WrapOn"/>
+           <menu:menuitem menu:id=".uno:WrapIdeal"/>
+           <menu:menuitem menu:id=".uno:WrapThrough"/>
+-          <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++          <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+           <menu:menuseparator/>
+           <menu:menuitem menu:id=".uno:WrapContour"/>
+           <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swriter/popupmenu/draw.xml b/sw/uiconfig/swriter/popupmenu/draw.xml
+index fc12e15..0f2c33c 100644
+--- a/sw/uiconfig/swriter/popupmenu/draw.xml
++++ b/sw/uiconfig/swriter/popupmenu/draw.xml
+@@ -26,7 +26,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swriter/popupmenu/form.xml b/sw/uiconfig/swriter/popupmenu/form.xml
+index 6c2cf9e..af77788 100644
+--- a/sw/uiconfig/swriter/popupmenu/form.xml
++++ b/sw/uiconfig/swriter/popupmenu/form.xml
+@@ -45,7 +45,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swriter/popupmenu/frame.xml b/sw/uiconfig/swriter/popupmenu/frame.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/swriter/popupmenu/frame.xml
++++ b/sw/uiconfig/swriter/popupmenu/frame.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swriter/popupmenu/graphic.xml b/sw/uiconfig/swriter/popupmenu/graphic.xml
+index 2f50aa8..afd5b89 100644
+--- a/sw/uiconfig/swriter/popupmenu/graphic.xml
++++ b/sw/uiconfig/swriter/popupmenu/graphic.xml
+@@ -28,7 +28,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swriter/popupmenu/media.xml b/sw/uiconfig/swriter/popupmenu/media.xml
+index 30b6baa..92da6ab 100644
+--- a/sw/uiconfig/swriter/popupmenu/media.xml
++++ b/sw/uiconfig/swriter/popupmenu/media.xml
+@@ -41,7 +41,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swriter/popupmenu/oleobject.xml b/sw/uiconfig/swriter/popupmenu/oleobject.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/swriter/popupmenu/oleobject.xml
++++ b/sw/uiconfig/swriter/popupmenu/oleobject.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swxform/menubar/menubar.xml b/sw/uiconfig/swxform/menubar/menubar.xml
+index d3534b9..f4b58eb 100644
+--- a/sw/uiconfig/swxform/menubar/menubar.xml
++++ b/sw/uiconfig/swxform/menubar/menubar.xml
+@@ -287,7 +287,7 @@
+           <menu:menuitem menu:id=".uno:WrapOn"/>
+           <menu:menuitem menu:id=".uno:WrapIdeal"/>
+           <menu:menuitem menu:id=".uno:WrapThrough"/>
+-          <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++          <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+           <menu:menuseparator/>
+           <menu:menuitem menu:id=".uno:WrapContour"/>
+           <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swxform/popupmenu/draw.xml b/sw/uiconfig/swxform/popupmenu/draw.xml
+index fc12e15..0f2c33c 100644
+--- a/sw/uiconfig/swxform/popupmenu/draw.xml
++++ b/sw/uiconfig/swxform/popupmenu/draw.xml
+@@ -26,7 +26,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swxform/popupmenu/form.xml b/sw/uiconfig/swxform/popupmenu/form.xml
+index 6c2cf9e..af77788 100644
+--- a/sw/uiconfig/swxform/popupmenu/form.xml
++++ b/sw/uiconfig/swxform/popupmenu/form.xml
+@@ -45,7 +45,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swxform/popupmenu/frame.xml b/sw/uiconfig/swxform/popupmenu/frame.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/swxform/popupmenu/frame.xml
++++ b/sw/uiconfig/swxform/popupmenu/frame.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swxform/popupmenu/graphic.xml b/sw/uiconfig/swxform/popupmenu/graphic.xml
+index ae7bad9..689b6a3 100644
+--- a/sw/uiconfig/swxform/popupmenu/graphic.xml
++++ b/sw/uiconfig/swxform/popupmenu/graphic.xml
+@@ -28,7 +28,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>
+diff --git a/sw/uiconfig/swxform/popupmenu/media.xml b/sw/uiconfig/swxform/popupmenu/media.xml
+index 30b6baa..92da6ab 100644
+--- a/sw/uiconfig/swxform/popupmenu/media.xml
++++ b/sw/uiconfig/swxform/popupmenu/media.xml
+@@ -41,7 +41,7 @@
+       <menu:menuitem menu:id=".uno:WrapOn"/>
+       <menu:menuitem menu:id=".uno:WrapIdeal"/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:WrapAnchorOnly"/>
+diff --git a/sw/uiconfig/swxform/popupmenu/oleobject.xml b/sw/uiconfig/swxform/popupmenu/oleobject.xml
+index 3cd900b..3820491 100644
+--- a/sw/uiconfig/swxform/popupmenu/oleobject.xml
++++ b/sw/uiconfig/swxform/popupmenu/oleobject.xml
+@@ -22,7 +22,7 @@
+       <menu:menuitem menu:id=".uno:WrapRight"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapThrough"/>
+-      <menu:menuitem menu:id=".uno:WrapThroughTransparent"/>
++      <menu:menuitem menu:id=".uno:WrapThroughTransparencyToggle"/>
+       <menu:menuseparator/>
+       <menu:menuitem menu:id=".uno:WrapContour"/>
+       <menu:menuitem menu:id=".uno:ContourDialog"/>

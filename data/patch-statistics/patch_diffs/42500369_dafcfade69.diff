@@ -1,0 +1,116 @@
+From d4388c4628b478365a79081942e0832566a2968e Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Mon, 23 Oct 2017 19:54:43 +0000
+Subject: [PATCH] /vsis3/ /vsigs/: avoid using CPLFormFilename() to not run
+ short of static buffers. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=3735. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@40537 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/port/cpl_aws.cpp          | 42 ++++++++++++++++++++++++++--------
+ gdal/port/cpl_google_cloud.cpp | 22 ++++++++++++++----
+ 2 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/gdal/port/cpl_aws.cpp b/gdal/port/cpl_aws.cpp
+index fa089ec21baa..135d7df15cf6 100644
+--- a/gdal/port/cpl_aws.cpp
++++ b/gdal/port/cpl_aws.cpp
+@@ -726,17 +726,32 @@ bool VSIS3HandleHelper::GetConfigurationFromAWSConfigFiles(
+ 
+ #ifdef WIN32
+     const char* pszHome = CPLGetConfigOption("USERPROFILE", NULL);
++    static const char SEP_STRING[] = "\\";
+ #else
+     const char* pszHome = CPLGetConfigOption("HOME", NULL);
++    static const char SEP_STRING[] = "/";
+ #endif
+-    const CPLString osDotAws( CPLFormFilename( pszHome, ".aws", NULL) );
++
++    CPLString osDotAws( pszHome ? pszHome : "" );
++    osDotAws += SEP_STRING;
++    osDotAws += ".aws";
+ 
+     // Read first ~/.aws/credential file
+-    osCredentials =
+-        // GDAL specific config option (mostly for testing purpose, but also
+-        // used in production in some cases)
+-        CPLGetConfigOption( "CPL_AWS_CREDENTIALS_FILE",
+-                        CPLFormFilename( osDotAws, "credentials", NULL ) );
++
++    // GDAL specific config option (mostly for testing purpose, but also
++    // used in production in some cases)
++    const char* pszCredentials =
++                    CPLGetConfigOption( "CPL_AWS_CREDENTIALS_FILE", NULL );
++    if( pszCredentials )
++    {
++        osCredentials = pszCredentials;
++    }
++    else
++    {
++        osCredentials = osDotAws;
++        osCredentials += SEP_STRING;
++        osCredentials += "credentials";
++    }
+     VSILFILE* fp = VSIFOpenL( osCredentials, "rb" );
+     if( fp != NULL )
+     {
+@@ -773,9 +788,18 @@ bool VSIS3HandleHelper::GetConfigurationFromAWSConfigFiles(
+ 
+     // And then ~/.aws/config file (unless AWS_CONFIG_FILE is defined)
+     const char* pszAWSConfigFileEnv =
+-                        CPLGetConfigOption( "AWS_CONFIG_FILE", NULL );
+-    const CPLString osConfig( pszAWSConfigFileEnv ? pszAWSConfigFileEnv :
+-                              CPLFormFilename( osDotAws, "config", NULL ) );
++                            CPLGetConfigOption( "AWS_CONFIG_FILE", NULL );
++    CPLString osConfig;
++    if( pszAWSConfigFileEnv )
++    {
++        osConfig = pszAWSConfigFileEnv;
++    }
++    else
++    {
++        osConfig = osDotAws;
++        osConfig += SEP_STRING;
++        osConfig += "credentials";
++    }
+     fp = VSIFOpenL( osConfig, "rb" );
+     if( fp != NULL )
+     {
+diff --git a/gdal/port/cpl_google_cloud.cpp b/gdal/port/cpl_google_cloud.cpp
+index e9bad551c8b1..0eb80d98f05f 100644
+--- a/gdal/port/cpl_google_cloud.cpp
++++ b/gdal/port/cpl_google_cloud.cpp
+@@ -240,15 +240,27 @@ bool VSIGSHandleHelper::GetConfigurationFromConfigFile(
+ {
+ #ifdef WIN32
+     const char* pszHome = CPLGetConfigOption("USERPROFILE", NULL);
++    static const char SEP_STRING[] = "\\";
+ #else
+     const char* pszHome = CPLGetConfigOption("HOME", NULL);
++    static const char SEP_STRING[] = "/";
+ #endif
+ 
+-    osCredentials =
+-        // GDAL specific config option (mostly for testing purpose, but also
+-        // used in production in some cases)
+-        CPLGetConfigOption( "CPL_GS_CREDENTIALS_FILE",
+-                        CPLFormFilename( pszHome, ".boto", NULL ) );
++    // GDAL specific config option (mostly for testing purpose, but also
++    // used in production in some cases)
++    const char* pszCredentials =
++                    CPLGetConfigOption( "CPL_GS_CREDENTIALS_FILE", NULL);
++    if( pszCredentials )
++    {
++        osCredentials = pszCredentials;
++    }
++    else
++    {
++        osCredentials = pszHome ? pszHome : "";
++        osCredentials += SEP_STRING;
++        osCredentials += ".boto";
++    }
++
+     VSILFILE* fp = VSIFOpenL( osCredentials, "rb" );
+     if( fp != NULL )
+     {

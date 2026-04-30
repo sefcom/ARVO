@@ -1,0 +1,97 @@
+From faac745421f0ef85baf6001216b80aaaddb0e821 Mon Sep 17 00:00:00 2001
+From: Frank Yung-Fong Tang <ftang@google.com>
+Date: Wed, 29 May 2024 21:34:13 +0000
+Subject: [PATCH] ICU-22768 Fix bidi buffer overflow
+
+See #3016
+---
+ icu4c/source/common/ubidiwrt.cpp          | 10 ++++++++--
+ icu4c/source/test/cintltst/cbiditst.c     | 19 +++++++++++++++++++
+ icu4c/source/test/fuzzer/ubidi_fuzzer.cpp |  2 +-
+ 3 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/icu4c/source/common/ubidiwrt.cpp b/icu4c/source/common/ubidiwrt.cpp
+index 969807c24376..209b140722cb 100644
+--- a/icu4c/source/common/ubidiwrt.cpp
++++ b/icu4c/source/common/ubidiwrt.cpp
+@@ -501,7 +501,10 @@ ubidi_writeReordered(UBiDi *pBiDi,
+                     destSize-=runLength;
+ 
+                     if((pBiDi->isInverse) &&
+-                       (/*run<runCount-1 &&*/ dirProps[logicalStart+runLength-1]!=L)) {
++                           (/*run<runCount-1 &&*/
++                            runLength > 0 && // doWriteForward may return 0 if src
++                                             // only include bidi control chars
++                            dirProps[logicalStart+runLength-1]!=L)) {
+                         markFlag |= LRM_AFTER;
+                     }
+                     if (markFlag & LRM_AFTER) {
+@@ -632,7 +635,10 @@ ubidi_writeReordered(UBiDi *pBiDi,
+                     }
+                     destSize-=runLength;
+ 
+-                    if(/*run>0 &&*/ !(MASK_R_AL&DIRPROP_FLAG(dirProps[logicalStart+runLength-1]))) {
++                    if(/*run>0 &&*/
++                            runLength > 0 && // doWriteForward may return 0 if src
++                                             // only include bidi control chars
++                            !(MASK_R_AL&DIRPROP_FLAG(dirProps[logicalStart+runLength-1]))) {
+                         if(destSize>0) {
+                             *dest++=RLM_CHAR;
+                         }
+diff --git a/icu4c/source/test/cintltst/cbiditst.c b/icu4c/source/test/cintltst/cbiditst.c
+index 37d69df48fdb..8b0a01057045 100644
+--- a/icu4c/source/test/cintltst/cbiditst.c
++++ b/icu4c/source/test/cintltst/cbiditst.c
+@@ -92,6 +92,7 @@ static void doTailTest(void);
+ 
+ static void testBracketOverflow(void);
+ static void TestExplicitLevel0(void);
++static void testUBidiWriteReorderedBufferOverflow(void);
+ 
+ /* new BIDI API */
+ static void testReorderingMode(void);
+@@ -141,6 +142,7 @@ addComplexTest(TestNode** root) {
+     addTest(root, testContext, "complex/bidi/testContext");
+     addTest(root, testBracketOverflow, "complex/bidi/TestBracketOverflow");
+     addTest(root, TestExplicitLevel0, "complex/bidi/TestExplicitLevel0");
++    addTest(root, testUBidiWriteReorderedBufferOverflow, "complex/bidi/writeReorderedBufferOverflow");
+ 
+     addTest(root, doArabicShapingTest, "complex/arabic-shaping/ArabicShapingTest");
+     addTest(root, doLamAlefSpecialVLTRArabicShapingTest, "complex/arabic-shaping/lamalef");
+@@ -4939,6 +4941,23 @@ testBracketOverflow(void) {
+     ubidi_close(bidi);
+ }
+ 
++/* ICU-22768 */
++static void
++testUBidiWriteReorderedBufferOverflow (void) {
++    UErrorCode status = U_ZERO_ERROR;
++    UBiDi* bidi;
++    bidi = ubidi_open();
++    ubidi_setInverse(bidi, true);
++    static const UChar text[1] = { 0x2067 };
++    ubidi_setPara(bidi, text, 1, UBIDI_DEFAULT_RTL, NULL, &status);
++    UChar dest[MAXLEN];
++    uint16_t opt = UBIDI_REMOVE_BIDI_CONTROLS |
++        UBIDI_INSERT_LRM_FOR_NUMERIC |
++        UBIDI_OUTPUT_REVERSE;
++    ubidi_writeReordered(bidi, dest, MAXLEN, opt, &status);
++    ubidi_close(bidi);
++}
++
+ static void TestExplicitLevel0(void) {
+     // The following used to fail with an error, see ICU ticket #12922.
+     static const UChar text[2] = { 0x202d, 0x05d0 };
+diff --git a/icu4c/source/test/fuzzer/ubidi_fuzzer.cpp b/icu4c/source/test/fuzzer/ubidi_fuzzer.cpp
+index 077a14f83fdc..23cf35d746ae 100644
+--- a/icu4c/source/test/fuzzer/ubidi_fuzzer.cpp
++++ b/icu4c/source/test/fuzzer/ubidi_fuzzer.cpp
+@@ -125,7 +125,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+   checkVisual = (*(fuzzData.data()) & 0x01) == 0;
+   fuzzData.remove_prefix(sizeof(checkVisual));
+ 
+-  std::memcpy(&isInverse, fuzzData.data(), sizeof(isInverse));
++  isInverse = (*(fuzzData.data()) & 0x01) != 0;
+   fuzzData.remove_prefix(sizeof(isInverse));
+ 
+   std::memcpy(&options2, fuzzData.data(), sizeof(options2));

@@ -1,0 +1,285 @@
+From 2b8c00850b86ab40457dcd09a35a8cd9e0c4f9f0 Mon Sep 17 00:00:00 2001
+From: Niels Dossche <7771979+nielsdos@users.noreply.github.com>
+Date: Mon, 11 Dec 2023 23:40:26 +0100
+Subject: [PATCH] Fix GH-12936: hash() function hangs endlessly if using sha512
+ on strings >= 4GiB
+
+There's two problems:
+- Some loops used `unsigned int` instead of `size_t`.
+- The 2*N-bit addition that is emulated using 2 N bit numbers has a bug:
+  it first truncated the number to 32/64 bit and only then shifted. This
+  resulted in the wrong length info stored inside the resulting hash.
+
+Closes GH-12937.
+---
+ NEWS                    |  4 ++++
+ ext/hash/hash_adler32.c |  4 ++--
+ ext/hash/hash_haval.c   |  5 +++--
+ ext/hash/hash_md.c      |  5 +++--
+ ext/hash/hash_ripemd.c  | 20 ++++++++++++--------
+ ext/hash/hash_sha.c     | 20 ++++++++++++--------
+ ext/standard/sha1.c     |  5 +++--
+ 7 files changed, 39 insertions(+), 24 deletions(-)
+
+diff --git a/NEWS b/NEWS
+index f2c2ede3ae0ad..6223ed32b752a 100644
+--- a/NEWS
++++ b/NEWS
+@@ -6,6 +6,10 @@ PHP                                                                        NEWS
+   . Fix incorrect timeout in built-in web server when using router script and
+     max_input_time. (ilutov)
+ 
++- Hash:
++  . Fixed bug GH-12936 (hash() function hangs endlessly if using sha512 on
++    strings >= 4GiB). (nielsdos)
++
+ - Opcache:
+   . Fixed oss-fuzz #64727 (JIT undefined array key warning may overwrite DIM
+     with NULL when DIM is the same var as result). (ilutov)
+diff --git a/ext/hash/hash_adler32.c b/ext/hash/hash_adler32.c
+index 52ad17c39fd05..3937853fdc317 100644
+--- a/ext/hash/hash_adler32.c
++++ b/ext/hash/hash_adler32.c
+@@ -25,11 +25,11 @@ PHP_HASH_API void PHP_ADLER32Init(PHP_ADLER32_CTX *context, ZEND_ATTRIBUTE_UNUSE
+ 
+ PHP_HASH_API void PHP_ADLER32Update(PHP_ADLER32_CTX *context, const unsigned char *input, size_t len)
+ {
+-	uint32_t i, s[2];
++	uint32_t s[2];
+ 
+ 	s[0] = context->state & 0xffff;
+ 	s[1] = (context->state >> 16) & 0xffff;
+-	for (i = 0; i < len; ++i) {
++	for (size_t i = 0; i < len; ++i) {
+ 		s[0] += input[i];
+ 		s[1] += s[0];
+ 		if (s[1]>=0x7fffffff)
+diff --git a/ext/hash/hash_haval.c b/ext/hash/hash_haval.c
+index e1211a0b22ac8..67bc2b2e4780e 100644
+--- a/ext/hash/hash_haval.c
++++ b/ext/hash/hash_haval.c
+@@ -280,7 +280,8 @@ PHP_HASH_HAVAL_INIT(5,256)
+ /* {{{ PHP_HAVALUpdate */
+ PHP_HASH_API void PHP_HAVALUpdate(PHP_HAVAL_CTX *context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 128 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x7F);
+@@ -288,7 +289,7 @@ PHP_HASH_API void PHP_HAVALUpdate(PHP_HAVAL_CTX *context, const unsigned char *i
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3)) < ((uint32_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 128 - index;
+ 
+diff --git a/ext/hash/hash_md.c b/ext/hash/hash_md.c
+index a065f417e5395..04ad9ec15d2fe 100644
+--- a/ext/hash/hash_md.c
++++ b/ext/hash/hash_md.c
+@@ -204,7 +204,8 @@ PHP_HASH_API void PHP_MD4InitArgs(PHP_MD4_CTX * context, ZEND_ATTRIBUTE_UNUSED H
+  */
+ PHP_HASH_API void PHP_MD4Update(PHP_MD4_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 64 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x3F);
+@@ -213,7 +214,7 @@ PHP_HASH_API void PHP_MD4Update(PHP_MD4_CTX * context, const unsigned char *inpu
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3))
+ 		< ((uint32_t) inputLen << 3))
+ 		context->count[1]++;
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 64 - index;
+ 
+diff --git a/ext/hash/hash_ripemd.c b/ext/hash/hash_ripemd.c
+index b09615532335d..4802fdf9a1fcc 100644
+--- a/ext/hash/hash_ripemd.c
++++ b/ext/hash/hash_ripemd.c
+@@ -271,7 +271,8 @@ static void RIPEMD128Transform(uint32_t state[4], const unsigned char block[64])
+  */
+ PHP_HASH_API void PHP_RIPEMD128Update(PHP_RIPEMD128_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 64 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x3F);
+@@ -280,7 +281,7 @@ PHP_HASH_API void PHP_RIPEMD128Update(PHP_RIPEMD128_CTX * context, const unsigne
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3)) < ((uint32_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 64 - index;
+ 
+@@ -369,7 +370,8 @@ static void RIPEMD256Transform(uint32_t state[8], const unsigned char block[64])
+  */
+ PHP_HASH_API void PHP_RIPEMD256Update(PHP_RIPEMD256_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 64 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x3F);
+@@ -378,7 +380,7 @@ PHP_HASH_API void PHP_RIPEMD256Update(PHP_RIPEMD256_CTX * context, const unsigne
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3)) < ((uint32_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 64 - index;
+ 
+@@ -468,7 +470,8 @@ static void RIPEMD160Transform(uint32_t state[5], const unsigned char block[64])
+  */
+ PHP_HASH_API void PHP_RIPEMD160Update(PHP_RIPEMD160_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 64 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x3F);
+@@ -477,7 +480,7 @@ PHP_HASH_API void PHP_RIPEMD160Update(PHP_RIPEMD160_CTX * context, const unsigne
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3)) < ((uint32_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 64 - index;
+ 
+@@ -576,7 +579,8 @@ static void RIPEMD320Transform(uint32_t state[10], const unsigned char block[64]
+  */
+ PHP_HASH_API void PHP_RIPEMD320Update(PHP_RIPEMD320_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 64 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x3F);
+@@ -585,7 +589,7 @@ PHP_HASH_API void PHP_RIPEMD320Update(PHP_RIPEMD320_CTX * context, const unsigne
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3)) < ((uint32_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 64 - index;
+ 
+diff --git a/ext/hash/hash_sha.c b/ext/hash/hash_sha.c
+index 0fc0d02828cb2..7de00f37be4d0 100644
+--- a/ext/hash/hash_sha.c
++++ b/ext/hash/hash_sha.c
+@@ -222,7 +222,8 @@ PHP_HASH_API void PHP_SHA224InitArgs(PHP_SHA224_CTX * context, ZEND_ATTRIBUTE_UN
+  */
+ PHP_HASH_API void PHP_SHA224Update(PHP_SHA224_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 64 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x3F);
+@@ -231,7 +232,7 @@ PHP_HASH_API void PHP_SHA224Update(PHP_SHA224_CTX * context, const unsigned char
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3)) < ((uint32_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 64 - index;
+ 
+@@ -299,7 +300,8 @@ PHP_HASH_API void PHP_SHA224Final(unsigned char digest[28], PHP_SHA224_CTX * con
+  */
+ PHP_HASH_API void PHP_SHA256Update(PHP_SHA256_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 64 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x3F);
+@@ -308,7 +310,7 @@ PHP_HASH_API void PHP_SHA256Update(PHP_SHA256_CTX * context, const unsigned char
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3)) < ((uint32_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 64 - index;
+ 
+@@ -513,7 +515,8 @@ static void SHA512Transform(uint64_t state[8], const unsigned char block[128])
+  */
+ PHP_HASH_API void PHP_SHA384Update(PHP_SHA384_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i = 0, index, partLen;
++	unsigned int index, partLen;
++	size_t i = 0;
+ 
+ 	/* Compute number of bytes mod 128 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x7F);
+@@ -522,7 +525,7 @@ PHP_HASH_API void PHP_SHA384Update(PHP_SHA384_CTX * context, const unsigned char
+ 	if ((context->count[0] += ((uint64_t) inputLen << 3)) < ((uint64_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint64_t) inputLen >> 61);
++	context->count[1] += (uint64_t) (inputLen >> 61);
+ 
+ 	partLen = 128 - index;
+ 
+@@ -666,7 +669,8 @@ PHP_HASH_API void PHP_SHA512_224InitArgs(PHP_SHA512_CTX * context, ZEND_ATTRIBUT
+  */
+ PHP_HASH_API void PHP_SHA512Update(PHP_SHA512_CTX * context, const unsigned char *input, size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 128 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x7F);
+@@ -675,7 +679,7 @@ PHP_HASH_API void PHP_SHA512Update(PHP_SHA512_CTX * context, const unsigned char
+ 	if ((context->count[0] += ((uint64_t) inputLen << 3)) < ((uint64_t) inputLen << 3)) {
+ 		context->count[1]++;
+ 	}
+-	context->count[1] += ((uint64_t) inputLen >> 61);
++	context->count[1] += (uint64_t) (inputLen >> 61);
+ 
+ 	partLen = 128 - index;
+ 
+diff --git a/ext/standard/sha1.c b/ext/standard/sha1.c
+index ed59d80ab0ef2..95f2b54d0fd02 100644
+--- a/ext/standard/sha1.c
++++ b/ext/standard/sha1.c
+@@ -173,7 +173,8 @@ PHPAPI void PHP_SHA1InitArgs(PHP_SHA1_CTX * context, ZEND_ATTRIBUTE_UNUSED HashT
+ PHPAPI void PHP_SHA1Update(PHP_SHA1_CTX * context, const unsigned char *input,
+ 			   size_t inputLen)
+ {
+-	unsigned int i, index, partLen;
++	unsigned int index, partLen;
++	size_t i;
+ 
+ 	/* Compute number of bytes mod 64 */
+ 	index = (unsigned int) ((context->count[0] >> 3) & 0x3F);
+@@ -182,7 +183,7 @@ PHPAPI void PHP_SHA1Update(PHP_SHA1_CTX * context, const unsigned char *input,
+ 	if ((context->count[0] += ((uint32_t) inputLen << 3))
+ 		< ((uint32_t) inputLen << 3))
+ 		context->count[1]++;
+-	context->count[1] += ((uint32_t) inputLen >> 29);
++	context->count[1] += (uint32_t) (inputLen >> 29);
+ 
+ 	partLen = 64 - index;
+ 

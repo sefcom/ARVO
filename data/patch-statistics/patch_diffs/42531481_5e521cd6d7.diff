@@ -1,0 +1,521 @@
+From f3fa34dcad6fbfaadb5c68d67315149e6c652a93 Mon Sep 17 00:00:00 2001
+From: Nick Wellnhofer <wellnhofer@aevum.de>
+Date: Tue, 26 Dec 2023 22:37:26 +0100
+Subject: [PATCH] parser: Fix general entity parsing
+
+Clear namespace database.
+
+Ignore non-fatal errors.
+---
+ parser.c                       | 116 +++++++++++++++++----------------
+ result/{ => errors}/ns-ent.xml |   0
+ result/errors/ns-ent.xml.ent   |   3 +
+ result/errors/ns-ent.xml.err   |   3 +
+ result/errors/ns-ent.xml.str   |   3 +
+ result/noent/ns-ent.xml        |  11 ----
+ result/noent/ns-ent.xml.sax2   |  41 ------------
+ result/ns-ent.xml.rde          |  25 -------
+ result/ns-ent.xml.rdr          |  25 -------
+ result/ns-ent.xml.sax          |  45 -------------
+ result/ns-ent.xml.sax2         |  45 -------------
+ test/{ => errors}/ns-ent.xml   |   0
+ 12 files changed, 69 insertions(+), 248 deletions(-)
+ rename result/{ => errors}/ns-ent.xml (100%)
+ create mode 100644 result/errors/ns-ent.xml.ent
+ create mode 100644 result/errors/ns-ent.xml.err
+ create mode 100644 result/errors/ns-ent.xml.str
+ delete mode 100644 result/noent/ns-ent.xml
+ delete mode 100644 result/noent/ns-ent.xml.sax2
+ delete mode 100644 result/ns-ent.xml.rde
+ delete mode 100644 result/ns-ent.xml.rdr
+ delete mode 100644 result/ns-ent.xml.sax
+ delete mode 100644 result/ns-ent.xml.sax2
+ rename test/{ => errors}/ns-ent.xml (100%)
+
+diff --git a/parser.c b/parser.c
+index cae2b7fd1..47e56b3ab 100644
+--- a/parser.c
++++ b/parser.c
+@@ -12357,21 +12357,43 @@ xmlParseDTD(const xmlChar *ExternalID, const xmlChar *SystemID) {
+  *									*
+  ************************************************************************/
+ 
+-static xmlNodePtr
++static xmlParserErrors
+ xmlCtxtParseContent(xmlParserCtxtPtr ctxt, xmlParserInputPtr input,
+-                    int hasTextDecl) {
++                    int hasTextDecl, xmlNodePtr *list) {
+     xmlParserInputPtr oldInput;
+     xmlNodePtr oldNode, root = NULL;
+     int oldNameNr, oldSpaceNr, oldNodeNr;
+     int oldWellFormed;
+     int oldProgressive;
+     int oldNodeLen, oldNodeMem;
++    xmlParserNsData *nsdb, *oldNsdb;
++    int ret;
++
++    if (list != NULL)
++        *list = NULL;
+ 
+     if (((ctxt->depth > 40) && ((ctxt->options & XML_PARSE_HUGE) == 0)) ||
+ 	(ctxt->depth > 100)) {
+         xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_LOOP,
+                        "Maximum entity nesting depth exceeded");
+-        return(NULL);
++        return(XML_ERR_ENTITY_LOOP);
++    }
++
++    root = xmlNewDocNode(ctxt->myDoc, NULL, BAD_CAST "pseudoroot", NULL);
++    if (root == NULL) {
++        xmlErrMemory(ctxt);
++        return(XML_ERR_NO_MEMORY);
++    }
++
++    /*
++     * We need to reset the namespace database, so that entities don't
++     * pick up namespaces from the parent of a reference.
++     */
++    nsdb = xmlParserNsCreate();
++    if (nsdb == NULL) {
++        xmlErrMemory(ctxt);
++        xmlFreeNode(root);
++        return(XML_ERR_NO_MEMORY);
+     }
+ 
+     oldNode = ctxt->node;
+@@ -12380,17 +12402,12 @@ xmlCtxtParseContent(xmlParserCtxtPtr ctxt, xmlParserInputPtr input,
+     oldProgressive = ctxt->progressive;
+     oldNodeLen = ctxt->nodelen;
+     oldNodeMem = ctxt->nodemem;
++    oldNsdb = ctxt->nsdb;
+ 
+     oldNameNr = ctxt->nameNr;
+     oldSpaceNr = ctxt->spaceNr;
+     oldNodeNr = ctxt->nodeNr;
+ 
+-    root = xmlNewDocNode(ctxt->myDoc, NULL, BAD_CAST "pseudoroot", NULL);
+-    if (root == NULL) {
+-        xmlErrMemory(ctxt);
+-        return(NULL);
+-    }
+-
+     /*
+      * TODO: It would be nice if we could simply push the input onto
+      * the input stack. But there's still some code that assumes that
+@@ -12400,6 +12417,7 @@ xmlCtxtParseContent(xmlParserCtxtPtr ctxt, xmlParserInputPtr input,
+     ctxt->progressive = 0;
+     ctxt->nodelen = 0;
+     ctxt->nodemem = 0;
++    ctxt->nsdb = nsdb;
+ 
+     nameNsPush(ctxt, root->name, NULL, NULL, 0, 0);
+     spacePush(ctxt, -1);
+@@ -12436,10 +12454,28 @@ xmlCtxtParseContent(xmlParserCtxtPtr ctxt, xmlParserInputPtr input,
+ 	xmlFatalErr(ctxt, XML_ERR_EXTRA_CONTENT, NULL);
+     }
+ 
+-    if ((ctxt->wellFormed == 0) &&
+-        ((ctxt->recovery == 0) || (ctxt->errNo == XML_ERR_NO_MEMORY))) {
+-        xmlFreeNode(root);
+-        root = NULL;
++    if ((ctxt->wellFormed) ||
++        ((ctxt->recovery) && (ctxt->errNo != XML_ERR_NO_MEMORY))) {
++        if (list != NULL) {
++            xmlNodePtr cur;
++
++            /*
++             * Return the newly created nodeset after unlinking it from
++             * its pseudo parent.
++             */
++            cur = root->children;
++            *list = cur;
++            while (cur != NULL) {
++                cur->parent = NULL;
++                cur = cur->next;
++            }
++            root->children = NULL;
++            root->last = NULL;
++        }
++
++        ret = XML_ERR_OK;
++    } else {
++        ret = ctxt->errNo;
+     }
+ 
+     /*
+@@ -12469,8 +12505,12 @@ xmlCtxtParseContent(xmlParserCtxtPtr ctxt, xmlParserInputPtr input,
+     ctxt->progressive = oldProgressive;
+     ctxt->nodelen = oldNodeLen;
+     ctxt->nodemem = oldNodeMem;
++    ctxt->nsdb = oldNsdb;
+ 
+-    return(root);
++    xmlParserNsFree(nsdb);
++    xmlFreeNode(root);
++
++    return(ret);
+ }
+ 
+ /**
+@@ -12494,8 +12534,8 @@ int
+ xmlParseCtxtExternalEntity(xmlParserCtxtPtr ctxt, const xmlChar *URL,
+                            const xmlChar *ID, xmlNodePtr *list) {
+     xmlParserInputPtr input;
+-    xmlNodePtr root;
+     unsigned long consumed;
++    int ret;
+ 
+     if (list != NULL)
+         *list = NULL;
+@@ -12507,24 +12547,7 @@ xmlParseCtxtExternalEntity(xmlParserCtxtPtr ctxt, const xmlChar *URL,
+     if (input == NULL)
+         return(ctxt->errNo);
+ 
+-    root = xmlCtxtParseContent(ctxt, input, 1 /* hasTextDecl */);
+-
+-    if ((list != NULL) && (root != NULL)) {
+-        xmlNodePtr cur;
+-
+-        /*
+-         * Return the newly created nodeset after unlinking it from
+-         * their pseudo parent.
+-         */
+-        cur = root->children;
+-        *list = cur;
+-        while (cur != NULL) {
+-            cur->parent = NULL;
+-            cur = cur->next;
+-        }
+-        root->children = NULL;
+-        root->last = NULL;
+-    }
++    ret = xmlCtxtParseContent(ctxt, input, /* hasTextDecl */ 1, list);
+ 
+     /*
+      * Also record the size of the entity parsed
+@@ -12535,10 +12558,9 @@ xmlParseCtxtExternalEntity(xmlParserCtxtPtr ctxt, const xmlChar *URL,
+     xmlSaturatedAdd(&ctxt->sizeentities, consumed);
+     xmlSaturatedAdd(&ctxt->sizeentcopy, consumed);
+ 
+-    xmlFreeNode(root);
+     xmlFreeInputStream(input);
+ 
+-    return(ctxt->errNo);
++    return(ret);
+ }
+ 
+ #ifdef LIBXML_SAX1_ENABLED
+@@ -12638,8 +12660,8 @@ static xmlParserErrors
+ xmlCtxtParseInternalEntity(xmlParserCtxtPtr ctxt, const xmlChar *string,
+                            xmlNodePtr *list) {
+     xmlParserInputPtr input;
+-    xmlNodePtr root;
+     unsigned long consumed;
++    int ret;
+ 
+     if (list != NULL)
+         *list = NULL;
+@@ -12651,24 +12673,7 @@ xmlCtxtParseInternalEntity(xmlParserCtxtPtr ctxt, const xmlChar *string,
+     if (input == NULL)
+         return(ctxt->errNo);
+ 
+-    root = xmlCtxtParseContent(ctxt, input, 0 /* hasTextDecl */);
+-
+-    if ((list != NULL) && (root != NULL)) {
+-        xmlNodePtr cur;
+-
+-        /*
+-         * Return the newly created nodeset after unlinking it from
+-         * their pseudo parent.
+-         */
+-        cur = root->children;
+-        *list = cur;
+-        while (cur != NULL) {
+-            cur->parent = NULL;
+-            cur = cur->next;
+-        }
+-        root->children = NULL;
+-        root->last = NULL;
+-    }
++    ret = xmlCtxtParseContent(ctxt, input, /* hasTextDecl */ 0, list);
+ 
+     /*
+      * Also record the size of the entity parsed
+@@ -12678,10 +12683,9 @@ xmlCtxtParseInternalEntity(xmlParserCtxtPtr ctxt, const xmlChar *string,
+ 
+     xmlSaturatedAdd(&ctxt->sizeentcopy, consumed);
+ 
+-    xmlFreeNode(root);
+     xmlFreeInputStream(input);
+ 
+-    return(ctxt->errNo);
++    return(ret);
+ }
+ 
+ /**
+diff --git a/result/ns-ent.xml b/result/errors/ns-ent.xml
+similarity index 100%
+rename from result/ns-ent.xml
+rename to result/errors/ns-ent.xml
+diff --git a/result/errors/ns-ent.xml.ent b/result/errors/ns-ent.xml.ent
+new file mode 100644
+index 000000000..1875add90
+--- /dev/null
++++ b/result/errors/ns-ent.xml.ent
+@@ -0,0 +1,3 @@
++namespace error : Namespace prefix ns on elem is not defined
++<ns:elem/>
++        ^
+diff --git a/result/errors/ns-ent.xml.err b/result/errors/ns-ent.xml.err
+new file mode 100644
+index 000000000..1875add90
+--- /dev/null
++++ b/result/errors/ns-ent.xml.err
+@@ -0,0 +1,3 @@
++namespace error : Namespace prefix ns on elem is not defined
++<ns:elem/>
++        ^
+diff --git a/result/errors/ns-ent.xml.str b/result/errors/ns-ent.xml.str
+new file mode 100644
+index 000000000..1875add90
+--- /dev/null
++++ b/result/errors/ns-ent.xml.str
+@@ -0,0 +1,3 @@
++namespace error : Namespace prefix ns on elem is not defined
++<ns:elem/>
++        ^
+diff --git a/result/noent/ns-ent.xml b/result/noent/ns-ent.xml
+deleted file mode 100644
+index 9b8d8cd42..000000000
+--- a/result/noent/ns-ent.xml
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<?xml version="1.0"?>
+-<!DOCTYPE doc [
+-<!ENTITY ent1 "<elem/>">
+-<!ENTITY ent2 "<ns:elem/>">
+-]>
+-<doc>
+-    <a xmlns="urn:a"><elem/></a>
+-    <b xmlns="urn:b"><default:elem xmlns:default="urn:a"/></b>
+-    <a xmlns:ns="urn:a"><ns:elem/></a>
+-    <b xmlns:ns="urn:b"><ns:elem xmlns:ns="urn:a"/></b>
+-</doc>
+diff --git a/result/noent/ns-ent.xml.sax2 b/result/noent/ns-ent.xml.sax2
+deleted file mode 100644
+index 7fe00ae15..000000000
+--- a/result/noent/ns-ent.xml.sax2
++++ /dev/null
+@@ -1,41 +0,0 @@
+-SAX.setDocumentLocator()
+-SAX.startDocument()
+-SAX.internalSubset(doc, , )
+-SAX.entityDecl(ent1, 1, (null), (null), <elem/>)
+-SAX.getEntity(ent1)
+-SAX.entityDecl(ent2, 1, (null), (null), <ns:elem/>)
+-SAX.getEntity(ent2)
+-SAX.externalSubset(doc, , )
+-SAX.startElementNs(doc, NULL, NULL, 0, 0, 0)
+-SAX.characters(
+-    , 5)
+-SAX.startElementNs(a, NULL, 'urn:a', 1, xmlns='urn:a', 0, 0)
+-SAX.getEntity(ent1)
+-SAX.startElementNs(elem, NULL, 'urn:a', 0, 0, 0)
+-SAX.endElementNs(elem, NULL, 'urn:a')
+-SAX.endElementNs(a, NULL, 'urn:a')
+-SAX.characters(
+-    , 5)
+-SAX.startElementNs(b, NULL, 'urn:b', 1, xmlns='urn:b', 0, 0)
+-SAX.getEntity(ent1)
+-SAX.startElementNs(elem, NULL, 'urn:b', 0, 0, 0)
+-SAX.endElementNs(elem, NULL, 'urn:b')
+-SAX.endElementNs(b, NULL, 'urn:b')
+-SAX.characters(
+-    , 5)
+-SAX.startElementNs(a, NULL, NULL, 1, xmlns:ns='urn:a', 0, 0)
+-SAX.getEntity(ent2)
+-SAX.startElementNs(elem, ns, 'urn:a', 0, 0, 0)
+-SAX.endElementNs(elem, ns, 'urn:a')
+-SAX.endElementNs(a, NULL, NULL)
+-SAX.characters(
+-    , 5)
+-SAX.startElementNs(b, NULL, NULL, 1, xmlns:ns='urn:b', 0, 0)
+-SAX.getEntity(ent2)
+-SAX.startElementNs(elem, ns, 'urn:b', 0, 0, 0)
+-SAX.endElementNs(elem, ns, 'urn:b')
+-SAX.endElementNs(b, NULL, NULL)
+-SAX.characters(
+-, 1)
+-SAX.endElementNs(doc, NULL, NULL)
+-SAX.endDocument()
+diff --git a/result/ns-ent.xml.rde b/result/ns-ent.xml.rde
+deleted file mode 100644
+index f0eeedd45..000000000
+--- a/result/ns-ent.xml.rde
++++ /dev/null
+@@ -1,25 +0,0 @@
+-0 10 doc 0 0
+-0 1 doc 0 0
+-1 14 #text 0 1 
+-    
+-1 1 a 0 0
+-2 1 default:elem 1 0
+-1 15 a 0 0
+-1 14 #text 0 1 
+-    
+-1 1 b 0 0
+-2 1 default:elem 1 0
+-1 15 b 0 0
+-1 14 #text 0 1 
+-    
+-1 1 a 0 0
+-2 1 ns:elem 1 0
+-1 15 a 0 0
+-1 14 #text 0 1 
+-    
+-1 1 b 0 0
+-2 1 ns:elem 1 0
+-1 15 b 0 0
+-1 14 #text 0 1 
+-
+-0 15 doc 0 0
+diff --git a/result/ns-ent.xml.rdr b/result/ns-ent.xml.rdr
+deleted file mode 100644
+index 88bcf472c..000000000
+--- a/result/ns-ent.xml.rdr
++++ /dev/null
+@@ -1,25 +0,0 @@
+-0 10 doc 0 0
+-0 1 doc 0 0
+-1 14 #text 0 1 
+-    
+-1 1 a 0 0
+-2 5 ent1 0 0
+-1 15 a 0 0
+-1 14 #text 0 1 
+-    
+-1 1 b 0 0
+-2 5 ent1 0 0
+-1 15 b 0 0
+-1 14 #text 0 1 
+-    
+-1 1 a 0 0
+-2 5 ent2 0 0
+-1 15 a 0 0
+-1 14 #text 0 1 
+-    
+-1 1 b 0 0
+-2 5 ent2 0 0
+-1 15 b 0 0
+-1 14 #text 0 1 
+-
+-0 15 doc 0 0
+diff --git a/result/ns-ent.xml.sax b/result/ns-ent.xml.sax
+deleted file mode 100644
+index 98b63fcd5..000000000
+--- a/result/ns-ent.xml.sax
++++ /dev/null
+@@ -1,45 +0,0 @@
+-SAX.setDocumentLocator()
+-SAX.startDocument()
+-SAX.internalSubset(doc, , )
+-SAX.entityDecl(ent1, 1, (null), (null), <elem/>)
+-SAX.getEntity(ent1)
+-SAX.entityDecl(ent2, 1, (null), (null), <ns:elem/>)
+-SAX.getEntity(ent2)
+-SAX.externalSubset(doc, , )
+-SAX.startElement(doc)
+-SAX.characters(
+-    , 5)
+-SAX.startElement(a, xmlns='urn:a')
+-SAX.getEntity(ent1)
+-SAX.startElement(elem)
+-SAX.endElement(elem)
+-SAX.reference(ent1)
+-SAX.endElement(a)
+-SAX.characters(
+-    , 5)
+-SAX.startElement(b, xmlns='urn:b')
+-SAX.getEntity(ent1)
+-SAX.startElement(elem)
+-SAX.endElement(elem)
+-SAX.reference(ent1)
+-SAX.endElement(b)
+-SAX.characters(
+-    , 5)
+-SAX.startElement(a, xmlns:ns='urn:a')
+-SAX.getEntity(ent2)
+-SAX.startElement(ns:elem)
+-SAX.endElement(ns:elem)
+-SAX.reference(ent2)
+-SAX.endElement(a)
+-SAX.characters(
+-    , 5)
+-SAX.startElement(b, xmlns:ns='urn:b')
+-SAX.getEntity(ent2)
+-SAX.startElement(ns:elem)
+-SAX.endElement(ns:elem)
+-SAX.reference(ent2)
+-SAX.endElement(b)
+-SAX.characters(
+-, 1)
+-SAX.endElement(doc)
+-SAX.endDocument()
+diff --git a/result/ns-ent.xml.sax2 b/result/ns-ent.xml.sax2
+deleted file mode 100644
+index 25106c41a..000000000
+--- a/result/ns-ent.xml.sax2
++++ /dev/null
+@@ -1,45 +0,0 @@
+-SAX.setDocumentLocator()
+-SAX.startDocument()
+-SAX.internalSubset(doc, , )
+-SAX.entityDecl(ent1, 1, (null), (null), <elem/>)
+-SAX.getEntity(ent1)
+-SAX.entityDecl(ent2, 1, (null), (null), <ns:elem/>)
+-SAX.getEntity(ent2)
+-SAX.externalSubset(doc, , )
+-SAX.startElementNs(doc, NULL, NULL, 0, 0, 0)
+-SAX.characters(
+-    , 5)
+-SAX.startElementNs(a, NULL, 'urn:a', 1, xmlns='urn:a', 0, 0)
+-SAX.getEntity(ent1)
+-SAX.startElementNs(elem, NULL, 'urn:a', 0, 0, 0)
+-SAX.endElementNs(elem, NULL, 'urn:a')
+-SAX.reference(ent1)
+-SAX.endElementNs(a, NULL, 'urn:a')
+-SAX.characters(
+-    , 5)
+-SAX.startElementNs(b, NULL, 'urn:b', 1, xmlns='urn:b', 0, 0)
+-SAX.getEntity(ent1)
+-SAX.startElementNs(elem, NULL, 'urn:b', 0, 0, 0)
+-SAX.endElementNs(elem, NULL, 'urn:b')
+-SAX.reference(ent1)
+-SAX.endElementNs(b, NULL, 'urn:b')
+-SAX.characters(
+-    , 5)
+-SAX.startElementNs(a, NULL, NULL, 1, xmlns:ns='urn:a', 0, 0)
+-SAX.getEntity(ent2)
+-SAX.startElementNs(elem, ns, 'urn:a', 0, 0, 0)
+-SAX.endElementNs(elem, ns, 'urn:a')
+-SAX.reference(ent2)
+-SAX.endElementNs(a, NULL, NULL)
+-SAX.characters(
+-    , 5)
+-SAX.startElementNs(b, NULL, NULL, 1, xmlns:ns='urn:b', 0, 0)
+-SAX.getEntity(ent2)
+-SAX.startElementNs(elem, ns, 'urn:b', 0, 0, 0)
+-SAX.endElementNs(elem, ns, 'urn:b')
+-SAX.reference(ent2)
+-SAX.endElementNs(b, NULL, NULL)
+-SAX.characters(
+-, 1)
+-SAX.endElementNs(doc, NULL, NULL)
+-SAX.endDocument()
+diff --git a/test/ns-ent.xml b/test/errors/ns-ent.xml
+similarity index 100%
+rename from test/ns-ent.xml
+rename to test/errors/ns-ent.xml
+-- 
+GitLab
+

@@ -1,0 +1,46 @@
+From cd59485f7e2b99889f279b0dff7daca857079fa3 Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Tue, 31 Oct 2023 20:02:37 +0100
+Subject: [PATCH] Custom rules: add missing check (#2132)
+
+Fix an use-of-uninitialized-value error
+
+```
+==28646==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x55a9b7a3dea2 in ndpi_patricia_lookup /home/ivan/svnrepos/nDPI/src/lib/third_party/src/ndpi_patricia.c:739:8
+    #1 0x55a9b7442cac in add_to_ptree /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:2588:10
+    #2 0x55a9b7469290 in ndpi_add_ip_risk_mask /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:4161:12
+    #3 0x55a9b746cf14 in ndpi_handle_rule /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:4297:11
+    #4 0x55a9b74842ae in ndpi_load_protocols_file_fd /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:4944:8
+    #5 0x55a9b7424706 in LLVMFuzzerTestOneInput /home/ivan/svnrepos/nDPI/fuzz/fuzz_filecfg_protocols.c:38:3
+[...]
+```
+
+Found by oss-fuzz
+See: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=63754
+---
+ src/lib/ndpi_main.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib/ndpi_main.c b/src/lib/ndpi_main.c
+index 781fc1e2988..5447c03e0e5 100644
+--- a/src/lib/ndpi_main.c
++++ b/src/lib/ndpi_main.c
+@@ -4151,13 +4151,15 @@ int ndpi_add_ip_risk_mask(struct ndpi_detection_module_struct *ndpi_str,
+   if(!is_ipv6 && ndpi_str->ip_risk_mask_ptree) {
+     struct in_addr pin;
+ 
+-    pin.s_addr = inet_addr(addr);
++    if(inet_pton(AF_INET, addr, &pin) != 1)
++      return(-1);
+     node = add_to_ptree(ndpi_str->ip_risk_mask_ptree, AF_INET,
+ 			&pin, cidr ? atoi(cidr) : 32 /* bits */);
+   } else if(is_ipv6 && ndpi_str->ip_risk_mask_ptree6) {
+     struct in6_addr pin6;
+ 
+-    inet_pton(AF_INET6, addr, &pin6);
++    if(inet_pton(AF_INET6, addr, &pin6) != 1)
++      return(-1);
+     node = add_to_ptree(ndpi_str->ip_risk_mask_ptree6, AF_INET6,
+ 			&pin6, cidr ? atoi(cidr) : 128 /* bits */);
+   } else {

@@ -1,0 +1,77 @@
+From 52f859fd534e3c16c2c03b9a2375f00a50f3996e Mon Sep 17 00:00:00 2001
+From: Patrick Steinhardt <ps@pks.im>
+Date: Fri, 9 Nov 2018 19:32:08 +0100
+Subject: [PATCH] signature: fix out-of-bounds read when parsing timezone
+ offset
+
+When parsing a signature's timezone offset, we first check whether there
+is a timezone at all by verifying that there are still bytes left to
+read following the time itself. The check thus looks like `time_end + 1
+< buffer_end`, which is actually correct in this case. After setting the
+timezone's start pointer to that location, we compute the remaining
+bytes by using the formula `buffer_end - tz_start + 1`, re-using the
+previous `time_end + 1`. But this is in fact missing the braces around
+`(tz_start + 1)`, thus leading to an overestimation of the remaining
+bytes by a length of two. In case of a non-NUL terminated buffer, this
+will result in an overflow.
+
+The function `git_signature__parse` is only used in two locations. First
+is `git_signature_from_buffer`, which only accepts a string without a
+length. The string thus necessarily has to be NUL terminated and cannot
+trigger the issue.
+
+The other function is `git_commit__parse_raw`, which can in fact trigger
+the error as it may receive non-NUL terminated commit data. But as
+objects read from the ODB are always NUL-terminated by us as a
+cautionary measure, it cannot trigger the issue either.
+
+In other words, this error does not have any impact on security.
+---
+ src/signature.c          |  2 +-
+ tests/commit/signature.c | 20 ++++++++++++++++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/signature.c b/src/signature.c
+index 91864bb88dc..11416d786c4 100644
+--- a/src/signature.c
++++ b/src/signature.c
+@@ -248,7 +248,7 @@ int git_signature__parse(git_signature *sig, const char **buffer_out,
+ 
+ 			if ((tz_start[0] != '-' && tz_start[0] != '+') ||
+ 			    git__strntol32(&offset, tz_start + 1,
+-					   buffer_end - tz_start + 1, &tz_end, 10) < 0) {
++					   buffer_end - tz_start - 1, &tz_end, 10) < 0) {
+ 				/* malformed timezone, just assume it's zero */
+ 				offset = 0;
+ 			}
+diff --git a/tests/commit/signature.c b/tests/commit/signature.c
+index 78ddbbef3f6..a91551415d6 100644
+--- a/tests/commit/signature.c
++++ b/tests/commit/signature.c
+@@ -43,6 +43,26 @@ void test_commit_signature__leading_and_trailing_crud_is_trimmed(void)
+ 	assert_name_and_email("nulltoken \xe2\x98\xba", "emeric.fermas@gmail.com", "nulltoken \xe2\x98\xba", "emeric.fermas@gmail.com");
+ }
+ 
++void test_commit_signature__timezone_does_not_read_oob(void)
++{
++	const char *header = "A <a@example.com> 1461698487 +1234", *header_end;
++	git_signature *sig;
++
++	/* Let the buffer end midway between the timezone offeset's "+12" and "34" */
++	header_end = header + strlen(header) - 2;
++
++	sig = git__calloc(1, sizeof(git_signature));
++	cl_assert(sig);
++
++	cl_git_pass(git_signature__parse(sig, &header, header_end, NULL, '\0'));
++	cl_assert_equal_s(sig->name, "A");
++	cl_assert_equal_s(sig->email, "a@example.com");
++	cl_assert_equal_i(sig->when.time, 1461698487);
++	cl_assert_equal_i(sig->when.offset, 12);
++
++	git_signature_free(sig);
++}
++
+ void test_commit_signature__angle_brackets_in_names_are_not_supported(void)
+ {
+ 	cl_git_fail(try_build_signature("<Phil Haack", "phil@haack", 1234567890, 60));

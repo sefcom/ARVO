@@ -1,0 +1,39 @@
+From 630163d19be79c37d28b5e2d25f8a0aed669d639 Mon Sep 17 00:00:00 2001
+From: Tristan Matthews <tmatth@videolan.org>
+Date: Wed, 22 May 2024 10:12:35 -0400
+Subject: [PATCH] nb_decode: memset innovation memory in null mode
+
+After calling nb_decode, sb_decode is reading this memory (as `low_innov_alias`)
+so in the case of returning early, we should make sure it's initialized.
+
+Fixes msan error:
+ Issue 68413: speex:speex_decode_fuzzer_fixed: Use-of-uninitialized-value in compute_rms16
+
+found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/speex
+
+Fixes https://gitlab.xiph.org/xiph/speex/-/issues/2047
+Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=68413
+
+Signed-off-by: Tristan Matthews <tmatth@videolan.org>
+---
+ libspeex/nb_celp.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/libspeex/nb_celp.c b/libspeex/nb_celp.c
+index 71b950c..ad67207 100644
+--- a/libspeex/nb_celp.c
++++ b/libspeex/nb_celp.c
+@@ -1472,6 +1472,10 @@ int nb_decode(void *state, SpeexBits *bits, void *vout)
+       /* Final signal synthesis from excitation */
+       iir_mem16(st->exc, lpc, out, NB_FRAME_SIZE, NB_ORDER, st->mem_sp, stack);
+ 
++      /* Normally this is written to later but since this is returning early,
++         avoid reading uninitialized memory in caller */
++      SPEEX_MEMSET(st->innov_save, 0, NB_NB_SUBFRAMES*NB_SUBFRAME_SIZE);
++
+       st->count_lost=0;
+       return 0;
+    }
+-- 
+GitLab
+

@@ -1,0 +1,293 @@
+From 04d1bedd8c3fc5d9e41d11e2d0da08a966b732d3 Mon Sep 17 00:00:00 2001
+From: Nick Wellnhofer <wellnhofer@aevum.de>
+Date: Tue, 21 Mar 2023 13:08:44 +0100
+Subject: [PATCH] parser: Rework shrinking of input buffers
+
+Don't try to grow the input buffer in xmlParserShrink. This makes sure
+that no memory allocations are made and the function always succeeds.
+
+Remove unnecessary invocations of SHRINK. Invoke SHRINK at the end of
+DTD parsing loops.
+
+Shrink before growing.
+---
+ HTMLparser.c             |  7 ++-----
+ include/private/parser.h |  2 +-
+ parser.c                 | 29 +++++------------------------
+ parserInternals.c        | 16 ++--------------
+ 4 files changed, 10 insertions(+), 44 deletions(-)
+
+diff --git a/HTMLparser.c b/HTMLparser.c
+index 81bd11f9a..3bebda6e2 100644
+--- a/HTMLparser.c
++++ b/HTMLparser.c
+@@ -3100,7 +3100,6 @@ htmlParseScript(htmlParserCtxtPtr ctxt) {
+     int nbchar = 0;
+     int cur,l;
+ 
+-    SHRINK;
+     cur = CUR_CHAR(l);
+     while (cur != 0) {
+ 	if ((cur == '<') && (NXT(1) == '/')) {
+@@ -3358,7 +3357,6 @@ htmlParsePI(htmlParserCtxtPtr ctxt) {
+ 	 * this is a Processing Instruction.
+ 	 */
+ 	SKIP(2);
+-	SHRINK;
+ 
+ 	/*
+ 	 * Parse the target name and check for special support like
+@@ -3481,7 +3479,6 @@ htmlParseComment(htmlParserCtxtPtr ctxt) {
+ 
+     state = ctxt->instate;
+     ctxt->instate = XML_PARSER_COMMENT;
+-    SHRINK;
+     SKIP(4);
+     buf = (xmlChar *) xmlMallocAtomic(size);
+     if (buf == NULL) {
+@@ -4477,8 +4474,8 @@ htmlParseContent(htmlParserCtxtPtr ctxt) {
+             htmlParseCharData(ctxt);
+         }
+ 
+-        GROW;
+         SHRINK;
++        GROW;
+     }
+     if (currentNode != NULL) xmlFree(currentNode);
+ }
+@@ -4920,8 +4917,8 @@ htmlParseContentInternal(htmlParserCtxtPtr ctxt) {
+             htmlParseCharData(ctxt);
+         }
+ 
+-        GROW;
+         SHRINK;
++        GROW;
+     }
+     if (currentNode != NULL) xmlFree(currentNode);
+ }
+diff --git a/include/private/parser.h b/include/private/parser.h
+index 18036db58..820bb587c 100644
+--- a/include/private/parser.h
++++ b/include/private/parser.h
+@@ -27,7 +27,7 @@ XML_HIDDEN void
+ xmlHaltParser(xmlParserCtxtPtr ctxt);
+ XML_HIDDEN int
+ xmlParserGrow(xmlParserCtxtPtr ctxt);
+-XML_HIDDEN int
++XML_HIDDEN void
+ xmlParserShrink(xmlParserCtxtPtr ctxt);
+ 
+ #endif /* XML_PARSER_H_PRIVATE__ */
+diff --git a/parser.c b/parser.c
+index 8e548cdae..bf4d08bde 100644
+--- a/parser.c
++++ b/parser.c
+@@ -4183,7 +4183,6 @@ xmlParseSystemLiteral(xmlParserCtxtPtr ctxt) {
+     xmlChar stop;
+     int state = ctxt->instate;
+ 
+-    SHRINK;
+     if (RAW == '"') {
+         NEXT;
+ 	stop = '"';
+@@ -4265,7 +4264,6 @@ xmlParsePubidLiteral(xmlParserCtxtPtr ctxt) {
+     xmlChar stop;
+     xmlParserInputState oldstate = ctxt->instate;
+ 
+-    SHRINK;
+     if (RAW == '"') {
+         NEXT;
+ 	stop = '"';
+@@ -4387,7 +4385,6 @@ xmlParseCharData(xmlParserCtxtPtr ctxt, ATTRIBUTE_UNUSED int cdata) {
+     int col = ctxt->input->col;
+     int ccol;
+ 
+-    SHRINK;
+     GROW;
+     /*
+      * Accelerated common case where input don't need to be
+@@ -4533,7 +4530,6 @@ xmlParseCharDataComplex(xmlParserCtxtPtr ctxt) {
+     int nbchar = 0;
+     int cur, l;
+ 
+-    SHRINK;
+     cur = CUR_CHAR(l);
+     while ((cur != '<') && /* checked */
+            (cur != '&') &&
+@@ -4629,8 +4625,6 @@ xmlChar *
+ xmlParseExternalID(xmlParserCtxtPtr ctxt, xmlChar **publicID, int strict) {
+     xmlChar *URI = NULL;
+ 
+-    SHRINK;
+-
+     *publicID = NULL;
+     if (CMP6(CUR_PTR, 'S', 'Y', 'S', 'T', 'E', 'M')) {
+         SKIP(6);
+@@ -4847,7 +4841,6 @@ xmlParseComment(xmlParserCtxtPtr ctxt) {
+     ctxt->instate = XML_PARSER_COMMENT;
+     inputid = ctxt->input->id;
+     SKIP(2);
+-    SHRINK;
+     GROW;
+ 
+     /*
+@@ -5133,7 +5126,6 @@ xmlParsePI(xmlParserCtxtPtr ctxt) {
+ 	 * this is a Processing Instruction.
+ 	 */
+ 	SKIP(2);
+-	SHRINK;
+ 
+ 	/*
+ 	 * Parse the target name and check for special support like
+@@ -5272,7 +5264,6 @@ xmlParseNotationDecl(xmlParserCtxtPtr ctxt) {
+ 
+     if (CMP8(CUR_PTR, 'N', 'O', 'T', 'A', 'T', 'I', 'O', 'N')) {
+ 	int inputid = ctxt->input->id;
+-	SHRINK;
+ 	SKIP(8);
+ 	if (SKIP_BLANKS == 0) {
+ 	    xmlFatalErrMsg(ctxt, XML_ERR_SPACE_REQUIRED,
+@@ -5360,7 +5351,6 @@ xmlParseEntityDecl(xmlParserCtxtPtr ctxt) {
+     /* GROW; done in the caller */
+     if (CMP6(CUR_PTR, 'E', 'N', 'T', 'I', 'T', 'Y')) {
+ 	int inputid = ctxt->input->id;
+-	SHRINK;
+ 	SKIP(6);
+ 	if (SKIP_BLANKS == 0) {
+ 	    xmlFatalErrMsg(ctxt, XML_ERR_SPACE_REQUIRED,
+@@ -5684,7 +5674,6 @@ xmlParseNotationType(xmlParserCtxtPtr ctxt) {
+ 	xmlFatalErr(ctxt, XML_ERR_NOTATION_NOT_STARTED, NULL);
+ 	return(NULL);
+     }
+-    SHRINK;
+     do {
+         NEXT;
+ 	SKIP_BLANKS;
+@@ -5756,7 +5745,6 @@ xmlParseEnumerationType(xmlParserCtxtPtr ctxt) {
+ 	xmlFatalErr(ctxt, XML_ERR_ATTLIST_NOT_STARTED, NULL);
+ 	return(NULL);
+     }
+-    SHRINK;
+     do {
+         NEXT;
+ 	SKIP_BLANKS;
+@@ -5885,7 +5873,6 @@ xmlParseEnumeratedType(xmlParserCtxtPtr ctxt, xmlEnumerationPtr *tree) {
+  */
+ int
+ xmlParseAttributeType(xmlParserCtxtPtr ctxt, xmlEnumerationPtr *tree) {
+-    SHRINK;
+     if (CMP5(CUR_PTR, 'C', 'D', 'A', 'T', 'A')) {
+ 	SKIP(5);
+ 	return(XML_ATTRIBUTE_CDATA);
+@@ -6070,7 +6057,6 @@ xmlParseElementMixedContentDecl(xmlParserCtxtPtr ctxt, int inputchk) {
+     if (CMP7(CUR_PTR, '#', 'P', 'C', 'D', 'A', 'T', 'A')) {
+ 	SKIP(7);
+ 	SKIP_BLANKS;
+-	SHRINK;
+ 	if (RAW == ')') {
+ 	    if (ctxt->input->id != inputchk) {
+ 		xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_BOUNDARY,
+@@ -6242,7 +6228,6 @@ xmlParseElementChildrenContentDeclPriv(xmlParserCtxtPtr ctxt, int inputchk,
+ 	GROW;
+     }
+     SKIP_BLANKS;
+-    SHRINK;
+     while ((RAW != ')') && (ctxt->instate != XML_PARSER_EOF)) {
+         /*
+ 	 * Each loop we parse one separator and one element.
+@@ -6787,6 +6772,7 @@ xmlParseConditionalSections(xmlParserCtxtPtr ctxt) {
+             break;
+ 
+         SKIP_BLANKS;
++        SHRINK;
+         GROW;
+     }
+ 
+@@ -7018,6 +7004,7 @@ xmlParseExternalSubset(xmlParserCtxtPtr ctxt, const xmlChar *ExternalID,
+             return;
+         }
+         SKIP_BLANKS;
++        SHRINK;
+     }
+ 
+     if (RAW != 0) {
+@@ -8343,6 +8330,8 @@ xmlParseInternalSubset(xmlParserCtxtPtr ctxt) {
+                 return;
+             }
+ 	    SKIP_BLANKS;
++            SHRINK;
++            GROW;
+ 	}
+ 	if (RAW == ']') {
+ 	    NEXT;
+@@ -9229,14 +9218,6 @@ xmlParseStartTag2(xmlParserCtxtPtr ctxt, const xmlChar **pref,
+     if (RAW != '<') return(NULL);
+     NEXT1;
+ 
+-    /*
+-     * NOTE: it is crucial with the SAX2 API to never call SHRINK beyond that
+-     *       point since the attribute values may be stored as pointers to
+-     *       the buffer and calling SHRINK would destroy them !
+-     *       The Shrinking is only possible once the full set of attribute
+-     *       callbacks have been done.
+-     */
+-    SHRINK;
+     cur = ctxt->input->cur - ctxt->input->base;
+     inputid = ctxt->input->id;
+     nbatts = 0;
+@@ -9881,8 +9862,8 @@ xmlParseContentInternal(xmlParserCtxtPtr ctxt) {
+ 	    xmlParseCharData(ctxt, 0);
+ 	}
+ 
+-	GROW;
+ 	SHRINK;
++	GROW;
+     }
+ }
+ 
+diff --git a/parserInternals.c b/parserInternals.c
+index dd165790e..ce4f75e02 100644
+--- a/parserInternals.c
++++ b/parserInternals.c
+@@ -409,17 +409,16 @@ xmlParserInputGrow(xmlParserInputPtr in, int len) {
+  * xmlParserShrink:
+  * @ctxt:  an XML parser context
+  */
+-int
++void
+ xmlParserShrink(xmlParserCtxtPtr ctxt) {
+     xmlParserInputPtr in = ctxt->input;
+     xmlParserInputBufferPtr buf = in->buf;
+     size_t used;
+-    int ret = 0;
+ 
+     /* Don't shrink memory buffers. */
+     if ((buf == NULL) ||
+         ((buf->encoder == NULL) && (buf->readcallback == NULL)))
+-        return(0);
++        return;
+ 
+     used = in->cur - in->base;
+     /*
+@@ -439,18 +438,7 @@ xmlParserShrink(xmlParserCtxtPtr ctxt) {
+ 	}
+     }
+ 
+-    if (xmlBufUse(buf->buffer) < INPUT_CHUNK)
+-        ret = xmlParserInputBufferGrow(buf, INPUT_CHUNK);
+-
+     xmlBufSetInputBaseCur(buf->buffer, in, 0, used);
+-
+-    /* TODO: Get error code from xmlParserInputBufferGrow */
+-    if (ret < 0) {
+-        xmlErrInternal(ctxt, "Growing input buffer", NULL);
+-        xmlHaltParser(ctxt);
+-    }
+-
+-    return(ret);
+ }
+ 
+ /**
+-- 
+GitLab
+

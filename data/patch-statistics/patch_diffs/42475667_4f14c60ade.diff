@@ -1,0 +1,285 @@
+From 83b4a24384e62ed8cf91f51bf9a303f98017e13e Mon Sep 17 00:00:00 2001
+From: Shane Lontis <shane.lontis@oracle.com>
+Date: Fri, 7 Jun 2019 12:05:23 +1000
+Subject: [PATCH] Make EVP_MD_CTX_ctrl() work for legacy use cases (ssl3).
+
+This is still required currently by engines and digestsign/digestverify.
+This PR contains merged in code from Richard Levitte's PR #9126.
+
+[extended tests]
+
+Reviewed-by: Matt Caswell <matt@openssl.org>
+Reviewed-by: Richard Levitte <levitte@openssl.org>
+(Merged from https://github.com/openssl/openssl/pull/9103)
+---
+ crypto/evp/digest.c                       | 47 ++++++++++++-----------
+ doc/man3/EVP_DigestInit.pod               |  2 +-
+ include/openssl/core_names.h              |  3 +-
+ include/openssl/evp.h                     |  2 +-
+ providers/common/digests/sha2_prov.c      | 15 +++-----
+ providers/default/digests/md5_sha1_prov.c | 14 ++-----
+ ssl/s3_enc.c                              | 13 +++----
+ ssl/statem/statem_lib.c                   | 22 +++++++----
+ util/libcrypto.num                        |  2 +-
+ 9 files changed, 57 insertions(+), 63 deletions(-)
+
+diff --git a/crypto/evp/digest.c b/crypto/evp/digest.c
+index faa6ccf0de474..604bf7fea0657 100644
+--- a/crypto/evp/digest.c
++++ b/crypto/evp/digest.c
+@@ -539,30 +539,34 @@ int EVP_MD_CTX_get_params(EVP_MD_CTX *ctx, const OSSL_PARAM params[])
+     return 0;
+ }
+ 
+-#if !OPENSSL_API_3
++/* TODO(3.0): Remove legacy code below - only used by engines & DigestSign */
+ int EVP_MD_CTX_ctrl(EVP_MD_CTX *ctx, int cmd, int p1, void *p2)
+ {
+     if (ctx->digest != NULL) {
+-        OSSL_PARAM params[2];
+-        size_t i, sz, n = 0;
+-
+-        switch (cmd) {
+-        case EVP_MD_CTRL_XOF_LEN:
+-            if (ctx->digest->set_params == NULL)
+-                break;
+-            i = (size_t)p1;
+-            params[n++] = OSSL_PARAM_construct_size_t(
+-                              OSSL_DIGEST_PARAM_XOFLEN, &i, &sz);
+-            params[n++] = OSSL_PARAM_construct_end();
+-            return ctx->digest->set_params(ctx->provctx, params) > 0;
+-        case EVP_MD_CTRL_MICALG:
+-            if (ctx->digest->get_params == NULL)
+-                break;
+-            params[n++] = OSSL_PARAM_construct_utf8_string(
+-                              OSSL_DIGEST_PARAM_MICALG, p2, p1 ? p1 : 9999,
+-                              &sz);
+-            params[n++] = OSSL_PARAM_construct_end();
+-            return ctx->digest->get_params(ctx->provctx, params);
++        if (ctx->digest->prov != NULL) {
++            OSSL_PARAM params[2];
++            size_t i, sz, n = 0;
++
++            switch (cmd) {
++            case EVP_MD_CTRL_XOF_LEN:
++                if (ctx->digest->set_params == NULL)
++                    break;
++                i = (size_t)p1;
++                params[n++] =
++                    OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_XOFLEN, &i,
++                                                &sz);
++                params[n++] = OSSL_PARAM_construct_end();
++                return ctx->digest->set_params(ctx->provctx, params);
++            case EVP_MD_CTRL_MICALG:
++                if (ctx->digest->get_params == NULL)
++                    break;
++                params[n++] =
++                    OSSL_PARAM_construct_utf8_string(OSSL_DIGEST_PARAM_MICALG,
++                                                     p2, p1 ? p1 : 9999, &sz);
++                params[n++] = OSSL_PARAM_construct_end();
++                return ctx->digest->get_params(ctx->provctx, params);
++            }
++            return 0;
+         }
+         /* legacy code */
+         if (ctx->digest->md_ctrl != NULL) {
+@@ -574,7 +578,6 @@ int EVP_MD_CTX_ctrl(EVP_MD_CTX *ctx, int cmd, int p1, void *p2)
+     }
+     return 0;
+ }
+-#endif
+ 
+ static void *evp_md_from_dispatch(const OSSL_DISPATCH *fns,
+                                   OSSL_PROVIDER *prov)
+diff --git a/doc/man3/EVP_DigestInit.pod b/doc/man3/EVP_DigestInit.pod
+index 95ede34026399..ec8f6cc1c7eaa 100644
+--- a/doc/man3/EVP_DigestInit.pod
++++ b/doc/man3/EVP_DigestInit.pod
+@@ -90,7 +90,7 @@ Cleans up digest context B<ctx> and frees up the space allocated to it.
+ 
+ =item EVP_MD_CTX_ctrl()
+ 
+-This is a deprecated function. EVP_MD_CTX_set_params() and EVP_MD_CTX_get_params()
++This is a legacy method. EVP_MD_CTX_set_params() and EVP_MD_CTX_get_params()
+ is the mechanism that should be used to set and get parameters that are used by
+ providers.
+ Performs digest-specific control actions on context B<ctx>. The control command
+diff --git a/include/openssl/core_names.h b/include/openssl/core_names.h
+index 52a3f8b30be59..a9a3b448e5ec5 100644
+--- a/include/openssl/core_names.h
++++ b/include/openssl/core_names.h
+@@ -42,8 +42,7 @@ extern "C" {
+ 
+ /* digest parameters */
+ #define OSSL_DIGEST_PARAM_XOFLEN    "xoflen"
+-#define OSSL_DIGEST_PARAM_CMD       "cmd"
+-#define OSSL_DIGEST_PARAM_MSG       "msg"
++#define OSSL_DIGEST_PARAM_SSL3_MS   "ssl3-ms"
+ #define OSSL_DIGEST_PARAM_PAD_TYPE  "pad_type"
+ #define OSSL_DIGEST_PARAM_MICALG    "micalg"
+ 
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index afdd17cb5f553..5fb04d15c32b5 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -542,7 +542,7 @@ void BIO_set_md(BIO *, const EVP_MD *md);
+ 
+ int EVP_MD_CTX_set_params(EVP_MD_CTX *ctx, const OSSL_PARAM params[]);
+ int EVP_MD_CTX_get_params(EVP_MD_CTX *ctx, const OSSL_PARAM params[]);
+-DEPRECATEDIN_3(int EVP_MD_CTX_ctrl(EVP_MD_CTX *ctx, int cmd, int p1, void *p2))
++int EVP_MD_CTX_ctrl(EVP_MD_CTX *ctx, int cmd, int p1, void *p2);
+ EVP_MD_CTX *EVP_MD_CTX_new(void);
+ int EVP_MD_CTX_reset(EVP_MD_CTX *ctx);
+ void EVP_MD_CTX_free(EVP_MD_CTX *ctx);
+diff --git a/providers/common/digests/sha2_prov.c b/providers/common/digests/sha2_prov.c
+index 4b5979e4ab72d..547d1bcab6833 100644
+--- a/providers/common/digests/sha2_prov.c
++++ b/providers/common/digests/sha2_prov.c
+@@ -10,6 +10,7 @@
+ #include <openssl/crypto.h>
+ #include <openssl/core_numbers.h>
+ #include <openssl/sha.h>
++#include <openssl/evp.h>
+ #include <openssl/params.h>
+ #include <openssl/core_names.h>
+ #include "internal/core_mkdigest.h"
+@@ -21,20 +22,14 @@ static OSSL_OP_digest_set_params_fn sha1_set_params;
+ /* Special set_params method for SSL3 */
+ static int sha1_set_params(void *vctx, const OSSL_PARAM params[])
+ {
+-    int cmd = 0;
+-    size_t msg_len = 0;
+-    const void *msg = NULL;
+     const OSSL_PARAM *p;
+     SHA_CTX *ctx = (SHA_CTX *)vctx;
+ 
+     if (ctx != NULL && params != NULL) {
+-        p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_CMD);
+-        if (p != NULL && !OSSL_PARAM_get_int(p, &cmd))
+-            return 0;
+-        p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_MSG);
+-        if (p != NULL && !OSSL_PARAM_get_octet_ptr(p, &msg, &msg_len))
+-            return 0;
+-        return sha1_ctrl(ctx, cmd, msg_len, (void *)msg);
++        p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_SSL3_MS);
++        if (p != NULL && p->data_type == OSSL_PARAM_OCTET_STRING)
++            return sha1_ctrl(ctx, EVP_CTRL_SSL3_MASTER_SECRET, p->data_size,
++                             p->data);
+     }
+     return 0;
+ }
+diff --git a/providers/default/digests/md5_sha1_prov.c b/providers/default/digests/md5_sha1_prov.c
+index 59a7df83ff6d9..e6091bd80fb87 100644
+--- a/providers/default/digests/md5_sha1_prov.c
++++ b/providers/default/digests/md5_sha1_prov.c
+@@ -22,20 +22,14 @@ static OSSL_OP_digest_set_params_fn md5_sha1_set_params;
+ /* Special set_params method for SSL3 */
+ static int md5_sha1_set_params(void *vctx, const OSSL_PARAM params[])
+ {
+-    int cmd = 0;
+-    size_t msg_len = 0;
+-    const void *msg = NULL;
+     const OSSL_PARAM *p;
+     MD5_SHA1_CTX *ctx = (MD5_SHA1_CTX *)vctx;
+ 
+     if (ctx != NULL && params != NULL) {
+-        p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_CMD);
+-        if (p != NULL && !OSSL_PARAM_get_int(p, &cmd))
+-            return 0;
+-        p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_MSG);
+-        if (p != NULL && !OSSL_PARAM_get_octet_ptr(p, &msg, &msg_len))
+-            return 0;
+-        return md5_sha1_ctrl(ctx, cmd, msg_len, (void *)msg);
++        p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_SSL3_MS);
++        if (p != NULL && p->data_type == OSSL_PARAM_OCTET_STRING)
++            return md5_sha1_ctrl(ctx, EVP_CTRL_SSL3_MASTER_SECRET, p->data_size,
++                                 p->data);
+     }
+     return 0;
+ }
+diff --git a/ssl/s3_enc.c b/ssl/s3_enc.c
+index c6660143279c8..6c3b7110723e0 100644
+--- a/ssl/s3_enc.c
++++ b/ssl/s3_enc.c
+@@ -415,14 +415,10 @@ void ssl3_digest_master_key_set_params(const SSL_SESSION *session,
+                                        OSSL_PARAM params[])
+ {
+     int n = 0;
+-    int cmd = EVP_CTRL_SSL3_MASTER_SECRET;
+-
+-    params[n++] = OSSL_PARAM_construct_int(OSSL_DIGEST_PARAM_CMD, &cmd,
+-                                           NULL);
+-    params[n++] = OSSL_PARAM_construct_octet_ptr(OSSL_DIGEST_PARAM_MSG,
+-                                                (void **)&session->master_key,
+-                                                 session->master_key_length,
+-                                                 NULL);
++    params[n++] = OSSL_PARAM_construct_octet_string(OSSL_DIGEST_PARAM_SSL3_MS,
++                                                    (void *)session->master_key,
++                                                    session->master_key_length,
++                                                    NULL);
+     params[n++] = OSSL_PARAM_construct_end();
+ }
+ 
+@@ -468,6 +464,7 @@ size_t ssl3_final_finish_mac(SSL *s, const char *sender, size_t len,
+         OSSL_PARAM digest_cmd_params[3];
+ 
+         ssl3_digest_master_key_set_params(s->session, digest_cmd_params);
++
+         if (EVP_DigestUpdate(ctx, sender, len) <= 0
+             || EVP_MD_CTX_set_params(ctx, digest_cmd_params) <= 0
+             || EVP_DigestFinal_ex(ctx, p, NULL) <= 0) {
+diff --git a/ssl/statem/statem_lib.c b/ssl/statem/statem_lib.c
+index e59b49bb3d29f..e6d2478dcbac7 100644
+--- a/ssl/statem/statem_lib.c
++++ b/ssl/statem/statem_lib.c
+@@ -285,11 +285,14 @@ int tls_construct_cert_verify(SSL *s, WPACKET *pkt)
+         }
+     }
+     if (s->version == SSL3_VERSION) {
+-        OSSL_PARAM digest_cmd_params[3];
+-
+-        ssl3_digest_master_key_set_params(s->session, digest_cmd_params);
+         if (EVP_DigestSignUpdate(mctx, hdata, hdatalen) <= 0
+-            || EVP_MD_CTX_set_params(mctx, digest_cmd_params) <= 0
++            /*
++             * TODO(3.0) Replace this when EVP_MD_CTX_ctrl() is deprecated
++             * with a call to ssl3_digest_master_key_set_params()
++             */
++            || EVP_MD_CTX_ctrl(mctx, EVP_CTRL_SSL3_MASTER_SECRET,
++                               (int)s->session->master_key_length,
++                               s->session->master_key) <= 0
+             || EVP_DigestSignFinal(mctx, sig, &siglen) <= 0) {
+ 
+             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLS_CONSTRUCT_CERT_VERIFY,
+@@ -474,11 +477,14 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL *s, PACKET *pkt)
+         }
+     }
+     if (s->version == SSL3_VERSION) {
+-        OSSL_PARAM digest_cmd_params[3];
+-
+-        ssl3_digest_master_key_set_params(s->session, digest_cmd_params);
++        /*
++         * TODO(3.0) Replace this when EVP_MD_CTX_ctrl() is deprecated
++         * with a call to ssl3_digest_master_key_set_params()
++         */
+         if (EVP_DigestVerifyUpdate(mctx, hdata, hdatalen) <= 0
+-                || EVP_MD_CTX_set_params(mctx, digest_cmd_params) <= 0) {
++                || EVP_MD_CTX_ctrl(mctx, EVP_CTRL_SSL3_MASTER_SECRET,
++                                   (int)s->session->master_key_length,
++                                    s->session->master_key) <= 0) {
+             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLS_PROCESS_CERT_VERIFY,
+                      ERR_R_EVP_LIB);
+             goto err;
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index af17aba7f599f..0c2a8f5da7a4e 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -3562,7 +3562,7 @@ X509_NAME_get_index_by_NID              3515	3_0_0	EXIST::FUNCTION:
+ ENGINE_get_first                        3516	3_0_0	EXIST::FUNCTION:ENGINE
+ CERTIFICATEPOLICIES_it                  3517	3_0_0	EXIST:!EXPORT_VAR_AS_FUNCTION:VARIABLE:
+ CERTIFICATEPOLICIES_it                  3517	3_0_0	EXIST:EXPORT_VAR_AS_FUNCTION:FUNCTION:
+-EVP_MD_CTX_ctrl                         3518	3_0_0	EXIST::FUNCTION:DEPRECATEDIN_3
++EVP_MD_CTX_ctrl                         3518	3_0_0	EXIST::FUNCTION:
+ PKCS7_final                             3519	3_0_0	EXIST::FUNCTION:
+ EVP_PKEY_size                           3520	3_0_0	EXIST::FUNCTION:
+ EVP_DecryptFinal_ex                     3521	3_0_0	EXIST::FUNCTION:

@@ -1,0 +1,66 @@
+From e21c83650f15a197b286f8eed8c7d723c6900925 Mon Sep 17 00:00:00 2001
+From: Oliver Sander <oliver.sander@tu-dresden.de>
+Date: Wed, 10 Feb 2021 21:36:51 +0100
+Subject: [PATCH] pdftoppm: Fix rounding bug in computation of output bitmap
+ size
+
+When a specific output image size was requested, the code would use
+that size to compute the target resolution, and then use the
+resolution to get the image size back.  In finite-precision
+arithmetic the resulting image size is not necessarily an
+integer, and a subsequent call to `ceil` then sometimes lead to
+an image size that was 1 larger than what was explicitly
+requested.
+
+Fix this by using a given image size directly, without converting
+it to resolution and back.
+
+BUG: https://gitlab.freedesktop.org/poppler/poppler/issues/927
+---
+ utils/pdftoppm.cc | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/utils/pdftoppm.cc b/utils/pdftoppm.cc
+index 1789aadf9..97fdbea26 100644
+--- a/utils/pdftoppm.cc
++++ b/utils/pdftoppm.cc
+@@ -628,23 +628,34 @@ int main(int argc, char *argv[])
+         if (scaleDimensionBeforeRotation && needToRotate(doc->getPageRotate(pg)))
+             std::swap(pg_w, pg_h);
+ 
++        // Handle requests for specific image size
+         if (scaleTo != 0) {
+             resolution = (72.0 * scaleTo) / (pg_w > pg_h ? pg_w : pg_h);
+             x_resolution = y_resolution = resolution;
++            pg_w = pg_h = scaleTo;
+         } else {
+             if (x_scaleTo > 0) {
+                 x_resolution = (72.0 * x_scaleTo) / pg_w;
++                pg_w = x_scaleTo;
+                 if (y_scaleTo == -1)
+                     y_resolution = x_resolution;
+             }
++
+             if (y_scaleTo > 0) {
+                 y_resolution = (72.0 * y_scaleTo) / pg_h;
++                pg_h = y_scaleTo;
+                 if (x_scaleTo == -1)
+                     x_resolution = y_resolution;
+             }
++
++            // No specific image size requested---compute the size from the resolution
++            if (x_scaleTo <= 0) {
++                pg_w = pg_w * (x_resolution / 72.0);
++            }
++            if (y_scaleTo <= 0) {
++                pg_h = pg_h * (y_resolution / 72.0);
++            }
+         }
+-        pg_w = pg_w * (x_resolution / 72.0);
+-        pg_h = pg_h * (y_resolution / 72.0);
+ 
+         if (!scaleDimensionBeforeRotation && needToRotate(doc->getPageRotate(pg)))
+             std::swap(pg_w, pg_h);
+-- 
+GitLab
+

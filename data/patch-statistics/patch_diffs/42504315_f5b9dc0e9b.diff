@@ -1,0 +1,104 @@
+From 6445b60cebc7fe5db2852d9f5a404ae330fbc0df Mon Sep 17 00:00:00 2001
+From: Eric Blankenhorn <eric@wolfssl.com>
+Date: Tue, 22 Feb 2022 10:16:34 -0600
+Subject: [PATCH 1/2] Allow MqttClient_WaitType to return MQTT_CODE_CONTINUE
+ with MT
+
+---
+ src/mqtt_client.c | 14 ++++++--------
+ 1 file changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/src/mqtt_client.c b/src/mqtt_client.c
+index 1ca1da497..efc402103 100644
+--- a/src/mqtt_client.c
++++ b/src/mqtt_client.c
+@@ -861,9 +861,7 @@ static int MqttClient_WaitType(MqttClient *client, void *packet_obj,
+             /* Check to see if packet type and id have already completed */
+             rc = MqttClient_CheckPendResp(client, wait_type, wait_packet_id);
+             if (rc != MQTT_CODE_ERROR_NOT_FOUND
+-            #ifdef WOLFMQTT_NONBLOCK
+                 && rc != MQTT_CODE_CONTINUE
+-            #endif
+             ) {
+                 return rc;
+             }
+@@ -1434,7 +1432,7 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
+     /* Wait for connect ack packet */
+     rc = MqttClient_WaitType(client, &mc_connect->ack,
+         MQTT_PACKET_TYPE_CONNECT_ACK, 0, client->cmd_timeout_ms);
+-#ifdef WOLFMQTT_NONBLOCK
++#if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+     if (rc == MQTT_CODE_CONTINUE)
+         return rc;
+ #endif
+@@ -1830,7 +1828,7 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
+                     rc = MqttClient_WaitType(client, &publish->resp, resp_type,
+                         publish->packet_id, client->cmd_timeout_ms);
+                 }
+-            #ifdef WOLFMQTT_NONBLOCK
++            #if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+                 if (rc == MQTT_CODE_CONTINUE)
+                     break;
+             #endif
+@@ -1966,7 +1964,7 @@ int MqttClient_Subscribe(MqttClient *client, MqttSubscribe *subscribe)
+     rc = MqttClient_WaitType(client, &subscribe->ack,
+         MQTT_PACKET_TYPE_SUBSCRIBE_ACK, subscribe->packet_id,
+         client->cmd_timeout_ms);
+-#ifdef WOLFMQTT_NONBLOCK
++#if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+     if (rc == MQTT_CODE_CONTINUE)
+         return rc;
+ #endif
+@@ -2068,7 +2066,7 @@ int MqttClient_Unsubscribe(MqttClient *client, MqttUnsubscribe *unsubscribe)
+     rc = MqttClient_WaitType(client, &unsubscribe->ack,
+         MQTT_PACKET_TYPE_UNSUBSCRIBE_ACK, unsubscribe->packet_id,
+         client->cmd_timeout_ms);
+-#ifdef WOLFMQTT_NONBLOCK
++#if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+     if (rc == MQTT_CODE_CONTINUE)
+         return rc;
+ #endif
+@@ -2161,7 +2159,7 @@ int MqttClient_Ping_ex(MqttClient *client, MqttPing* ping)
+     /* Wait for ping resp packet */
+     rc = MqttClient_WaitType(client, ping, MQTT_PACKET_TYPE_PING_RESP, 0,
+         client->cmd_timeout_ms);
+-#ifdef WOLFMQTT_NONBLOCK
++#if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+     if (rc == MQTT_CODE_CONTINUE)
+         return rc;
+ #endif
+@@ -2311,7 +2309,7 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
+     /* Wait for auth packet */
+     rc = MqttClient_WaitType(client, auth, MQTT_PACKET_TYPE_AUTH, 0,
+         client->cmd_timeout_ms);
+-#ifdef WOLFMQTT_NONBLOCK
++#if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+     if (rc == MQTT_CODE_CONTINUE)
+         return rc;
+ #endif
+
+From e47a4cc6e11510cb55e73a26671b0359aa046278 Mon Sep 17 00:00:00 2001
+From: David Garske <david@wolfssl.com>
+Date: Tue, 22 Feb 2022 09:47:31 -0800
+Subject: [PATCH 2/2] Fix for `--enable-debug=verbose` without non-block.
+
+---
+ src/mqtt_client.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/mqtt_client.c b/src/mqtt_client.c
+index efc402103..ff79f7202 100644
+--- a/src/mqtt_client.c
++++ b/src/mqtt_client.c
+@@ -273,7 +273,10 @@ static int MqttClient_RespList_Find(MqttClient *client,
+            (packet_id == tmpResp->packet_id))
+         {
+         #ifdef WOLFMQTT_DEBUG_CLIENT
+-            if (client->lastRc != MQTT_CODE_CONTINUE) {
++            #if defined(WOLFMQTT_NONBLOCK) && defined(WOLFMQTT_DEBUG_CLIENT)
++            if (client->lastRc != MQTT_CODE_CONTINUE)
++            #endif
++            {
+             PRINTF("PendResp Found: %p, Type %s (%d), ID %d, InProc %d, Done %d",
+                 tmpResp, MqttPacket_TypeDesc(tmpResp->packet_type),
+                 tmpResp->packet_type, tmpResp->packet_id,

@@ -1,0 +1,45 @@
+From 68fdad82c9a3d1d1fc03975b7b91fdb940c621e0 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Sun, 7 Jun 2020 10:24:03 +0200
+Subject: [PATCH] Fix free of uninitialized memory in attributes
+
+Fixes OSS-Fuzz #23140.
+---
+ .../tests/attributes/018_fatal_error_in_argument.phpt | 11 +++++++++++
+ Zend/zend_attributes.c                                |  5 +++++
+ 2 files changed, 16 insertions(+)
+ create mode 100644 Zend/tests/attributes/018_fatal_error_in_argument.phpt
+
+diff --git a/Zend/tests/attributes/018_fatal_error_in_argument.phpt b/Zend/tests/attributes/018_fatal_error_in_argument.phpt
+new file mode 100644
+index 0000000000000..a950c8658ab19
+--- /dev/null
++++ b/Zend/tests/attributes/018_fatal_error_in_argument.phpt
+@@ -0,0 +1,11 @@
++--TEST--
++Don't free uninitialized memory if a fatal error occurs in an attribute argument
++--FILE--
++<?php
++
++<<Attr(a->b::c)>>
++function test() {}
++
++?>
++--EXPECTF--
++Fatal error: Dynamic class names are not allowed in compile-time class constant references in %s on line %d
+diff --git a/Zend/zend_attributes.c b/Zend/zend_attributes.c
+index b9bd467acf546..935f37e5b930f 100644
+--- a/Zend/zend_attributes.c
++++ b/Zend/zend_attributes.c
+@@ -113,6 +113,11 @@ ZEND_API zend_attribute *zend_add_attribute(HashTable **attributes, zend_bool pe
+ 	attr->offset = offset;
+ 	attr->argc = argc;
+ 
++	/* Initialize arguments to avoid partial initialization in case of fatal errors. */
++	for (uint32_t i = 0; i < argc; i++) {
++		ZVAL_UNDEF(&attr->argv[i]);
++	}
++
+ 	zend_hash_next_index_insert_ptr(*attributes, attr);
+ 
+ 	return attr;

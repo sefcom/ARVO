@@ -1,0 +1,60 @@
+From 56bb742e2ba12c9f2453d27b158aaa5b6a97141a Mon Sep 17 00:00:00 2001
+From: Stefan Profanter <git@s.profanter.me>
+Date: Mon, 19 Nov 2018 14:25:03 +0100
+Subject: [PATCH] Stack: Add check for successful network layer allocation
+
+Credit to oss-fuzz
+
+Fixes issue:
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=11435
+---
+ arch/ua_network_tcp.c       | 14 ++++++++------
+ plugins/ua_config_default.c |  2 ++
+ 2 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/arch/ua_network_tcp.c b/arch/ua_network_tcp.c
+index 4ee317b398f..51e7d8625a5 100644
+--- a/arch/ua_network_tcp.c
++++ b/arch/ua_network_tcp.c
+@@ -525,20 +525,22 @@ UA_ServerNetworkLayer
+ UA_ServerNetworkLayerTCP(UA_ConnectionConfig config, UA_UInt16 port, UA_Logger logger) {
+     UA_ServerNetworkLayer nl;
+     memset(&nl, 0, sizeof(UA_ServerNetworkLayer));
++    nl.deleteMembers = ServerNetworkLayerTCP_deleteMembers;
++    nl.localConnectionConfig = config;
++    nl.start = ServerNetworkLayerTCP_start;
++    nl.listen = ServerNetworkLayerTCP_listen;
++    nl.stop = ServerNetworkLayerTCP_stop;
++    nl.handle = NULL;
++
+     ServerNetworkLayerTCP *layer = (ServerNetworkLayerTCP*)
+         UA_calloc(1,sizeof(ServerNetworkLayerTCP));
+     if(!layer)
+         return nl;
++    nl.handle = layer;
+ 
+     layer->logger = (logger != NULL ? logger : UA_Log_Stdout);
+     layer->port = port;
+ 
+-    nl.handle = layer;
+-    nl.localConnectionConfig = config;
+-    nl.start = ServerNetworkLayerTCP_start;
+-    nl.listen = ServerNetworkLayerTCP_listen;
+-    nl.stop = ServerNetworkLayerTCP_stop;
+-    nl.deleteMembers = ServerNetworkLayerTCP_deleteMembers;
+     return nl;
+ }
+ 
+diff --git a/plugins/ua_config_default.c b/plugins/ua_config_default.c
+index cbeec02dfa7..4a400c1c5ca 100644
+--- a/plugins/ua_config_default.c
++++ b/plugins/ua_config_default.c
+@@ -321,6 +321,8 @@ addDefaultNetworkLayers(UA_ServerConfig *conf, UA_UInt16 portNumber, UA_UInt32 s
+ 
+     conf->networkLayers[0] =
+         UA_ServerNetworkLayerTCP(config, portNumber, conf->logger);
++    if (!conf->networkLayers[0].handle)
++        return UA_STATUSCODE_BADOUTOFMEMORY;
+     conf->networkLayersSize = 1;
+ 
+     return UA_STATUSCODE_GOOD;

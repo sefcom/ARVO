@@ -1,0 +1,108 @@
+From 6986e81f6fa441a56c4effe2bf2f177ca892255e Mon Sep 17 00:00:00 2001
+From: Alex <aleksandrosansan@gmail.com>
+Date: Thu, 24 Aug 2023 09:27:13 +0200
+Subject: [PATCH] Fixes poc_assign from #1129 (#1178)
+
+---
+ Common++/header/GeneralUtils.h          | 15 +++++++++++++++
+ Packet++/header/NflogLayer.h            | 17 +++++++----------
+ Tests/Packet++Test/Tests/NflogTests.cpp |  8 ++++----
+ 3 files changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/Common++/header/GeneralUtils.h b/Common++/header/GeneralUtils.h
+index 86fccc5f0e..ec5409ee95 100644
+--- a/Common++/header/GeneralUtils.h
++++ b/Common++/header/GeneralUtils.h
+@@ -50,6 +50,21 @@ namespace pcpp
+ 	 * @return A pointer to the beginning of the substring, or NULL if the substring is not found
+ 	 */
+ 	char* cross_platform_memmem(const char* haystack, size_t haystackLen, const char* needle, size_t needleLen);
++
++	/**
++	 * Calculates alignment.
++	 * @param[in] number Given number
++	 * @return The aligned number
++	*/
++	template <int alignment>
++	static int align(int number)
++	{
++		// Only works for alignment with power of 2
++		constexpr bool isPowerOfTwo = alignment && ((alignment & (alignment - 1)) == 0);
++		static_assert(isPowerOfTwo, "Alignment must be a power of 2");
++		int mask = alignment - 1;
++		return (number + mask) & ~mask;
++	}
+ }
+ 
+ #endif // PCAPPP_GENERAL_UTILS
+diff --git a/Packet++/header/NflogLayer.h b/Packet++/header/NflogLayer.h
+index 4df4d5d25a..2fd7804cdc 100644
+--- a/Packet++/header/NflogLayer.h
++++ b/Packet++/header/NflogLayer.h
+@@ -3,6 +3,7 @@
+ 
+ #include "Layer.h"
+ #include "TLVData.h"
++#include "GeneralUtils.h"
+ 
+ /// @file
+ 
+@@ -101,7 +102,11 @@ namespace pcpp
+ 		/**
+ 		 * @return recordLen attribute in NflogTLVRawData
+ 		 */
+-		size_t getTotalSize() const { return m_Data->recordLen; }
++		size_t getTotalSize() const
++		{
++			// as in https://github.com/the-tcpdump-group/libpcap/blob/766b607d60d8038087b49fc4cf433dac3dcdb49c/pcap-util.c#L371-L374
++			return align<4>(m_Data->recordLen);
++		}
+ 
+ 		/**
+ 		 * Assign a pointer to the TLV record raw data (byte array)
+@@ -109,15 +114,7 @@ namespace pcpp
+ 		 */
+ 		void assign(uint8_t* recordRawData)
+ 		{
+-			if(recordRawData == nullptr)
+-				m_Data = nullptr;
+-			else
+-			{
+-				// to pass from some unknown paddings after tlv with type NFULA_PREFIX
+-				while (*recordRawData == 0)
+-					recordRawData += 1;
+-				m_Data = (NflogTLVRawData*)recordRawData;
+-			}
++			m_Data = (NflogTLVRawData*)recordRawData;
+ 		}
+ 
+ 		/**
+diff --git a/Tests/Packet++Test/Tests/NflogTests.cpp b/Tests/Packet++Test/Tests/NflogTests.cpp
+index 0aabea2f04..ec8a5fb1df 100644
+--- a/Tests/Packet++Test/Tests/NflogTests.cpp
++++ b/Tests/Packet++Test/Tests/NflogTests.cpp
+@@ -38,14 +38,14 @@ PTF_TEST_CASE(NflogPacketParsingTest)
+ 		pcpp::NflogTlvType::NFULA_PAYLOAD
+ 	};
+ 
+-	int optSizes[6] = {8, 5, 8, 8, 8, 65};
++	int optSizes[6] = {8, 8, 8, 8, 8, 68};
+ 	std::string optDataAsHexString[6] = {
+ 		"0800010000000300",
+-		"05000a0000",
++		"05000a0000000000",
+ 		"0800050000000002",
+ 		"08000b0000000000",
+ 		"08000e0000000000",
+-		"410009004500003d021040004011208f0a00020f0a000203a542003500294156c04e0100000100000000000003777777076578616d706c65036e65740000010001"
++		"410009004500003d021040004011208f0a00020f0a000203a542003500294156c04e0100000100000000000003777777076578616d706c65036e657400000100012f0a31"
+ 	};
+ 
+ 	for (int i = 0; i < 6; i++) {
+@@ -56,5 +56,5 @@ PTF_TEST_CASE(NflogPacketParsingTest)
+ 	}
+ 
+ 	/// sum of all TLVs before payload + size of nflog_header + size of (recordLength + recordType) variables of payload TLV
+-	PTF_ASSERT_EQUAL(nflogLayer->getHeaderLen(), 45);
++	PTF_ASSERT_EQUAL(nflogLayer->getHeaderLen(), 48);
+ }

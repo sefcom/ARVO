@@ -1,0 +1,293 @@
+From 07851aae9d28fed751663c543799f2b59369f892 Mon Sep 17 00:00:00 2001
+From: Garret Rieger <grieger@google.com>
+Date: Mon, 26 Mar 2018 20:56:56 -0600
+Subject: [PATCH] [subset] Couple of fixes for fuzzer discovered issues. (#924)
+
+* [subset] sanitize individual DeviceRecord's as part of hdmx sanitization.
+
+* [subset] Fix out of bounds read with non-two byte align glyphs.
+
+* [subset] Just use size_device_record >= DeviceRecord::min_size.
+
+* [subset] Add TODO.
+
+* [subset] Re-order checks in hdmx sanitize.
+---
+ src/hb-ot-hdmx-table.hh                       |   1 +
+ src/hb-subset-glyf.cc                         |   6 ++---
+ src/hb-subset.cc                              |   6 ++++-
+ ...inimized-hb-subset-fuzzer-5609911946838016 | Bin 0 -> 313 bytes
+ ...inimized-hb-subset-fuzzer-6651660668502016 | Bin 0 -> 15229 bytes
+ test/api/test-subset-hdmx.c                   |  23 ++++++++++++++++++
+ 6 files changed, 32 insertions(+), 4 deletions(-)
+ create mode 100644 test/api/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5609911946838016
+ create mode 100644 test/api/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-6651660668502016
+
+diff --git a/src/hb-ot-hdmx-table.hh b/src/hb-ot-hdmx-table.hh
+index 6ad57af22a2..c0b22b28b8a 100644
+--- a/src/hb-ot-hdmx-table.hh
++++ b/src/hb-ot-hdmx-table.hh
+@@ -198,6 +198,7 @@ struct hdmx
+     TRACE_SANITIZE (this);
+     return_trace (c->check_struct (this) && version == 0 &&
+ 		  !_hb_unsigned_int_mul_overflows (num_records, size_device_record) &&
++		  size_device_record >= DeviceRecord::min_size &&
+ 		  c->check_range (this, get_size()));
+   }
+ 
+diff --git a/src/hb-subset-glyf.cc b/src/hb-subset-glyf.cc
+index 1bbcbdcdaf7..b9e6355c35f 100644
+--- a/src/hb-subset-glyf.cc
++++ b/src/hb-subset-glyf.cc
+@@ -121,7 +121,6 @@ static void
+ _update_components (hb_subset_plan_t * plan,
+ 		    char * glyph_start,
+ 		    unsigned int length)
+-
+ {
+   OT::glyf::CompositeGlyphHeader::Iterator iterator;
+   if (OT::glyf::CompositeGlyphHeader::get_iterator (glyph_start,
+@@ -176,11 +175,11 @@ _write_glyf_and_loca_prime (hb_subset_plan_t              *plan,
+     if (unlikely (!(glyf.get_offsets (glyph_ids[i], &start_offset, &end_offset)
+                     && glyf.remove_padding(start_offset, &end_offset))))
+       end_offset = start_offset = 0;
++
+     unsigned int instruction_start = instruction_ranges[i * 2];
+     unsigned int instruction_end = instruction_ranges[i * 2 + 1];
+ 
+     int length = end_offset - start_offset - (instruction_end - instruction_start);
+-    length += length % 2;
+ 
+     if (glyf_prime_data_next + length > glyf_prime_data + glyf_prime_size)
+     {
+@@ -214,7 +213,8 @@ _write_glyf_and_loca_prime (hb_subset_plan_t              *plan,
+                                             loca_prime_size);
+     _update_components (plan, glyf_prime_data_next, length);
+ 
+-    glyf_prime_data_next += length;
++    // TODO: don't align to two bytes if using long loca.
++    glyf_prime_data_next += length + (length % 2); // Align to 2 bytes for short loca.
+   }
+ 
+   success = success && _write_loca_entry (glyph_ids.len,
+diff --git a/src/hb-subset.cc b/src/hb-subset.cc
+index 4062c9b4d49..2a2f85579d9 100644
+--- a/src/hb-subset.cc
++++ b/src/hb-subset.cc
+@@ -89,12 +89,16 @@ _subset (hb_subset_plan_t *plan)
+   hb_blob_t *source_blob = sanitizer.sanitize (plan->source->reference_table (TableType::tableTag));
+   const TableType *table = OT::Sanitizer<TableType>::lock_instance (source_blob);
+ 
++  hb_tag_t tag = TableType::tableTag;
+   hb_bool_t result = false;
+   if (table != &OT::Null(TableType))
++  {
+     result = table->subset(plan);
++  } else {
++    DEBUG_MSG(SUBSET, nullptr, "OT::%c%c%c%c::subset sanitize failed on source table.", HB_UNTAG(tag));
++  }
+ 
+   hb_blob_destroy (source_blob);
+-  hb_tag_t tag = TableType::tableTag;
+   DEBUG_MSG(SUBSET, nullptr, "OT::%c%c%c%c::subset %s", HB_UNTAG(tag), result ? "success" : "FAILED!");
+   return result;
+ }
+diff --git a/test/api/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5609911946838016 b/test/api/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5609911946838016
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c647a8a48ddff5b95f56d919d2a60840622a838
+GIT binary patch
+literal 313
+lcmZQzWME(rQUHUDl-vpsgMoq35F#>4VuSz#11NwP7yviDCYJyJ
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/api/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-6651660668502016 b/test/api/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-6651660668502016
+new file mode 100644
+index 0000000000000000000000000000000000000000..6206f0776c86cda8bc5a474160c125b6da6f5b7d
+GIT binary patch
+literal 15229
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/api/test-subset-hdmx.c b/test/api/test-subset-hdmx.c
+index dd20b2a2b98..c78009b6bb0 100644
+--- a/test/api/test-subset-hdmx.c
++++ b/test/api/test-subset-hdmx.c
+@@ -72,6 +72,28 @@ test_subset_hdmx_invalid (void)
+   hb_face_destroy (face);
+ }
+ 
++static void
++test_subset_hdmx_fails_sanitize (void)
++{
++  hb_face_t *face = hb_subset_test_open_font("fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5609911946838016");
++
++  hb_subset_input_t *input = hb_subset_input_create_or_fail ();
++  hb_set_t *codepoints = hb_subset_input_unicode_set (input);
++  hb_set_add (codepoints, 'a');
++  hb_set_add (codepoints, 'b');
++  hb_set_add (codepoints, 'c');
++
++  hb_subset_profile_t *profile = hb_subset_profile_create();
++  hb_face_t *subset = hb_subset (face, profile, input);
++  g_assert (subset);
++  g_assert (subset == hb_face_get_empty ());
++
++  hb_subset_input_destroy (input);
++  hb_subset_profile_destroy (profile);
++  hb_face_destroy (subset);
++  hb_face_destroy (face);
++}
++
+ static void
+ test_subset_hdmx_noop (void)
+ {
+@@ -98,6 +120,7 @@ main (int argc, char **argv)
+ 
+   hb_test_add (test_subset_hdmx_simple_subset);
+   hb_test_add (test_subset_hdmx_invalid);
++  hb_test_add (test_subset_hdmx_fails_sanitize);
+   hb_test_add (test_subset_hdmx_noop);
+ 
+   return hb_test_run();

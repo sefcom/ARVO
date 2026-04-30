@@ -1,0 +1,270 @@
+From 9fd06a363987aa56a79db2532266c6218b1ca343 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sun, 2 May 2021 14:44:03 +0200
+Subject: [PATCH] Revert "avcodec/mjpegdec: postpone calling ff_get_buffer()
+ until the SOS marker"
+
+This also temporary disables fate-jpegls which is re-enabled in the next commit
+
+This reverts commit c8197f73e684b0edc450f3dc2b2b4b3fb9dedd0d.
+---
+ libavcodec/jpeglsdec.c |  6 ++-
+ libavcodec/mjpegbdec.c |  1 -
+ libavcodec/mjpegdec.c  | 83 +++++++++++++++++-------------------------
+ libavcodec/mjpegdec.h  |  3 --
+ libavcodec/mxpegdec.c  |  2 +-
+ tests/fate/image.mak   |  2 +-
+ 6 files changed, 40 insertions(+), 57 deletions(-)
+
+diff --git a/libavcodec/jpeglsdec.c b/libavcodec/jpeglsdec.c
+index bf51d63c3a..d79bbe1ee3 100644
+--- a/libavcodec/jpeglsdec.c
++++ b/libavcodec/jpeglsdec.c
+@@ -108,8 +108,9 @@ int ff_jpegls_decode_lse(MJpegDecodeContext *s)
+         if (s->palette_index > maxtab)
+             return AVERROR_INVALIDDATA;
+ 
+-        if (s->avctx->pix_fmt == AV_PIX_FMT_GRAY8 || s->avctx->pix_fmt == AV_PIX_FMT_PAL8) {
+-            uint32_t *pal = s->palette;
++        if ((s->avctx->pix_fmt == AV_PIX_FMT_GRAY8 || s->avctx->pix_fmt == AV_PIX_FMT_PAL8) &&
++            (s->picture_ptr->format == AV_PIX_FMT_GRAY8 || s->picture_ptr->format == AV_PIX_FMT_PAL8)) {
++            uint32_t *pal = (uint32_t *)s->picture_ptr->data[1];
+             int shift = 0;
+ 
+             if (s->avctx->bits_per_raw_sample > 0 && s->avctx->bits_per_raw_sample < 8) {
+@@ -117,6 +118,7 @@ int ff_jpegls_decode_lse(MJpegDecodeContext *s)
+                 shift = 8 - s->avctx->bits_per_raw_sample;
+             }
+ 
++            s->picture_ptr->format =
+             s->avctx->pix_fmt = AV_PIX_FMT_PAL8;
+             for (i=s->palette_index; i<=maxtab; i++) {
+                 uint8_t k = i << shift;
+diff --git a/libavcodec/mjpegbdec.c b/libavcodec/mjpegbdec.c
+index abc607176a..87eebb8771 100644
+--- a/libavcodec/mjpegbdec.c
++++ b/libavcodec/mjpegbdec.c
+@@ -55,7 +55,6 @@ static int mjpegb_decode_frame(AVCodecContext *avctx,
+ 
+     buf_ptr = buf;
+     buf_end = buf + buf_size;
+-    s->seen_sof = 0;
+     s->got_picture = 0;
+     s->adobe_transform = -1;
+ 
+diff --git a/libavcodec/mjpegdec.c b/libavcodec/mjpegdec.c
+index 16aed078f6..7c66ff8637 100644
+--- a/libavcodec/mjpegdec.c
++++ b/libavcodec/mjpegdec.c
+@@ -138,7 +138,6 @@ av_cold int ff_mjpeg_decode_init(AVCodecContext *avctx)
+     s->buffer        = NULL;
+     s->start_code    = -1;
+     s->first_picture = 1;
+-    s->seen_sof      = 0;
+     s->got_picture   = 0;
+     s->orig_height    = avctx->coded_height;
+     avctx->chroma_sample_location = AVCHROMA_LOC_CENTER;
+@@ -430,7 +429,6 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
+         memcpy(s->h_count, h_count, sizeof(h_count));
+         memcpy(s->v_count, v_count, sizeof(v_count));
+         s->interlaced = 0;
+-        s->seen_sof = 0;
+         s->got_picture = 0;
+ 
+         /* test interlaced mode */
+@@ -683,13 +681,11 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
+             } else if (s->nb_components != 1) {
+                 av_log(s->avctx, AV_LOG_ERROR, "Unsupported number of components %d\n", s->nb_components);
+                 return AVERROR_PATCHWELCOME;
+-            } else if (s->bits <= 8) {
+-                avpriv_set_systematic_pal2(s->palette, s->avctx->pix_fmt);
+-                if (s->palette_index)
+-                    s->avctx->pix_fmt = AV_PIX_FMT_PAL8;
+-                else
+-                    s->avctx->pix_fmt = AV_PIX_FMT_GRAY8;
+-            } else
++            } else if (s->palette_index && s->bits <= 8)
++                s->avctx->pix_fmt = AV_PIX_FMT_PAL8;
++            else if (s->bits <= 8)
++                s->avctx->pix_fmt = AV_PIX_FMT_GRAY8;
++            else
+                 s->avctx->pix_fmt = AV_PIX_FMT_GRAY16;
+         }
+ 
+@@ -723,12 +719,25 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
+         if (s->avctx->skip_frame == AVDISCARD_ALL) {
+             s->picture_ptr->pict_type = AV_PICTURE_TYPE_I;
+             s->picture_ptr->key_frame = 1;
+-            s->seen_sof               = 1;
++            s->got_picture            = 1;
+             return 0;
+         }
+-    }
+ 
+-    s->seen_sof = 1;
++        av_frame_unref(s->picture_ptr);
++        if (ff_get_buffer(s->avctx, s->picture_ptr, AV_GET_BUFFER_FLAG_REF) < 0)
++            return -1;
++        s->picture_ptr->pict_type = AV_PICTURE_TYPE_I;
++        s->picture_ptr->key_frame = 1;
++        s->got_picture            = 1;
++
++        for (i = 0; i < 4; i++)
++            s->linesize[i] = s->picture_ptr->linesize[i] << s->interlaced;
++
++        ff_dlog(s->avctx, "%d %d %d %d %d %d\n",
++                s->width, s->height, s->linesize[0], s->linesize[1],
++                s->interlaced, s->avctx->height);
++
++    }
+ 
+     if ((s->rgb && !s->lossless && !s->ls) ||
+         (!s->rgb && s->ls && s->nb_components > 1) ||
+@@ -755,6 +764,18 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
+         memset(s->coefs_finished, 0, sizeof(s->coefs_finished));
+     }
+ 
++    if (s->avctx->hwaccel) {
++        s->hwaccel_picture_private =
++            av_mallocz(s->avctx->hwaccel->frame_priv_data_size);
++        if (!s->hwaccel_picture_private)
++            return AVERROR(ENOMEM);
++
++        ret = s->avctx->hwaccel->start_frame(s->avctx, s->raw_image_buffer,
++                                             s->raw_image_buffer_size);
++        if (ret < 0)
++            return ret;
++    }
++
+     return 0;
+ }
+ 
+@@ -1609,44 +1630,12 @@ int ff_mjpeg_decode_sos(MJpegDecodeContext *s, const uint8_t *mb_bitmask,
+     const int block_size = s->lossless ? 1 : 8;
+     int ilv, prev_shift;
+ 
+-    if (!s->seen_sof) {
++    if (!s->got_picture) {
+         av_log(s->avctx, AV_LOG_WARNING,
+                 "Can not process SOS before SOF, skipping\n");
+         return -1;
+     }
+ 
+-    if (!s->got_picture || !s->interlaced || !(s->bottom_field == !s->interlace_polarity)) {
+-        av_frame_unref(s->picture_ptr);
+-        if (ff_get_buffer(s->avctx, s->picture_ptr, AV_GET_BUFFER_FLAG_REF) < 0)
+-            return -1;
+-        s->picture_ptr->pict_type = AV_PICTURE_TYPE_I;
+-        s->picture_ptr->key_frame = 1;
+-
+-        for (i = 0; i < 4; i++)
+-            s->linesize[i] = s->picture_ptr->linesize[i] << s->interlaced;
+-
+-        if (s->picture_ptr->format == AV_PIX_FMT_PAL8)
+-            memcpy(s->picture_ptr->data[1], s->palette, sizeof(s->palette));
+-
+-        s->got_picture = 1;
+-
+-        ff_dlog(s->avctx, "%d %d %d %d %d %d\n",
+-                s->width, s->height, s->linesize[0], s->linesize[1],
+-                s->interlaced, s->avctx->height);
+-
+-        if (s->avctx->hwaccel && !s->hwaccel_picture_private) {
+-            s->hwaccel_picture_private =
+-                av_mallocz(s->avctx->hwaccel->frame_priv_data_size);
+-            if (!s->hwaccel_picture_private)
+-                return AVERROR(ENOMEM);
+-
+-            ret = s->avctx->hwaccel->start_frame(s->avctx, s->raw_image_buffer,
+-                                                 s->raw_image_buffer_size);
+-            if (ret < 0)
+-                return ret;
+-        }
+-    }
+-
+     if (reference) {
+         if (reference->width  != s->picture_ptr->width  ||
+             reference->height != s->picture_ptr->height ||
+@@ -2572,7 +2561,6 @@ eoi_parser:
+                     break;
+             }
+             if (avctx->skip_frame == AVDISCARD_ALL) {
+-                s->seen_sof = 0;
+                 s->got_picture = 0;
+                 ret = AVERROR(EAGAIN);
+                 goto the_end_no_picture;
+@@ -2586,7 +2574,6 @@ eoi_parser:
+             }
+             if ((ret = av_frame_ref(frame, s->picture_ptr)) < 0)
+                 return ret;
+-            s->seen_sof = 0;
+             s->got_picture = 0;
+ 
+             frame->pkt_dts = s->pkt->dts;
+@@ -2647,7 +2634,6 @@ skip:
+     av_log(avctx, AV_LOG_FATAL, "No JPEG data found in image\n");
+     return AVERROR_INVALIDDATA;
+ fail:
+-    s->seen_sof = 0;
+     s->got_picture = 0;
+     return ret;
+ the_end:
+@@ -2938,7 +2924,6 @@ av_cold int ff_mjpeg_decode_end(AVCodecContext *avctx)
+ static void decode_flush(AVCodecContext *avctx)
+ {
+     MJpegDecodeContext *s = avctx->priv_data;
+-    s->seen_sof = 0;
+     s->got_picture = 0;
+ 
+     s->smv_next_frame = 0;
+diff --git a/libavcodec/mjpegdec.h b/libavcodec/mjpegdec.h
+index 71cacb0b27..2400a179f1 100644
+--- a/libavcodec/mjpegdec.h
++++ b/libavcodec/mjpegdec.h
+@@ -109,7 +109,6 @@ typedef struct MJpegDecodeContext {
+     int last_dc[MAX_COMPONENTS]; /* last DEQUANTIZED dc (XXX: am I right to do that ?) */
+     AVFrame *picture; /* picture structure */
+     AVFrame *picture_ptr; /* pointer to picture structure */
+-    int seen_sof;                                   ///< we found a SOF.
+     int got_picture;                                ///< we found a SOF and picture is valid, too.
+     int linesize[MAX_COMPONENTS];                   ///< linesize << interlaced
+     int8_t *qscale_table;
+@@ -166,9 +165,7 @@ typedef struct MJpegDecodeContext {
+     enum AVPixelFormat hwaccel_sw_pix_fmt;
+     enum AVPixelFormat hwaccel_pix_fmt;
+     void *hwaccel_picture_private;
+-
+     struct JLSState *jls_state;
+-    uint32_t palette[AVPALETTE_COUNT];
+ } MJpegDecodeContext;
+ 
+ int ff_mjpeg_build_vlc(VLC *vlc, const uint8_t *bits_table,
+diff --git a/libavcodec/mxpegdec.c b/libavcodec/mxpegdec.c
+index 8283a3976a..7c97a9340e 100644
+--- a/libavcodec/mxpegdec.c
++++ b/libavcodec/mxpegdec.c
+@@ -197,7 +197,7 @@ static int mxpeg_decode_frame(AVCodecContext *avctx,
+     buf_end = buf + buf_size;
+     jpg->got_picture = 0;
+     s->got_mxm_bitmask = 0;
+-    jpg->seen_sof = s->got_sof_data = !!s->got_sof_data;
++    s->got_sof_data = !!s->got_sof_data;
+     while (buf_ptr < buf_end) {
+         start_code = ff_mjpeg_find_marker(jpg, &buf_ptr, buf_end,
+                                           &unescaped_buf_ptr, &unescaped_buf_size);
+diff --git a/tests/fate/image.mak b/tests/fate/image.mak
+index 07316542e1..d8316fddc3 100644
+--- a/tests/fate/image.mak
++++ b/tests/fate/image.mak
+@@ -350,7 +350,7 @@ fate-jpegls-5bpc: CMD = framecrc -idct simple -i $(TARGET_SAMPLES)/jpegls/32.jls
+ FATE_JPEGLS += fate-jpegls-7bpc
+ fate-jpegls-7bpc: CMD = framecrc -idct simple -i $(TARGET_SAMPLES)/jpegls/128.jls -pix_fmt rgb24 -vf scale
+ 
+-FATE_JPEGLS-$(call DEMDEC, IMAGE2, JPEGLS) += $(FATE_JPEGLS)
++#FATE_JPEGLS-$(call DEMDEC, IMAGE2, JPEGLS) += $(FATE_JPEGLS)
+ FATE_IMAGE += $(FATE_JPEGLS-yes)
+ fate-jpegls: $(FATE_JPEGLS-yes)
+ 
+-- 
+2.25.1
+

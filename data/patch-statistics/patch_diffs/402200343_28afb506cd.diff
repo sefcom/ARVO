@@ -1,0 +1,72 @@
+From a1ef410509a6e80ea337f8beddcd522e814d0f98 Mon Sep 17 00:00:00 2001
+From: John Reiser <jreiser@BitWagon.com>
+Date: Wed, 7 May 2025 13:43:48 -0700
+Subject: [PATCH] ELF DT_DYNSYM: fix checking of symbol table
+
+Particularly JNI_OnLoad
+https://github.com/upx/upx/issues/914
+	modified:   p_lx_elf.cpp
+---
+ src/p_lx_elf.cpp | 28 +++++++++++++++++-----------
+ 1 file changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/src/p_lx_elf.cpp b/src/p_lx_elf.cpp
+index d7f435aa3b..2e18a29b9e 100644
+--- a/src/p_lx_elf.cpp
++++ b/src/p_lx_elf.cpp
+@@ -2378,10 +2378,11 @@ PackLinuxElf32::invert_pt_dynamic(Elf32_Dyn const *dynp, u32_t headway)
+         throwCantPack("bad DT_STRSZ %#x", strtab_max);
+     }
+ 
+-    // Find end of DT_SYMTAB
+-    unsigned const tmp2 = elf_find_table_size(Elf32_Dyn::DT_SYMTAB,
+-        Elf32_Shdr::SHT_DYNSYM);
+-    symnum_max = (~0u == tmp2) ? 0 : tmp1 / sizeof(Elf32_Sym);
++    { // Find end of DT_SYMTAB
++        unsigned const tmp2 = elf_find_table_size(Elf32_Dyn::DT_SYMTAB,
++            Elf32_Shdr::SHT_DYNSYM);
++        symnum_max = (~0u == tmp2) ? 0 : tmp2 / sizeof(Elf32_Sym);
++    }
+ 
+     unsigned v_sym = dt_table[Elf32_Dyn::DT_SYMTAB];
+     if (v_sym) {
+@@ -8470,10 +8471,11 @@ PackLinuxElf64::invert_pt_dynamic(Elf64_Dyn const *dynp, upx_uint64_t headway)
+         throwCantPack("bad DT_STRSZ %#x", strtab_max);
+     }
+ 
+-    // Find end of DT_SYMTAB
+-    unsigned const tmp2 = elf_find_table_size(Elf64_Dyn::DT_SYMTAB,
+-        Elf64_Shdr::SHT_DYNSYM);
+-    symnum_max = (~0u == tmp2) ? 0 : tmp1 / sizeof(Elf64_Sym);
++    { // Find end of DT_SYMTAB
++        unsigned const tmp2 = elf_find_table_size(Elf64_Dyn::DT_SYMTAB,
++            Elf64_Shdr::SHT_DYNSYM);
++        symnum_max = (~0u == tmp2) ? 0 : tmp2 / sizeof(Elf64_Sym);
++    }
+ 
+     unsigned v_sym = dt_table[Elf64_Dyn::DT_SYMTAB];
+     if (v_sym) {
+@@ -8704,9 +8706,9 @@ Elf32_Sym const *PackLinuxElf32::elf_lookup(char const *name) const
+ 
+             if (1& (w>>hbit1) & (w>>hbit2)) {
+                 unsigned const hhead = get_te32(&buckets[h % n_bucket]);
+-                if (n_bucket <= (hhead - symbias)) {
+-                    throwCantPack("bad DT_GNU_HASH n_bucket{%#x} <= buckets[%d]{%#x} - symbias{%#x}\n",
+-                            n_bucket, h % n_bucket, hhead, symbias);
++                if (symnum_max <= hhead || (hhead && hhead < symbias)) {
++                    throwCantPack("bad DT_GNU_HASH symnum_max{%#x} <= buckets[%d]{%#x} < symbias{%#x}\n",
++                            symnum_max, h % n_bucket, hhead, symbias);
+                 }
+                 if (hhead) {
+                     Elf32_Sym const *dsp = &dynsym[hhead];
+@@ -8805,6 +8807,10 @@ Elf64_Sym const *PackLinuxElf64::elf_lookup(char const *name) const
+             upx_uint64_t const w = get_te64(&bitmask[(n_bitmask -1) & (h>>6)]);
+             if (1& (w>>hbit1) & (w>>hbit2)) {
+                 unsigned hhead = get_te32(&buckets[h % n_bucket]);
++                if (symnum_max <= hhead || (hhead && hhead < symbias)) {
++                    throwCantPack("bad DT_GNU_HASH symnum_max{%#x} <= buckets[%d]{%#x} < symbias{%#x}\n",
++                            symnum_max, h % n_bucket, hhead, symbias);
++                }
+                 if (hhead) {
+                     Elf64_Sym const *dsp = &dynsym[hhead];
+                     unsigned const *hp = &hasharr[hhead - symbias];

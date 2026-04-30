@@ -1,0 +1,33 @@
+From d7ac39b02df895d93d93526913cf8e4cd7ae954b Mon Sep 17 00:00:00 2001
+From: Dmitry Stogov <dmitry@zend.com>
+Date: Mon, 1 Nov 2021 22:14:12 +0300
+Subject: [PATCH] Tracing JIT: Fixed reference counting when escape because of
+ IS_UNDEF element
+
+---
+ ext/opcache/jit/zend_jit_x86.dasc | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/ext/opcache/jit/zend_jit_x86.dasc b/ext/opcache/jit/zend_jit_x86.dasc
+index 1aa42aeaa7caf..9969ad532a298 100644
+--- a/ext/opcache/jit/zend_jit_x86.dasc
++++ b/ext/opcache/jit/zend_jit_x86.dasc
+@@ -3920,6 +3920,18 @@ static int zend_jit_escape_if_undef_r0(dasm_State **Dst, int var, uint32_t flags
+ 
+ 	ZEND_ASSERT(opline);
+ 
++	if ((opline-1)->opcode != ZEND_FETCH_CONSTANT
++	 && (opline-1)->opcode != ZEND_FETCH_LIST_R
++	 && ((opline-1)->op1_type & (IS_VAR|IS_TMP_VAR))
++	 && !(flags & ZEND_JIT_EXIT_FREE_OP1)) {
++		val_addr = ZEND_ADDR_MEM_ZVAL(ZREG_FP, (opline-1)->op1.var);
++
++		|	IF_NOT_ZVAL_REFCOUNTED val_addr, >2
++		|	GET_ZVAL_PTR r0, val_addr
++		|	GC_ADDREF r0
++		|2:
++	}
++
+ 	|	LOAD_IP_ADDR (opline - 1)
+ 	|	jmp ->trace_escape
+ 	|1:

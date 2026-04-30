@@ -1,0 +1,60 @@
+
+# HG changeset patch
+# User Vadim Zhestikov <v.zhestikov@f5.com>
+# Date 1698121143 25200
+# Node ID c081cc5377a8cdff216a5cfaea5a5fb3ff75d213
+# Parent  d83c6616f2b168bc1051dede3e42f395afe457ef
+Parser: fixed return statement parsing with invalid expression.
+
+diff -r d83c6616f2b1 -r c081cc5377a8 src/njs_parser.c
+--- a/src/njs_parser.c	Fri Oct 20 08:44:52 2023 -0700
++++ b/src/njs_parser.c	Mon Oct 23 21:19:03 2023 -0700
+@@ -6347,10 +6347,12 @@
+ 
+         parser->node = NULL;
+ 
+-        njs_parser_next(parser, njs_parser_expression);
+-
+-        return njs_parser_after(parser, current, node, 0,
+-                                njs_parser_return_statement_after);
++        if (token->type != NJS_TOKEN_CLOSE_BRACE) {
++            njs_parser_next(parser, njs_parser_expression);
++
++            return njs_parser_after(parser, current, node, 0,
++                                    njs_parser_return_statement_after);
++        }
+     }
+ 
+     parser->node = node;
+@@ -6364,8 +6366,9 @@
+     njs_lexer_token_t *token, njs_queue_link_t *current)
+ {
+     if (parser->ret != NJS_OK) {
+-        parser->node = parser->target;
+-        return njs_parser_stack_pop(parser);
++        njs_parser_syntax_error(parser, "Unexpected token \"%V\"",
++                                &token->text);
++        return NJS_DONE;
+     }
+ 
+     if (njs_parser_expect_semicolon(parser, token) != NJS_OK) {
+diff -r d83c6616f2b1 -r c081cc5377a8 src/test/njs_unit_test.c
+--- a/src/test/njs_unit_test.c	Fri Oct 20 08:44:52 2023 -0700
++++ b/src/test/njs_unit_test.c	Mon Oct 23 21:19:03 2023 -0700
+@@ -10093,6 +10093,15 @@
+     { njs_str("\n{\nreturn;\n}"),
+       njs_str("SyntaxError: Illegal return statement in 3") },
+ 
++    { njs_str("function f () {return a +}"),
++      njs_str("SyntaxError: Unexpected token \"}\" in 1") },
++
++    { njs_str("`${function(){return n=>}}`"),
++      njs_str("SyntaxError: Unexpected token \"}\" in 1") },
++
++    { njs_str("(function(){return a +})"),
++      njs_str("SyntaxError: Unexpected token \"}\" in 1") },
++
+     { njs_str("if (1) function f(){}"),
+       njs_str("SyntaxError: Functions can only be declared at top level or inside a block in 1") },
+ 
+

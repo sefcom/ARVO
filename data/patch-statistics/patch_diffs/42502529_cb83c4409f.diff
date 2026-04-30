@@ -1,0 +1,147 @@
+From 17b127a84ffdd47a74cc2298c0c45545af14cf59 Mon Sep 17 00:00:00 2001
+From: Dmitry Stogov <dmitry@zend.com>
+Date: Tue, 28 Sep 2021 14:19:23 +0300
+Subject: [PATCH] JIT: Fixed result when assigning to typed reference
+
+---
+ ext/opcache/jit/zend_jit_helpers.c    | 20 ++++++++++----------
+ ext/opcache/jit/zend_jit_trace.c      |  7 ++++++-
+ ext/opcache/jit/zend_jit_x86.dasc     |  9 ++++++++-
+ ext/opcache/tests/jit/assign_041.phpt | 22 ++++++++++++++++++++++
+ 4 files changed, 46 insertions(+), 12 deletions(-)
+ create mode 100644 ext/opcache/tests/jit/assign_041.phpt
+
+diff --git a/ext/opcache/jit/zend_jit_helpers.c b/ext/opcache/jit/zend_jit_helpers.c
+index 1b11f2eb0a032..7dd6d9b02ae50 100644
+--- a/ext/opcache/jit/zend_jit_helpers.c
++++ b/ext/opcache/jit/zend_jit_helpers.c
+@@ -1880,30 +1880,30 @@ static void ZEND_FASTCALL zend_jit_vm_stack_free_args_helper(zend_execute_data *
+ 	zend_vm_stack_free_args(call);
+ }
+ 
+-static zend_always_inline void zend_jit_assign_to_typed_ref_helper(zend_reference *ref, zval *value, zend_uchar value_type)
++static zend_always_inline zval* zend_jit_assign_to_typed_ref_helper(zend_reference *ref, zval *value, zend_uchar value_type)
+ {
+ 	zval variable;
+ 
+ 	ZVAL_REF(&variable, ref);
+-	zend_assign_to_variable(&variable, value, value_type, ZEND_CALL_USES_STRICT_TYPES(EG(current_execute_data)));
++	return zend_assign_to_variable(&variable, value, value_type, ZEND_CALL_USES_STRICT_TYPES(EG(current_execute_data)));
+ }
+ 
+-static void ZEND_FASTCALL zend_jit_assign_const_to_typed_ref(zend_reference *ref, zval *value)
++static zval* ZEND_FASTCALL zend_jit_assign_const_to_typed_ref(zend_reference *ref, zval *value)
+ {
+-	zend_jit_assign_to_typed_ref_helper(ref, value, IS_CONST);
++	return zend_jit_assign_to_typed_ref_helper(ref, value, IS_CONST);
+ }
+ 
+-static void ZEND_FASTCALL zend_jit_assign_tmp_to_typed_ref(zend_reference *ref, zval *value)
++static zval* ZEND_FASTCALL zend_jit_assign_tmp_to_typed_ref(zend_reference *ref, zval *value)
+ {
+-	zend_jit_assign_to_typed_ref_helper(ref, value, IS_TMP_VAR);
++	return zend_jit_assign_to_typed_ref_helper(ref, value, IS_TMP_VAR);
+ }
+ 
+-static void ZEND_FASTCALL zend_jit_assign_var_to_typed_ref(zend_reference *ref, zval *value)
++static zval* ZEND_FASTCALL zend_jit_assign_var_to_typed_ref(zend_reference *ref, zval *value)
+ {
+-	zend_jit_assign_to_typed_ref_helper(ref, value, IS_VAR);
++	return zend_jit_assign_to_typed_ref_helper(ref, value, IS_VAR);
+ }
+ 
+-static void ZEND_FASTCALL zend_jit_assign_cv_to_typed_ref(zend_reference *ref, zval *value)
++static zval* ZEND_FASTCALL zend_jit_assign_cv_to_typed_ref(zend_reference *ref, zval *value)
+ {
+ 	if (UNEXPECTED(Z_TYPE_P(value) == IS_UNDEF)) {
+ 		const zend_op *opline = EG(current_execute_data)->opline;
+@@ -1917,7 +1917,7 @@ static void ZEND_FASTCALL zend_jit_assign_cv_to_typed_ref(zend_reference *ref, z
+ 		zend_jit_undefined_op_helper(var);
+ 		value = &EG(uninitialized_zval);
+ 	}
+-	zend_jit_assign_to_typed_ref_helper(ref, value, IS_CV);
++	return zend_jit_assign_to_typed_ref_helper(ref, value, IS_CV);
+ }
+ 
+ 
+diff --git a/ext/opcache/jit/zend_jit_trace.c b/ext/opcache/jit/zend_jit_trace.c
+index 1bfecf0ca427b..455bcce6ef7ae 100644
+--- a/ext/opcache/jit/zend_jit_trace.c
++++ b/ext/opcache/jit/zend_jit_trace.c
+@@ -4527,7 +4527,12 @@ static const void *zend_jit_trace(zend_jit_trace_rec *trace_buffer, uint32_t par
+ 								 && ssa->vars[ssa_op->op1_def].alias == NO_ALIAS) {
+ 									ssa->var_info[ssa_op->op1_def].guarded_reference = 1;
+ 								}
+-								if (!zend_jit_assign_to_typed_ref(&dasm_state, opline, opline->op2_type, op2_addr, 1)) {
++								if (opline->result_type == IS_UNUSED) {
++									res_addr = 0;
++								} else {
++									res_addr = RES_REG_ADDR();
++								}
++								if (!zend_jit_assign_to_typed_ref(&dasm_state, opline, opline->op2_type, op2_addr, res_addr, 1)) {
+ 									goto jit_failure;
+ 								}
+ 								op1_def_addr = op1_addr;
+diff --git a/ext/opcache/jit/zend_jit_x86.dasc b/ext/opcache/jit/zend_jit_x86.dasc
+index 4d0105338a8c6..d9cb1994f9170 100644
+--- a/ext/opcache/jit/zend_jit_x86.dasc
++++ b/ext/opcache/jit/zend_jit_x86.dasc
+@@ -5990,6 +5990,7 @@ static int zend_jit_assign_to_typed_ref(dasm_State         **Dst,
+                                        const zend_op        *opline,
+                                        zend_uchar            val_type,
+                                        zend_jit_addr         val_addr,
++                                       zend_jit_addr         res_addr,
+                                        zend_bool             check_exception)
+ {
+ 	|	// if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(Z_REF_P(variable_ptr)))) {
+@@ -6014,6 +6015,12 @@ static int zend_jit_assign_to_typed_ref(dasm_State         **Dst,
+ 	} else {
+ 		ZEND_UNREACHABLE();
+ 	}
++	if (res_addr) {
++		zend_jit_addr ret_addr = ZEND_ADDR_MEM_ZVAL(ZREG_R0, 0);
++
++		|	ZVAL_COPY_VALUE res_addr, -1, ret_addr, -1, ZREG_R1, ZREG_R2
++		|	TRY_ADDREF -1, ch, r2
++	}
+ 	if (check_exception) {
+ 		|	// if (UNEXPECTED(EG(exception) != NULL)) {
+ 		|	MEM_OP2_1_ZTS cmp, aword, executor_globals, exception, 0, r0
+@@ -6143,7 +6150,7 @@ static int zend_jit_assign_to_variable(dasm_State    **Dst,
+ 		|	IF_NOT_Z_TYPE, Ra(ref_reg), IS_REFERENCE, >1
+ 		|	// if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(Z_REF_P(variable_ptr)))) {
+ 		|	GET_Z_PTR FCARG1a, Ra(ref_reg)
+-		if (!zend_jit_assign_to_typed_ref(Dst, opline, val_type, val_addr, check_exception)) {
++		if (!zend_jit_assign_to_typed_ref(Dst, opline, val_type, val_addr, res_addr, check_exception)) {
+ 			return 0;
+ 		}
+ 		|	lea Ra(ref_reg), [FCARG1a + offsetof(zend_reference, val)]
+diff --git a/ext/opcache/tests/jit/assign_041.phpt b/ext/opcache/tests/jit/assign_041.phpt
+new file mode 100644
+index 0000000000000..c9b74ffa2b31a
+--- /dev/null
++++ b/ext/opcache/tests/jit/assign_041.phpt
+@@ -0,0 +1,22 @@
++--TEST--
++JIT ASSIGN: Assign to typed reference should return modified value
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=1M
++opcache.protect_memory=1
++--FILE--
++<?php
++class Test {
++    public ?string $prop;
++}
++function test($val) {
++    $obj = new Test;
++    $ref =& $obj->prop;
++    var_dump($ref = $val);
++}
++test(0);
++?>
++--EXPECT--
++string(1) "0"
+\ No newline at end of file

@@ -1,0 +1,65 @@
+From 3eb9907dd7bfd21be4980632761852eaee5aec81 Mon Sep 17 00:00:00 2001
+From: Philippe Antoine <contact@catenacyber.fr>
+Date: Tue, 18 Feb 2020 11:50:22 +0100
+Subject: [PATCH] Fix various buffer over reads
+
+---
+ example/reader_util.c     | 7 +++++--
+ src/lib/protocols/dns.c   | 3 +++
+ src/lib/protocols/oscar.c | 2 +-
+ 3 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/example/reader_util.c b/example/reader_util.c
+index ec070afb35e..7ab060ef559 100644
+--- a/example/reader_util.c
++++ b/example/reader_util.c
+@@ -1476,10 +1476,11 @@ struct ndpi_proto ndpi_workflow_process_packet(struct ndpi_workflow * workflow,
+   datalink_type = (int)pcap_datalink(workflow->pcap_handle);
+ #endif
+ 
+-  if(header->caplen < 40)
+-    return(nproto); /* Too short */
+ 
+  datalink_check:
++  if(header->caplen < eth_offset + 40)
++    return(nproto); /* Too short */
++
+   switch(datalink_type) {
+   case DLT_NULL:
+     if(ntohl(*((u_int32_t*)&packet[eth_offset])) == 2)
+@@ -1680,6 +1681,8 @@ struct ndpi_proto ndpi_workflow_process_packet(struct ndpi_workflow * workflow,
+       return(nproto);
+     }
+   } else if(iph->version == 6) {
++    if (header->caplen < ip_offset + sizeof(struct ndpi_ipv6hdr))
++      return(nproto); /* Too short for IPv6 header*/
+     iph6 = (struct ndpi_ipv6hdr *)&packet[ip_offset];
+     proto = iph6->ip6_hdr.ip6_un1_nxt;
+     ip_len = sizeof(struct ndpi_ipv6hdr);
+diff --git a/src/lib/protocols/dns.c b/src/lib/protocols/dns.c
+index 924e7eb86b2..2f8fd5612d3 100644
+--- a/src/lib/protocols/dns.c
++++ b/src/lib/protocols/dns.c
+@@ -168,6 +168,9 @@ static int search_valid_dns(struct ndpi_detection_module_struct *ndpi_struct,
+ 	  } else
+ 	    x += data_len;
+ 
++	  if((x+2) >= flow->packet.payload_packet_len) {
++	    break;
++	  }
+ 	  rsp_type = get16(&x, flow->packet.payload);
+ 	  flow->protos.dns.rsp_type = rsp_type;
+ 
+diff --git a/src/lib/protocols/oscar.c b/src/lib/protocols/oscar.c
+index a24b9441e87..cba0c3bccfc 100644
+--- a/src/lib/protocols/oscar.c
++++ b/src/lib/protocols/oscar.c
+@@ -137,7 +137,7 @@ static void ndpi_search_oscar_tcp_connect(struct ndpi_detection_module_struct
+ 	 + TLVs         | [Class: FLAP__SIGNON_TAGS] TLVs   +
+ 	 +--------------------------------------------------+
+       */
+-      if(channel == SIGNON &&
++      if(channel == SIGNON && packet->payload_packet_len >= 10 &&
+ 	  get_u_int16_t(packet->payload, 4) == htons(packet->payload_packet_len - 6) &&
+ 	  get_u_int32_t(packet->payload, 6) == htonl(FLAPVERSION))
+ 	{

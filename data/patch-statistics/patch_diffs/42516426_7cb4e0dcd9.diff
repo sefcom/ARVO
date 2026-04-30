@@ -1,0 +1,58 @@
+From 1ead12acd5a7decb31ab3623da53eebfd88ddc15 Mon Sep 17 00:00:00 2001
+From: Marti Maria <marti.maria@littlecms.com>
+Date: Tue, 3 Jan 2023 17:52:02 +0100
+Subject: [PATCH] Add more checking on multilocalized unicode tags
+
+Don't allow odd numbers as offsets on utf16 tables.
+Maybe some arcane profiles would use odd addresses and then define an utf16 table with a spare byte in the beginning, but I have checked my +10,000 ICC profiles zoo and none of the legal ones does that. It is likely someone is trying an exploit or a fuzzer is involved. Kill'em all
+---
+ src/cmsnamed.c |  2 ++
+ src/cmstypes.c | 14 ++++++++++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/cmsnamed.c b/src/cmsnamed.c
+index 87f39366e..bc580aa89 100644
+--- a/src/cmsnamed.c
++++ b/src/cmsnamed.c
+@@ -370,6 +370,8 @@ const wchar_t* _cmsMLUgetWide(const cmsMLU* mlu,
+ 
+     if (len != NULL) *len   = v ->Len;
+ 
++    if (v->StrW + v->Len > mlu->PoolSize) return NULL;
++
+     return(wchar_t*) ((cmsUInt8Number*) mlu ->MemPool + v ->StrW);
+ }
+ 
+diff --git a/src/cmstypes.c b/src/cmstypes.c
+index 1144d98e7..48c0b4b95 100644
+--- a/src/cmstypes.c
++++ b/src/cmstypes.c
+@@ -1520,6 +1520,12 @@ void *Type_MLU_Read(struct _cms_typehandler_struct* self, cmsIOHANDLER* io, cmsU
+         if (!_cmsReadUInt32Number(io, &Len)) goto Error;
+         if (!_cmsReadUInt32Number(io, &Offset)) goto Error;
+ 
++        // Offset MUST be even because it indexes a block of utf16 chars. 
++        // Tricky profiles that uses odd positions will not work anyway
++        // because the whole utf16 block is previously converted to wchar_t 
++        // and sizeof this type may be of 4 bytes. On Linux systems, for example.
++        if (Offset & 1) goto Error;
++
+         // Check for overflow
+         if (Offset < (SizeOfHeader + 8)) goto Error;        
+         if (((Offset + Len) < Len) || ((Offset + Len) > SizeOfTag + 8)) goto Error;
+@@ -1547,9 +1553,13 @@ void *Type_MLU_Read(struct _cms_typehandler_struct* self, cmsIOHANDLER* io, cmsU
+     }
+     else
+     {
+-        Block = (wchar_t*) _cmsMalloc(self ->ContextID, SizeOfTag);
++        // Make sure this is an even utf16 size.
++        if (SizeOfTag & 1) goto Error;
++
++        Block = (wchar_t*) _cmsCalloc(self ->ContextID, 1, SizeOfTag);
+         if (Block == NULL) goto Error;
+-        NumOfWchar = SizeOfTag / sizeof(wchar_t);
++       
++        NumOfWchar = SizeOfTag / sizeof(cmsUInt16Number);
+         if (!_cmsReadWCharArray(io, NumOfWchar, Block)) {
+             _cmsFree(self->ContextID, Block);
+             goto Error;

@@ -1,0 +1,1446 @@
+From 8cb2fd424309fa6ff70cf00bfcedc4e66d3355c0 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Mon, 26 Apr 2021 13:22:54 +0300
+Subject: [PATCH 01/22] Disable function execution for now, to focus on parsing
+ issues
+
+---
+ platforms/app_fuzz/fuzzer.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/platforms/app_fuzz/fuzzer.c b/platforms/app_fuzz/fuzzer.c
+index 76e236b3..b97d649a 100644
+--- a/platforms/app_fuzz/fuzzer.c
++++ b/platforms/app_fuzz/fuzzer.c
+@@ -31,9 +31,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+                 if (result == 0) {
+                     IM3Function f = NULL;
+                     result = m3_FindFunction (&f, runtime, "fib");
++                    /* TODO:
+                     if (f) {
+                         m3_CallV (f, 10);
+-                    }
++                    }*/
+                 } else {
+                     m3_FreeModule (module);
+                 }
+
+From 96c750622f3edb281c261d05f36a1c2f37e5e100 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Mon, 26 Apr 2021 14:32:39 +0300
+Subject: [PATCH 02/22] Use clang for "build-as-cpp" tests
+
+---
+ .github/workflows/tests.yml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 5b88d05d..ad9fbb88 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -528,7 +528,7 @@ jobs:
+       run: |
+         mkdir build
+         cd build
+-        g++ -xc++ -Dd_m3HasWASI \
++        clang -xc++ -Dd_m3HasWASI \
+             -I../source ../source/*.c ../platforms/app/main.c \
+             -O3 -g0 -lm \
+             -o wasm3
+@@ -546,7 +546,7 @@ jobs:
+       run: |
+         mkdir build
+         cd build
+-        g++ -xc++ -Dd_m3HasWASI -DDEBUG \
++        clang -xc++ -Dd_m3HasWASI -DDEBUG \
+             -Dd_m3EnableOpTracing=1     \
+             -Dd_m3EnableStrace=1        \
+             -Dd_m3LogParse=1            \
+
+From 4f0b769629fa8f2ba6e7baa9195ef9f1bf5dc310 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jean-Fran=C3=A7ois=20Geyelin?=
+ <jyaif@users.noreply.github.com>
+Date: Mon, 26 Apr 2021 14:10:46 +0200
+Subject: [PATCH 03/22] Support compilation with -Wmissing-field-initializers
+ (#230)
+
+---
+ source/m3_env.c   | 3 ++-
+ source/m3_parse.c | 2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/source/m3_env.c b/source/m3_env.c
+index b6c8e010..e252ae0c 100644
+--- a/source/m3_env.c
++++ b/source/m3_env.c
+@@ -1035,7 +1035,8 @@ M3Result  m3Error  (M3Result i_result, IM3Runtime i_runtime, IM3Module i_module,
+ {
+     if (i_runtime)
+     {
+-        i_runtime->error = (M3ErrorInfo){ i_result, i_runtime, i_module, i_function, i_file, i_lineNum };
++        i_runtime->error = (M3ErrorInfo){ .result = i_result, .runtime = i_runtime, .module = i_module,
++                                          .function = i_function, .file = i_file, .line = i_lineNum };
+         i_runtime->error.message = i_runtime->error_message;
+ 
+         va_list args;
+diff --git a/source/m3_parse.c b/source/m3_parse.c
+index 4ea7bb14..ed681f5f 100644
+--- a/source/m3_parse.c
++++ b/source/m3_parse.c
+@@ -291,7 +291,7 @@ M3Result  Parse_InitExpr  (M3Module * io_module, bytes_t * io_bytes, cbytes_t i_
+ #else
+     M3Compilation compilation;
+ #endif
+-    compilation = (M3Compilation){ NULL, io_module, * io_bytes, i_end };
++    compilation = (M3Compilation){ .runtime = NULL, .module = io_module, .wasm = * io_bytes, .wasmEnd = i_end };
+ 
+     result = CompileBlockStatements (& compilation);
+ 
+
+From d931d669d960d8c0679bf547c04c98c857120712 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 13:43:13 +0300
+Subject: [PATCH 04/22] Add Cookbook
+
+---
+ docs/Cookbook.md | 91 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 91 insertions(+)
+ create mode 100644 docs/Cookbook.md
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+new file mode 100644
+index 00000000..cb56a2a0
+--- /dev/null
++++ b/docs/Cookbook.md
+@@ -0,0 +1,91 @@
++# Wasm3 cookbook
++
++### Rust WASI app
++
++TODO
++
++### AssemblyScript WASI app
++
++TODO
++
++### TinyGo WASI app
++
++TODO
++
++### Zig WASI app
++
++Create `hello.zig`:
++```zig
++const std = @import("std");
++
++pub fn main() !void {
++    const stdout = std.io.getStdOut().writer();
++    try stdout.print("Hello, {s}!\n", .{"world"});
++}
++```
++
++```sh
++$ zig build-exe -O ReleaseSmall -target wasm32-wasi hello.zig
++
++$ wasm3 hello.wasm
++Hello, world!
++```
++
++## Zig library
++
++Create `add.zig`:
++```zig
++export fn add(a: i32, b: i32) i64 {
++    return a + b;
++}
++```
++
++```sh
++$ zig build-lib add.zig -O ReleaseSmall -target wasm32-freestanding
++
++$ wasm3 --repl add.wasm
++wasm3> add 1 2
++Result: 3
++```
++
++### C WASI app
++
++The easiest way to start is to use [Wasienv](https://github.com/wasienv/wasienv).
++
++Create `hello.c`:
++```c
++#include <stdio.h>
++
++int main()
++{
++   printf("Hello, %s!\n", "world");
++   return 0;
++}
++```
++
++```sh
++$ wasicc -O3 -Wl,--stack-first hello.c -o hello.wasm
++
++$ wasm3 hello.wasm                      
++Hello, world!
++```
++
++### C++ WASI app
++
++Create `hello.cpp`:
++```cpp
++#include <iostream>
++
++int main()
++{
++    std::cout << "Hello World!" << std::endl;
++    return 0;
++}
++```
++
++```sh
++$ wasic++ -O3 -Wl,--stack-first hello.cpp -o hello.wasm
++
++$ wasm3 hello.wasm
++Hello World!
++```
+
+From 011e04bcfa8d981ffb800d182d826072803bfa54 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 13:57:16 +0300
+Subject: [PATCH 05/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 43 +++++++++++++++++++------------------------
+ 1 file changed, 19 insertions(+), 24 deletions(-)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index cb56a2a0..df4e190e 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -52,40 +52,35 @@ Result: 3
+ 
+ The easiest way to start is to use [Wasienv](https://github.com/wasienv/wasienv).
+ 
+-Create `hello.c`:
+-```c
+-#include <stdio.h>
+-
+-int main()
+-{
+-   printf("Hello, %s!\n", "world");
+-   return 0;
+-}
+-```
+-
+-```sh
+-$ wasicc -O3 -Wl,--stack-first hello.c -o hello.wasm
+-
+-$ wasm3 hello.wasm                      
+-Hello, world!
+-```
+-
+-### C++ WASI app
++### C/C++ WASI app
+ 
+ Create `hello.cpp`:
+ ```cpp
+ #include <iostream>
+-
+-int main()
+-{
+-    std::cout << "Hello World!" << std::endl;
++int main() {
++    std::cout << "Hello, world!" << std::endl;
+     return 0;
+ }
+ ```
+ 
++Or `hello.c`:
++```c
++#include <stdio.h>
++int main() {
++   printf("Hello, %s!\n", "world");
++   return 0;
++}
++```
++
+ ```sh
+-$ wasic++ -O3 -Wl,--stack-first hello.cpp -o hello.wasm
++$ wasic++ -O3 hello.cpp -o hello.wasm
++$ wasicc -O3 hello.c -o hello.wasm
+ 
+ $ wasm3 hello.wasm
+ Hello World!
+ ```
++
++Limitations:
++- `setjmp/longjmp` and `C++ exceptions` are not available
++- no support for `threads` and `atomics`
++- no support for `dynamic libraries`
+
+From 68af26e4b434635c6643d9c893050b99b7e91db0 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 14:14:08 +0300
+Subject: [PATCH 06/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 48 +++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index df4e190e..ce0fec70 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -2,11 +2,48 @@
+ 
+ ### Rust WASI app
+ 
+-TODO
++Create a new project:
++```sh
++$ cargo new --bin hello
++$ cd hello
++$ rustup target add wasm32-wasi
++```
++
++Build and run:
++```sh
++$ cargo build --release --target wasm32-wasi
++
++$ wasm3 ./target/wasm32-wasi/release/hello.wasm
++Hello, world!
++```
+ 
+ ### AssemblyScript WASI app
+ 
+-TODO
++Create `package.json`:
++```json
++{
++  "name": "hello",
++  "version": "1.0.0",
++  "description": "Hello world with AssemblyScript and as-wasi",
++  "main": "hello.ts",
++  "scripts": {
++    "build": "asc hello.ts -b hello.wasm"
++  },
++  "devDependencies": {
++    "assemblyscript": "^0.10.0",
++    "as-wasi": "^0.1.1"
++  }
++}
++```
++
++Build and run:
++```sh
++$ npm install
++$ npm run build
++
++$ wasm3 hello.wasm
++Hello World!
++```
+ 
+ ### TinyGo WASI app
+ 
+@@ -24,6 +61,7 @@ pub fn main() !void {
+ }
+ ```
+ 
++Build and run:
+ ```sh
+ $ zig build-exe -O ReleaseSmall -target wasm32-wasi hello.zig
+ 
+@@ -40,6 +78,7 @@ export fn add(a: i32, b: i32) i64 {
+ }
+ ```
+ 
++Build and run:
+ ```sh
+ $ zig build-lib add.zig -O ReleaseSmall -target wasm32-freestanding
+ 
+@@ -48,12 +87,10 @@ wasm3> add 1 2
+ Result: 3
+ ```
+ 
+-### C WASI app
++### C/C++ WASI app
+ 
+ The easiest way to start is to use [Wasienv](https://github.com/wasienv/wasienv).
+ 
+-### C/C++ WASI app
+-
+ Create `hello.cpp`:
+ ```cpp
+ #include <iostream>
+@@ -72,6 +109,7 @@ int main() {
+ }
+ ```
+ 
++Build and run:
+ ```sh
+ $ wasic++ -O3 hello.cpp -o hello.wasm
+ $ wasicc -O3 hello.c -o hello.wasm
+
+From 79ae7573f6c6bc49e2c49b7d69879e0d32b6080f Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 14:15:06 +0300
+Subject: [PATCH 07/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index ce0fec70..a03727d8 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -36,6 +36,14 @@ Create `package.json`:
+ }
+ ```
+ 
++Create `hello.ts`:
++```ts
++import "wasi"
++
++import {Console} from "as-wasi"
++Console.log('Hello World!\n');
++```
++
+ Build and run:
+ ```sh
+ $ npm install
+
+From c620d7c85580949f59d9fff7995b0cf6919f11a8 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 14:31:37 +0300
+Subject: [PATCH 08/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 37 +++++++++++++++++++++++++++----------
+ 1 file changed, 27 insertions(+), 10 deletions(-)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index a03727d8..6cf6bc0b 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -1,4 +1,4 @@
+-# Wasm3 cookbook
++# Wasm3 Cookbook
+ 
+ ### Rust WASI app
+ 
+@@ -19,6 +19,14 @@ Hello, world!
+ 
+ ### AssemblyScript WASI app
+ 
++Create `hello.ts`:
++```ts
++import "wasi"
++
++import {Console} from "as-wasi"
++Console.log('Hello World!\n');
++```
++
+ Create `package.json`:
+ ```json
+ {
+@@ -36,14 +44,6 @@ Create `package.json`:
+ }
+ ```
+ 
+-Create `hello.ts`:
+-```ts
+-import "wasi"
+-
+-import {Console} from "as-wasi"
+-Console.log('Hello World!\n');
+-```
+-
+ Build and run:
+ ```sh
+ $ npm install
+@@ -55,7 +55,24 @@ Hello World!
+ 
+ ### TinyGo WASI app
+ 
+-TODO
++Create `hello.go`:
++```go
++package main
++
++import "fmt"
++
++func main() {
++    fmt.Printf("Hello, %s!\n", "world")
++}
++```
++
++Build and run:
++```sh
++$ tinygo build -o hello.wasm -target wasi ./hello.go
++
++$ wasm3 hello.wasm
++Hello, world!
++```
+ 
+ ### Zig WASI app
+ 
+
+From 273ca8f42e6fad7918fc5f78dd35e47ec7adaa6e Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 14:34:05 +0300
+Subject: [PATCH 09/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index 6cf6bc0b..5d05cac4 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -24,7 +24,7 @@ Create `hello.ts`:
+ import "wasi"
+ 
+ import {Console} from "as-wasi"
+-Console.log('Hello World!\n');
++Console.log('Hello World!');
+ ```
+ 
+ Create `package.json`:
+@@ -38,8 +38,8 @@ Create `package.json`:
+     "build": "asc hello.ts -b hello.wasm"
+   },
+   "devDependencies": {
+-    "assemblyscript": "^0.10.0",
+-    "as-wasi": "^0.1.1"
++    "assemblyscript": "^0.18.30",
++    "as-wasi": "^0.4.4"
+   }
+ }
+ ```
+
+From 37d81e4f4653e5beea8e743fad24919f9214a04c Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 14:42:41 +0300
+Subject: [PATCH 10/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index 5d05cac4..390f996a 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -1,5 +1,7 @@
+ # Wasm3 Cookbook
+ 
++## WASM module examples
++
+ ### Rust WASI app
+ 
+ Create a new project:
+@@ -147,3 +149,24 @@ Limitations:
+ - `setjmp/longjmp` and `C++ exceptions` are not available
+ - no support for `threads` and `atomics`
+ - no support for `dynamic libraries`
++
++### WAT library
++
++Create `swap.wat`:
++```wat
++(module
++  (func (export "swap") (param i32 i32) (result i32 i32)
++    (get_local 1)
++    (get_local 0)
++  )
++)
++```
++
++Build and run:
++```sh
++$ wat2wasm swap.wat -o swap.wasm
++
++$ wasm3 --repl swap.wasm
++wasm3> :invoke swap 123 456
++Result: 456:i32, 123:i32
++```
+
+From f9c62af53ce98dcfc8dceb23bdd23bc7e01a0176 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 15:20:11 +0300
+Subject: [PATCH 11/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index 390f996a..c3ea7400 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -150,6 +150,44 @@ Limitations:
+ - no support for `threads` and `atomics`
+ - no support for `dynamic libraries`
+ 
++### WAT WASI app
++
++Create `hello.wat`:
++```
++(module
++    ;; wasi_unstable!fd_write(file_descriptor, *iovs, iovs_len, nwritten) -> status_code
++    (import "wasi_unstable" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
++
++    (memory 1)
++    (export "memory" (memory 0))
++
++    ;; Put a message to linear memory at offset 32
++    (data (i32.const 32) "Hello, world\n")
++
++    (func $main (export "_start")
++        ;; Create a new io vector
++        (i32.store (i32.const 0) (i32.const 32))  ;; iov.iov_base - pointer to the start of the message
++        (i32.store (i32.const 4) (i32.const 13))  ;; iov.iov_len  - length of the message
++
++        (call $fd_write
++            (i32.const 1)  ;; file_descriptor - 1 for stdout
++            (i32.const 0)  ;; *iovs           - pointer to the io vector
++            (i32.const 1)  ;; iovs_len        - count of items in io vector
++            (i32.const 20) ;; nwritten        - where to store the number of bytes written
++        )
++        drop ;; discard the WASI status code
++)
++```
++
++
++Build and run:
++```sh
++$ wat2wasm hello.wat -o hello.wasm
++
++$ wasm3 hello.wasm    
++Hello, world!
++```
++
+ ### WAT library
+ 
+ Create `swap.wat`:
+
+From 461a7668b9f32bac74bc3ac93ea58193a79c3044 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 15:20:47 +0300
+Subject: [PATCH 12/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index c3ea7400..36b707fa 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -153,7 +153,7 @@ Limitations:
+ ### WAT WASI app
+ 
+ Create `hello.wat`:
+-```
++```wat
+ (module
+     ;; wasi_unstable!fd_write(file_descriptor, *iovs, iovs_len, nwritten) -> status_code
+     (import "wasi_unstable" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+
+From a55c34377eb33a102eee1aa353e55d61c01d6ebc Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 15:21:19 +0300
+Subject: [PATCH 13/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index 36b707fa..76879061 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -155,27 +155,28 @@ Limitations:
+ Create `hello.wat`:
+ ```wat
+ (module
+-    ;; wasi_unstable!fd_write(file_descriptor, *iovs, iovs_len, nwritten) -> status_code
+-    (import "wasi_unstable" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
++    ;; wasi_snapshot_preview1!fd_write(file_descriptor, *iovs, iovs_len, nwritten) -> status_code
++    (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+ 
+     (memory 1)
+     (export "memory" (memory 0))
+ 
+     ;; Put a message to linear memory at offset 32
+-    (data (i32.const 32) "Hello, world\n")
++    (data (i32.const 32) "Hello, world!\n")
+ 
+     (func $main (export "_start")
+-        ;; Create a new io vector
+-        (i32.store (i32.const 0) (i32.const 32))  ;; iov.iov_base - pointer to the start of the message
+-        (i32.store (i32.const 4) (i32.const 13))  ;; iov.iov_len  - length of the message
++        ;; Create a new io vector at address 0x4
++        (i32.store (i32.const 4) (i32.const 32))  ;; iov.iov_base - pointer to the start of the message
++        (i32.store (i32.const 8) (i32.const 14))  ;; iov.iov_len  - length of the message
+ 
+         (call $fd_write
+             (i32.const 1)  ;; file_descriptor - 1 for stdout
+-            (i32.const 0)  ;; *iovs           - pointer to the io vector
++            (i32.const 4)  ;; *iovs           - pointer to the io vector
+             (i32.const 1)  ;; iovs_len        - count of items in io vector
+             (i32.const 20) ;; nwritten        - where to store the number of bytes written
+         )
+         drop ;; discard the WASI status code
++    )
+ )
+ ```
+ 
+
+From c23adeba7e45712ecd88c1bbf4ea6bbdfae0650f Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 15:24:06 +0300
+Subject: [PATCH 14/22] Update README.md
+
+---
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/README.md b/README.md
+index 4f976543..892fb60d 100644
+--- a/README.md
++++ b/README.md
+@@ -98,6 +98,7 @@ Wasm3 started as a research project and remains so by many means. Evaluating the
+ ## Further Resources
+ 
+ [Demos](./docs/Demos.md)  
++[Cookbook](./docs/Cookbook.md)  
+ [Installation instructions](./docs/Installation.md)  
+ [Build and Development instructions](./docs/Development.md)  
+ [Supported Hardware](./docs/Hardware.md)  
+
+From 73ca6e7796249d7593e4f9c2dd8969cd4d5a8b38 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 15:46:54 +0300
+Subject: [PATCH 15/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 163 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 163 insertions(+)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index 76879061..a5e3b5eb 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -209,3 +209,166 @@ $ wasm3 --repl swap.wasm
+ wasm3> :invoke swap 123 456
+ Result: 456:i32, 123:i32
+ ```
++
++___
++
++## WASM/WASI tracing
++
++Drag'n'drop any of the WASI apps to [`WebAssembly.sh`](https://webassembly.sh/) and run:
++```sh
++$ wasm3-strace /tmp/hello.wasm
++```
++
++The execution trace will be produced:
++```js
++_start () {
++  __wasilibc_init_preopen () {
++    malloc (i32: 16) {
++      dlmalloc (i32: 16) {
++        sbrk (i32: 0) {
++        } = 131072
++        sbrk (i32: 65536) {
++```
++<details>
++  <summary>Click to expand!</summary>
++
++```js
++        } = 131072
++      } = 131088
++    } = 131088
++    calloc (i32: 24, i32: 0) {
++      dlmalloc (i32: 96) {
++      } = 131120
++      memset (i32: 131120, i32: 65504, i32: 0) {
++      } = 131120
++    } = 131120
++    po_map_assertvalid (i32: 131088) {
++    }
++    po_map_assertvalid (i32: 131088) {
++    }
++  }
++  wasi_unstable!fd_prestat_get(3, 65528) { <native> } = 0
++  malloc (i32: 2) {
++    dlmalloc (i32: 2) {
++    } = 131232
++  } = 131232
++  wasi_unstable!fd_prestat_dir_name(3, 131232, 1) { <native> } = 0
++  __wasilibc_register_preopened_fd (i32: 3, i32: 131120) {
++    po_map_assertvalid (i32: 131088) {
++    }
++    po_map_assertvalid (i32: 131088) {
++    }
++    strdup (i32: 131232) {
++      strlen (i32: 131232) {
++      } = 1
++      malloc (i32: 2) {
++        dlmalloc (i32: 2) {
++        } = 131248
++      } = 131248
++      memcpy (i32: 131248, i32: 131233, i32: 131232) {
++      } = 131248
++    } = 131248
++    wasi_unstable!fd_fdstat_get(3, 65496) { <native> } = 0
++    po_map_assertvalid (i32: 131088) {
++    }
++    po_map_assertvalid (i32: 131088) {
++    }
++  } = 0
++  free (i32: 131232) {
++    dlfree (i32: 131232) {
++    }
++  }
++  wasi_unstable!fd_prestat_get(4, 65528) { <native> } = 0
++  malloc (i32: 2) {
++    dlmalloc (i32: 2) {
++    } = 131232
++  } = 131232
++  wasi_unstable!fd_prestat_dir_name(4, 131232, 1) { <native> } = 0
++  __wasilibc_register_preopened_fd (i32: 4, i32: 131120) {
++    po_map_assertvalid (i32: 131088) {
++    }
++    po_map_assertvalid (i32: 131088) {
++    }
++    strdup (i32: 131232) {
++      strlen (i32: 131232) {
++      } = 1
++      malloc (i32: 2) {
++        dlmalloc (i32: 2) {
++        } = 131264
++      } = 131264
++      memcpy (i32: 131264, i32: 131233, i32: 131232) {
++      } = 131264
++    } = 131264
++    wasi_unstable!fd_fdstat_get(4, 65496) { <native> } = 0
++    po_map_assertvalid (i32: 131088) {
++    }
++    po_map_assertvalid (i32: 131088) {
++    }
++  } = 0
++  free (i32: 131232) {
++    dlfree (i32: 131232) {
++    }
++  }
++  wasi_unstable!fd_prestat_get(5, 65528) { <native> } = 8
++  __wasm_call_ctors () {
++  }
++  __original_main () {
++    printf (i32: 65536, i32: 0) {
++      vfprintf (i32: 69512, i32: 0, i32: 65536) {
++        printf_core (i32: 0, i32: -1, i32: 65536, i32: -16, i32: 65480) {
++        } = 0
++        __towrite (i32: 69512) {
++        } = 0
++        printf_core (i32: 69512, i32: 8, i32: 65536, i32: -1, i32: 65480) {
++          __fwritex (i32: 65536, i32: 0, i32: 7) {
++            memcpy (i32: 68472, i32: 0, i32: 65536) {
++            } = 68472
++          } = 7
++          __fwritex (i32: 65543, i32: 0, i32: 0) {
++            memcpy (i32: 68479, i32: 0, i32: 65543) {
++            } = 68479
++          } = 0
++          pop_arg (i32: 64456, i32: 0, i32: 9) {
++          }
++          strnlen (i32: 65548, i32: 0) {
++            memchr (i32: 65548, i32: 4, i32: 0) {
++            } = 65553
++          } = 5
++          __fwritex (i32: 67222, i32: 65553, i32: 0) {
++            memcpy (i32: 68479, i32: 0, i32: 67222) {
++            } = 68479
++          } = 0
++          __fwritex (i32: 65548, i32: 65553, i32: 5) {
++            memcpy (i32: 68479, i32: 0, i32: 65548) {
++            } = 68479
++          } = 5
++          __fwritex (i32: 65545, i32: 0, i32: 2) {
++            __stdout_write (i32: 69512, i32: 0, i32: 65545) {
++              __isatty (i32: 1) {
++                wasi_unstable!fd_fdstat_get(1, 64376) { <native> } = 0
++              } = 1
++              __stdio_write (i32: 69512, i32: 64368, i32: 65545) {
++                writev (i32: 1, i32: -16, i32: 64384) {
++Hello, world!
++                  wasi_unstable!fd_write(1, 64384, 2, 64380) { <native> } = 0
++                } = 14
++              } = 2
++            } = 2
++            memcpy (i32: 68472, i32: -1, i32: 65547) {
++            } = 68472
++          } = 2
++        } = 14
++      } = 14
++    } = 14
++  } = 0
++  __prepare_for_exit () {
++    dummy () {
++    }
++    __stdio_exit () {
++      __ofl_lock () {
++      } = 69504
++    }
++  }
++}
++```
++</details>
+
+From 7c5503a262c1fda99deb3bc2d85314ea97534f35 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 16:11:35 +0300
+Subject: [PATCH 16/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index a5e3b5eb..9a6ec986 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -372,3 +372,9 @@ Hello, world!
+ }
+ ```
+ </details>
++
++
++## Other resources
++
++- [WebAssembly by examples](https://wasmbyexample.dev/home.en-us.html) by Aaron Turner
++- [Writing WebAssembly](https://docs.wasmtime.dev/wasm.html) in Wasmtime docs
+
+From 0bf8cab501e494f0f8aa4550749143f85ecbb577 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 16:28:36 +0300
+Subject: [PATCH 17/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index 9a6ec986..cb927d0e 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -373,6 +373,17 @@ Hello, world!
+ ```
+ </details>
+ 
++## Gas Metering
++```sh
++$ npm install -g wasm-metering
++
++$ wasm-meter hello.wasm hello-metered.wasm
++
++$ wasm3 hello-metered.wasm       
++Warning: Gas is limited to 500000000.0000
++Hello, world!
++Gas used: 20.8950
++```
+ 
+ ## Other resources
+ 
+
+From 7464857046b9ba9f77588989c7081a6cf0539e16 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 16:41:05 +0300
+Subject: [PATCH 18/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index cb927d0e..0eb9ec39 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -383,6 +383,11 @@ $ wasm3 hello-metered.wasm
+ Warning: Gas is limited to 500000000.0000
+ Hello, world!
+ Gas used: 20.8950
++
++$ wasm3 --gas-limit 10 hello-metered.wasm
++Warning: Gas is limited to 10.0000
++Gas used: 10.0309
++Error: [trap] Out of gas
+ ```
+ 
+ ## Other resources
+
+From c68aa7bdbfb18d939ec338cc313e3040b1dc5ce8 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 16:48:14 +0300
+Subject: [PATCH 19/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 13 +++++--------
+ 1 file changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index 0eb9ec39..2d1a5821 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -1,6 +1,4 @@
+-# Wasm3 Cookbook
+-
+-## WASM module examples
++# WASM module examples
+ 
+ ### Rust WASI app
+ 
+@@ -210,9 +208,7 @@ wasm3> :invoke swap 123 456
+ Result: 456:i32, 123:i32
+ ```
+ 
+-___
+-
+-## WASM/WASI tracing
++# Tracing
+ 
+ Drag'n'drop any of the WASI apps to [`WebAssembly.sh`](https://webassembly.sh/) and run:
+ ```sh
+@@ -373,7 +369,8 @@ Hello, world!
+ ```
+ </details>
+ 
+-## Gas Metering
++# Gas Metering
++
+ ```sh
+ $ npm install -g wasm-metering
+ 
+@@ -390,7 +387,7 @@ Gas used: 10.0309
+ Error: [trap] Out of gas
+ ```
+ 
+-## Other resources
++# Other resources
+ 
+ - [WebAssembly by examples](https://wasmbyexample.dev/home.en-us.html) by Aaron Turner
+ - [Writing WebAssembly](https://docs.wasmtime.dev/wasm.html) in Wasmtime docs
+
+From ddf5afeee20a4f9cc39aad5a48414ea7de240cf3 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Fri, 30 Apr 2021 16:58:29 +0300
+Subject: [PATCH 20/22] Add --gas-limit option
+
+---
+ platforms/app/main.c | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/platforms/app/main.c b/platforms/app/main.c
+index 172ede82..39f10e6e 100644
+--- a/platforms/app/main.c
++++ b/platforms/app/main.c
+@@ -43,6 +43,7 @@ int wasm_bins_qty = 0;
+ 
+ #if defined(GAS_LIMIT)
+ 
++static int64_t initial_gas = GAS_FACTOR * GAS_LIMIT;
+ static int64_t current_gas = GAS_FACTOR * GAS_LIMIT;
+ static bool is_gas_metered = false;
+ 
+@@ -208,6 +209,15 @@ M3Result repl_load_hex  (u32 fsize)
+     return result;
+ }
+ 
++void print_gas_used()
++{
++#if defined(GAS_LIMIT)
++    if (is_gas_metered) {
++        fprintf(stderr, "Gas used: %0.4f\n", (double)(initial_gas - current_gas) / GAS_FACTOR);
++    }
++#endif
++}
++
+ void print_backtrace()
+ {
+     IM3BacktraceInfo info = m3_GetBacktrace(runtime);
+@@ -253,6 +263,8 @@ M3Result repl_call  (const char* name, int argc, const char* argv[])
+ 
+         result = m3_CallArgv(func, 0, NULL);
+ 
++        print_gas_used();
++
+         if (result == m3Err_trapExit) {
+             exit(wasi_ctx->exit_code);
+         }
+@@ -273,11 +285,7 @@ M3Result repl_call  (const char* name, int argc, const char* argv[])
+ 
+     result = m3_CallArgv (func, argc, argv);
+ 
+-#if defined(GAS_LIMIT)
+-    if (is_gas_metered) {
+-        fprintf(stderr, "Gas used: %0.4f\n", (double)((GAS_FACTOR * GAS_LIMIT) - current_gas) / GAS_FACTOR);
+-    }
+-#endif
++    print_gas_used();
+ 
+     if (result) return result;
+ 
+@@ -566,6 +574,10 @@ int  main  (int i_argc, const char* i_argv[])
+             const char* tmp = "65536";
+             ARGV_SET(tmp);
+             argStackSize = atol(tmp);
++        } else if (!strcmp("--gas-limit", arg)) {
++            const char* tmp = "0";
++            ARGV_SET(tmp);
++            initial_gas = current_gas = GAS_FACTOR * atol(tmp);
+         } else if (!strcmp("--dir", arg)) {
+             const char* argDir;
+             ARGV_SET(argDir);
+
+From 29c81a5622c9cc09bd43e47a6e616a5708f976d0 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Sat, 1 May 2021 02:49:21 +0300
+Subject: [PATCH 21/22] Update Cookbook.md
+
+---
+ docs/Cookbook.md | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/docs/Cookbook.md b/docs/Cookbook.md
+index 2d1a5821..f89a3c8d 100644
+--- a/docs/Cookbook.md
++++ b/docs/Cookbook.md
+@@ -22,24 +22,23 @@ Hello, world!
+ Create `hello.ts`:
+ ```ts
+ import "wasi"
+-
+ import {Console} from "as-wasi"
++
+ Console.log('Hello World!');
+ ```
+ 
+ Create `package.json`:
+ ```json
+ {
+-  "name": "hello",
+-  "version": "1.0.0",
+-  "description": "Hello world with AssemblyScript and as-wasi",
+-  "main": "hello.ts",
+   "scripts": {
+-    "build": "asc hello.ts -b hello.wasm"
++    "asbuild:debug":        "asc hello.ts -b hello.wasm --debug",
++    "asbuild:optimized":    "asc hello.ts -b hello.wasm -O3s --noAssert",
++    "asbuild:tiny":         "asc hello.ts -b hello.wasm -O3z --noAssert --runtime stub --use abort=",
++    "build":                "npm run asbuild:optimized"
+   },
+   "devDependencies": {
+-    "assemblyscript": "^0.18.30",
+-    "as-wasi": "^0.4.4"
++    "assemblyscript": "*",
++    "as-wasi": "*"
+   }
+ }
+ ```
+@@ -68,7 +67,7 @@ func main() {
+ 
+ Build and run:
+ ```sh
+-$ tinygo build -o hello.wasm -target wasi ./hello.go
++$ tinygo build -o hello.wasm -target wasi -no-debug hello.go
+ 
+ $ wasm3 hello.wasm
+ Hello, world!
+@@ -119,6 +118,7 @@ The easiest way to start is to use [Wasienv](https://github.com/wasienv/wasienv)
+ Create `hello.cpp`:
+ ```cpp
+ #include <iostream>
++
+ int main() {
+     std::cout << "Hello, world!" << std::endl;
+     return 0;
+@@ -128,6 +128,7 @@ int main() {
+ Or `hello.c`:
+ ```c
+ #include <stdio.h>
++
+ int main() {
+    printf("Hello, %s!\n", "world");
+    return 0;
+
+From 67b96cc96a78eb89be90b26eaab59fecfd5c29bf Mon Sep 17 00:00:00 2001
+From: Steven Massey <soundandform@gmail.com>
+Date: Sat, 1 May 2021 14:07:01 -0700
+Subject: [PATCH 22/22] d_m3HasFloat=0 build fixes
+
+---
+ platforms/app/main.c  |  2 ++
+ source/m3_compile.c   |  9 +++++++-
+ source/m3_core.c      |  2 +-
+ source/m3_core.h      | 14 +++++++-----
+ source/m3_env.c       | 16 +++++++++++++-
+ source/m3_exec_defs.h | 50 +++++++++++++++++++++++++------------------
+ 6 files changed, 64 insertions(+), 29 deletions(-)
+
+diff --git a/platforms/app/main.c b/platforms/app/main.c
+index 39f10e6e..49d65356 100644
+--- a/platforms/app/main.c
++++ b/platforms/app/main.c
+@@ -305,8 +305,10 @@ M3Result repl_call  (const char* name, int argc, const char* argv[])
+         switch (m3_GetRetType(func, i)) {
+         case c_m3Type_i32:  fprintf (stderr, "Result: %" PRIi32 "\n", *(i32*)valptrs[i]);  break;
+         case c_m3Type_i64:  fprintf (stderr, "Result: %" PRIi64 "\n", *(i64*)valptrs[i]);  break;
++# if d_m3HasFloat
+         case c_m3Type_f32:  fprintf (stderr, "Result: %" PRIf32 "\n", *(f32*)valptrs[i]);  break;
+         case c_m3Type_f64:  fprintf (stderr, "Result: %" PRIf64 "\n", *(f64*)valptrs[i]);  break;
++# endif
+         default: return "unknown return type";
+         }
+     }
+diff --git a/source/m3_compile.c b/source/m3_compile.c
+index 835a9a40..39215b38 100644
+--- a/source/m3_compile.c
++++ b/source/m3_compile.c
+@@ -1073,7 +1073,7 @@ _   (PushConst (o, value, c_m3Type_i64));                       m3log (compile,
+ }
+ 
+ 
+-#if d_m3HasFloat
++#if d_m3ImplementFloat
+ M3Result  Compile_Const_f32  (IM3Compilation o, m3opcode_t i_opcode)
+ {
+     M3Result result;
+@@ -2367,7 +2367,12 @@ const M3OpInfo c_operations [] =
+ 
+ # ifdef DEBUG // for codepage logging. the order doesn't matter:
+ #   define d_m3DebugOp(OP) M3OP (#OP, 0, none, { op_##OP })
++
++# if d_m3HasFloat
+ #   define d_m3DebugTypedOp(OP) M3OP (#OP, 0, none, { op_##OP##_i32, op_##OP##_i64, op_##OP##_f32, op_##OP##_f64, })
++# else
++#   define d_m3DebugTypedOp(OP) M3OP (#OP, 0, none, { op_##OP##_i32, op_##OP##_i64 })
++# endif
+ 
+     d_m3DebugOp (Compile),          d_m3DebugOp (Entry),            d_m3DebugOp (End),
+     d_m3DebugOp (Unsupported),      d_m3DebugOp (CallRawFunction),
+@@ -2380,11 +2385,13 @@ const M3OpInfo c_operations [] =
+     d_m3DebugOp (Select_i32_rss),   d_m3DebugOp (Select_i32_srs),   d_m3DebugOp (Select_i32_ssr),   d_m3DebugOp (Select_i32_sss),
+     d_m3DebugOp (Select_i64_rss),   d_m3DebugOp (Select_i64_srs),   d_m3DebugOp (Select_i64_ssr),   d_m3DebugOp (Select_i64_sss),
+ 
++# if d_m3HasFloat
+     d_m3DebugOp (Select_f32_sss),   d_m3DebugOp (Select_f32_srs),   d_m3DebugOp (Select_f32_ssr),
+     d_m3DebugOp (Select_f32_rss),   d_m3DebugOp (Select_f32_rrs),   d_m3DebugOp (Select_f32_rsr),
+ 
+     d_m3DebugOp (Select_f64_sss),   d_m3DebugOp (Select_f64_srs),   d_m3DebugOp (Select_f64_ssr),
+     d_m3DebugOp (Select_f64_rss),   d_m3DebugOp (Select_f64_rrs),   d_m3DebugOp (Select_f64_rsr),
++# endif
+ 
+     d_m3DebugTypedOp (SetGlobal),   d_m3DebugOp (SetGlobal_s32),    d_m3DebugOp (SetGlobal_s64),
+ 
+diff --git a/source/m3_core.c b/source/m3_core.c
+index 2618b51d..e21faf3f 100644
+--- a/source/m3_core.c
++++ b/source/m3_core.c
+@@ -263,7 +263,7 @@ M3Result  Read_u32  (u32 * o_value, bytes_t * io_bytes, cbytes_t i_end)
+     else return m3Err_wasmUnderrun;
+ }
+ 
+-#if d_m3HasFloat || d_m3NoFloatDynamic
++#if d_m3ImplementFloat
+ 
+ M3Result  Read_f64  (f64 * o_value, bytes_t * io_bytes, cbytes_t i_end)
+ {
+diff --git a/source/m3_core.h b/source/m3_core.h
+index 71d827d5..745a24b1 100644
+--- a/source/m3_core.h
++++ b/source/m3_core.h
+@@ -27,11 +27,9 @@
+ 
+ d_m3BeginExternC
+ 
++#define d_m3ImplementFloat (d_m3HasFloat || d_m3NoFloatDynamic)
++
+ #if !defined(d_m3ShortTypesDefined)
+-#if d_m3HasFloat || d_m3NoFloatDynamic
+-typedef double          f64;
+-typedef float           f32;
+-#endif
+ 
+ typedef uint64_t        u64;
+ typedef int64_t         i64;
+@@ -41,6 +39,12 @@ typedef uint16_t        u16;
+ typedef int16_t         i16;
+ typedef uint8_t         u8;
+ typedef int8_t          i8;
++
++#if d_m3ImplementFloat
++typedef double          f64;
++typedef float           f32;
++#endif
++
+ #endif // d_m3ShortTypesDefined
+ 
+ #define PRIf32          "f"
+@@ -224,7 +228,7 @@ u32         SizeOfType              (u8 i_m3Type);
+ 
+ M3Result    Read_u64                (u64 * o_value, bytes_t * io_bytes, cbytes_t i_end);
+ M3Result    Read_u32                (u32 * o_value, bytes_t * io_bytes, cbytes_t i_end);
+-#if d_m3HasFloat || d_m3NoFloatDynamic
++#if d_m3ImplementFloat
+ M3Result    Read_f64                (f64 * o_value, bytes_t * io_bytes, cbytes_t i_end);
+ M3Result    Read_f32                (f32 * o_value, bytes_t * io_bytes, cbytes_t i_end);
+ #endif
+diff --git a/source/m3_env.c b/source/m3_env.c
+index e252ae0c..c6430c8c 100644
+--- a/source/m3_env.c
++++ b/source/m3_env.c
+@@ -611,8 +611,10 @@ M3Result  m3_GetGlobal  (IM3Global                 i_global,
+     switch (i_global->type) {
+     case c_m3Type_i32: o_value->value.i32 = i_global->intValue; break;
+     case c_m3Type_i64: o_value->value.i64 = i_global->intValue; break;
++# if d_m3HasFloat
+     case c_m3Type_f32: o_value->value.f32 = i_global->f32Value; break;
+     case c_m3Type_f64: o_value->value.f64 = i_global->f64Value; break;
++# endif
+     default: return m3Err_invalidTypeId;
+     }
+ 
+@@ -631,8 +633,10 @@ M3Result  m3_SetGlobal  (IM3Global                 i_global,
+     switch (i_value->type) {
+     case c_m3Type_i32: i_global->intValue = i_value->value.i32; break;
+     case c_m3Type_i64: i_global->intValue = i_value->value.i64; break;
++# if d_m3HasFloat
+     case c_m3Type_f32: i_global->f32Value = i_value->value.f32; break;
+     case c_m3Type_f64: i_global->f64Value = i_value->value.f64; break;
++# endif
+     default: return m3Err_invalidTypeId;
+     }
+ 
+@@ -790,8 +794,10 @@ M3Result  m3_CallVL  (IM3Function i_function, va_list i_args)
+         switch (d_FuncArgType(ftype, i)) {
+         case c_m3Type_i32:  *(i32*)(s) = va_arg(i_args, i32);  s += 8; break;
+         case c_m3Type_i64:  *(i64*)(s) = va_arg(i_args, i64);  s += 8; break;
++# if d_m3HasFloat
+         case c_m3Type_f32:  *(f32*)(s) = va_arg(i_args, f64);  s += 8; break; // f32 is passed as f64
+         case c_m3Type_f64:  *(f64*)(s) = va_arg(i_args, f64);  s += 8; break;
++# endif
+         default: return "unknown argument type";
+         }
+     }
+@@ -831,8 +837,10 @@ M3Result  m3_Call  (IM3Function i_function, uint32_t i_argc, const void * i_argp
+         switch (d_FuncArgType(ftype, i)) {
+         case c_m3Type_i32:  *(i32*)(s) = *(i32*)i_argptrs[i];  s += 8; break;
+         case c_m3Type_i64:  *(i64*)(s) = *(i64*)i_argptrs[i];  s += 8; break;
++# if d_m3HasFloat
+         case c_m3Type_f32:  *(f32*)(s) = *(f32*)i_argptrs[i];  s += 8; break;
+         case c_m3Type_f64:  *(f64*)(s) = *(f64*)i_argptrs[i];  s += 8; break;
++# endif
+         default: return "unknown argument type";
+         }
+     }
+@@ -873,8 +881,10 @@ M3Result  m3_CallArgv  (IM3Function i_function, uint32_t i_argc, const char * i_
+         switch (d_FuncArgType(ftype, i)) {
+         case c_m3Type_i32:  *(i32*)(s) = strtoul(i_argv[i], NULL, 10);  s += 8; break;
+         case c_m3Type_i64:  *(i64*)(s) = strtoull(i_argv[i], NULL, 10); s += 8; break;
+-        case c_m3Type_f32:  *(f32*)(s) = strtod(i_argv[i], NULL);       s += 8; break;  // strtof would be less portable
++# if d_m3HasFloat
++		case c_m3Type_f32:  *(f32*)(s) = strtod(i_argv[i], NULL);       s += 8; break;  // strtof would be less portable
+         case c_m3Type_f64:  *(f64*)(s) = strtod(i_argv[i], NULL);       s += 8; break;
++# endif
+         default: return "unknown argument type";
+         }
+     }
+@@ -919,8 +929,10 @@ M3Result  m3_GetResults  (IM3Function i_function, uint32_t i_retc, const void *
+         switch (d_FuncRetType(ftype, i)) {
+         case c_m3Type_i32:  *(i32*)o_retptrs[i] = *(i32*)(s); s += 8; break;
+         case c_m3Type_i64:  *(i64*)o_retptrs[i] = *(i64*)(s); s += 8; break;
++# if d_m3HasFloat
+         case c_m3Type_f32:  *(f32*)o_retptrs[i] = *(f32*)(s); s += 8; break;
+         case c_m3Type_f64:  *(f64*)o_retptrs[i] = *(f64*)(s); s += 8; break;
++# endif 
+         default: return "unknown return type";
+         }
+     }
+@@ -951,8 +963,10 @@ M3Result  m3_GetResultsVL  (IM3Function i_function, va_list o_rets)
+         switch (d_FuncRetType(ftype, i)) {
+         case c_m3Type_i32:  *va_arg(o_rets, i32*) = *(i32*)(s);  s += 8; break;
+         case c_m3Type_i64:  *va_arg(o_rets, i64*) = *(i64*)(s);  s += 8; break;
++# if d_m3HasFloat
+         case c_m3Type_f32:  *va_arg(o_rets, f32*) = *(f32*)(s);  s += 8; break;
+         case c_m3Type_f64:  *va_arg(o_rets, f64*) = *(f64*)(s);  s += 8; break;
++# endif
+         default: return "unknown argument type";
+         }
+     }
+diff --git a/source/m3_exec_defs.h b/source/m3_exec_defs.h
+index 7bb4e814..a7992a72 100644
+--- a/source/m3_exec_defs.h
++++ b/source/m3_exec_defs.h
+@@ -12,27 +12,35 @@
+ 
+ d_m3BeginExternC
+ 
+-#define m3MemData(mem)              (u8*)(((M3MemoryHeader*)(mem))+1)
+-#define m3MemRuntime(mem)           (((M3MemoryHeader*)(mem))->runtime)
+-#define m3MemInfo(mem)              (&(((M3MemoryHeader*)(mem))->runtime->memory))
+-
+-#if d_m3HasFloat
+-
+-#   define d_m3OpSig                pc_t _pc, m3stack_t _sp, M3MemoryHeader * _mem, m3reg_t _r0, f64 _fp0
+-#   define d_m3OpArgs               _sp, _mem, _r0, _fp0
+-#   define d_m3OpAllArgs            _pc, _sp, _mem, _r0, _fp0
+-#   define d_m3OpDefaultArgs        0, 0.0
+-#   define d_m3ClearRegisters       _r0 = 0; _fp0 = 0.0;
+-
+-#else
+-
+-#   define d_m3OpSig                pc_t _pc, m3stack_t _sp, M3MemoryHeader * _mem, m3reg_t _r0
+-#   define d_m3OpArgs               _sp, _mem, _r0
+-#   define d_m3OpAllArgs            _pc, _sp, _mem, _r0
+-#   define d_m3OpDefaultArgs        0
+-#   define d_m3ClearRegisters       _r0 = 0;
+-
+-#endif
++# define m3MemData(mem)					(u8*)(((M3MemoryHeader*)(mem))+1)
++# define m3MemRuntime(mem)				(((M3MemoryHeader*)(mem))->runtime)
++# define m3MemInfo(mem)					(&(((M3MemoryHeader*)(mem))->runtime->memory))
++
++# define d_m3BaseOpSig              	pc_t _pc, m3stack_t _sp, M3MemoryHeader * _mem, m3reg_t _r0
++# define d_m3BaseOpArgs               	_sp, _mem, _r0
++# define d_m3BaseOpAllArgs            	_pc, _sp, _mem, _r0
++# define d_m3BaseOpDefaultArgs        	0
++# define d_m3BaseClearRegisters       	_r0 = 0;
++
++# define d_m3ExpOpSig(...)				d_m3BaseOpSig, __VA_ARGS__
++# define d_m3ExpOpArgs(...)				d_m3BaseOpArgs, __VA_ARGS__
++# define d_m3ExpOpAllArgs(...)			d_m3BaseOpAllArgs, __VA_ARGS__
++# define d_m3ExpOpDefaultArgs(...)		d_m3BaseOpDefaultArgs, __VA_ARGS__
++# define d_m3ExpClearRegisters(...)		d_m3BaseClearRegisters; __VA_ARGS__
++
++# if d_m3HasFloat
++#	define d_m3OpSig                d_m3ExpOpSig			(f64 _fp0)
++#   define d_m3OpArgs               d_m3ExpOpArgs			(_fp0)
++#   define d_m3OpAllArgs            d_m3ExpOpAllArgs		(_fp0)
++#   define d_m3OpDefaultArgs        d_m3ExpOpDefaultArgs	(0.)
++#   define d_m3ClearRegisters       d_m3ExpClearRegisters	(_fp0 = 0.;)
++# else
++#	define d_m3OpSig                d_m3BaseOpSig
++#   define d_m3OpArgs               d_m3BaseOpArgs
++#   define d_m3OpAllArgs            d_m3BaseOpAllArgs
++#   define d_m3OpDefaultArgs        d_m3BaseOpDefaultArgs
++#   define d_m3ClearRegisters       d_m3BaseClearRegisters
++# endif
+ 
+ typedef m3ret_t (vectorcall * IM3Operation) (d_m3OpSig);
+ 

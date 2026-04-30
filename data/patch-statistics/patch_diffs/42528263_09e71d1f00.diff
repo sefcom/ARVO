@@ -1,0 +1,37 @@
+From ac4e3e188af8bf6f0c4a808a24f6ff0daba78248 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Thu, 5 Oct 2023 00:59:19 +0200
+Subject: [PATCH] avcodec/evc_parse: Check num_remaining_tiles_in_slice_minus1
+
+Fixes: out of array access
+Fixes: 62467/clusterfuzz-testcase-minimized-ffmpeg_BSF_EVC_FRAME_MERGE_fuzzer-6092990982258688
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Reviewed-by: "Dawid Kozinski/Multimedia (PLT) /SRPOL/Staff Engineer/Samsung Electronics" <d.kozinski@samsung.com>
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/evc_parse.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/evc_parse.c b/libavcodec/evc_parse.c
+index 43b8dabf8b..cc9aa106fb 100644
+--- a/libavcodec/evc_parse.c
++++ b/libavcodec/evc_parse.c
+@@ -58,8 +58,12 @@ int ff_evc_parse_slice_header(GetBitContext *gb, EVCParserSliceHeader *sh,
+         if (!sh->arbitrary_slice_flag)
+             sh->last_tile_id = get_bits(gb, pps->tile_id_len_minus1 + 1);
+         else {
+-            sh->num_remaining_tiles_in_slice_minus1 = get_ue_golomb_long(gb);
+-            num_tiles_in_slice = sh->num_remaining_tiles_in_slice_minus1 + 2;
++            unsigned num_remaining_tiles_in_slice_minus1 = get_ue_golomb_long(gb);
++            if (num_remaining_tiles_in_slice_minus1 > EVC_MAX_TILE_ROWS * EVC_MAX_TILE_COLUMNS - 2)
++                return AVERROR_INVALIDDATA;
++
++            num_tiles_in_slice = num_remaining_tiles_in_slice_minus1 + 2;
++            sh->num_remaining_tiles_in_slice_minus1 = num_remaining_tiles_in_slice_minus1;
+             for (int i = 0; i < num_tiles_in_slice - 1; ++i)
+                 sh->delta_tile_id_minus1[i] = get_ue_golomb_long(gb);
+         }
+-- 
+2.25.1
+

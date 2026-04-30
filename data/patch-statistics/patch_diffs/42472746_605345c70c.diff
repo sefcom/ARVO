@@ -1,0 +1,387 @@
+diff --git a/gm/makecolorspace.cpp b/gm/makecolorspace.cpp
+index 82ba3a6..2f5acd6 100644
+--- a/gm/makecolorspace.cpp
++++ b/gm/makecolorspace.cpp
+@@ -8,7 +8,6 @@
+ #include "gm.h"
+ #include "Resources.h"
+ #include "SkCodec.h"
+-#include "SkColorSpace.h"
+ #include "SkImage.h"
+ #include "SkImagePriv.h"
+ 
+@@ -83,37 +82,3 @@
+ };
+ 
+ DEF_GM(return new MakeCSGM;)
+-
+-DEF_SIMPLE_GM_BG(makecolortypeandspace, canvas, 128 * 3, 128 * 4, SK_ColorWHITE) {
+-    sk_sp<SkImage> images[] = {
+-        GetResourceAsImage("images/mandrill_128.png"),
+-        GetResourceAsImage("images/color_wheel.png"),
+-    };
+-    auto rec2020 = SkColorSpace::MakeRGB(SkNamedTransferFn::kSRGB, SkNamedGamut::kRec2020);
+-
+-    // Use the lazy images on the first iteration, and concrete (raster/GPU) images on the second
+-    for (int i = 0; i < 2; ++i) {
+-        for (int j = 0; j < 2; ++j) {
+-            // Unmodified
+-            canvas->drawImage(images[j], 0, 0);
+-
+-            // 565 in a wide color space (should be visibly quantized).
+-            // With the lazy color_wheel image, this fails to draw, because we refuse to decode
+-            // transparent sources to opaque color types. Sigh.
+-            canvas->drawImage(images[j]->makeColorTypeAndColorSpace(kRGB_565_SkColorType, rec2020),
+-                              128, 0);
+-
+-            // Grayscale in the original color space. This fails in even more cases, due to the
+-            // above opaque issue, and because Ganesh doesn't support drawing to gray, at all.
+-            canvas->drawImage(images[j]->makeColorTypeAndColorSpace(kGray_8_SkColorType,
+-                                                                    images[j]->refColorSpace()),
+-                              256, 0);
+-
+-            images[j] = canvas->getGrContext()
+-                    ? images[j]->makeTextureImage(canvas->getGrContext(), nullptr)
+-                    : images[j]->makeRasterImage();
+-
+-            canvas->translate(0, 128);
+-        }
+-    }
+-}
+diff --git a/include/core/SkImage.h b/include/core/SkImage.h
+index d090d2b..c35ae95 100644
+--- a/include/core/SkImage.h
++++ b/include/core/SkImage.h
+@@ -1020,18 +1020,6 @@
+     */
+     sk_sp<SkImage> makeColorSpace(sk_sp<SkColorSpace> target) const;
+ 
+-    /** Creates SkImage in target SkColorType and SkColorSpace.
+-        Returns nullptr if SkImage could not be created.
+-
+-        Returns original SkImage if it is in target SkColorType and SkColorSpace.
+-
+-        @param targetColorType  SkColorType of returned SkImage
+-        @param targetColorSpace SkColorSpace of returned SkImage
+-        @return                 created SkImage in target SkColorType and SkColorSpace
+-    */
+-    sk_sp<SkImage> makeColorTypeAndColorSpace(SkColorType targetColorType,
+-                                              sk_sp<SkColorSpace> targetColorSpace) const;
+-
+ private:
+     SkImage(int width, int height, uint32_t uniqueID);
+     friend class SkImage_Base;
+diff --git a/src/image/SkImage.cpp b/src/image/SkImage.cpp
+index a28028e..ccc258b 100644
+--- a/src/image/SkImage.cpp
++++ b/src/image/SkImage.cpp
+@@ -313,30 +313,12 @@
+     if (!colorSpace) {
+         colorSpace = sk_srgb_singleton();
+     }
+-    if (SkColorSpace::Equals(colorSpace, target.get()) || this->isAlphaOnly()) {
++    if (SkColorSpace::Equals(colorSpace, target.get()) ||
++            kAlpha_8_SkColorType == as_IB(this)->onImageInfo().colorType()) {
+         return sk_ref_sp(const_cast<SkImage*>(this));
+     }
+ 
+-    return as_IB(this)->onMakeColorTypeAndColorSpace(this->colorType(), std::move(target));
+-}
+-
+-sk_sp<SkImage> SkImage::makeColorTypeAndColorSpace(SkColorType targetColorType,
+-                                                   sk_sp<SkColorSpace> targetColorSpace) const {
+-    if (kUnknown_SkColorType == targetColorType || !targetColorSpace) {
+-        return nullptr;
+-    }
+-
+-    SkColorType colorType = this->colorType();
+-    SkColorSpace* colorSpace = this->colorSpace();
+-    if (!colorSpace) {
+-        colorSpace = sk_srgb_singleton();
+-    }
+-    if (colorType == targetColorType &&
+-        (SkColorSpace::Equals(colorSpace, targetColorSpace.get()) || this->isAlphaOnly())) {
+-        return sk_ref_sp(const_cast<SkImage*>(this));
+-    }
+-
+-    return as_IB(this)->onMakeColorTypeAndColorSpace(targetColorType, std::move(targetColorSpace));
++    return as_IB(this)->onMakeColorSpace(std::move(target));
+ }
+ 
+ sk_sp<SkImage> SkImage::makeNonTextureImage() const {
+diff --git a/src/image/SkImage_Base.h b/src/image/SkImage_Base.h
+index e6736eb..8a73366 100644
+--- a/src/image/SkImage_Base.h
++++ b/src/image/SkImage_Base.h
+@@ -96,7 +96,7 @@
+     virtual bool onPinAsTexture(GrContext*) const { return false; }
+     virtual void onUnpinAsTexture(GrContext*) const {}
+ 
+-    virtual sk_sp<SkImage> onMakeColorTypeAndColorSpace(SkColorType, sk_sp<SkColorSpace>) const = 0;
++    virtual sk_sp<SkImage> onMakeColorSpace(sk_sp<SkColorSpace>) const = 0;
+ protected:
+     SkImage_Base(int width, int height, uint32_t uniqueID);
+ 
+diff --git a/src/image/SkImage_Gpu.cpp b/src/image/SkImage_Gpu.cpp
+index 5bec1cd..2b28f1a 100644
+--- a/src/image/SkImage_Gpu.cpp
++++ b/src/image/SkImage_Gpu.cpp
+@@ -60,11 +60,10 @@
+     return SkImageInfo::Make(fProxy->width(), fProxy->height(), colorType, fAlphaType, fColorSpace);
+ }
+ 
+-sk_sp<SkImage> SkImage_Gpu::onMakeColorTypeAndColorSpace(SkColorType targetCT,
+-                                                         sk_sp<SkColorSpace> targetCS) const {
++sk_sp<SkImage> SkImage_Gpu::onMakeColorSpace(sk_sp<SkColorSpace> target) const {
+     auto xform = GrColorSpaceXformEffect::Make(fColorSpace.get(), fAlphaType,
+-                                               targetCS.get(), fAlphaType);
+-    SkASSERT(xform || targetCT != this->colorType());
++                                               target.get(), fAlphaType);
++    SkASSERT(xform);
+ 
+     sk_sp<GrTextureProxy> proxy = this->asTextureProxyRef();
+ 
+@@ -76,7 +75,7 @@
+     sk_sp<GrRenderTargetContext> renderTargetContext(
+         fContext->contextPriv().makeDeferredRenderTargetContextWithFallback(
+             format, SkBackingFit::kExact, this->width(), this->height(),
+-            SkColorType2GrPixelConfig(targetCT), nullptr));
++            proxy->config(), nullptr));
+     if (!renderTargetContext) {
+         return nullptr;
+     }
+@@ -84,9 +83,7 @@
+     GrPaint paint;
+     paint.setPorterDuffXPFactory(SkBlendMode::kSrc);
+     paint.addColorTextureProcessor(std::move(proxy), SkMatrix::I());
+-    if (xform) {
+-        paint.addColorFragmentProcessor(std::move(xform));
+-    }
++    paint.addColorFragmentProcessor(std::move(xform));
+ 
+     renderTargetContext->drawRect(GrNoClip(), std::move(paint), GrAA::kNo, SkMatrix::I(),
+                                   SkRect::MakeIWH(this->width(), this->height()));
+@@ -96,7 +93,7 @@
+ 
+     // MDB: this call is okay bc we know 'renderTargetContext' was exact
+     return sk_make_sp<SkImage_Gpu>(fContext, kNeedNewImageUniqueID, fAlphaType,
+-                                   renderTargetContext->asTextureProxyRef(), std::move(targetCS));
++                                   renderTargetContext->asTextureProxyRef(), std::move(target));
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/src/image/SkImage_Gpu.h b/src/image/SkImage_Gpu.h
+index 3b13ec8..42ba0a5 100644
+--- a/src/image/SkImage_Gpu.h
++++ b/src/image/SkImage_Gpu.h
+@@ -37,7 +37,7 @@
+ 
+     virtual bool onIsTextureBacked() const override { return SkToBool(fProxy.get()); }
+ 
+-    sk_sp<SkImage> onMakeColorTypeAndColorSpace(SkColorType, sk_sp<SkColorSpace>) const final;
++    sk_sp<SkImage> onMakeColorSpace(sk_sp<SkColorSpace>) const final;
+ 
+     /**
+         Create a new SkImage that is very similar to an SkImage created by MakeFromTexture. The main
+diff --git a/src/image/SkImage_GpuYUVA.cpp b/src/image/SkImage_GpuYUVA.cpp
+index e178894..55411cc 100644
+--- a/src/image/SkImage_GpuYUVA.cpp
++++ b/src/image/SkImage_GpuYUVA.cpp
+@@ -143,18 +143,15 @@
+ 
+ //////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-sk_sp<SkImage> SkImage_GpuYUVA::onMakeColorTypeAndColorSpace(SkColorType,
+-                                                             sk_sp<SkColorSpace> targetCS) const {
+-    // We explicitly ignore color type changes, for now.
+-
++sk_sp<SkImage> SkImage_GpuYUVA::onMakeColorSpace(sk_sp<SkColorSpace> target) const {
+     // we may need a mutex here but for now we expect usage to be in a single thread
+     if (fOnMakeColorSpaceTarget &&
+-        SkColorSpace::Equals(targetCS.get(), fOnMakeColorSpaceTarget.get())) {
++        SkColorSpace::Equals(target.get(), fOnMakeColorSpaceTarget.get())) {
+         return fOnMakeColorSpaceResult;
+     }
+-    sk_sp<SkImage> result = sk_sp<SkImage>(new SkImage_GpuYUVA(this, targetCS));
++    sk_sp<SkImage> result = sk_sp<SkImage>(new SkImage_GpuYUVA(this, target));
+     if (result) {
+-        fOnMakeColorSpaceTarget = targetCS;
++        fOnMakeColorSpaceTarget = target;
+         fOnMakeColorSpaceResult = result;
+     }
+     return result;
+diff --git a/src/image/SkImage_GpuYUVA.h b/src/image/SkImage_GpuYUVA.h
+index 35bcbba..c8b9616 100644
+--- a/src/image/SkImage_GpuYUVA.h
++++ b/src/image/SkImage_GpuYUVA.h
+@@ -36,7 +36,7 @@
+ 
+     virtual bool onIsTextureBacked() const override { return SkToBool(fProxies[0].get()); }
+ 
+-    sk_sp<SkImage> onMakeColorTypeAndColorSpace(SkColorType, sk_sp<SkColorSpace>) const final;
++    sk_sp<SkImage> onMakeColorSpace(sk_sp<SkColorSpace>) const final;
+ 
+     virtual bool isYUVA() const override { return true; }
+     virtual bool asYUVATextureProxiesRef(sk_sp<GrTextureProxy> proxies[4],
+diff --git a/src/image/SkImage_Lazy.cpp b/src/image/SkImage_Lazy.cpp
+index 3782974..a1557e1 100644
+--- a/src/image/SkImage_Lazy.cpp
++++ b/src/image/SkImage_Lazy.cpp
+@@ -53,7 +53,7 @@
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ SkImage_Lazy::Validator::Validator(sk_sp<SharedGenerator> gen, const SkIRect* subset,
+-                                   const SkColorType* colorType, sk_sp<SkColorSpace> colorSpace)
++                                   sk_sp<SkColorSpace> colorSpace)
+         : fSharedGenerator(std::move(gen)) {
+     if (!fSharedGenerator) {
+         return;
+@@ -84,13 +84,8 @@
+ 
+     fInfo   = info.makeWH(subset->width(), subset->height());
+     fOrigin = SkIPoint::Make(subset->x(), subset->y());
+-    if (colorType || colorSpace) {
+-        if (colorType) {
+-            fInfo = fInfo.makeColorType(*colorType);
+-        }
+-        if (colorSpace) {
+-            fInfo = fInfo.makeColorSpace(colorSpace);
+-        }
++    if (colorSpace) {
++        fInfo = fInfo.makeColorSpace(colorSpace);
+         fUniqueID = SkNextID::ImageID();
+     }
+ }
+@@ -254,33 +249,30 @@
+     SkASSERT(fInfo.bounds() != subset);
+ 
+     const SkIRect generatorSubset = subset.makeOffset(fOrigin.x(), fOrigin.y());
+-    const SkColorType colorType = fInfo.colorType();
+-    Validator validator(fSharedGenerator, &generatorSubset, &colorType, fInfo.refColorSpace());
++    Validator validator(fSharedGenerator, &generatorSubset, fInfo.refColorSpace());
+     return validator ? sk_sp<SkImage>(new SkImage_Lazy(&validator)) : nullptr;
+ }
+ 
+-sk_sp<SkImage> SkImage_Lazy::onMakeColorTypeAndColorSpace(SkColorType targetCT,
+-                                                          sk_sp<SkColorSpace> targetCS) const {
+-    SkAutoExclusive autoAquire(fOnMakeColorTypeAndSpaceMutex);
+-    if (fOnMakeColorTypeAndSpaceResult &&
+-        targetCT == fOnMakeColorTypeAndSpaceResult->colorType() &&
+-        SkColorSpace::Equals(targetCS.get(), fOnMakeColorTypeAndSpaceResult->colorSpace())) {
+-        return fOnMakeColorTypeAndSpaceResult;
++sk_sp<SkImage> SkImage_Lazy::onMakeColorSpace(sk_sp<SkColorSpace> target) const {
++    SkAutoExclusive autoAquire(fOnMakeColorSpaceMutex);
++    if (fOnMakeColorSpaceTarget &&
++        SkColorSpace::Equals(target.get(), fOnMakeColorSpaceTarget.get())) {
++        return fOnMakeColorSpaceResult;
+     }
+     const SkIRect generatorSubset =
+             SkIRect::MakeXYWH(fOrigin.x(), fOrigin.y(), fInfo.width(), fInfo.height());
+-    Validator validator(fSharedGenerator, &generatorSubset, &targetCT, targetCS);
++    Validator validator(fSharedGenerator, &generatorSubset, target);
+     sk_sp<SkImage> result = validator ? sk_sp<SkImage>(new SkImage_Lazy(&validator)) : nullptr;
+     if (result) {
+-        fOnMakeColorTypeAndSpaceResult = result;
++        fOnMakeColorSpaceTarget = target;
++        fOnMakeColorSpaceResult = result;
+     }
+     return result;
+ }
+ 
+ sk_sp<SkImage> SkImage::MakeFromGenerator(std::unique_ptr<SkImageGenerator> generator,
+                                           const SkIRect* subset) {
+-    SkImage_Lazy::Validator
+-            validator(SharedGenerator::Make(std::move(generator)), subset, nullptr, nullptr);
++    SkImage_Lazy::Validator validator(SharedGenerator::Make(std::move(generator)), subset, nullptr);
+ 
+     return validator ? sk_make_sp<SkImage_Lazy>(&validator) : nullptr;
+ }
+@@ -435,10 +427,9 @@
+         ScopedGenerator generator(fSharedGenerator);
+         Generator_GrYUVProvider provider(generator);
+ 
+-        // The pixels in the texture will be in the generator's color space.
+-        // If onMakeColorTypeAndColorSpace has been called then this will not match this image's
+-        // color space. To correct this, apply a color space conversion from the generator's color
+-        // space to this image's color space.
++        // The pixels in the texture will be in the generator's color space. If onMakeColorSpace
++        // has been called then this will not match this image's color space. To correct this, apply
++        // a color space conversion from the generator's color space to this image's color space.
+         SkColorSpace* generatorColorSpace = fSharedGenerator->fGenerator->getInfo().colorSpace();
+         SkColorSpace* thisColorSpace = fInfo.colorSpace();
+ 
+diff --git a/src/image/SkImage_Lazy.h b/src/image/SkImage_Lazy.h
+index 51b893a..dbec740 100644
+--- a/src/image/SkImage_Lazy.h
++++ b/src/image/SkImage_Lazy.h
+@@ -20,8 +20,7 @@
+ class SkImage_Lazy : public SkImage_Base {
+ public:
+     struct Validator {
+-        Validator(sk_sp<SharedGenerator>, const SkIRect* subset, const SkColorType* colorType,
+-                  sk_sp<SkColorSpace> colorSpace);
++        Validator(sk_sp<SharedGenerator>, const SkIRect* subset, sk_sp<SkColorSpace> colorSpace);
+ 
+         operator bool() const { return fSharedGenerator.get(); }
+ 
+@@ -56,7 +55,7 @@
+     sk_sp<SkImage> onMakeSubset(const SkIRect&) const override;
+     bool getROPixels(SkBitmap*, CachingHint) const override;
+     bool onIsLazyGenerated() const override { return true; }
+-    sk_sp<SkImage> onMakeColorTypeAndColorSpace(SkColorType, sk_sp<SkColorSpace>) const override;
++    sk_sp<SkImage> onMakeColorSpace(sk_sp<SkColorSpace>) const override;
+ 
+     bool onIsValid(GrContext*) const override;
+ 
+@@ -78,16 +77,17 @@
+ 
+     sk_sp<SharedGenerator> fSharedGenerator;
+     // Note that fInfo is not necessarily the info from the generator. It may be cropped by
+-    // onMakeSubset and its color type/space may be changed by onMakeColorTypeAndColorSpace.
++    // onMakeSubset and its color space may be changed by onMakeColorSpace.
+     const SkImageInfo      fInfo;
+     const SkIPoint         fOrigin;
+ 
+     uint32_t fUniqueID;
+ 
+-    // Repeated calls to onMakeColorTypeAndColorSpace will result in a proliferation of unique IDs
+-    // and SkImage_Lazy instances. Cache the result of the last successful call.
+-    mutable SkMutex             fOnMakeColorTypeAndSpaceMutex;
+-    mutable sk_sp<SkImage>      fOnMakeColorTypeAndSpaceResult;
++    // Repeated calls to onMakeColorSpace will result in a proliferation of unique IDs and
++    // SkImage_Lazy instances. Cache the result of the last successful onMakeColorSpace call.
++    mutable SkMutex             fOnMakeColorSpaceMutex;
++    mutable sk_sp<SkColorSpace> fOnMakeColorSpaceTarget;
++    mutable sk_sp<SkImage>      fOnMakeColorSpaceResult;
+ 
+ #if SK_SUPPORT_GPU
+     // When the SkImage_Lazy goes away, we will iterate over all the unique keys we've used and
+diff --git a/src/image/SkImage_Raster.cpp b/src/image/SkImage_Raster.cpp
+index 806f366..78ecedb 100644
+--- a/src/image/SkImage_Raster.cpp
++++ b/src/image/SkImage_Raster.cpp
+@@ -101,7 +101,7 @@
+         SkASSERT(bitmapMayBeMutable || fBitmap.isImmutable());
+     }
+ 
+-    sk_sp<SkImage> onMakeColorTypeAndColorSpace(SkColorType, sk_sp<SkColorSpace>) const override;
++    sk_sp<SkImage> onMakeColorSpace(sk_sp<SkColorSpace>) const override;
+ 
+     bool onIsValid(GrContext* context) const override { return true; }
+     void notifyAddedToRasterCache() const override {
+@@ -337,13 +337,12 @@
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+-sk_sp<SkImage> SkImage_Raster::onMakeColorTypeAndColorSpace(SkColorType targetCT,
+-                                                            sk_sp<SkColorSpace> targetCS) const {
++sk_sp<SkImage> SkImage_Raster::onMakeColorSpace(sk_sp<SkColorSpace> target) const {
+     SkPixmap src;
+     SkAssertResult(fBitmap.peekPixels(&src));
+ 
+     SkBitmap dst;
+-    dst.allocPixels(fBitmap.info().makeColorType(targetCT).makeColorSpace(targetCS));
++    dst.allocPixels(fBitmap.info().makeColorSpace(target));
+ 
+     SkAssertResult(dst.writePixels(src));
+     dst.setImmutable();

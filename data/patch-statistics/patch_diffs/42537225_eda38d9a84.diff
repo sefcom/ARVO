@@ -1,0 +1,240 @@
+From a9bb3c7b3bd8ba90de87d03cd4d614dca764b116 Mon Sep 17 00:00:00 2001
+From: Donghee Na <donghee.na@python.org>
+Date: Tue, 23 Jul 2024 09:22:04 +0900
+Subject: [PATCH]  gh-121996: Introduce --disable-safety and
+ --enable-slower-safety options (#122054)
+
+* gh-121996: Introduce --disable-safty and --enable-slower-safty
+
+* Update GA
+
+* fix
+
+* Address code review
+
+* Update CI
+---
+ .github/workflows/build.yml                   |  3 +-
+ .github/workflows/reusable-macos.yml          |  1 +
+ .github/workflows/reusable-ubuntu.yml         |  1 +
+ Doc/using/configure.rst                       | 19 +++++++
+ ...-07-19-10-14-31.gh-issue-121996.IEb2sz.rst |  2 +
+ configure                                     | 49 +++++++++++++++++--
+ configure.ac                                  | 25 ++++++++--
+ 7 files changed, 93 insertions(+), 7 deletions(-)
+ create mode 100644 Misc/NEWS.d/next/Build/2024-07-19-10-14-31.gh-issue-121996.IEb2sz.rst
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 7ad596437507e0..fc5b98f0220626 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -307,7 +307,7 @@ jobs:
+       with:
+         save: false
+     - name: Configure CPython
+-      run: ./configure --config-cache --with-pydebug --with-openssl=$OPENSSL_DIR
++      run: ./configure --config-cache --enable-slower-safety --with-pydebug --with-openssl=$OPENSSL_DIR
+     - name: Build CPython
+       run: make -j4
+     - name: Display build info
+@@ -380,6 +380,7 @@ jobs:
+         ../cpython-ro-srcdir/configure \
+           --config-cache \
+           --with-pydebug \
++          --enable-slower-safety \
+           --with-openssl=$OPENSSL_DIR
+     - name: Build CPython out-of-tree
+       working-directory: ${{ env.CPYTHON_BUILDDIR }}
+diff --git a/.github/workflows/reusable-macos.yml b/.github/workflows/reusable-macos.yml
+index f825d1a7b3f69a..0f189960dbea61 100644
+--- a/.github/workflows/reusable-macos.yml
++++ b/.github/workflows/reusable-macos.yml
+@@ -53,6 +53,7 @@ jobs:
+         ./configure \
+           --config-cache \
+           --with-pydebug \
++          --enable-slower-safety \
+           ${{ inputs.free-threading && '--disable-gil' || '' }} \
+           --prefix=/opt/python-dev \
+           --with-openssl="$(brew --prefix openssl@3.0)"
+diff --git a/.github/workflows/reusable-ubuntu.yml b/.github/workflows/reusable-ubuntu.yml
+index 018a1d80497659..54d7765d159d49 100644
+--- a/.github/workflows/reusable-ubuntu.yml
++++ b/.github/workflows/reusable-ubuntu.yml
+@@ -69,6 +69,7 @@ jobs:
+         ../cpython-ro-srcdir/configure
+         --config-cache
+         --with-pydebug
++        --enable-slower-safety
+         --with-openssl=$OPENSSL_DIR
+         ${{ fromJSON(inputs.free-threading) && '--disable-gil' || '' }}
+     - name: Build CPython out-of-tree
+diff --git a/Doc/using/configure.rst b/Doc/using/configure.rst
+index a69343d402eb8d..32adfb0ba6e5fc 100644
+--- a/Doc/using/configure.rst
++++ b/Doc/using/configure.rst
+@@ -907,6 +907,25 @@ Security Options
+       The settings ``python`` and *STRING* also set TLS 1.2 as minimum
+       protocol version.
+ 
++.. option:: --disable-safety
++
++   Disable compiler options that are recommended by `OpenSSF`_ for security reasons with no performance overhead.
++   If this option is not enabled, CPython will be built based on safety compiler options with no slow down.
++
++   .. _OpenSSF: https://openssf.org/
++
++   .. versionadded:: 3.14
++
++.. option:: --enable-slower-safety
++
++   Enable compiler options that are recommended by `OpenSSF`_ for security reasons which require overhead.
++   If this option is not enabled, CPython will not be built based on safety compiler options which performance impact.
++
++   .. _OpenSSF: https://openssf.org/
++
++   .. versionadded:: 3.14
++
++
+ macOS Options
+ -------------
+ 
+diff --git a/Misc/NEWS.d/next/Build/2024-07-19-10-14-31.gh-issue-121996.IEb2sz.rst b/Misc/NEWS.d/next/Build/2024-07-19-10-14-31.gh-issue-121996.IEb2sz.rst
+new file mode 100644
+index 00000000000000..171efe8388bc0d
+--- /dev/null
++++ b/Misc/NEWS.d/next/Build/2024-07-19-10-14-31.gh-issue-121996.IEb2sz.rst
+@@ -0,0 +1,2 @@
++Introduce ./configure --disable-safety and --enable-slower-safety options.
++Patch by Donghee Na.
+diff --git a/configure b/configure
+index afa338902ecd71..7b3dfa71a2a192 100755
+--- a/configure
++++ b/configure
+@@ -1094,6 +1094,8 @@ enable_optimizations
+ with_lto
+ enable_bolt
+ with_strict_overflow
++enable_safety
++enable_slower_safety
+ with_dsymutil
+ with_address_sanitizer
+ with_memory_sanitizer
+@@ -1826,6 +1828,10 @@ Optional Features:
+                           (default is no)
+   --enable-bolt           enable usage of the llvm-bolt post-link optimizer
+                           (default is no)
++  --disable-safety        disable usage of the security compiler options with
++                          no performance overhead
++  --enable-slower-safety  enable usage of the security compiler options with
++                          performance overhead
+   --enable-loadable-sqlite-extensions
+                           support loadable extensions in the sqlite3 module,
+                           see Doc/library/sqlite3.rst (default is no)
+@@ -9666,7 +9672,28 @@ fi
+ 
+ # Enable flags that warn and protect for potential security vulnerabilities.
+ # These flags should be enabled by default for all builds.
+-{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether C compiler accepts -fstack-protector-strong" >&5
++
++{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for --disable-safety" >&5
++printf %s "checking for --disable-safety... " >&6; }
++# Check whether --enable-safety was given.
++if test ${enable_safety+y}
++then :
++  enableval=$enable_safety; if test "x$enable_safety" = xyes
++then :
++  disable_safety=no
++else $as_nop
++  disable_saftey=yes
++fi
++else $as_nop
++  disable_saftey=no
++fi
++
++{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $disable_safety" >&5
++printf "%s\n" "$disable_safety" >&6; }
++
++if test "$disable_safety" = "no"
++then
++  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether C compiler accepts -fstack-protector-strong" >&5
+ printf %s "checking whether C compiler accepts -fstack-protector-strong... " >&6; }
+ if test ${ax_cv_check_cflags__Werror__fstack_protector_strong+y}
+ then :
+@@ -9705,7 +9732,7 @@ else $as_nop
+ printf "%s\n" "$as_me: WARNING: -fstack-protector-strong not supported" >&2;}
+ fi
+ 
+-{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether C compiler accepts -Wtrampolines" >&5
++  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether C compiler accepts -Wtrampolines" >&5
+ printf %s "checking whether C compiler accepts -Wtrampolines... " >&6; }
+ if test ${ax_cv_check_cflags__Werror__Wtrampolines+y}
+ then :
+@@ -9744,7 +9771,22 @@ else $as_nop
+ printf "%s\n" "$as_me: WARNING: -Wtrampolines not supported" >&2;}
+ fi
+ 
+-{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether C compiler accepts -D_FORTIFY_SOURCE=3" >&5
++fi
++
++{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for --enable-slower-safety" >&5
++printf %s "checking for --enable-slower-safety... " >&6; }
++# Check whether --enable-slower-safety was given.
++if test ${enable_slower_safety+y}
++then :
++  enableval=$enable_slower_safety;
++fi
++
++{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $enable_slower_safety" >&5
++printf "%s\n" "$enable_slower_safety" >&6; }
++
++if test "$enable_slower_safety" = "yes"
++then
++  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether C compiler accepts -D_FORTIFY_SOURCE=3" >&5
+ printf %s "checking whether C compiler accepts -D_FORTIFY_SOURCE=3... " >&6; }
+ if test ${ax_cv_check_cflags___D_FORTIFY_SOURCE_3+y}
+ then :
+@@ -9783,6 +9825,7 @@ else $as_nop
+ printf "%s\n" "$as_me: WARNING: -D_FORTIFY_SOURCE=3 not supported" >&2;}
+ fi
+ 
++fi
+ 
+ case $GCC in
+ yes)
+diff --git a/configure.ac b/configure.ac
+index d695cb7a96e1af..1275c199a7cf1c 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2499,9 +2499,28 @@ AS_VAR_IF([with_strict_overflow], [yes],
+ 
+ # Enable flags that warn and protect for potential security vulnerabilities.
+ # These flags should be enabled by default for all builds.
+-AX_CHECK_COMPILE_FLAG([-fstack-protector-strong], [BASECFLAGS="$BASECFLAGS -fstack-protector-strong"], [AC_MSG_WARN([-fstack-protector-strong not supported])], [-Werror])
+-AX_CHECK_COMPILE_FLAG([-Wtrampolines], [BASECFLAGS="$BASECFLAGS -Wtrampolines"], [AC_MSG_WARN([-Wtrampolines not supported])], [-Werror])
+-AX_CHECK_COMPILE_FLAG([-D_FORTIFY_SOURCE=3], [BASECFLAGS="$BASECFLAGS -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3"], [AC_MSG_WARN([-D_FORTIFY_SOURCE=3 not supported])])
++
++AC_MSG_CHECKING([for --disable-safety])
++AC_ARG_ENABLE([safety],
++  [AS_HELP_STRING([--disable-safety], [disable usage of the security compiler options with no performance overhead])],
++  [AS_VAR_IF([enable_safety], [yes], [disable_safety=no], [disable_saftey=yes])], [disable_saftey=no])
++AC_MSG_RESULT([$disable_safety])
++
++if test "$disable_safety" = "no"
++then
++  AX_CHECK_COMPILE_FLAG([-fstack-protector-strong], [BASECFLAGS="$BASECFLAGS -fstack-protector-strong"], [AC_MSG_WARN([-fstack-protector-strong not supported])], [-Werror])
++  AX_CHECK_COMPILE_FLAG([-Wtrampolines], [BASECFLAGS="$BASECFLAGS -Wtrampolines"], [AC_MSG_WARN([-Wtrampolines not supported])], [-Werror])
++fi
++
++AC_MSG_CHECKING([for --enable-slower-safety])
++AC_ARG_ENABLE([slower-safety],
++  [AS_HELP_STRING([--enable-slower-safety], [enable usage of the security compiler options with performance overhead])],[])
++AC_MSG_RESULT([$enable_slower_safety])
++
++if test "$enable_slower_safety" = "yes"
++then
++  AX_CHECK_COMPILE_FLAG([-D_FORTIFY_SOURCE=3], [BASECFLAGS="$BASECFLAGS -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3"], [AC_MSG_WARN([-D_FORTIFY_SOURCE=3 not supported])])
++fi
+ 
+ case $GCC in
+ yes)

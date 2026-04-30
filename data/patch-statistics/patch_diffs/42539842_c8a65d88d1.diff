@@ -1,0 +1,152 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1526478063 18000
+#      Wed May 16 08:41:03 2018 -0500
+# Node ID 6416b871cf3926b081ddd2f44d455730e3c70b61
+# Parent  82bbd84affdd0eb505a3d0ca9eac78f1967961a4
+WritePTIFImage(): Fix Image blob referencing in order to avoid double-free when writing PTIF to memory BLOB. (Credit to OSS-Fuzz)
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,12 @@
++2018-05-16  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
++
++	* tests/rwblob.tap: Add a test for PTIF format.
++
++	* coders/tiff.c (WritePTIFImage): Fix Image blob referencing in
++	order to avoid double-free when writing PTIF to memory BLOB. Fixes
++	oss-fuzz 8280 "graphicsmagick/coder_PTIF_fuzzer: Heap-double-free
++	in Magick::BlobRef::~BlobRef". (Credit to OSS-Fuzz)
++
+ 2018-05-14  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
+ 	* coders/tiff.c (WriteTIFFImage): Use libtiff's
+diff --git a/VisualMagick/installer/inc/version.isx b/VisualMagick/installer/inc/version.isx
+--- a/VisualMagick/installer/inc/version.isx
++++ b/VisualMagick/installer/inc/version.isx
+@@ -10,5 +10,5 @@
+ 
+ #define public MagickPackageName "GraphicsMagick"
+ #define public MagickPackageVersion "1.4"
+-#define public MagickPackageVersionAddendum ".020180514"
+-#define public MagickPackageReleaseDate "snapshot-20180514"
++#define public MagickPackageVersionAddendum ".020180516"
++#define public MagickPackageReleaseDate "snapshot-20180516"
+diff --git a/coders/ept.c b/coders/ept.c
+--- a/coders/ept.c
++++ b/coders/ept.c
+@@ -452,7 +452,7 @@
+   entry->encoder=(EncoderHandler) WriteEPTImage;
+   entry->magick=(MagickHandler) IsEPT;
+   entry->adjoin=False;
+-  entry->blob_support=False;
++  entry->blob_support=MagickFalse;
+   entry->description="Adobe Encapsulated PostScript with MS-DOS TIFF preview";
+   entry->module="EPT";
+   entry->coder_class=PrimaryCoderClass;
+@@ -463,7 +463,7 @@
+   entry->encoder=(EncoderHandler) WriteEPTImage;
+   entry->magick=(MagickHandler) IsEPT;
+   entry->adjoin=False;
+-  entry->blob_support=False;
++  entry->blob_support=MagickFalse;
+   entry->description="Adobe Level II Encapsulated PostScript with MS-DOS TIFF preview";
+   entry->module="EPT";
+   entry->coder_class=PrimaryCoderClass;
+@@ -474,7 +474,7 @@
+   entry->encoder=(EncoderHandler) WriteEPTImage;
+   entry->magick=(MagickHandler) IsEPT;
+   entry->adjoin=False;
+-  entry->blob_support=False;
++  entry->blob_support=MagickFalse;
+   entry->description="Adobe Level III Encapsulated PostScript with MS-DOS TIFF preview";
+   entry->module="EPT";
+   entry->coder_class=PrimaryCoderClass;
+diff --git a/coders/tiff.c b/coders/tiff.c
+--- a/coders/tiff.c
++++ b/coders/tiff.c
+@@ -3798,6 +3798,8 @@
+   pyramid_image=CloneImage(image,0,0,True,&image->exception);
+   if (pyramid_image == (Image *) NULL)
+     ThrowWriterException2(FileOpenError,image->exception.reason,image);
++  DestroyBlob(pyramid_image);
++  pyramid_image->blob=ReferenceBlob(image->blob);
+   (void) SetImageAttribute(pyramid_image,"subfiletype","NONE");
+   do
+     {
+@@ -3806,6 +3808,8 @@
+                                       1.0,&image->exception);
+       if (pyramid_image->next == (Image *) NULL)
+         ThrowWriterException2(FileOpenError,image->exception.reason,image);
++      DestroyBlob(pyramid_image->next);
++        pyramid_image->next->blob=ReferenceBlob(image->blob);
+       if ((!image->is_monochrome) && (image->storage_class == PseudoClass))
+         (void) MapImage(pyramid_image->next,image,False);
+       pyramid_image->next->x_resolution=pyramid_image->x_resolution/2;
+diff --git a/magick/version.h b/magick/version.h
+--- a/magick/version.h
++++ b/magick/version.h
+@@ -38,8 +38,8 @@
+ #define MagickLibVersion  0x211800
+ #define MagickLibVersionText  "1.4"
+ #define MagickLibVersionNumber 21,18,0
+-#define MagickChangeDate   "20180514"
+-#define MagickReleaseDate  "snapshot-20180514"
++#define MagickChangeDate   "20180516"
++#define MagickReleaseDate  "snapshot-20180516"
+ 	
+ /*
+   The MagickLibInterfaceNewest and MagickLibInterfaceOldest defines
+diff --git a/tests/rwblob.tap b/tests/rwblob.tap
+--- a/tests/rwblob.tap
++++ b/tests/rwblob.tap
+@@ -1,5 +1,5 @@
+ #!/bin/sh
+-# Copyright (C) 2004-2015 GraphicsMagick Group
++# Copyright (C) 2004-2018 GraphicsMagick Group
+ . ./common.shi
+ . ${top_srcdir}/tests/common.shi
+ 
+@@ -10,7 +10,7 @@
+ check_types='bilevel gray pallette truecolor'
+ 
+ # Number of tests we plan to run
+-test_plan_fn 204
++test_plan_fn 208
+ 
+ # ART format
+ for type in ${check_types}
+@@ -222,6 +222,12 @@
+   test_command_fn "PPM ${type}" ${MEMCHECK} ${rwblob} "${SRCDIR}/input_${type}.miff" PPM
+ done
+ 
++# PTIF format
++for type in ${check_types}
++do
++  test_command_fn "PTIF ${type}" ${MEMCHECK} ${rwblob} "${SRCDIR}/input_${type}.miff" PTIF
++done
++
+ # RAS format
+ for type in ${check_types}
+ do
+diff --git a/www/Changelog.html b/www/Changelog.html
+--- a/www/Changelog.html
++++ b/www/Changelog.html
+@@ -35,6 +35,16 @@
+ <div class="document">
+ 
+ 
++<p>2018-05-16  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
++<blockquote>
++<ul class="simple">
++<li>tests/rwblob.tap: Add a test for PTIF format.</li>
++<li>coders/tiff.c (WritePTIFImage): Fix Image blob referencing in
++order to avoid double-free when writing PTIF to memory BLOB. Fixes
++oss-fuzz 8280 &quot;graphicsmagick/coder_PTIF_fuzzer: Heap-double-free
++in Magick::BlobRef::~BlobRef&quot;. (Credit to OSS-Fuzz)</li>
++</ul>
++</blockquote>
+ <p>2018-05-14  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
+ <blockquote>
+ <ul class="simple">

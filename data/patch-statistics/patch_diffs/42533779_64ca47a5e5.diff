@@ -1,0 +1,64 @@
+From 6ea61bfe531edd387ee01ca91b049845ac0d841d Mon Sep 17 00:00:00 2001
+From: Rob Davies <rmd+git@sanger.ac.uk>
+Date: Wed, 20 Mar 2024 10:11:48 +0000
+Subject: [PATCH] Fix duplicated but missing FORMAT bug
+
+7ce510c added code to drop duplicate FORMAT tags, but missed the
+case where the duplicated entry was off the end of the per-sample
+data, so it hit the part that put in MISSING values.  This lead
+to an attempt to call memset() with a negative size.  Fixed by
+adding code to skip the duplicated FORMAT tag.
+
+Credit to OSS-Fuzz
+Fixes oss-fuzz 67431
+---
+ test/noroundtrip-out.vcf | 2 ++
+ test/noroundtrip.vcf     | 2 ++
+ vcf.c                    | 4 ++++
+ 3 files changed, 8 insertions(+)
+
+diff --git a/test/noroundtrip-out.vcf b/test/noroundtrip-out.vcf
+index 60e52c2bf..21fa1602a 100644
+--- a/test/noroundtrip-out.vcf
++++ b/test/noroundtrip-out.vcf
+@@ -2,8 +2,10 @@
+ ##FILTER=<ID=PASS,Description="All filters passed">
+ ##contig=<ID=3>
+ ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
++##FORMAT=<ID=S,Number=1,Type=String,Description="Non-GT string">
+ #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NA1
+ 3	50	.	A	T	0	PASS	.	GT	0/1
+ 3	60	.	T	C	0	PASS	.	GT	0/1
+ 3	70	.	G	A	0	PASS	.	GT	0/1
+ 3	80	.	C	G	0	PASS	.	GT	0/1
++3	90	.	A	G	0	PASS	.	GT:S	0/1:.
+diff --git a/test/noroundtrip.vcf b/test/noroundtrip.vcf
+index c4610415d..61206bf0c 100644
+--- a/test/noroundtrip.vcf
++++ b/test/noroundtrip.vcf
+@@ -1,8 +1,10 @@
+ ##fileformat=VCFv4.3
+ ##contig=<ID=3>
+ ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
++##FORMAT=<ID=S,Number=1,Type=String,Description="Non-GT string">
+ #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NA1
+ 3	50	.	A	T	0	PASS	.	GT:GT	0/1
+ 3	60	.	T	C	0	PASS	.	GT	0/1
+ 3	70	.	G	A	0	PASS	.	GT:GT	0/1:.
+ 3	80	.	C	G	0	PASS	.	GT:GT	0/1:0/1
++3	90	.	A	G	0	PASS	.	GT:S:S	0/1
+diff --git a/vcf.c b/vcf.c
+index 492e2ebd5..9dec8481b 100644
+--- a/vcf.c
++++ b/vcf.c
+@@ -3234,6 +3234,10 @@ static int vcf_parse_format_fill5(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
+             fmt_aux_t *z = &fmt[j];
+             const int htype = z->y>>4&0xf;
+             int l;
++
++            if (z->size == -1) // this field is to be ignored
++                continue;
++
+             if (htype == BCF_HT_STR) {
+                 if (z->is_gt) {
+                     int32_t *x = (int32_t*)(z->buf + z->size * (size_t)m);

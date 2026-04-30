@@ -1,0 +1,70 @@
+From 7eced55b5700c0d2aa2e102ed78f10b0ce755a64 Mon Sep 17 00:00:00 2001
+From: Ken Sharp <ken.sharp@artifex.com>
+Date: Thu, 6 Apr 2023 16:14:20 +0100
+Subject: GhostPDF - prevent buffer overrun when evaluating functions
+
+OSS-fuzz bug #57745
+
+The problem in the report is that the BlackGeneration function is a 1-in
+3-out function. It is required to be a 1-in, 1-out function. The result
+was that the evaluation was writing 3 floats to a 1 float buffer.
+
+Check the parameters of the function to make sure it is of the correct
+size before trying to evaluate it.
+
+I also desk-checked all the other uses of functions; most were already
+checking the function parameters but I found two more cases which were
+not. Fix the /Separation and DeviceN tint transform so that we check the
+number of inputs and outputs to make sure they are correct.
+---
+ pdf/pdf_colour.c | 10 ++++++++++
+ pdf/pdf_gstate.c |  5 +++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/pdf/pdf_colour.c b/pdf/pdf_colour.c
+index 24610adcd..cdbc73700 100644
+--- a/pdf/pdf_colour.c
++++ b/pdf/pdf_colour.c
+@@ -2004,6 +2004,11 @@ static int pdfi_create_Separation(pdf_context *ctx, pdf_array *color_array, int
+     if (code < 0)
+         goto pdfi_separation_error;
+ 
++    if (pfn->params.m != 1 || pfn->params.n != cs_num_components(pcs_alt)) {
++        code = gs_note_error(gs_error_rangecheck);
++        goto pdfi_separation_error;
++    }
++
+     code = gs_cspace_new_Separation(&pcs, pcs_alt, ctx->memory);
+     if (code < 0)
+         goto pdfi_separation_error;
+@@ -2184,6 +2189,11 @@ all_error:
+     if (code < 0)
+         goto pdfi_devicen_error;
+ 
++    if (pfn->params.m != pdfi_array_size(inks) || pfn->params.n != cs_num_components(pcs_alt)) {
++        code = gs_note_error(gs_error_rangecheck);
++        goto pdfi_devicen_error;
++    }
++
+     code = gs_cspace_new_DeviceN(&pcs, pdfi_array_size(inks), pcs_alt, ctx->memory);
+     if (code < 0)
+         return code;
+diff --git a/pdf/pdf_gstate.c b/pdf/pdf_gstate.c
+index 8df271924..f33976356 100644
+--- a/pdf/pdf_gstate.c
++++ b/pdf/pdf_gstate.c
+@@ -609,6 +609,11 @@ static int pdfi_set_blackgeneration(pdf_context *ctx, pdf_obj *obj, pdf_dict *pa
+             if (code < 0)
+                 return code;
+ 
++            if (pfn->params.n != 1) {
++                pdfi_free_function(ctx, pfn);
++                return_error(gs_error_rangecheck);
++            }
++
+             gs_setblackgeneration_remap(ctx->pgs, gs_mapped_transfer, false);
+             for (i = 0; i < transfer_map_size; i++) {
+                 float v, f;
+-- 
+cgit v1.2.3
+

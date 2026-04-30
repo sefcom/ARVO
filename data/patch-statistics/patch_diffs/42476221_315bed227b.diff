@@ -1,0 +1,474 @@
+From 4833cc89b2fae2e8863b46bf1dc785964847e882 Mon Sep 17 00:00:00 2001
+From: Markus Scherer <markus.icu@gmail.com>
+Date: Fri, 1 Apr 2022 22:25:34 +0000
+Subject: [PATCH] ICU-20715 CollationDataBuilder reset outdated
+ prefix+contraction values
+
+See #2052
+---
+ icu4c/source/i18n/collationdatabuilder.cpp    | 52 +++++++++----
+ icu4c/source/i18n/collationdatabuilder.h      |  9 +++
+ icu4c/source/test/intltest/collationtest.cpp  | 30 ++++++++
+ .../icu/impl/coll/CollationDataBuilder.java   | 75 ++++++++++++++-----
+ .../icu/dev/test/collator/CollationTest.java  | 54 +++++++++++--
+ 5 files changed, 182 insertions(+), 38 deletions(-)
+
+diff --git a/icu4c/source/i18n/collationdatabuilder.cpp b/icu4c/source/i18n/collationdatabuilder.cpp
+index b10de993c279..d6ef51716343 100644
+--- a/icu4c/source/i18n/collationdatabuilder.cpp
++++ b/icu4c/source/i18n/collationdatabuilder.cpp
+@@ -86,13 +86,25 @@ struct ConditionalCE32 : public UMemory {
+      * When fetching CEs from the builder, the contexts are built into their runtime form
+      * so that the normal collation implementation can process them.
+      * The result is cached in the list head. It is reset when the contexts are modified.
++     * All of these builtCE32 are invalidated by clearContexts(),
++     * via incrementing the contextsEra.
+      */
+     uint32_t builtCE32;
++    /**
++     * The "era" of building intermediate contexts when the above builtCE32 was set.
++     * When the array of cached, temporary contexts overflows, then clearContexts()
++     * removes them all and invalidates the builtCE32 that used to point to built tries.
++     */
++    int32_t era = -1;
+     /**
+      * Index of the next ConditionalCE32.
+      * Negative for the end of the list.
+      */
+     int32_t next;
++    // Note: We could create a separate class for all of the contextual mappings for
++    // a code point, with the builtCE32, the era, and a list of the actual mappings.
++    // The class that represents one mapping would then not need to
++    // store those fields in each element.
+ };
+ 
+ U_CDECL_BEGIN
+@@ -267,7 +279,7 @@ DataBuilderCollationIterator::getCE32FromBuilderData(uint32_t ce32, UErrorCode &
+             // TODO: ICU-21531 figure out why this happens.
+             return 0;
+         }
+-        if(cond->builtCE32 == Collation::NO_CE32) {
++        if(cond->builtCE32 == Collation::NO_CE32 || cond->era != builder.contextsEra) {
+             // Build the context-sensitive mappings into their runtime form and cache the result.
+             cond->builtCE32 = builder.buildContext(cond, errorCode);
+             if(errorCode == U_BUFFER_OVERFLOW_ERROR) {
+@@ -275,6 +287,7 @@ DataBuilderCollationIterator::getCE32FromBuilderData(uint32_t ce32, UErrorCode &
+                 builder.clearContexts();
+                 cond->builtCE32 = builder.buildContext(cond, errorCode);
+             }
++            cond->era = builder.contextsEra;
+             builderData.contexts = builder.contexts.getBuffer();
+         }
+         return cond->builtCE32;
+@@ -1322,13 +1335,10 @@ CollationDataBuilder::buildMappings(CollationData &data, UErrorCode &errorCode)
+ void
+ CollationDataBuilder::clearContexts() {
+     contexts.remove();
+-    UnicodeSetIterator iter(contextChars);
+-    while(iter.next()) {
+-        U_ASSERT(!iter.isString());
+-        uint32_t ce32 = utrie2_get32(trie, iter.getCodepoint());
+-        U_ASSERT(isBuilderContextCE32(ce32));
+-        getConditionalCE32ForCE32(ce32)->builtCE32 = Collation::NO_CE32;
+-    }
++    // Incrementing the contexts build "era" invalidates all of the builtCE32
++    // from before this clearContexts() call.
++    // Simpler than finding and resetting all of those fields.
++    ++contextsEra;
+ }
+ 
+ void
+@@ -1336,7 +1346,7 @@ CollationDataBuilder::buildContexts(UErrorCode &errorCode) {
+     if(U_FAILURE(errorCode)) { return; }
+     // Ignore abandoned lists and the cached builtCE32,
+     // and build all contexts from scratch.
+-    contexts.remove();
++    clearContexts();
+     UnicodeSetIterator iter(contextChars);
+     while(U_SUCCESS(errorCode) && iter.next()) {
+         U_ASSERT(!iter.isString());
+@@ -1362,18 +1372,34 @@ CollationDataBuilder::buildContext(ConditionalCE32 *head, UErrorCode &errorCode)
+     U_ASSERT(head->next >= 0);
+     UCharsTrieBuilder prefixBuilder(errorCode);
+     UCharsTrieBuilder contractionBuilder(errorCode);
++    // This outer loop goes from each prefix to the next.
++    // For each prefix it finds the one or more same-prefix entries (firstCond..lastCond).
++    // If there are multiple suffixes for the same prefix,
++    // then an inner loop builds a contraction trie for them.
+     for(ConditionalCE32 *cond = head;; cond = getConditionalCE32(cond->next)) {
++        if(U_FAILURE(errorCode)) { return 0; }  // early out for memory allocation errors
+         // After the list head, the prefix or suffix can be empty, but not both.
+         U_ASSERT(cond == head || cond->hasContext());
+         int32_t prefixLength = cond->prefixLength();
+         UnicodeString prefix(cond->context, 0, prefixLength + 1);
+         // Collect all contraction suffixes for one prefix.
+         ConditionalCE32 *firstCond = cond;
+-        ConditionalCE32 *lastCond = cond;
+-        while(cond->next >= 0 &&
+-                (cond = getConditionalCE32(cond->next))->context.startsWith(prefix)) {
++        ConditionalCE32 *lastCond;
++        do {
+             lastCond = cond;
+-        }
++            // Clear the defaultCE32 fields as we go.
++            // They are left over from building a previous version of this list of contexts.
++            //
++            // One of the code paths below may copy a preceding defaultCE32
++            // into its emptySuffixCE32.
++            // If a new suffix has been inserted before what used to be
++            // the firstCond for its prefix, then that previous firstCond could still
++            // contain an outdated defaultCE32 from an earlier buildContext() and
++            // result in an incorrect emptySuffixCE32.
++            // So we reset all defaultCE32 before reading and setting new values.
++            cond->defaultCE32 = Collation::NO_CE32;
++        } while(cond->next >= 0 &&
++                (cond = getConditionalCE32(cond->next))->context.startsWith(prefix));
+         uint32_t ce32;
+         int32_t suffixStart = prefixLength + 1;  // == prefix.length()
+         if(lastCond->context.length() == suffixStart) {
+diff --git a/icu4c/source/i18n/collationdatabuilder.h b/icu4c/source/i18n/collationdatabuilder.h
+index 6ae77772fd5a..4b981118f11c 100644
+--- a/icu4c/source/i18n/collationdatabuilder.h
++++ b/icu4c/source/i18n/collationdatabuilder.h
+@@ -244,6 +244,15 @@ class U_I18N_API CollationDataBuilder : public UObject {
+     UnicodeSet contextChars;
+     // Serialized UCharsTrie structures for finalized contexts.
+     UnicodeString contexts;
++private:
++    /**
++     * The "era" of building intermediate contexts.
++     * When the array of cached, temporary contexts overflows, then clearContexts()
++     * removes them all and invalidates the builtCE32 that used to point to built tries.
++     * See ConditionalCE32::era.
++     */
++    int32_t contextsEra = 0;
++protected:
+     UnicodeSet unsafeBackwardSet;
+     UBool modified;
+ 
+diff --git a/icu4c/source/test/intltest/collationtest.cpp b/icu4c/source/test/intltest/collationtest.cpp
+index 4ce9ada56ca6..5cc45a5423dd 100644
+--- a/icu4c/source/test/intltest/collationtest.cpp
++++ b/icu4c/source/test/intltest/collationtest.cpp
+@@ -79,6 +79,7 @@ class CollationTest : public IntlTest {
+     void TestTailoredElements();
+     void TestDataDriven();
+     void TestLongLocale();
++    void TestBuilderContextsOverflow();
+ 
+ private:
+     void checkFCD(const char *name, CollationIterator &ci, CodePointIterator &cpi);
+@@ -150,6 +151,7 @@ void CollationTest::runIndexedTest(int32_t index, UBool exec, const char *&name,
+     TESTCASE_AUTO(TestTailoredElements);
+     TESTCASE_AUTO(TestDataDriven);
+     TESTCASE_AUTO(TestLongLocale);
++    TESTCASE_AUTO(TestBuilderContextsOverflow);
+     TESTCASE_AUTO_END;
+ }
+ 
+@@ -1862,4 +1864,32 @@ void CollationTest::TestLongLocale() {
+     LocalPointer<Collator> coll(Collator::createInstance(longLocale, errorCode));
+ }
+ 
++void CollationTest::TestBuilderContextsOverflow() {
++    IcuTestErrorCode errorCode(*this, "TestBuilderContextsOverflow");
++    // ICU-20715: Bad memory access in what looks like a bogus CharsTrie after
++    // intermediate contextual-mappings data overflowed.
++    // Caused by the CollationDataBuilder using some outdated values when building
++    // contextual mappings with both prefix and contraction matching.
++    // Fixed by resetting those outdated values before code looks at them.
++    char16_t rules[] = {
++        u'&', 0x10, 0x2ff, 0x503c, 0x4617,
++        u'=', 0x80, 0x4f7f, 0xff, 0x3c3d, 0x1c4f, 0x3c3c,
++        u'<', 0, 0, 0, 0, u'|', 0, 0, 0, 0, 0, 0xf400, 0x30ff, 0, 0, 0x4f7f, 0xff,
++        u'=', 0, u'|', 0, 0, 0, 0, 0, 0, 0x1f00, 0xe30,
++        0x3035, 0, 0, 0xd200, 0, 0x7f00, 0xff4f, 0x3d00, 0, 0x7c00,
++        0, 0, 0, 0, 0, 0, 0, 0x301f, 0x350e, 0x30,
++        0, 0, 0xd2, 0x7c00, 0, 0, 0, 0, 0, 0,
++        0, 0x301f, 0x350e, 0x30, 0, 0, 0x52d2, 0x2f3c, 0x5552, 0x493c,
++        0x1f10, 0x1f50, 0x300, 0, 0, 0xf400, 0x30ff, 0, 0, 0x4f7f,
++        0xff,
++        u'=', 0, u'|', 0, 0, 0, 0, 0x5000, 0x4617,
++        u'=', 0x80, 0x4f7f, 0, 0, 0xd200, 0
++    };
++    UnicodeString s(false, rules, UPRV_LENGTHOF(rules));
++    LocalPointer<Collator> coll(new RuleBasedCollator(s, errorCode), errorCode);
++    if(errorCode.isSuccess()) {
++        logln("successfully built the Collator");
++    }
++}
++
+ #endif  // !UCONFIG_NO_COLLATION
+diff --git a/icu4j/main/classes/collate/src/com/ibm/icu/impl/coll/CollationDataBuilder.java b/icu4j/main/classes/collate/src/com/ibm/icu/impl/coll/CollationDataBuilder.java
+index 9f424ff67e27..675dcb610690 100644
+--- a/icu4j/main/classes/collate/src/com/ibm/icu/impl/coll/CollationDataBuilder.java
++++ b/icu4j/main/classes/collate/src/com/ibm/icu/impl/coll/CollationDataBuilder.java
+@@ -54,7 +54,7 @@ interface CEModifier {
+         trie = null;
+         ce32s = new UVector32();
+         ce64s = new UVector64();
+-        conditionalCE32s = new ArrayList<ConditionalCE32>();
++        conditionalCE32s = new ArrayList<>();
+         modified = false;
+         fastLatinEnabled = false;
+         fastLatinBuilder = null;
+@@ -385,13 +385,25 @@ private static final class ConditionalCE32 {
+          * When fetching CEs from the builder, the contexts are built into their runtime form
+          * so that the normal collation implementation can process them.
+          * The result is cached in the list head. It is reset when the contexts are modified.
++         * All of these builtCE32 are invalidated by clearContexts(),
++         * via incrementing the contextsEra.
+          */
+         int builtCE32;
++        /**
++         * The "era" of building intermediate contexts when the above builtCE32 was set.
++         * When the array of cached, temporary contexts overflows, then clearContexts()
++         * removes them all and invalidates the builtCE32 that used to point to built tries.
++         */
++        int era = -1;
+         /**
+          * Index of the next ConditionalCE32.
+          * Negative for the end of the list.
+          */
+         int next;
++        // Note: We could create a separate class for all of the contextual mappings for
++        // a code point, with the builtCE32, the era, and a list of the actual mappings.
++        // The class that represents one mapping would then not need to
++        // store those fields in each element.
+     }
+ 
+     protected int getCE32FromOffsetCE32(boolean fromBase, int c, int ce32) {
+@@ -415,7 +427,7 @@ protected int addCE32(int ce32) {
+         for(int i = 0; i < length; ++i) {
+             if(ce32 == ce32s.elementAti(i)) { return i; }
+         }
+-        ce32s.addElement(ce32);  
++        ce32s.addElement(ce32);
+         return length;
+     }
+ 
+@@ -989,19 +1001,16 @@ protected void buildMappings(CollationData data) {
+ 
+     protected void clearContexts() {
+         contexts.setLength(0);
+-        UnicodeSetIterator iter = new UnicodeSetIterator(contextChars);
+-        while(iter.next()) {
+-            assert(iter.codepoint != UnicodeSetIterator.IS_STRING);
+-            int ce32 = trie.get(iter.codepoint);
+-            assert(isBuilderContextCE32(ce32));
+-            getConditionalCE32ForCE32(ce32).builtCE32 = Collation.NO_CE32;
+-        }
++        // Incrementing the contexts build "era" invalidates all of the builtCE32
++        // from before this clearContexts() call.
++        // Simpler than finding and resetting all of those fields.
++        ++contextsEra;
+     }
+ 
+     protected void buildContexts() {
+         // Ignore abandoned lists and the cached builtCE32,
+         // and build all contexts from scratch.
+-        contexts.setLength(0);
++        clearContexts();
+         UnicodeSetIterator iter = new UnicodeSetIterator(contextChars);
+         while(iter.next()) {
+             assert(iter.codepoint != UnicodeSetIterator.IS_STRING);
+@@ -1021,8 +1030,12 @@ protected int buildContext(ConditionalCE32 head) {
+         assert(!head.hasContext());
+         // The list head must be followed by one or more nodes that all do have context.
+         assert(head.next >= 0);
+-        CharsTrieBuilder prefixBuilder = new CharsTrieBuilder();
+-        CharsTrieBuilder contractionBuilder = new CharsTrieBuilder();
++        CharsTrieBuilder prefixBuilder = null;
++        CharsTrieBuilder contractionBuilder = null;
++        // This outer loop goes from each prefix to the next.
++        // For each prefix it finds the one or more same-prefix entries (firstCond..lastCond).
++        // If there are multiple suffixes for the same prefix,
++        // then an inner loop builds a contraction trie for them.
+         for(ConditionalCE32 cond = head;; cond = getConditionalCE32(cond.next)) {
+             // After the list head, the prefix or suffix can be empty, but not both.
+             assert(cond == head || cond.hasContext());
+@@ -1031,11 +1044,22 @@ protected int buildContext(ConditionalCE32 head) {
+             String prefixString = prefix.toString();
+             // Collect all contraction suffixes for one prefix.
+             ConditionalCE32 firstCond = cond;
+-            ConditionalCE32 lastCond = cond;
+-            while(cond.next >= 0 &&
+-                    (cond = getConditionalCE32(cond.next)).context.startsWith(prefixString)) {
++            ConditionalCE32 lastCond;
++            do {
+                 lastCond = cond;
+-            }
++                // Clear the defaultCE32 fields as we go.
++                // They are left over from building a previous version of this list of contexts.
++                //
++                // One of the code paths below may copy a preceding defaultCE32
++                // into its emptySuffixCE32.
++                // If a new suffix has been inserted before what used to be
++                // the firstCond for its prefix, then that previous firstCond could still
++                // contain an outdated defaultCE32 from an earlier buildContext() and
++                // result in an incorrect emptySuffixCE32.
++                // So we reset all defaultCE32 before reading and setting new values.
++                cond.defaultCE32 = Collation.NO_CE32;
++            } while(cond.next >= 0 &&
++                    (cond = getConditionalCE32(cond.next)).context.startsWith(prefixString));
+             int ce32;
+             int suffixStart = prefixLength + 1;  // == prefix.length()
+             if(lastCond.context.length() == suffixStart) {
+@@ -1045,7 +1069,11 @@ protected int buildContext(ConditionalCE32 head) {
+                 cond = lastCond;
+             } else {
+                 // Build the contractions trie.
+-                contractionBuilder.clear();
++                if(contractionBuilder == null) {
++                    contractionBuilder = new CharsTrieBuilder();
++                } else {
++                    contractionBuilder.clear();
++                }
+                 // Entry for an empty suffix, to be stored before the trie.
+                 int emptySuffixCE32 = Collation.NO_CE32;  // Will always be set to a real value.
+                 int flags = 0;
+@@ -1114,6 +1142,9 @@ protected int buildContext(ConditionalCE32 head) {
+             } else {
+                 prefix.delete(0, 1);  // Remove the length unit.
+                 prefix.reverse();
++                if(prefixBuilder == null) {
++                    prefixBuilder = new CharsTrieBuilder();
++                }
+                 prefixBuilder.add(prefix, ce32);
+                 if(cond.next < 0) { break; }
+             }
+@@ -1304,7 +1335,7 @@ protected int getCE32FromBuilderData(int ce32) {
+                 return builder.trie.get(jamo);
+             } else {
+                 ConditionalCE32 cond = builder.getConditionalCE32ForCE32(ce32);
+-                if(cond.builtCE32 == Collation.NO_CE32) {
++                if(cond.builtCE32 == Collation.NO_CE32 || cond.era != builder.contextsEra) {
+                     // Build the context-sensitive mappings into their runtime form and cache the result.
+                     try {
+                         cond.builtCE32 = builder.buildContext(cond);
+@@ -1312,6 +1343,7 @@ protected int getCE32FromBuilderData(int ce32) {
+                         builder.clearContexts();
+                         cond.builtCE32 = builder.buildContext(cond);
+                     }
++                    cond.era = builder.contextsEra;
+                     builderData.contexts = builder.contexts.toString();
+                 }
+                 return cond.builtCE32;
+@@ -1345,6 +1377,13 @@ protected final boolean isMutable() {
+     protected UnicodeSet contextChars = new UnicodeSet();
+     // Serialized UCharsTrie structures for finalized contexts.
+     protected StringBuilder contexts = new StringBuilder();
++    /**
++     * The "era" of building intermediate contexts.
++     * When the array of cached, temporary contexts overflows, then clearContexts()
++     * removes them all and invalidates the builtCE32 that used to point to built tries.
++     * See {@link ConditionalCE32#era}.
++     */
++    private int contextsEra = 0;
+     protected UnicodeSet unsafeBackwardSet = new UnicodeSet();
+     protected boolean modified;
+ 
+diff --git a/icu4j/main/tests/collate/src/com/ibm/icu/dev/test/collator/CollationTest.java b/icu4j/main/tests/collate/src/com/ibm/icu/dev/test/collator/CollationTest.java
+index 28f893a5c199..dce9312a95b6 100644
+--- a/icu4j/main/tests/collate/src/com/ibm/icu/dev/test/collator/CollationTest.java
++++ b/icu4j/main/tests/collate/src/com/ibm/icu/dev/test/collator/CollationTest.java
+@@ -948,7 +948,7 @@ public void TestTailoredElements() {
+         CollationData root = CollationRoot.getData();
+         CollationRootElements rootElements = new CollationRootElements(root.rootElements);
+ 
+-        Set<String> prevLocales = new HashSet<String>();
++        Set<String> prevLocales = new HashSet<>();
+         prevLocales.add("");
+         prevLocales.add("root");
+         prevLocales.add("root@collation=standard");
+@@ -1145,7 +1145,7 @@ private int parseRelationAndString(Output<String> s) throws ParseException {
+         }
+ 
+         start = skipSpaces(start);
+-        Output<String> prefixOut = new Output<String>();
++        Output<String> prefixOut = new Output<>();
+         start = parseString(start, prefixOut, s);
+         if (prefixOut.value != null) {
+             logln(fileLine);
+@@ -1491,14 +1491,14 @@ private static int getDifferenceLevel(CollationKey prevKey, CollationKey key,
+     private boolean checkCompareTwo(String norm, String prevFileLine, String prevString, String s,
+                                     int expectedOrder, int expectedLevel) {
+         // Get the sort keys first, for error debug output.
+-        Output<CollationKey> prevKeyOut = new Output<CollationKey>();
++        Output<CollationKey> prevKeyOut = new Output<>();
+         CollationKey prevKey;
+         if (!getCollationKey(norm, fileLine, prevString, prevKeyOut)) {
+             return false;
+         }
+         prevKey = prevKeyOut.value;
+ 
+-        Output<CollationKey> keyOut = new Output<CollationKey>();
++        Output<CollationKey> keyOut = new Output<>();
+         CollationKey key;
+         if (!getCollationKey(norm, fileLine, s, keyOut)) {
+             return false;
+@@ -1566,8 +1566,8 @@ private boolean checkCompareTwo(String norm, String prevFileLine, String prevStr
+         // only that those two methods yield the same order.
+         //
+         // Use bit-wise OR so that getMergedCollationKey() is always called for both strings.
+-        Output<CollationKey> outPrevKey = new Output<CollationKey>(prevKey);
+-        Output<CollationKey> outKey = new Output<CollationKey>(key);
++        Output<CollationKey> outPrevKey = new Output<>(prevKey);
++        Output<CollationKey> outKey = new Output<>(key);
+         if (getMergedCollationKey(prevString, outPrevKey) | getMergedCollationKey(s, outKey)) {
+             prevKey = outPrevKey.value;
+             key = outKey.value;
+@@ -1606,7 +1606,7 @@ private boolean checkCompareTwo(String norm, String prevFileLine, String prevStr
+     private void checkCompareStrings(BufferedReader in) throws IOException {
+         String prevFileLine = "(none)";
+         String prevString = "";
+-        Output<String> sOut = new Output<String>();
++        Output<String> sOut = new Output<>();
+         while (readNonEmptyLine(in) && !isSectionStarter(fileLine.charAt(0))) {
+             // Parse the line even if it will be ignored (when we do not have a Collator)
+             // in order to report syntax issues.
+@@ -1703,4 +1703,44 @@ public void TestDataDriven() {
+             }
+         }
+     }
++
++    @Test
++    public void TestBuilderContextsOverflow() {
++        // ICU-20715: ParseException caused by StringIndexOutOfBoundsException
++        // using what looks like a bogus CharsTrie after
++        // intermediate contextual-mappings data overflowed.
++        // Caused by the CollationDataBuilder using some outdated values when building
++        // contextual mappings with both prefix and contraction matching.
++        // Fixed by resetting those outdated values before code looks at them.
++        char[] rules = {
++            '&', 0x10, 0x2ff, 0x503c, 0x4617,
++            '=', 0x80, 0x4f7f, 0xff, 0x3c3d, 0x1c4f, 0x3c3c,
++            '<', 0, 0, 0, 0, '|', 0, 0, 0, 0, 0, 0xf400, 0x30ff, 0, 0, 0x4f7f, 0xff,
++            '=', 0, '|', 0, 0, 0, 0, 0, 0, 0x1f00, 0xe30,
++            0x3035, 0, 0, 0xd200, 0, 0x7f00, 0xff4f, 0x3d00, 0, 0x7c00,
++            0, 0, 0, 0, 0, 0, 0, 0x301f, 0x350e, 0x30,
++            0, 0, 0xd2, 0x7c00, 0, 0, 0, 0, 0, 0,
++            0, 0x301f, 0x350e, 0x30, 0, 0, 0x52d2, 0x2f3c, 0x5552, 0x493c,
++            0x1f10, 0x1f50, 0x300, 0, 0, 0xf400, 0x30ff, 0, 0, 0x4f7f,
++            0xff,
++            '=', 0, '|', 0, 0, 0, 0, 0x5000, 0x4617,
++            '=', 0x80, 0x4f7f, 0, 0, 0xd200, 0
++        };
++        String s = new String(rules);
++        try {
++            new RuleBasedCollator(s);
++            logln("successfully built the Collator");
++        } catch (StringIndexOutOfBoundsException e) {
++            errln("unhandled StringIndexOutOfBoundsException: " + e);
++        } catch (ParseException pe) {
++            Throwable cause = pe.getCause();
++            if (cause != null && cause instanceof StringIndexOutOfBoundsException) {
++                errln("internal parser error: " + pe);
++            } else {
++                logln("collation data builder overflow or similar: " + pe);
++            }
++        } catch (Exception e) {
++            errln("unexpected type of exception: " + e);
++        }
++    }
+ }

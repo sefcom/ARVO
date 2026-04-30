@@ -1,0 +1,76 @@
+From 2dc319b1b1610e4c8ae95b8ca47b46926cd41ce1 Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 5 Apr 2022 08:34:45 +0100
+Subject: [PATCH] Revert "stop JPEG load after 20 warnings"
+
+This reverts commit 89bd46d1c4e0465974b886ef5b5021e988f111a2.
+---
+ libvips/foreign/jpeg2vips.c |  6 ------
+ libvips/foreign/vips2jpeg.c | 32 +++++++++-----------------------
+ 2 files changed, 9 insertions(+), 29 deletions(-)
+
+diff --git a/libvips/foreign/jpeg2vips.c b/libvips/foreign/jpeg2vips.c
+index e3f69ef60d..067d4efcda 100644
+--- a/libvips/foreign/jpeg2vips.c
++++ b/libvips/foreign/jpeg2vips.c
+@@ -488,12 +488,6 @@ read_jpeg_header( ReadJpeg *jpeg, VipsImage *out )
+ 	size_t data_length;
+ 	int i;
+ 
+-	/* Trace level 3 means emit warning messages as they happen. This
+-	 * lets us spot files with crazy numbers of warnings early and
+-	 * prevents some DoS attacks.
+-	 */
+-	jpeg->eman.pub.trace_level = 3;
+-
+ 	/* Read JPEG header. libjpeg will set out_color_space sanely for us 
+ 	 * for YUV YCCK etc.
+ 	 */
+diff --git a/libvips/foreign/vips2jpeg.c b/libvips/foreign/vips2jpeg.c
+index bfe99f4fed..56e6617cdf 100644
+--- a/libvips/foreign/vips2jpeg.c
++++ b/libvips/foreign/vips2jpeg.c
+@@ -165,34 +165,20 @@
+ void
+ vips__new_output_message( j_common_ptr cinfo )
+ {
+-	/* Some DoS attacks use jpg files with thousands of warnings. Try to
+-	 * limit the effect these have.
+-	 */
+-	if( cinfo->err->num_warnings >= 20 ) {
+-		if( cinfo->err->num_warnings == 20 ) {
+-			vips_error( "VipsJpeg", 
+-				"%s", _( "too many warnings" ) );
+-		}
+-
+-		jpeg_abort( cinfo );
+-	}
+-	else {
+-		char buffer[JMSG_LENGTH_MAX];
++	char buffer[JMSG_LENGTH_MAX];
+ 
+-		(*cinfo->err->format_message)( cinfo, buffer );
+-		vips_error( "VipsJpeg", _( "%s" ), buffer );
++	(*cinfo->err->format_message)( cinfo, buffer );
++	vips_error( "VipsJpeg", _( "%s" ), buffer );
+ 
+ #ifdef DEBUG
+-		printf( "vips__new_output_message: \"%s\"\n", buffer );
++	printf( "vips__new_output_message: \"%s\"\n", buffer );
+ #endif /*DEBUG*/
+ 
+-		/* This is run for things like file truncated. Signal 
+-		 * invalidate to force this op out of cache. 
+-		 */
+-		if( cinfo->client_data )
+-			vips_foreign_load_invalidate( 
+-				VIPS_IMAGE( cinfo->client_data ) );
+-	}
++	/* This is run for things like file truncated. Signal invalidate to
++	 * force this op out of cache. 
++	 */
++        if( cinfo->client_data )
++		vips_foreign_load_invalidate( VIPS_IMAGE( cinfo->client_data ) );
+ }
+ 
+ /* New error_exit handler.

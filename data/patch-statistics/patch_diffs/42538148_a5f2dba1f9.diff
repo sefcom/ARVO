@@ -1,0 +1,104 @@
+From dea5e86051aadcdf42f7db7a8855a78d8f5ff3d6 Mon Sep 17 00:00:00 2001
+From: Diego Devesa <slarengh@gmail.com>
+Date: Thu, 31 Oct 2024 11:40:59 +0100
+Subject: [PATCH] ggml : check tensor name lengths in gguf files (#10100)
+
+---
+ ggml/src/ggml.c | 45 ++++++++++++++++++++++++++++++++++++---------
+ src/llama.cpp   |  7 +++++--
+ 2 files changed, 41 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 0d99b0791cb..149d8f9709e 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -22102,18 +22102,46 @@ static size_t gguf_type_size(enum gguf_type type) {
+     return GGUF_TYPE_SIZE[type];
+ }
+ 
+-static void gguf_tensor_info_sanitize(struct gguf_tensor_info * info) {
+-    GGML_ASSERT(info->n_dims <= GGML_MAX_DIMS);
+-    GGML_ASSERT(0 <= info->type && info->type < GGML_TYPE_COUNT);
++static bool gguf_tensor_info_sanitize(struct gguf_tensor_info * info) {
++    if (info->n_dims > GGML_MAX_DIMS) {
++        fprintf(stderr, "%s: invalid number of dimensions (%" PRIu32 ")\n", __func__, info->n_dims);
++        return false;
++    }
++
++    if (info->type < 0 || info->type >= GGML_TYPE_COUNT) {
++        fprintf(stderr, "%s: invalid type (%d)\n", __func__, info->type);
++        return false;
++    }
++
++    if (strlen(info->name.data) >= GGML_MAX_NAME) {
++        fprintf(stderr, "%s: tensor '%s' name is too long\n", __func__, info->name.data);
++        return false;
++    }
+ 
+     for (uint32_t i = 0; i < info->n_dims; ++i) {
+-        GGML_ASSERT(info->ne[i] > 0);
++        if (info->ne[i] <= 0) {
++            fprintf(stderr, "%s: invalid number of elements (%" PRIu64 ")\n", __func__, info->ne[i]);
++            return false;
++        }
+     }
+ 
+     // prevent overflow for total number of elements
+-    GGML_ASSERT(INT64_MAX/info->ne[1] > info->ne[0]);
+-    GGML_ASSERT(INT64_MAX/info->ne[2] > info->ne[0]*info->ne[1]);
+-    GGML_ASSERT(INT64_MAX/info->ne[3] > info->ne[0]*info->ne[1]*info->ne[2]);
++    if (INT64_MAX/info->ne[1] <= info->ne[0]) {
++        fprintf(stderr, "%s: invalid number of elements (%" PRIu64 ")\n", __func__, info->ne[1]);
++        return false;
++    }
++
++    if (INT64_MAX/info->ne[2] <= info->ne[0]*info->ne[1]) {
++        fprintf(stderr, "%s: invalid number of elements (%" PRIu64 ")\n", __func__, info->ne[2]);
++        return false;
++    }
++
++    if (INT64_MAX/info->ne[3] <= info->ne[0]*info->ne[1]*info->ne[2]) {
++        fprintf(stderr, "%s: invalid number of elements (%" PRIu64 ")\n", __func__, info->ne[3]);
++        return false;
++    }
++
++    return true;
+ }
+ 
+ static bool gguf_fread_el(FILE * file, void * dst, size_t size, size_t * offset) {
+@@ -22414,8 +22442,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
+             ok = ok && gguf_fread_el (file, &info->type,   sizeof(info->type),    &offset);
+             ok = ok && gguf_fread_el (file, &info->offset, sizeof(info->offset),  &offset);
+ 
+-            // TODO: return an error instead of crashing with GGML_ASSERT
+-            gguf_tensor_info_sanitize(info);
++            ok = ok && gguf_tensor_info_sanitize(info);
+ 
+             // make sure there is no duplicated tensor names
+             for (uint64_t j = 0; j < i && ok; ++j) {
+diff --git a/src/llama.cpp b/src/llama.cpp
+index ef1b8ee5970..60a0db29c7b 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -4273,8 +4273,11 @@ struct llama_model_loader {
+ 
+         llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+             const int tensor_idx = gguf_find_tensor(gguf_ctx, name);
+-            offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
++            if (tensor_idx < 0) {
++                throw std::runtime_error(format("tensor '%s' not found in the model", name));
++            }
+ 
++            offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size) {
+                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", name));
+             }
+@@ -7426,7 +7429,7 @@ static bool llm_load_tensors(
+                 if (flags & llama_model_loader::TENSOR_NOT_REQUIRED) {
+                     return nullptr;
+                 }
+-                throw std::runtime_error(format("missing tensor %s", tn.str().c_str()));
++                throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+             }
+ 
+             // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops

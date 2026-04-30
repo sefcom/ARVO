@@ -1,0 +1,303 @@
+From 58dcabe695e8b4d8c604f7f73948061fa7dbabcd Mon Sep 17 00:00:00 2001
+From: Mike Pall <mike>
+Date: Sun, 4 Feb 2024 16:34:30 +0100
+Subject: [PATCH] Rework stack overflow handling.
+
+Reported by pwnhacker0x18. Fixed by Peter Cawley.
+
+(cherry picked from commit defe61a56751a0db5f00ff3ab7b8f45436ba74c8)
+
+In case of the Lua stack overflow error, LuaJIT restores the `L->top`
+value and pushes the error message above. It is possible that the
+restored value is greater than `L->maxstack`, so pushing the error
+message causes dirty write out-of-bounds.
+
+This patch prevents it by overwriting stack overflow handling machinery.
+Now, in the aforementioned case, the last frame is replaced with a dummy
+frame to avoid dirty writes. In some cases, there may not be enough
+space on the stack to invoke the error handler. See the related changes
+in the <test/LuaJIT-tests/lang/stackov.lua>.
+
+Sergey Kaplun:
+* added the description and the test for the problem
+
+Part of tarantool/tarantool#11278
+
+Reviewed-by: Sergey Bronnikov <sergeyb@tarantool.org>
+Signed-off-by: Sergey Kaplun <skaplun@tarantool.org>
+---
+ src/lj_debug.c                                |  1 +
+ src/lj_err.c                                  | 23 +++++-
+ src/lj_err.h                                  |  1 +
+ src/lj_state.c                                | 58 +++++++++-----
+ test/LuaJIT-tests/lang/stackov.lua            |  8 +-
+ ...52-stack-buffer-overflow-on-error.test.lua | 79 +++++++++++++++++++
+ test/tarantool-tests/utils/CMakeLists.txt     |  1 +
+ 7 files changed, 148 insertions(+), 23 deletions(-)
+ create mode 100644 test/tarantool-tests/lj-1152-stack-buffer-overflow-on-error.test.lua
+
+diff --git a/src/lj_debug.c b/src/lj_debug.c
+index 107f464c83..76e48acadc 100644
+--- a/src/lj_debug.c
++++ b/src/lj_debug.c
+@@ -64,6 +64,7 @@ static BCPos debug_framepc(lua_State *L, GCfunc *fn, cTValue *nextframe)
+     if (cf == NULL || (char *)cframe_pc(cf) == (char *)cframe_L(cf))
+       return NO_BCPOS;
+     ins = cframe_pc(cf);  /* Only happens during error/hook handling. */
++    if (!ins) return NO_BCPOS;
+   } else {
+     if (frame_islua(nextframe)) {
+       ins = frame_pc(nextframe);
+diff --git a/src/lj_err.c b/src/lj_err.c
+index 1a9a2f2b98..80dca8478a 100644
+--- a/src/lj_err.c
++++ b/src/lj_err.c
+@@ -784,7 +784,14 @@ LJ_NOINLINE void lj_err_mem(lua_State *L)
+     TValue *base = tvref(G(L)->jit_base);
+     if (base) L->base = base;
+   }
+-  if (curr_funcisL(L)) L->top = curr_topL(L);
++  if (curr_funcisL(L)) {
++    L->top = curr_topL(L);
++    if (LJ_UNLIKELY(L->top > tvref(L->maxstack))) {
++      /* The current Lua frame violates the stack. Replace it with a dummy. */
++      L->top = L->base;
++      setframe_gc(L->base - 1 - LJ_FR2, obj2gco(L), LJ_TTHREAD);
++    }
++  }
+   setstrV(L, L->top++, lj_err_str(L, LJ_ERR_ERRMEM));
+   lj_err_throw(L, LUA_ERRMEM);
+ }
+@@ -845,9 +852,11 @@ LJ_NOINLINE void LJ_FASTCALL lj_err_run(lua_State *L)
+ {
+   ptrdiff_t ef = (LJ_HASJIT && tvref(G(L)->jit_base)) ? 0 : finderrfunc(L);
+   if (ef) {
+-    TValue *errfunc = restorestack(L, ef);
+-    TValue *top = L->top;
++    TValue *errfunc, *top;
++    lj_state_checkstack(L, LUA_MINSTACK * 2);  /* Might raise new error. */
+     lj_trace_abort(G(L));
++    errfunc = restorestack(L, ef);
++    top = L->top;
+     if (!tvisfunc(errfunc) || L->status == LUA_ERRERR) {
+       setstrV(L, top-1, lj_err_str(L, LJ_ERR_ERRERR));
+       lj_err_throw(L, LUA_ERRERR);
+@@ -862,7 +871,15 @@ LJ_NOINLINE void LJ_FASTCALL lj_err_run(lua_State *L)
+   lj_err_throw(L, LUA_ERRRUN);
+ }
+ 
++/* Stack overflow error. */
++void LJ_FASTCALL lj_err_stkov(lua_State *L)
++{
++  lj_debug_addloc(L, err2msg(LJ_ERR_STKOV), L->base-1, NULL);
++  lj_err_run(L);
++}
++
+ #if LJ_HASJIT
++/* Rethrow error after doing a trace exit. */
+ LJ_NOINLINE void LJ_FASTCALL lj_err_trace(lua_State *L, int errcode)
+ {
+   if (errcode == LUA_ERRRUN)
+diff --git a/src/lj_err.h b/src/lj_err.h
+index b0c72c24f9..56bd0375a5 100644
+--- a/src/lj_err.h
++++ b/src/lj_err.h
+@@ -23,6 +23,7 @@ LJ_DATA const char *lj_err_allmsg;
+ LJ_FUNC GCstr *lj_err_str(lua_State *L, ErrMsg em);
+ LJ_FUNCA_NORET void LJ_FASTCALL lj_err_throw(lua_State *L, int errcode);
+ LJ_FUNC_NORET void lj_err_mem(lua_State *L);
++LJ_FUNC_NORET void LJ_FASTCALL lj_err_stkov(lua_State *L);
+ LJ_FUNC_NORET void LJ_FASTCALL lj_err_run(lua_State *L);
+ #if LJ_HASJIT
+ LJ_FUNCA_NORET void LJ_FASTCALL lj_err_trace(lua_State *L, int errcode);
+diff --git a/src/lj_state.c b/src/lj_state.c
+index 5a92010271..053e5ec966 100644
+--- a/src/lj_state.c
++++ b/src/lj_state.c
+@@ -120,27 +120,49 @@ void lj_state_shrinkstack(lua_State *L, MSize used)
+ /* Try to grow stack. */
+ void LJ_FASTCALL lj_state_growstack(lua_State *L, MSize need)
+ {
+-  MSize n;
+-  if (L->stacksize >= LJ_STACK_MAXEX) {
+-    /* 4. Throw 'error in error handling' when we are _over_ the limit. */
+-    if (L->stacksize > LJ_STACK_MAXEX)
++  MSize n = L->stacksize + need;
++  if (LJ_LIKELY(n < LJ_STACK_MAX)) {  /* The stack can grow as requested. */
++    if (n < 2 * L->stacksize) {  /* Try to double the size. */
++      n = 2 * L->stacksize;
++      if (n > LJ_STACK_MAX)
++	n = LJ_STACK_MAX;
++    }
++    resizestack(L, n);
++  } else {  /* Request would overflow. Raise a stack overflow error. */
++    if (LJ_HASJIT) {
++      TValue *base = tvref(G(L)->jit_base);
++      if (base) L->base = base;
++    }
++    if (curr_funcisL(L)) {
++      L->top = curr_topL(L);
++      if (L->top > tvref(L->maxstack)) {
++	/* The current Lua frame violates the stack, so replace it with a
++	** dummy. This can happen when BC_IFUNCF is trying to grow the stack.
++	*/
++	L->top = L->base;
++	setframe_gc(L->base - 1 - LJ_FR2, obj2gco(L), LJ_TTHREAD);
++      }
++    }
++    if (L->stacksize <= LJ_STACK_MAXEX) {
++      /* An error handler might want to inspect the stack overflow error, but
++      ** will need some stack space to run in. We give it a stack size beyond
++      ** the normal limit in order to do so, then rely on lj_state_relimitstack
++      ** calls during unwinding to bring us back to a convential stack size.
++      ** The + 1 is space for the error message, and 2 * LUA_MINSTACK is for
++      ** the lj_state_checkstack() call in lj_err_run().
++      */
++      resizestack(L, LJ_STACK_MAX + 1 + 2 * LUA_MINSTACK);
++      lj_err_stkov(L);  /* May invoke an error handler. */
++    } else {
++      /* If we're here, then the stack overflow error handler is requesting
++      ** to grow the stack even further. We have no choice but to abort the
++      ** error handler.
++      */
++      GCstr *em = lj_err_str(L, LJ_ERR_STKOV);  /* Might OOM. */
++      setstrV(L, L->top++, em);  /* There is always space to push an error. */
+       lj_err_throw(L, LUA_ERRERR);  /* Does not invoke an error handler. */
+-    /* 1. We are _at_ the limit after the last growth. */
+-    if (L->status < LUA_ERRRUN) {  /* 2. Throw 'stack overflow'. */
+-      L->status = LUA_ERRRUN;  /* Prevent ending here again for pushed msg. */
+-      lj_err_msg(L, LJ_ERR_STKOV);  /* May invoke an error handler. */
+     }
+-    /* 3. Add space (over the limit) for pushed message and error handler. */
+-  }
+-  n = L->stacksize + need;
+-  if (n > LJ_STACK_MAX) {
+-    n += 2*LUA_MINSTACK;
+-  } else if (n < 2*L->stacksize) {
+-    n = 2*L->stacksize;
+-    if (n >= LJ_STACK_MAX)
+-      n = LJ_STACK_MAX;
+   }
+-  resizestack(L, n);
+ }
+ 
+ void LJ_FASTCALL lj_state_growstack1(lua_State *L)
+diff --git a/test/LuaJIT-tests/lang/stackov.lua b/test/LuaJIT-tests/lang/stackov.lua
+index 8afa86b4c5..b052ad80ec 100644
+--- a/test/LuaJIT-tests/lang/stackov.lua
++++ b/test/LuaJIT-tests/lang/stackov.lua
+@@ -31,13 +31,17 @@ end
+ do --- Base test.
+   local err, s = xpcall(f, debug.traceback)
+   assert(err == false)
+-  test_error_msg(f, s)
++  -- There is no place on the stack to invoke the handler.
++  -- Just test the error reason.
++  assert(string.match(s, "stack overflow"))
+ end
+ 
+ do --- Stack overflow with non-empty arg list.
+   local err, s = xpcall(g, debug.traceback, 1)
+   assert(err == false)
+-  test_error_msg(g, s)
++  -- There is no place on the stack to invoke the handler.
++  -- Just test the error reason.
++  assert(string.match(s, "stack overflow"))
+ end
+ 
+ do --- Vararg tail call with non-empty arg list. +slow
+diff --git a/test/tarantool-tests/lj-1152-stack-buffer-overflow-on-error.test.lua b/test/tarantool-tests/lj-1152-stack-buffer-overflow-on-error.test.lua
+new file mode 100644
+index 0000000000..08e344deda
+--- /dev/null
++++ b/test/tarantool-tests/lj-1152-stack-buffer-overflow-on-error.test.lua
+@@ -0,0 +1,79 @@
++local tap = require('tap')
++local allocinject = require('allocinject')
++
++local test = tap.test('lj-1152-stack-buffer-overflow-on-error')
++test:plan(6)
++
++local LJ_MAX_LOCVAR = 200
++
++-- Generate the following Lua chunk:
++--   local function recursive_f()
++--     local _
++--     ...
++--     recursive_f()
++--   end
++--   return recursive_f
++local function generate_recursive_f(n_locals)
++  local chunk = 'local function recursive_f()\n'
++  for _ = 1, n_locals do
++    chunk = chunk .. 'local _\n'
++  end
++  chunk = chunk .. [[
++      recursive_f()
++    end
++    return recursive_f
++  ]]
++  local f = assert(loadstring(chunk))
++  return f()
++end
++
++-- Use `coroutine.wrap()` for functions to use newly created stack
++-- with fixed number of stack slots.
++
++-- Check that we still got the correct error message in case of
++-- the unsafe error handler function.
++coroutine.wrap(function()
++  -- XXX: Use different recursive functions as callee and handler
++  -- to be sure to get the invalid stack value instead of `nil`.
++  local function recursive() recursive() end
++  local function bad_errfunc() bad_errfunc() end
++  local r, e = xpcall(recursive, bad_errfunc)
++  -- XXX: Don't create a constant string that is anchored to the
++  -- prototype. It is necessary to make the error message freed by
++  -- the GC and OOM raising in the last test.
++  local EXPECTED_MSG = 'stack ' .. 'overflow'
++  test:ok(not r, 'correct status')
++  test:like(e, EXPECTED_MSG, 'correct error message')
++end)()
++
++coroutine.wrap(function()
++  -- Collect all strings including the possibly-existed string
++  -- with the 'stack overflow' error message.
++  collectgarbage()
++  local function recursive() recursive() end
++  -- Avoid trace recording. A trace can't be allocated anyway.
++  jit.off(recursive)
++
++  -- Check the case when the error
++  allocinject.enable_null_alloc()
++  local r, e = pcall(recursive)
++  allocinject.disable()
++
++  test:ok(not r, 'correct status')
++  test:like(e, 'not enough memory', 'correct error message')
++end)()
++
++-- Check overflow of the buffer related to the Lua stack.
++-- This test fails under ASAN without the patch.
++local recursive_f = generate_recursive_f(LJ_MAX_LOCVAR)
++coroutine.wrap(function()
++  local r, e = pcall(recursive_f)
++  test:ok(not r, 'correct status')
++  -- XXX: Don't create a constant string that is anchored to the
++  -- prototype. It is necessary to make the error message freed by
++  -- the GC and OOM raising in the last test.
++  local EXPECTED_MSG = 'stack ' .. 'overflow'
++  test:like(e, EXPECTED_MSG, 'correct error message')
++end)()
++
++test:done(true)
+diff --git a/test/tarantool-tests/utils/CMakeLists.txt b/test/tarantool-tests/utils/CMakeLists.txt
+index 158719347b..e74e184b9c 100644
+--- a/test/tarantool-tests/utils/CMakeLists.txt
++++ b/test/tarantool-tests/utils/CMakeLists.txt
+@@ -1,4 +1,5 @@
+ list(APPEND tests
++  lj-1152-stack-buffer-overflow-on-error.test.lua
+   lj-1166-error-stitch-oom-ir-buff.test.lua
+   lj-1166-error-stitch-oom-snap-buff.test.lua
+   lj-1247-fin-tab-rehashing-on-trace.test.lua

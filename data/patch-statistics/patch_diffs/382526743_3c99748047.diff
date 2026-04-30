@@ -1,0 +1,619 @@
+From a4ae80fa158d9f9fd5f745125288e301c2abf9fc Mon Sep 17 00:00:00 2001
+From: Lily Chen <chlily@google.com>
+Date: Thu, 23 Jan 2025 22:28:37 -0500
+Subject: [PATCH] v7.10.3: Extracted from
+ https://www.rarlab.com/rar/unrarsrc-7.1.3.tar.gz (sic: version numbers) (#43)
+
+---
+ archive.cpp    |  2 ++
+ archive.hpp    |  2 ++
+ arcread.cpp    | 14 ++++++--
+ dll.cpp        |  6 ++--
+ dll.rc         | 10 +++---
+ extract.cpp    |  4 ++-
+ filefn.cpp     |  2 ++
+ list.cpp       | 23 ++++++++++--
+ rar.cpp        |  5 ++-
+ scantree.cpp   | 40 +++++++++++++--------
+ strfn.cpp      |  5 +--
+ strfn.hpp      |  2 +-
+ threadmisc.cpp | 36 +++++++++++++++++++
+ threadpool.cpp | 97 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ ulinks.cpp     |  8 +++--
+ unpack.cpp     |  1 -
+ unpack.hpp     |  1 -
+ unpack20.cpp   |  6 +++-
+ unpack50.cpp   |  3 +-
+ version.hpp    |  8 ++---
+ 20 files changed, 231 insertions(+), 44 deletions(-)
+
+diff --git a/archive.cpp b/archive.cpp
+index f90b619..4fc2a89 100644
+--- a/archive.cpp
++++ b/archive.cpp
+@@ -26,10 +26,12 @@ Archive::Archive(CommandData *InitCmd)
+   FailedHeaderDecryption=false;
+   BrokenHeader=false;
+   LastReadBlock=0;
++  CurHeaderType=HEAD_UNKNOWN;
+ 
+   CurBlockPos=0;
+   NextBlockPos=0;
+ 
++  RecoveryPercent=-1;
+ 
+   MainHead.Reset();
+   CryptHead={};
+diff --git a/archive.hpp b/archive.hpp
+index 895f853..db1cb53 100644
+--- a/archive.hpp
++++ b/archive.hpp
+@@ -47,6 +47,7 @@ class Archive:public File
+     bool DummyCmd;
+     CommandData *Cmd;
+ 
++    int RecoveryPercent;
+ 
+     RarTime LatestTime;
+     int LastReadBlock;
+@@ -65,6 +66,7 @@ class Archive:public File
+     size_t SearchBlock(HEADER_TYPE HeaderType);
+     size_t SearchSubBlock(const wchar *Type);
+     size_t SearchRR();
++    int GetRecoveryPercent() {return RecoveryPercent;}
+     size_t ReadHeader();
+     void CheckArc(bool EnableBroken);
+     void CheckOpen(const std::wstring &Name);
+diff --git a/arcread.cpp b/arcread.cpp
+index ab80463..cf9d0ef 100644
+--- a/arcread.cpp
++++ b/arcread.cpp
+@@ -106,7 +106,7 @@ void Archive::UnexpEndArcMsg()
+   if (CurBlockPos!=ArcSize || NextBlockPos!=ArcSize)
+   {
+     uiMsg(UIERROR_UNEXPEOF,FileName);
+-    if (CurHeaderType!=HEAD_FILE)
++    if (CurHeaderType!=HEAD_FILE && CurHeaderType!=HEAD_UNKNOWN)
+       uiMsg(UIERROR_TRUNCSERVICE,FileName,SubHead.FileName);
+ 
+     ErrHandler.SetErrorCode(RARX_WARNING);
+@@ -904,6 +904,16 @@ size_t Archive::ReadHeader50()
+         if (!FileBlock && hd->CmpName(SUBHEAD_TYPE_CMT))
+           MainComment=true;
+ 
++        // For RAR5 format we read the user specified recovery percent here.
++        if (!FileBlock && hd->CmpName(SUBHEAD_TYPE_RR) && hd->SubData.size()>0)
++        {
++          // It is stored as a single byte up to RAR 6.02 and as vint since
++          // 6.10, where we extended the maximum RR size from 99% to 1000%.
++          RawRead RawPercent;
++          RawPercent.Read(hd->SubData.data(),hd->SubData.size());
++          RecoveryPercent=(int)RawPercent.GetV();
++
++        }
+ 
+         if (BadCRC) // Add the file name to broken header message displayed above.
+           uiMsg(UIERROR_FHEADERBROKEN,Archive::FileName,hd->FileName);
+@@ -1308,7 +1318,7 @@ size_t Archive::ReadHeader14()
+     std::string FileName(NameSize,0);
+     Raw.GetB((byte *)&FileName[0],NameSize);
+     std::string NameA;
+-    IntToExt(FileName,NameA);
++    OemToExt(FileName,NameA);
+     CharToWide(NameA,FileHead.FileName);
+     ConvertNameCase(FileHead.FileName);
+     ConvertFileHeader(&FileHead);
+diff --git a/dll.cpp b/dll.cpp
+index 4086409..8ceedf9 100644
+--- a/dll.cpp
++++ b/dll.cpp
+@@ -49,7 +49,7 @@ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
+       AnsiArcName=r->ArcName;
+ #ifdef _WIN_ALL
+       if (!AreFileApisANSI())
+-        IntToExt(r->ArcName,AnsiArcName);
++        OemToExt(r->ArcName,AnsiArcName);
+ #endif
+     }
+ 
+@@ -369,7 +369,7 @@ int PASCAL ProcessFile(HANDLE hArcData,int Operation,char *DestPath,char *DestNa
+         // We must not apply OemToCharBuffA directly to DestPath,
+         // because we do not know DestPath length and OemToCharBuffA
+         // does not stop at 0.
+-        IntToExt(ExtrPathA,ExtrPathA);
++        OemToExt(ExtrPathA,ExtrPathA);
+ #endif
+         CharToWide(ExtrPathA,Data->Cmd.ExtrPath);
+         AddEndSlash(Data->Cmd.ExtrPath);
+@@ -381,7 +381,7 @@ int PASCAL ProcessFile(HANDLE hArcData,int Operation,char *DestPath,char *DestNa
+         // We must not apply OemToCharBuffA directly to DestName,
+         // because we do not know DestName length and OemToCharBuffA
+         // does not stop at 0.
+-        IntToExt(DestNameA,DestNameA);
++        OemToExt(DestNameA,DestNameA);
+ #endif
+         CharToWide(DestNameA,Data->Cmd.DllDestName);
+       }
+diff --git a/dll.rc b/dll.rc
+index 47182ee..c838187 100644
+--- a/dll.rc
++++ b/dll.rc
+@@ -2,8 +2,8 @@
+ #include <commctrl.h>
+ 
+ VS_VERSION_INFO VERSIONINFO
+-FILEVERSION 7, 10, 2, 1436
+-PRODUCTVERSION 7, 10, 2, 1436
++FILEVERSION 7, 10, 3, 1480
++PRODUCTVERSION 7, 10, 3, 1480
+ FILEOS VOS__WINDOWS32
+ FILETYPE VFT_APP
+ {
+@@ -14,9 +14,9 @@ FILETYPE VFT_APP
+       VALUE "CompanyName", "Alexander Roshal\0"
+       VALUE "ProductName", "RAR decompression library\0"
+       VALUE "FileDescription", "RAR decompression library\0"
+-      VALUE "FileVersion", "7.10.2\0"
+-      VALUE "ProductVersion", "7.10.2\0"
+-      VALUE "LegalCopyright", "Copyright © Alexander Roshal 1993-2024\0"
++      VALUE "FileVersion", "7.10.3\0"
++      VALUE "ProductVersion", "7.10.3\0"
++      VALUE "LegalCopyright", "Copyright © Alexander Roshal 1993-2025\0"
+       VALUE "OriginalFilename", "Unrar.dll\0"
+     }
+   }
+diff --git a/extract.cpp b/extract.cpp
+index d9f37c4..c433fb8 100644
+--- a/extract.cpp
++++ b/extract.cpp
+@@ -1606,8 +1606,10 @@ void CmdExtract::AnalyzeArchive(const std::wstring &ArcName,bool Volume,bool New
+ 
+         if (!Arc.FileHead.SplitBefore)
+         {
+-          if (!MatchFound && !Arc.FileHead.Solid) // Can start extraction from here.
++          if (!MatchFound && !Arc.FileHead.Solid && !Arc.FileHead.Dir &&
++              Arc.FileHead.RedirType==FSREDIR_NONE && Arc.FileHead.Method!=0)
+           {
++            // Can start extraction from here.
+             // We would gain nothing and unnecessarily complicate extraction
+             // if we set StartName for first volume or StartPos for first
+             // archived file.
+diff --git a/filefn.cpp b/filefn.cpp
+index d23f4f7..d600c06 100644
+--- a/filefn.cpp
++++ b/filefn.cpp
+@@ -562,6 +562,8 @@ void ResetFileCache(const std::wstring &Name)
+ 
+ 
+ 
++
++
+ // Delete symbolic links in file path, if any, and replace them by directories.
+ // Prevents extracting files outside of destination folder with symlink chains.
+ bool LinksToDirs(const std::wstring &SrcName,const std::wstring &SkipPart,std::wstring &LastChecked)
+diff --git a/list.cpp b/list.cpp
+index 15aa73a..04225ee 100644
+--- a/list.cpp
++++ b/list.cpp
+@@ -110,10 +110,21 @@ void ListArchive(CommandData *Cmd)
+               }
+               break;
+             case HEAD_SERVICE:
++              // For service blocks dependent on previous block, such as ACL
++              // or NTFS stream, we use "file matched" flag of host file.
++              // Independent blocks like RR are matched separately,
++              // so we can list them by their name. Also we match even
++              // dependent blocks separately if "vta -idn" are set. User may
++              // want to see service blocks only in this case.
++              if (!Arc.SubHead.SubBlock || Cmd->DisableNames)
++                FileMatched=Cmd->IsProcessFile(Arc.SubHead,NULL,MATCH_WILDSUBPATH,0,NULL)!=0;
+               if (FileMatched && !Bare)
+               {
++                // Here we set DisableNames parameter to true regardless of
++                // Cmd->DisableNames. If "vta -idn" are set together, user
++                // wants to see service blocks like RR only.
+                 if (Technical && ShowService)
+-                  ListFileHeader(Arc,Arc.SubHead,TitleShown,Verbose,true,false,Cmd->DisableNames);
++                  ListFileHeader(Arc,Arc.SubHead,TitleShown,Verbose,true,false,false);
+               }
+               break;
+           }
+@@ -249,7 +260,7 @@ void ListFileHeader(Archive &Arc,FileHeader &hd,bool &TitleShown,bool Verbose,bo
+       if (hd.SplitAfter)
+         wcsncpyz(RatioStr,L"-->",ASIZE(RatioStr));
+       else
+-        swprintf(RatioStr,ASIZE(RatioStr),L"%d%%",ToPercentUnlim(hd.PackSize,hd.UnpSize));
++        swprintf(RatioStr,ASIZE(RatioStr),L"%u%%",ToPercentUnlim(hd.PackSize,hd.UnpSize));
+ 
+   wchar DateStr[50];
+   hd.mtime.GetText(DateStr,ASIZE(DateStr),Technical);
+@@ -315,6 +326,14 @@ void ListFileHeader(Archive &Arc,FileHeader &hd,bool &TitleShown,bool Verbose,bo
+       mprintf(L"\n%12ls: %ls",St(MListSize),UnpSizeText);
+       mprintf(L"\n%12ls: %ls",St(MListPacked),PackSizeText);
+       mprintf(L"\n%12ls: %ls",St(MListRatio),RatioStr);
++
++      if (!FileBlock && Arc.SubHead.CmpName(SUBHEAD_TYPE_RR))
++      {
++        // Display the original -rrN percent if available.
++        int RecoveryPercent=Arc.GetRecoveryPercent();
++        if (RecoveryPercent>0) // It can be -1 if failed to detect.
++          mprintf(L"\n%12ls: %u%%",L"RR%", RecoveryPercent);
++      }
+     }
+     bool WinTitles=false;
+ #ifdef _WIN_ALL
+diff --git a/rar.cpp b/rar.cpp
+index 075e768..cd20dbe 100644
+--- a/rar.cpp
++++ b/rar.cpp
+@@ -47,7 +47,10 @@ int main(int argc, char *argv[])
+       {
+         case 'T':
+         case 'V':
+-          Cmd->Command[0]=UpperCmd;
++          // Also copy 't' and 'a' modifiers for -v[t,a], if present.
++          Cmd->Command.clear();
++          for (char *c=Switch+1;*c!=0;c++)
++            Cmd->Command+=etoupper(*c);
+           break;
+         case '?':
+           Cmd->OutHelp(RARX_SUCCESS);
+diff --git a/scantree.cpp b/scantree.cpp
+index 4313177..17b5637 100644
+--- a/scantree.cpp
++++ b/scantree.cpp
+@@ -212,23 +212,36 @@ bool ScanTree::GetNextMask()
+   UnixSlashToDos(CurMask,CurMask);
+ #endif
+ 
++  // We shall set it before appending the path separator to \\server\share
++  // UNC mask below, so "rar a -ep1 arc \\server\share" includes paths
++  // starting from "share\".
++  SpecPathLength=GetNamePos(CurMask);
++
+   // We prefer to scan entire disk if mask like \\server\share\ or c:\
+-  // is specified regardless of recursion mode. Use \\server\share\*.*
+-  // or c:\*.* mask to scan only the root directory.
+-  if (CurMask.size()>2 && CurMask[0]=='\\' && CurMask[1]=='\\')
+-  {
+-    auto Slash=CurMask.find('\\',2);
+-    if (Slash!=std::wstring::npos)
++  // is specified even without -r, but not with -r-. Use \\server\share\*.*,
++  // c:\*.* mask or -r- to scan only the root directory. Note that UNC names
++  // are possible both in Win32 and Unix, just with proper path separators.
++  if (Recurse!=RECURSE_DISABLE)
++    if (CurMask.size()>2 && CurMask[0]==CPATHDIVIDER && CurMask[1]==CPATHDIVIDER)
+     {
+-      Slash=CurMask.find('\\',Slash+1);
+-      // If backslash is found and it is the last string character.
+-      ScanEntireDisk=Slash!=std::wstring::npos && Slash+1==CurMask.size();
++      auto Slash=CurMask.find(CPATHDIVIDER,2);
++      if (Slash!=std::wstring::npos)
++      {
++        Slash=CurMask.find(CPATHDIVIDER,Slash+1);
++        // If path separator is mssing or it is the last string character.
++        ScanEntireDisk=Slash==std::wstring::npos || 
++                       Slash!=std::wstring::npos && Slash+1==CurMask.size();
++
++        // Win32 FindFirstFile fails for \\server\share names without
++        // the trailing backslash. So we add it here.
++        if (Slash==std::wstring::npos)
++          CurMask+=CPATHDIVIDER;
++      }
+     }
+-  }
+-  else
+-    ScanEntireDisk=IsDriveLetter(CurMask) && IsPathDiv(CurMask[2]) && CurMask[3]==0;
+-
++    else
++      ScanEntireDisk=IsDriveLetter(CurMask) && IsPathDiv(CurMask[2]) && CurMask[3]==0;
+ 
++  // Calculate the name position again, because we could modify UNC path above.
+   auto NamePos=GetNamePos(CurMask);
+   std::wstring Name=CurMask.substr(NamePos);
+   if (Name.empty())
+@@ -238,7 +251,6 @@ bool ScanTree::GetNextMask()
+     AddEndSlash(CurMask);
+     CurMask+=MASKALL;
+   }
+-  SpecPathLength=NamePos;
+   Depth=0;
+ 
+   OrigCurMask=CurMask;
+diff --git a/strfn.cpp b/strfn.cpp
+index 3fdaca5..6ad51c8 100644
+--- a/strfn.cpp
++++ b/strfn.cpp
+@@ -12,7 +12,8 @@ const wchar *NullToEmpty(const wchar *Str)
+ }
+ 
+ 
+-void IntToExt(const std::string &Src,std::string &Dest)
++// Convert from OEM encoding.
++void OemToExt(const std::string &Src,std::string &Dest)
+ {
+ #ifdef _WIN_ALL
+   if (std::addressof(Src)!=std::addressof(Dest))
+@@ -44,7 +45,7 @@ void ArcCharToWide(const char *Src,std::wstring &Dest,ACTW_ENCODING Encoding)
+     std::string NameA;
+     if (Encoding==ACTW_OEM)
+     {
+-      IntToExt(Src,NameA);
++      OemToExt(Src,NameA);
+       Src=NameA.data();
+     }
+     CharToWide(Src,Dest);
+diff --git a/strfn.hpp b/strfn.hpp
+index fd4793c..8f8b1bc 100644
+--- a/strfn.hpp
++++ b/strfn.hpp
+@@ -3,7 +3,7 @@
+ 
+ const char* NullToEmpty(const char *Str);
+ const wchar* NullToEmpty(const wchar *Str);
+-void IntToExt(const std::string &Src,std::string &Dest);
++void OemToExt(const std::string &Src,std::string &Dest);
+ 
+ enum ACTW_ENCODING { ACTW_DEFAULT, ACTW_OEM, ACTW_UTF8};
+ void ArcCharToWide(const char *Src,std::wstring &Dest,ACTW_ENCODING Encoding);
+diff --git a/threadmisc.cpp b/threadmisc.cpp
+index 7a6ec78..753ea96 100644
+--- a/threadmisc.cpp
++++ b/threadmisc.cpp
+@@ -123,6 +123,42 @@ uint GetNumberOfCPU()
+   return sysctlbyname("hw.ncpu",&Count,&Size,NULL,0)==0 ? Count:1;
+ #endif
+ #else // !_UNIX
++
++#ifdef WIN32_CPU_GROUPS
++  // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessaffinitymask
++  // "Starting with Windows 11 and Windows Server 2022, on a system with
++  //  more than 64 processors, process and thread affinities span all
++  //  processors in the system, across all processor groups, by default."
++  // Supposing there are 80 CPUs in 2 processor groups 40 CPUs each.
++  // Looks like, beginning from Windows 11 an app can use them all by default,
++  // not resorting to processor groups API. But if we use GetProcessAffinityMask
++  // to count CPUs, we would be limited to 40 CPUs only. So we call 
++  // GetActiveProcessorCount() if it is available anf if there are multiple
++  // processor groups. For a single group we prefer the affinity aware
++  // GetProcessAffinityMask(). Out thread pool code handles the case
++  // with restricted processor group affinity. So we avoid the complicated
++  // code to calculate all processor groups affinity here, such as using
++  // GetLogicalProcessorInformationEx, and resort to GetActiveProcessorCount().
++  HMODULE hKernel=GetModuleHandle(L"kernel32.dll");
++  if (hKernel!=nullptr)
++  {
++    typedef DWORD (WINAPI *GETACTIVEPROCESSORCOUNT)(WORD GroupNumber);
++    GETACTIVEPROCESSORCOUNT pGetActiveProcessorCount=(GETACTIVEPROCESSORCOUNT)GetProcAddress(hKernel,"GetActiveProcessorCount");
++    typedef WORD (WINAPI *GETACTIVEPROCESSORGROUPCOUNT)();
++    GETACTIVEPROCESSORGROUPCOUNT pGetActiveProcessorGroupCount=(GETACTIVEPROCESSORGROUPCOUNT)GetProcAddress(hKernel,"GetActiveProcessorGroupCount");
++    if (pGetActiveProcessorCount!=nullptr && pGetActiveProcessorGroupCount!=nullptr &&
++        pGetActiveProcessorGroupCount()>1)
++    {
++      // Once the thread pool called SetThreadGroupAffinity(),
++      // GetProcessAffinityMask() below will return 0. So we shall always
++      // use GetActiveProcessorCount() here if there are multiple processor
++      // groups, which makes SetThreadGroupAffinity() call possible.
++      DWORD Count=pGetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
++      return Count;
++    }
++  }
++#endif
++
+   DWORD_PTR ProcessMask;
+   DWORD_PTR SystemMask;
+ 
+diff --git a/threadpool.cpp b/threadpool.cpp
+index 8c63a8b..1d21131 100644
+--- a/threadpool.cpp
++++ b/threadpool.cpp
+@@ -1,5 +1,6 @@
+ #include "rar.hpp"
+ 
++
+ #ifdef RAR_SMP
+ #include "threadmisc.cpp"
+ 
+@@ -92,11 +93,103 @@ ThreadPool::~ThreadPool()
+ 
+ void ThreadPool::CreateThreads()
+ {
+-  for(uint I=0;I<MaxAllowedThreads;I++)
++#ifdef WIN32_CPU_GROUPS
++  // 2024.12.28: Implement processor group support for pre-Windows 11 systems
++  // with number of CPUs exceeding 64. For example, for 72 CPU the single
++  // processor group size would be 36 and this is what RAR would use without
++  // processor group support.
++
++  uint GroupCount=0;
++  uint CurGroupNumber=(uint)-1; // We'll increment it to 0 later.
++  uint CurGroupSize=0,CumulativeGroupSize=0;
++
++  typedef DWORD (WINAPI *GETACTIVEPROCESSORCOUNT)(WORD GroupNumber);
++  GETACTIVEPROCESSORCOUNT pGetActiveProcessorCount=nullptr;
++  typedef BOOL (WINAPI *GETTHREADGROUPAFFINITY)(HANDLE hThread,PGROUP_AFFINITY GroupAffinity);
++  GETTHREADGROUPAFFINITY pGetThreadGroupAffinity=nullptr;
++  typedef BOOL (WINAPI *SETTHREADGROUPAFFINITY)(HANDLE hThread,const GROUP_AFFINITY *GroupAffinity,PGROUP_AFFINITY PreviousGroupAffinity);
++  SETTHREADGROUPAFFINITY pSetThreadGroupAffinity=nullptr;
++
++  // Doesn't seem to be needed in Windows 11 and newer.
++  // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessaffinitymask
++  // "Starting with Windows 11 and Windows Server 2022, on a system with
++  //  more than 64 processors, process and thread affinities span all
++  //  processors in the system, across all processor groups, by default."
++  if (!IsWindows11OrGreater())
+   {
+-    ThreadHandles[I] = ThreadCreate(PoolThread, this);
++    HMODULE hKernel=GetModuleHandle(L"kernel32.dll");
++    if (hKernel!=nullptr)
++    {
++      typedef WORD (WINAPI *GETACTIVEPROCESSORGROUPCOUNT)();
++      GETACTIVEPROCESSORGROUPCOUNT pGetActiveProcessorGroupCount=(GETACTIVEPROCESSORGROUPCOUNT)GetProcAddress(hKernel,"GetActiveProcessorGroupCount");
++
++      pGetActiveProcessorCount=(GETACTIVEPROCESSORCOUNT)GetProcAddress(hKernel,"GetActiveProcessorCount");
++      pGetThreadGroupAffinity=(GETTHREADGROUPAFFINITY)GetProcAddress(hKernel,"GetThreadGroupAffinity");
++      pSetThreadGroupAffinity=(SETTHREADGROUPAFFINITY)GetProcAddress(hKernel,"SetThreadGroupAffinity");
++
++      if (pGetActiveProcessorCount!=nullptr && pGetActiveProcessorGroupCount!=nullptr &&
++          pGetThreadGroupAffinity!=nullptr && pSetThreadGroupAffinity!=nullptr)
++        GroupCount=pGetActiveProcessorGroupCount();
++    }
++  }
++#endif
++
++  for (uint I=0;I<MaxAllowedThreads;I++)
++  {
++    THREAD_HANDLE hThread=ThreadCreate(PoolThread, this);
++    ThreadHandles[I] = hThread;
+     ThreadsCreatedCount++;
+ #ifdef _WIN_ALL
++#ifdef WIN32_CPU_GROUPS
++    if (GroupCount>1) // If we have multiple processor groups.
++    {
++      if (I>=CumulativeGroupSize) // Filled the processor group, go to next.
++      {
++        if (++CurGroupNumber>=GroupCount)
++        {
++          // If we exceeded the group number, such as when user specified
++          // -mt64 for lower core count, start assigning from beginning.
++          CurGroupNumber=0;
++          CumulativeGroupSize=0;
++        }
++        // Current group size.
++        CurGroupSize=pGetActiveProcessorCount(CurGroupNumber);
++        // Size of all preceding groups including the current.
++        CumulativeGroupSize+=CurGroupSize;
++      }
++      GROUP_AFFINITY GroupAffinity;
++      pGetThreadGroupAffinity(hThread,&GroupAffinity);
++
++      // Since normally before Windows 11 all threads belong to same source
++      // group, we could set this value only once. But we set it every time
++      // in case we'll decide for some reason to use it to rearrange threads
++      // from different source groups in Windows 11+.
++      uint SrcGroupSize=pGetActiveProcessorCount(GroupAffinity.Group);
++
++      // Shifting by 64 would be the undefined behavior, so we treat 64 separately.
++      KAFFINITY SrcGroupMask=(KAFFINITY)(SrcGroupSize==64 ? (uint64)0xffffffffffffffff:(uint64(1)<<SrcGroupSize)-1);
++
++      // Here we check that process affinity for existing thread group
++      // matches the entire group size. If user limited the process
++      // affinity, we prefer to not extend the process to other groups,
++      // because user might want to restrict the resource usage.
++      // Also if source processor group is larger than required number
++      // of threads, we do not need to move threads between groups.
++      if (SrcGroupSize!=0 && GroupAffinity.Mask==SrcGroupMask &&
++          GroupAffinity.Group!=CurGroupNumber && SrcGroupSize<MaxAllowedThreads)
++      {
++        // Shifting by 64 would be the undefined behavior, so we treat 64 separately.
++        KAFFINITY CurGroupMask=(KAFFINITY)(CurGroupSize==64 ? (uint64)0xffffffffffffffff:(uint64(1)<<CurGroupSize)-1);
++        GroupAffinity.Mask=CurGroupMask; // Use the entire group.
++        GroupAffinity.Group=CurGroupNumber;
++
++        // Assign the thread to a new group.
++        pSetThreadGroupAffinity(hThread,&GroupAffinity,NULL);
++      }
++    }
++#endif
++    
++    // Set the thread priority if needed.
+     if (ThreadPool::ThreadPriority!=THREAD_PRIORITY_NORMAL)
+       SetThreadPriority(ThreadHandles[I],ThreadPool::ThreadPriority);
+ #endif
+diff --git a/ulinks.cpp b/ulinks.cpp
+index ea84155..3a57d66 100644
+--- a/ulinks.cpp
++++ b/ulinks.cpp
+@@ -119,16 +119,20 @@ static bool ExtractUnixLink50(CommandData *Cmd,const wchar *Name,FileHeader *hd)
+   WideToChar(hd->RedirName,Target);
+   if (hd->RedirType==FSREDIR_WINSYMLINK || hd->RedirType==FSREDIR_JUNCTION)
+   {
+-    // Cannot create Windows absolute path symlinks in Unix. Only relative path
+-    // Windows symlinks can be created here. RAR 5.0 used \??\ prefix
++    // Windows absolute path symlinks in Unix. RAR 5.0 used \??\ prefix
+     // for Windows absolute symlinks, since RAR 5.1 /??/ is used.
+     // We escape ? as \? to avoid "trigraph" warning
+     if (Target.rfind("\\??\\",0)!=std::string::npos || 
+         Target.rfind("/\?\?/",0)!=std::string::npos)
+     {
++#if 0 // 2024.12.26: Not used anymore. We unpack absolute Windows symlinks even in Unix.
+       uiMsg(UIERROR_SLINKCREATE,nullptr,L"\"" + hd->FileName + L"\" -> \"" + hd->RedirName + L"\"");
+       ErrHandler.SetErrorCode(RARX_WARNING);
+       return false;
++#endif
++
++      // 2024.12.26: User asked to unpack absolute Windows symlinks even in Unix.
++      Target=Target.substr(4); // Remove \??\ prefix.
+     }
+     DosSlashToUnix(Target,Target);
+   }
+diff --git a/unpack.cpp b/unpack.cpp
+index 1b13293..a5950ea 100644
+--- a/unpack.cpp
++++ b/unpack.cpp
+@@ -22,7 +22,6 @@ Unpack::Unpack(ComprDataIO *DataIO)
+   Window=NULL;
+   Fragmented=false;
+   Suspended=false;
+-  UnpAllBuf=false;
+   UnpSomeRead=false;
+   ExtraDist=false;
+ #ifdef RAR_SMP
+diff --git a/unpack.hpp b/unpack.hpp
+index 8fa287a..397480a 100644
+--- a/unpack.hpp
++++ b/unpack.hpp
+@@ -285,7 +285,6 @@ class Unpack:PackDef
+     int64 DestUnpSize;
+ 
+     bool Suspended;
+-    bool UnpAllBuf;
+     bool UnpSomeRead;
+     int64 WrittenFileSize;
+     bool FileExtracted;
+diff --git a/unpack20.cpp b/unpack20.cpp
+index a0e179d..f62ee10 100644
+--- a/unpack20.cpp
++++ b/unpack20.cpp
+@@ -159,7 +159,11 @@ void Unpack::UnpWriteBuf20()
+   {
+     UnpIO->UnpWrite(&Window[WrPtr],-(int)WrPtr & MaxWinMask);
+     UnpIO->UnpWrite(Window,UnpPtr);
+-    UnpAllBuf=true;
++    
++    // 2024.12.24: Before 7.10 we set "UnpAllBuf=true" here. It was needed for
++    // Pack::PrepareSolidAppend(). Since both UnpAllBuf and FirstWinDone
++    // variables indicate the same thing and we set FirstWinDone in other place
++    // anyway, we replaced UnpAllBuf with FirstWinDone and removed this code.
+   }
+   else
+     UnpIO->UnpWrite(&Window[WrPtr],UnpPtr-WrPtr);
+diff --git a/unpack50.cpp b/unpack50.cpp
+index 830dfd4..137ce8f 100644
+--- a/unpack50.cpp
++++ b/unpack50.cpp
+@@ -511,8 +511,7 @@ void Unpack::UnpWriteArea(size_t StartPtr,size_t EndPtr)
+ {
+   if (EndPtr!=StartPtr)
+     UnpSomeRead=true;
+-  if (EndPtr<StartPtr)
+-    UnpAllBuf=true;
++
+ 
+   if (Fragmented)
+   {
+diff --git a/version.hpp b/version.hpp
+index 1fa5327..028e71d 100644
+--- a/version.hpp
++++ b/version.hpp
+@@ -1,6 +1,6 @@
+ #define RARVER_MAJOR     7
+ #define RARVER_MINOR    10
+-#define RARVER_BETA      2
+-#define RARVER_DAY       4
+-#define RARVER_MONTH    12
+-#define RARVER_YEAR   2024
++#define RARVER_BETA      3
++#define RARVER_DAY      17
++#define RARVER_MONTH     1
++#define RARVER_YEAR   2025

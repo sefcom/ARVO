@@ -1,0 +1,172 @@
+From 5c6180b5a0e9f9bd1c82938137582720d7a2e6e6 Mon Sep 17 00:00:00 2001
+From: Patrick Steinhardt <ps@pks.im>
+Date: Fri, 29 Nov 2019 11:06:11 +0100
+Subject: [PATCH] global: convert to fiber-local storage to fix exit races
+
+On Windows platforms, we automatically clean up the thread-local storage
+upon detaching a thread via `DllMain()`. The thing is that this happens
+for every thread of applications that link against the libgit2 DLL, even
+those that don't have anything to do with libgit2 itself. As a result,
+we cannot assume that these unsuspecting threads make use of our
+`git_libgit2_init()` and `git_libgit2_shutdow()` reference counting,
+which may lead to racy situations:
+
+    Thread 1                    Thread 2
+
+    git_libgit2_shutdown()
+                                DllMain(DETACH_THREAD)
+                                git__free_tls_data()
+    git_atomic_dec() == 0
+    git__free_tls_data()
+    TlsFree(_tls_index)
+                                TlsGetValue(_tls_index)
+
+Due to the second thread never having executed `git_libgit2_init()`, the
+first thread will clean up TLS data and as a result also free the
+`_tls_index` variable. When detaching the second thread, we
+unconditionally access the now-free'd `_tls_index` variable, which is
+obviously not going to work out well.
+
+Fix the issue by converting the code to use fiber-local storage instead
+of thread-local storage. While FLS will behave the exact same as TLS if
+no fibers are in use, it does allow us to specify a destructor similar
+to the one that is accepted by pthread_key_create(3P). Like this, we do
+not have to manually free indices anymore, but will let the FLS handle
+calling the destructor. This allows us to get rid of `DllMain()`
+completely, as we only used it to keep track of when threads were
+exiting and results in an overall simplification of TLS cleanup.
+---
+ src/global.c       | 52 +++++++++++-----------------------------------
+ src/global.h       |  2 --
+ src/win32/thread.c |  5 -----
+ 3 files changed, 12 insertions(+), 47 deletions(-)
+
+diff --git a/src/global.c b/src/global.c
+index 418c036c1bf..5af35aa62b8 100644
+--- a/src/global.c
++++ b/src/global.c
+@@ -141,14 +141,21 @@ static void shutdown_common(void)
+  */
+ #if defined(GIT_THREADS) && defined(GIT_WIN32)
+ 
+-static DWORD _tls_index;
++static DWORD _fls_index;
+ static volatile LONG _mutex = 0;
+ 
++static void WINAPI fls_free(void *st)
++{
++	git__global_state_cleanup(st);
++	git__free(st);
++}
++
+ static int synchronized_threads_init(void)
+ {
+ 	int error;
+ 
+-	_tls_index = TlsAlloc();
++	if ((_fls_index = FlsAlloc(fls_free)) == FLS_OUT_OF_INDEXES)
++		return -1;
+ 
+ 	git_threads_init();
+ 
+@@ -190,9 +197,7 @@ int git_libgit2_shutdown(void)
+ 	if ((ret = git_atomic_dec(&git__n_inits)) == 0) {
+ 		shutdown_common();
+ 
+-		git__free_tls_data();
+-
+-		TlsFree(_tls_index);
++		FlsFree(_fls_index);
+ 		git_mutex_free(&git__mwindow_mutex);
+ 
+ #if defined(GIT_MSVC_CRTDBG)
+@@ -213,7 +218,7 @@ git_global_st *git__global_state(void)
+ 
+ 	assert(git_atomic_get(&git__n_inits) > 0);
+ 
+-	if ((ptr = TlsGetValue(_tls_index)) != NULL)
++	if ((ptr = FlsGetValue(_fls_index)) != NULL)
+ 		return ptr;
+ 
+ 	ptr = git__calloc(1, sizeof(git_global_st));
+@@ -222,43 +227,10 @@ git_global_st *git__global_state(void)
+ 
+ 	git_buf_init(&ptr->error_buf, 0);
+ 
+-	TlsSetValue(_tls_index, ptr);
++	FlsSetValue(_fls_index, ptr);
+ 	return ptr;
+ }
+ 
+-/**
+- * Free the TLS data associated with this thread.
+- * This should only be used by the thread as it
+- * is exiting.
+- */
+-void git__free_tls_data(void)
+-{
+-	void *ptr = TlsGetValue(_tls_index);
+-	if (!ptr)
+-		return;
+-
+-	git__global_state_cleanup(ptr);
+-	git__free(ptr);
+-	TlsSetValue(_tls_index, NULL);
+-}
+-
+-BOOL WINAPI DllMain(HINSTANCE hInstDll, DWORD fdwReason, LPVOID lpvReserved)
+-{
+-	GIT_UNUSED(hInstDll);
+-	GIT_UNUSED(lpvReserved);
+-
+-	/* This is how Windows lets us know our thread is being shut down */
+-	if (fdwReason == DLL_THREAD_DETACH) {
+-		git__free_tls_data();
+-	}
+-
+-	/*
+-	 * Windows pays attention to this during library loading. We don't do anything
+-	 * so we trivially succeed.
+-	 */
+-	return TRUE;
+-}
+-
+ #elif defined(GIT_THREADS) && defined(_POSIX_THREADS)
+ 
+ static pthread_key_t _tls_key;
+diff --git a/src/global.h b/src/global.h
+index 3c0559c688c..db41dad1fc5 100644
+--- a/src/global.h
++++ b/src/global.h
+@@ -35,8 +35,6 @@ typedef void (*git_global_shutdown_fn)(void);
+ 
+ extern void git__on_shutdown(git_global_shutdown_fn callback);
+ 
+-extern void git__free_tls_data(void);
+-
+ extern const char *git_libgit2__user_agent(void);
+ extern const char *git_libgit2__ssl_ciphers(void);
+ 
+diff --git a/src/win32/thread.c b/src/win32/thread.c
+index c3a6c0e2812..42dba7f9740 100644
+--- a/src/win32/thread.c
++++ b/src/win32/thread.c
+@@ -32,8 +32,6 @@ static DWORD WINAPI git_win32__threadproc(LPVOID lpParameter)
+ 
+ 	thread->result = thread->proc(thread->param);
+ 
+-	git__free_tls_data();
+-
+ 	return CLEAN_THREAD_EXIT;
+ }
+ 
+@@ -103,9 +101,6 @@ void git_thread_exit(void *value)
+ {
+ 	assert(GIT_GLOBAL->current_thread);
+ 	GIT_GLOBAL->current_thread->result = value;
+-
+-	git__free_tls_data();
+-
+ 	ExitThread(CLEAN_THREAD_EXIT);
+ }
+ 

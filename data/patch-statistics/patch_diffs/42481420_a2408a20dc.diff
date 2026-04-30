@@ -1,0 +1,340 @@
+From fd08f062ae5a3c92bfc0345da7e83ab320046864 Mon Sep 17 00:00:00 2001
+From: Ivan Mikheykin <ivan.mikheykin@flant.com>
+Date: Fri, 17 Jan 2020 22:26:35 +0300
+Subject: [PATCH] Fix bug #78323: Code 0 is returned on invalid options
+
+Set CLI exit code to 1 when invalid parameters are passed,
+and print error to stderr.
+---
+ NEWS                           |  1 +
+ ext/standard/basic_functions.c |  2 +-
+ main/getopt.c                  |  3 +-
+ main/php_getopt.h              |  3 ++
+ sapi/cgi/cgi_main.c            |  4 ++
+ sapi/cgi/tests/bug78323.phpt   | 41 ++++++++++++++++++
+ sapi/cli/php_cli.c             |  6 ++-
+ sapi/cli/tests/015.phpt        |  2 +-
+ sapi/cli/tests/bug78323.phpt   | 78 ++++++++++++++++++++++++++++++++++
+ sapi/fpm/fpm/fpm_main.c        |  3 +-
+ sapi/fpm/tests/bug78323.phpt   | 39 +++++++++++++++++
+ 11 files changed, 177 insertions(+), 5 deletions(-)
+ create mode 100644 sapi/cgi/tests/bug78323.phpt
+ create mode 100644 sapi/cli/tests/bug78323.phpt
+ create mode 100644 sapi/fpm/tests/bug78323.phpt
+
+diff --git a/NEWS b/NEWS
+index a41b16a3589fb..fe4c2d37310ad 100644
+--- a/NEWS
++++ b/NEWS
+@@ -6,6 +6,7 @@ PHP                                                                        NEWS
+   . Fixed bug #71876 (Memory corruption htmlspecialchars(): charset `*' not
+     supported). (Nikita)
+   . Fixed bug ##79146 (cscript can fail to run on some systems). (clarodeus)
++  . Fixed bug #78323 (Code 0 is returned on invalid options). (Ivan Mikheykin)
+ 
+ - CURL:
+   . Fixed bug #79078 (Hypothetical use-after-free in curl_multi_add_handle()).
+diff --git a/ext/standard/basic_functions.c b/ext/standard/basic_functions.c
+index f34be0d1093a7..bbeb13f649b6b 100644
+--- a/ext/standard/basic_functions.c
++++ b/ext/standard/basic_functions.c
+@@ -4478,7 +4478,7 @@ PHP_FUNCTION(getopt)
+ 
+ 	while ((o = php_getopt(argc, argv, opts, &php_optarg, &php_optind, 0, 1)) != -1) {
+ 		/* Skip unknown arguments. */
+-		if (o == '?') {
++		if (o == PHP_GETOPT_INVALID_ARG) {
+ 			continue;
+ 		}
+ 
+diff --git a/main/getopt.c b/main/getopt.c
+index 3af45e0e964dc..9e802fa23c9ef 100644
+--- a/main/getopt.c
++++ b/main/getopt.c
+@@ -26,6 +26,7 @@
+ #define OPTERRNF (2)
+ #define OPTERRARG (3)
+ 
++// Print error message to stderr and return -2 to distinguish it from '?' command line option.
+ static int php_opt_error(int argc, char * const *argv, int oint, int optchr, int err, int show_err) /* {{{ */
+ {
+ 	if (show_err)
+@@ -47,7 +48,7 @@ static int php_opt_error(int argc, char * const *argv, int oint, int optchr, int
+ 			break;
+ 		}
+ 	}
+-	return('?');
++	return PHP_GETOPT_INVALID_ARG;
+ }
+ /* }}} */
+ 
+diff --git a/main/php_getopt.h b/main/php_getopt.h
+index a8b2f89b4cc52..027e15295285d 100644
+--- a/main/php_getopt.h
++++ b/main/php_getopt.h
+@@ -35,6 +35,9 @@ extern PHPAPI int php_optidx;
+ PHPAPI int php_getopt(int argc, char* const *argv, const opt_struct opts[], char **optarg, int *optind, int show_err, int arg_start);
+ END_EXTERN_C()
+ 
++/* php_getopt will return this value if there is an error in arguments */
++#define PHP_GETOPT_INVALID_ARG (-2)
++
+ #endif
+ 
+ /*
+diff --git a/sapi/cgi/cgi_main.c b/sapi/cgi/cgi_main.c
+index fb16f2b577ca0..d6449ba228586 100644
+--- a/sapi/cgi/cgi_main.c
++++ b/sapi/cgi/cgi_main.c
+@@ -2283,6 +2283,7 @@ consult the installation file that came with this distribution, or visit \n\
+ 					break;
+ 				case 'h':
+ 				case '?':
++				case PHP_GETOPT_INVALID_ARG:
+ 					if (request) {
+ 						fcgi_destroy_request(request);
+ 					}
+@@ -2292,6 +2293,9 @@ consult the installation file that came with this distribution, or visit \n\
+ 					php_cgi_usage(argv[0]);
+ 					php_output_end_all();
+ 					exit_status = 0;
++					if (c == PHP_GETOPT_INVALID_ARG) {
++						exit_status = 1;
++					}
+ 					goto out;
+ 			}
+ 		}
+diff --git a/sapi/cgi/tests/bug78323.phpt b/sapi/cgi/tests/bug78323.phpt
+new file mode 100644
+index 0000000000000..d89e51874a43f
+--- /dev/null
++++ b/sapi/cgi/tests/bug78323.phpt
+@@ -0,0 +1,41 @@
++--TEST--
++Bug #78323 Test exit code and error message for invalid parameters
++--SKIPIF--
++<?php include "skipif.inc"; ?>
++--FILE--
++<?php
++include "include.inc";
++$php = get_cgi_path();
++reset_env_vars();
++
++
++// no argument for option
++ob_start();
++passthru("$php --memory-limit=1G 2>&1", $exitCode);
++$output = ob_get_contents();
++ob_end_clean();
++
++$lines = preg_split('/\R/', $output);
++echo $lines[0], "\n",
++     $lines[1], "\n",
++     "Done: $exitCode\n\n";
++
++
++// Successful execution
++ob_start();
++passthru("$php -dmemory-limit=1G -v", $exitCode);
++$output = ob_get_contents();
++ob_end_clean();
++
++$lines = preg_split('/\R/', $output);
++echo $lines[0], "\n",
++     "Done: $exitCode\n";
++
++?>
++--EXPECTF--
++Error in argument 1, char 1: no argument for option -
++Usage: %s
++Done: 1
++
++PHP %s
++Done: 0
+diff --git a/sapi/cli/php_cli.c b/sapi/cli/php_cli.c
+index 3b053e223ab76..342c5e5feb80a 100644
+--- a/sapi/cli/php_cli.c
++++ b/sapi/cli/php_cli.c
+@@ -1265,7 +1265,7 @@ int main(int argc, char *argv[])
+ 	setmode(_fileno(stderr), O_BINARY);		/* make the stdio mode be binary */
+ #endif
+ 
+-	while ((c = php_getopt(argc, argv, OPTIONS, &php_optarg, &php_optind, 0, 2))!=-1) {
++	while ((c = php_getopt(argc, argv, OPTIONS, &php_optarg, &php_optind, 1, 2))!=-1) {
+ 		switch (c) {
+ 			case 'c':
+ 				if (ini_path_override) {
+@@ -1317,6 +1317,10 @@ int main(int argc, char *argv[])
+ 			case '?':
+ 				php_cli_usage(argv[0]);
+ 				goto out;
++			case PHP_GETOPT_INVALID_ARG: /* print usage on bad options, exit 1 */
++				php_cli_usage(argv[0]);
++				exit_status = 1;
++				goto out;
+ 			case 'i': case 'v': case 'm':
+ 				sapi_module = &cli_sapi_module;
+ 				goto exit_loop;
+diff --git a/sapi/cli/tests/015.phpt b/sapi/cli/tests/015.phpt
+index 01f5328e9924d..5a5e6c5190d25 100644
+--- a/sapi/cli/tests/015.phpt
++++ b/sapi/cli/tests/015.phpt
+@@ -16,7 +16,7 @@ $php = getenv('TEST_PHP_EXECUTABLE');
+ echo `"$php" -n --version | grep built:`;
+ echo `echo "<?php print_r(\\\$argv);" | "$php" -n -- foo bar baz`, "\n";
+ echo `"$php" -n --version foo bar baz | grep built:`;
+-echo `"$php" -n --notexisting foo bar baz | grep Usage:`;
++echo `"$php" -n --notexisting foo bar baz 2>&1 | grep Usage:`;
+ 
+ echo "Done\n";
+ ?>
+diff --git a/sapi/cli/tests/bug78323.phpt b/sapi/cli/tests/bug78323.phpt
+new file mode 100644
+index 0000000000000..02b18e02a2141
+--- /dev/null
++++ b/sapi/cli/tests/bug78323.phpt
+@@ -0,0 +1,78 @@
++--TEST--
++Bug #78323 Test exit code and error message for invalid parameters
++--SKIPIF--
++<?php
++include "skipif.inc";
++?>
++--FILE--
++<?php
++$php = getenv('TEST_PHP_EXECUTABLE');
++
++// There are 3 types of option errors:
++// 1 : in flags
++// 2 option not found
++// 3 no argument for option
++
++
++// colon in flags
++ob_start();
++passthru("$php -a:Z 2>&1", $exitCode);
++$output = ob_get_contents();
++ob_end_clean();
++
++$lines = preg_split('/\R/', $output);
++echo $lines[0], "\n",
++     $lines[1], "\n",
++     "Done: $exitCode\n\n";
++
++
++// option not found
++ob_start();
++passthru("$php -Z 2>&1", $exitCode);
++$output = ob_get_contents();
++ob_end_clean();
++
++$lines = preg_split('/\R/', $output);
++echo $lines[0], "\n",
++     $lines[1], "\n",
++     "Done: $exitCode\n\n";
++
++
++// no argument for option
++ob_start();
++passthru("$php --memory-limit=1G 2>&1", $exitCode);
++$output = ob_get_contents();
++ob_end_clean();
++
++$lines = preg_split('/\R/', $output);
++echo $lines[0], "\n",
++     $lines[1], "\n",
++     "Done: $exitCode\n\n";
++
++
++// Successful execution
++ob_start();
++passthru("$php -dmemory-limit=1G -v", $exitCode);
++$output = ob_get_contents();
++ob_end_clean();
++
++$lines = preg_split('/\R/', $output);
++echo $lines[0], "\n",
++     "Done: $exitCode\n";
++
++?>
++--EXPECTF--
++Error in argument %d, char %d: : in flags
++Usage: %s [options] [-f] <file> [--] [args...]
++Done: 1
++
++Error in argument %d, char %d: option not found %s
++Usage: %s [options] [-f] <file> [--] [args...]
++Done: 1
++
++Error in argument %d, char %d: no argument for option %s
++Usage: %s [options] [-f] <file> [--] [args...]
++Done: 1
++
++PHP %s
++Done: 0
+diff --git a/sapi/fpm/fpm/fpm_main.c b/sapi/fpm/fpm/fpm_main.c
+index dfc0d8f7413c1..65890f9fdfb44 100644
+--- a/sapi/fpm/fpm/fpm_main.c
++++ b/sapi/fpm/fpm/fpm_main.c
+@@ -1707,6 +1707,7 @@ int main(int argc, char *argv[])
+ 			default:
+ 			case 'h':
+ 			case '?':
++			case PHP_GETOPT_INVALID_ARG:
+ 				cgi_sapi_module.startup(&cgi_sapi_module);
+ 				php_output_activate();
+ 				SG(headers_sent) = 1;
+@@ -1714,7 +1715,7 @@ int main(int argc, char *argv[])
+ 				php_output_end_all();
+ 				php_output_deactivate();
+ 				fcgi_shutdown();
+-				exit_status = (c == 'h') ? FPM_EXIT_OK : FPM_EXIT_USAGE;
++				exit_status = (c != PHP_GETOPT_INVALID_ARG) ? FPM_EXIT_OK : FPM_EXIT_USAGE;
+ 				goto out;
+ 
+ 			case 'v': /* show php version & quit */
+diff --git a/sapi/fpm/tests/bug78323.phpt b/sapi/fpm/tests/bug78323.phpt
+new file mode 100644
+index 0000000000000..cf91020573144
+--- /dev/null
++++ b/sapi/fpm/tests/bug78323.phpt
+@@ -0,0 +1,39 @@
++--TEST--
++FPM: Bug #78323 Test exit code for invalid parameters
++--SKIPIF--
++<?php include "skipif.inc"; ?>
++--FILE--
++<?php
++
++require_once "tester.inc";
++
++$php = \FPM\Tester::findExecutable();
++
++// no argument for option
++ob_start();
++passthru("$php --memory-limit=1G 2>&1", $exitCode);
++$output = ob_get_contents();
++ob_end_clean();
++
++$lines = preg_split('/\R/', $output);
++echo $lines[0], "\n",
++     "Done: $exitCode\n\n";
++
++
++// Successful execution
++ob_start();
++passthru("$php -dmemory-limit=1G -v", $exitCode);
++$output = ob_get_contents();
++ob_end_clean();
++
++$lines = preg_split('/\R/', $output);
++echo $lines[0], "\n",
++     "Done: $exitCode\n";
++
++?>
++--EXPECTF--
++Usage: %s
++Done: 64
++
++PHP %s
++Done: 0

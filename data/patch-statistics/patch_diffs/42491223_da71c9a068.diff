@@ -1,0 +1,137 @@
+From c3b2f15c4316b1d76243df6588c86a1bfa6f54fe Mon Sep 17 00:00:00 2001
+From: Dan Bloomberg <dan.bloomberg@gmail.com>
+Date: Wed, 6 Jan 2021 21:24:21 -0800
+Subject: [PATCH] Oss-fuzz issue 29117: finditalic_fuzzer: heap overflow *
+ substituteObjectNumbers() was not checking array bounds * also fixed
+ enhance_fuzzer.cc * also fixed documentation in enhance.c
+
+---
+ prog/fuzzing/enhance_fuzzer.cc |  4 +---
+ src/enhance.c                  |  8 ++++----
+ src/finditalic.c               |  5 +++--
+ src/pdfio2.c                   | 21 ++++++++++++++++++++-
+ 4 files changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/prog/fuzzing/enhance_fuzzer.cc b/prog/fuzzing/enhance_fuzzer.cc
+index 6dd907772..ba9e78e7f 100644
+--- a/prog/fuzzing/enhance_fuzzer.cc
++++ b/prog/fuzzing/enhance_fuzzer.cc
+@@ -81,7 +81,6 @@ LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+ 	pix_pointer_payload = pixCopy(NULL, pixs_payload);
+ 	pixMultMatrixColor( pix_pointer_payload, kel);
+ 	pixDestroy(&pix_pointer_payload);
+-	pixDestroy(&return_pix);
+ 	kernelDestroy(&kel);
+ 
+ 	na1 = numaGammaTRC(1.0, 0, 255);
+@@ -89,8 +88,7 @@ LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+ 	na3 = numaGammaTRC(1.0, 0, 255);
+ 	pix_pointer_payload = pixCopy(NULL, pixs_payload);
+ 	pix2 = pixMakeSymmetricMask(10, 10, 0.5, 0.5, L_USE_INNER);
+-	return_pix = pixTRCMapGeneral(pix_pointer_payload, pix2, na1, na2, na3);
+-	pixDestroy(&return_pix);
++	pixTRCMapGeneral(pix_pointer_payload, pix2, na1, na2, na3);
+ 	numaDestroy(&na1);
+ 	numaDestroy(&na2);
+ 	numaDestroy(&na3);
+diff --git a/src/enhance.c b/src/enhance.c
+index 32813c458..9d4bf000d 100644
+--- a/src/enhance.c
++++ b/src/enhance.c
+@@ -44,8 +44,8 @@
+  *           NUMA    *numaEqualizeTRC()
+  *
+  *      Generic TRC mapper
+- *           PIX     *pixTRCMap()
+- *           PIX     *pixTRCMapGeneral()
++ *           l_int32  pixTRCMap()
++ *           l_int32  pixTRCMapGeneral()
+  *
+  *      Unsharp-masking
+  *           PIX     *pixUnsharpMasking()
+@@ -765,7 +765,7 @@ NUMA      *nah, *nasum, *nad;
+  * \param[in]    pixs    8 grayscale or 32 bpp rgb; not colormapped
+  * \param[in]    pixm    [optional] 1 bpp mask
+  * \param[in]    na      mapping array
+- * \return  pixd, or NULL on error
++ * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+@@ -886,7 +886,7 @@ l_uint32  *data, *datam, *line, *linem, *tab;
+  * \param[in]    pixs             32 bpp rgb; not colormapped
+  * \param[in]    pixm             [optional] 1 bpp mask
+  * \param[in]    nar, nag, nab    mapping arrays
+- * \return  pixd, or NULL on error
++ * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+diff --git a/src/finditalic.c b/src/finditalic.c
+index be7e4c533..adcd0e77e 100644
+--- a/src/finditalic.c
++++ b/src/finditalic.c
+@@ -127,10 +127,11 @@ SEL     *sel_ital1, *sel_ital2, *sel_ital3;
+ 
+     PROCNAME("pixItalicWords");
+ 
+-    if (!pixs)
+-        return ERROR_INT("pixs not defined", procName, 1);
+     if (!pboxa)
+         return ERROR_INT("&boxa not defined", procName, 1);
++    *pboxa = NULL;
++    if (!pixs)
++        return ERROR_INT("pixs not defined", procName, 1);
+     if (boxaw && pixw)
+         return ERROR_INT("both boxaw and pixw are defined", procName, 1);
+ 
+diff --git a/src/pdfio2.c b/src/pdfio2.c
+index 9ee412630..2f8629d17 100644
+--- a/src/pdfio2.c
++++ b/src/pdfio2.c
+@@ -2412,18 +2412,30 @@ substituteObjectNumbers(L_BYTEA  *bas,
+ l_uint8   space = ' ';
+ l_uint8  *datas;
+ l_uint8   buf[32];  /* only needs to hold one integer in ascii format */
+-l_int32   start, nrepl, i, j, objin, objout, found;
++l_int32   start, nrepl, i, j, nobjs, objin, objout, found;
+ l_int32  *objs, *matches;
+ size_t    size;
+ L_BYTEA  *bad;
+ L_DNA    *da_match;
+ 
++    PROCNAME("substituteObjectNumbers");
++    if (!bas)
++        return (L_BYTEA *)ERROR_PTR("bas not defined", procName, NULL);
++    if (!na_objs)
++        return (L_BYTEA *)ERROR_PTR("na_objs not defined", procName, NULL);
++
+     datas = l_byteaGetData(bas, &size);
+     bad = l_byteaCreate(100);
+     objs = numaGetIArray(na_objs);  /* object number mapper */
++    nobjs = numaGetCount(na_objs);  /* use for sanity checking */
+ 
+         /* Substitute the object number on the first line */
+     sscanf((char *)datas, "%d", &objin);
++    if (objin < 0 || objin >= nobjs) {
++        L_ERROR("index %d into array of size %d\n", procName, objin, nobjs);
++        LEPT_FREE(objs);
++        return bad;
++    }
+     objout = objs[objin];
+     snprintf((char *)buf, 32, "%d", objout);
+     l_byteaAppendString(bad, (char *)buf);
+@@ -2449,6 +2461,13 @@ L_DNA    *da_match;
+             /* Copy bytes from 'start' up to the object number */
+         l_byteaAppendData(bad, datas + start, j - start + 1);
+         sscanf((char *)(datas + j + 1), "%d", &objin);
++        if (objin < 0 || objin >= nobjs) {
++            L_ERROR("index %d into array of size %d\n", procName, objin, nobjs);
++            LEPT_FREE(objs);
++            LEPT_FREE(matches);
++            l_dnaDestroy(&da_match);
++            return bad;
++        }
+         objout = objs[objin];
+         snprintf((char *)buf, 32, "%d", objout);
+         l_byteaAppendString(bad, (char *)buf);

@@ -1,0 +1,128 @@
+From 90f85fe7088955532f84fa7e2c54f07824ed6eb3 Mon Sep 17 00:00:00 2001
+From: Ingo Berg <github_contact@beltoforion.de>
+Date: Sun, 14 Jun 2020 02:40:02 +0200
+Subject: [PATCH] fix for oss-fut issue  23410
+
+---
+ samples/example1/example1.cpp |  2 +-
+ src/muParserBase.cpp          |  6 ++++++
+ src/muParserBytecode.cpp      |  5 +++--
+ src/muParserTest.cpp          | 13 +++++++++++--
+ src/muParserTokenReader.cpp   |  4 ++--
+ 5 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/samples/example1/example1.cpp b/samples/example1/example1.cpp
+index 4d92dbf..393ed0d 100644
+--- a/samples/example1/example1.cpp
++++ b/samples/example1/example1.cpp
+@@ -355,7 +355,7 @@ static int CheckKeywords(const mu::char_type* a_szLine, mu::Parser& a_Parser)
+ 	}
+ 	else if (sLine == _T("dbg"))
+ 	{
+-		std::string dbg = "strfun2(\"100\", 1)";
++		std::string dbg = R"(6 - 6 ? 4 : "", ? 4 : "", ? 4 : ""), 1)";
+ 		a_Parser.SetExpr(dbg);
+ 		mu::console() << dbg;
+ 
+diff --git a/src/muParserBase.cpp b/src/muParserBase.cpp
+index 4aec5fb..eac46ca 100644
+--- a/src/muParserBase.cpp
++++ b/src/muParserBase.cpp
+@@ -1115,7 +1115,10 @@ namespace mu
+ 
+ 			case  cmIF:
+ 				if (Stack[sidx--] == 0)
++				{
++					MUP_ASSERT(sidx >= 0);
+ 					pTok += pTok->Oprt.offset;
++				}
+ 				continue;
+ 
+ 			case  cmELSE:
+@@ -1461,6 +1464,9 @@ namespace mu
+ 				StackDump(stVal, stOpt);
+ 				m_vRPN.AsciiDump();
+ 			}
++
++//			if (ParserBase::g_DbgDumpCmdCode)
++				//m_vRPN.AsciiDump();
+ 		} // while (true)
+ 
+ 		if (ParserBase::g_DbgDumpCmdCode)
+diff --git a/src/muParserBytecode.cpp b/src/muParserBytecode.cpp
+index e3af205..ebc603a 100644
+--- a/src/muParserBytecode.cpp
++++ b/src/muParserBytecode.cpp
+@@ -247,7 +247,8 @@ namespace mu
+ 						(m_vRPN[sz - 1].Cmd == cmVARMUL && m_vRPN[sz - 2].Cmd == cmVAR && m_vRPN[sz - 2].Val.ptr == m_vRPN[sz - 1].Val.ptr) ||
+ 						(m_vRPN[sz - 1].Cmd == cmVARMUL && m_vRPN[sz - 2].Cmd == cmVARMUL && m_vRPN[sz - 2].Val.ptr == m_vRPN[sz - 1].Val.ptr))
+ 					{
+-						MUP_ASSERT((m_vRPN[sz - 2].Val.ptr == nullptr && m_vRPN[sz - 1].Val.ptr != nullptr) ||
++						MUP_ASSERT(
++							(m_vRPN[sz - 2].Val.ptr == nullptr && m_vRPN[sz - 1].Val.ptr != nullptr) ||
+ 							(m_vRPN[sz - 2].Val.ptr != nullptr && m_vRPN[sz - 1].Val.ptr == nullptr) ||
+ 							(m_vRPN[sz - 2].Val.ptr == m_vRPN[sz - 1].Val.ptr));
+ 
+@@ -496,7 +497,7 @@ namespace mu
+ 				stIf.push(i);
+ 				break;
+ 
+-			case  cmELSE:
++			case cmELSE:
+ 				stElse.push(i);
+ 				idx = stIf.top();
+ 				stIf.pop();
+diff --git a/src/muParserTest.cpp b/src/muParserTest.cpp
+index 75b5924..75fbdf5 100644
+--- a/src/muParserTest.cpp
++++ b/src/muParserTest.cpp
+@@ -136,10 +136,18 @@ namespace mu
+ 			int iStat = 0;
+ 			mu::console() << _T("testing string arguments...");
+ 
++
++			// from oss-fuzz: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=23410
++			iStat += ThrowTest(_T(R"(6 - 6 ? 4 : "", ? 4 : "", ? 4 : "")"), ecUNEXPECTED_STR,  true);
++			// variations:
++			iStat += ThrowTest(_T(R"(1 ? 4 : "")"), ecUNEXPECTED_STR, true);
++			iStat += ThrowTest(_T(R"(1 ? "" : 4)"), ecUNEXPECTED_STR, true);
++			iStat += ThrowTest(_T(R"(1 ? "" : "")"), ecUNEXPECTED_STR, true);
++
+ 			// from oss-fuzz: https://oss-fuzz.com/testcase-detail/5106868061208576
+-			iStat += ThrowTest(_T("\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",8"), ecSTR_RESULT);
++			iStat += ThrowTest(_T(R"("","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",8)"), ecSTR_RESULT);
+ 			// variations:
+-			iStat += ThrowTest(_T("\"\",\"\",9"), ecSTR_RESULT);
++			iStat += ThrowTest(_T(R"("","",9)"), ecSTR_RESULT);
+ 
+ 			iStat += EqnTest(_T("valueof(\"\")"), 123, true);   // empty string arguments caused a crash
+ 			iStat += EqnTest(_T("valueof(\"aaa\")+valueof(\"bbb\")  "), 246, true);
+@@ -1191,6 +1199,7 @@ namespace mu
+ 				p.DefineFun(_T("strfun4"), StrFun4);
+ 				p.DefineFun(_T("strfun5"), StrFun5);
+ 				p.SetExpr(a_str);
++//				p.EnableDebugDump(1, 0);
+ 				p.Eval();
+ 			}
+ 			catch (ParserError& e)
+diff --git a/src/muParserTokenReader.cpp b/src/muParserTokenReader.cpp
+index 8e10561..f478d6a 100644
+--- a/src/muParserTokenReader.cpp
++++ b/src/muParserTokenReader.cpp
+@@ -486,14 +486,14 @@ namespace mu
+ 					if (m_iSynFlags & noELSE)
+ 						Error(ecUNEXPECTED_CONDITIONAL, m_iPos, pOprtDef[i]);
+ 
+-					m_iSynFlags = noBC | noPOSTOP | noEND | noOPT | noIF | noELSE;
++					m_iSynFlags = noBC | noPOSTOP | noEND | noOPT | noIF | noELSE | noSTR;
+ 					break;
+ 
+ 				case cmIF:
+ 					if (m_iSynFlags & noIF)
+ 						Error(ecUNEXPECTED_CONDITIONAL, m_iPos, pOprtDef[i]);
+ 
+-					m_iSynFlags = noBC | noPOSTOP | noEND | noOPT | noIF | noELSE;
++					m_iSynFlags = noBC | noPOSTOP | noEND | noOPT | noIF | noELSE | noSTR;
+ 					break;
+ 
+ 				default:      // The operator is listed in c_DefaultOprt, but not here. This is a bad thing...

@@ -1,0 +1,172 @@
+From 58c7b7905cba77fd8fb7687eed6d43b35442c31e Mon Sep 17 00:00:00 2001
+From: Andrey Saranchin <Andrey22102001@gmail.com>
+Date: Thu, 29 May 2025 16:05:25 +0300
+Subject: [PATCH] box: handle stale multikey tuple fields
+
+After a multikey index is altered or dropped, tuples that were inserted
+while it existed still reference the format with multikey parts. Actually,
+that multikey format field shouldn't be used anymore because multikey
+index is gone, but that's not true. It happens because format is arranged
+to a JSON tree, and this tree has an interesting property. Imagine having
+a field with path '[1][*]' in the tree. Then, when looking for a field
+'[1][1]' (or '[1]["abc"]', the second key can be anything), the field with
+path '[1][*]' will be returned since '*' is actually wildcard. Hence,
+even if the format is stale and there are no multikey fields in actual
+format, we can obtain a multikey field even if we didn't search for it
+and `multikey_idx` will be MULTIKEY_NONE in this case. Let's handle this
+scenario - simply ignore offset slot when `multikey_idx` is MULTIKEY_NONE
+for a multikey field.
+
+This bug could lead to assertion failure in Debug build and UB or even
+crash in Release build because when one builds an index over the field
+that was covered by multikey index, field map of tuples referencing the
+old format would be incorrect - it would store offset of multikey array
+instead of actual field.
+
+Closes #11291
+
+NO_DOC=bugfix
+---
+ .../gh-11291-mutikey-index-alter.md           |  4 +
+ src/box/tuple.h                               | 24 +++---
+ ...11291_assert_after_mk_index_alter_test.lua | 76 +++++++++++++++++++
+ 3 files changed, 94 insertions(+), 10 deletions(-)
+ create mode 100644 changelogs/unreleased/gh-11291-mutikey-index-alter.md
+ create mode 100644 test/box-luatest/gh_11291_assert_after_mk_index_alter_test.lua
+
+diff --git a/changelogs/unreleased/gh-11291-mutikey-index-alter.md b/changelogs/unreleased/gh-11291-mutikey-index-alter.md
+new file mode 100644
+index 000000000000..af8180daee19
+--- /dev/null
++++ b/changelogs/unreleased/gh-11291-mutikey-index-alter.md
+@@ -0,0 +1,4 @@
++## bugfix/memtx
++
++* Fixed a bug when altering a multikey index and creating a new one over
++  the same field could lead to a crash or undefined behavior (gh-11291).
+diff --git a/src/box/tuple.h b/src/box/tuple.h
+index df0cad361bd4..9ffe02f53195 100644
+--- a/src/box/tuple.h
++++ b/src/box/tuple.h
+@@ -962,16 +962,7 @@ tuple_field_raw_by_path(struct tuple_format *format, const char *tuple,
+ 		offset_slot = field->offset_slot;
+ 		if (offset_slot == TUPLE_OFFSET_SLOT_NIL)
+ 			goto parse;
+-		if (offset_slot_hint != NULL) {
+-			*offset_slot_hint = offset_slot;
+-			/*
+-			 * Hint is never requested for a multikey field without
+-			 * providing a concrete multikey index.
+-			 */
+-			assert(!field->is_multikey_part ||
+-			       multikey_idx != MULTIKEY_NONE);
+-		} else if (field->is_multikey_part &&
+-			   multikey_idx == MULTIKEY_NONE) {
++		if (field->is_multikey_part && multikey_idx == MULTIKEY_NONE) {
+ 			/*
+ 			 * When the field is multikey, the offset slot points
+ 			 * not at the data. It points at 'extra' array of
+@@ -980,8 +971,21 @@ tuple_field_raw_by_path(struct tuple_format *format, const char *tuple,
+ 			 * not known when the field is accessed not in an index.
+ 			 * For example, in an application's Lua code by a JSON
+ 			 * path.
++			 *
++			 * Also, JSON tree has an interesting property. Imagine
++			 * having a field with path '[1][*]' in the tree. Then,
++			 * when looking for a field '[1][1]' (or '[1]["abc"]',
++			 * the second key can be anything), the field with path
++			 * '[1][*]' will be returned since '*' is actually
++			 * wildcard. Hence, if the format is stale and there are
++			 * no multikey fields in actual format, we can obtain
++			 * here a multikey field even if we didn't search for it
++			 * and multikey_idx will be MULTIKEY_NONE in this case.
++			 * Offset slot of such field should be skipped.
+ 			 */
+ 			goto parse;
++		} else if (offset_slot_hint != NULL) {
++			*offset_slot_hint = offset_slot;
+ 		}
+ offset_slot_access:
+ 		/* Indexed field */
+diff --git a/test/box-luatest/gh_11291_assert_after_mk_index_alter_test.lua b/test/box-luatest/gh_11291_assert_after_mk_index_alter_test.lua
+new file mode 100644
+index 000000000000..718bf0f11452
+--- /dev/null
++++ b/test/box-luatest/gh_11291_assert_after_mk_index_alter_test.lua
+@@ -0,0 +1,76 @@
++local server = require('luatest.server')
++local t = require('luatest')
++
++local g = t.group()
++
++g.before_all(function(cg)
++    cg.server = server:new()
++    cg.server:start()
++end)
++
++g.after_all(function(cg)
++    cg.server:drop()
++end)
++
++g.after_each(function(cg)
++    cg.server:exec(function()
++        box.space.test:drop()
++    end)
++end)
++
++-- Drop multikey index and create a non-multikey one.
++g.test_drop_mk_index = function(cg)
++    cg.server:exec(function()
++        local s = box.schema.space.create('test')
++        s:create_index('pk')
++
++        for i = 1, 10 do
++            s:replace{i, {i, i + 100, i + 1000}}
++        end
++
++        s:create_index('sk',
++            {parts = {{field = 2, type = 'unsigned', path = '[*]'}}})
++
++        for i = 11, 20 do
++            s:replace{i, {i, i + 100, i + 1000}}
++        end
++
++        s.index.sk:drop()
++
++        for i = 21, 30 do
++            s:replace{i, {i, i + 100, i + 1000}}
++        end
++
++        s:create_index('sk',
++            {parts = {{field = 2, type = 'unsigned', path = '[2]'}}})
++
++        for i = 31, 40 do
++            s:replace{i, {i, i + 100, i + 1000}}
++        end
++    end)
++end
++
++-- Turn multikey index into non-multikey one.
++g.test_alter_mk_index = function(cg)
++    cg.server:exec(function()
++        local s = box.schema.space.create('test')
++        s:create_index('pk')
++
++        for i = 1, 10 do
++            s:replace{i, {i, i + 100, i + 1000}}
++        end
++
++        local sk = s:create_index('sk',
++            {parts = {{field = 2, type = 'unsigned', path = '[*]'}}})
++
++        for i = 11, 20 do
++            s:replace{i, {i, i + 100, i + 1000}}
++        end
++
++        sk:alter({parts = {{field = 2, type = 'unsigned', path = '[2]'}}})
++
++        for i = 21, 30 do
++            s:replace{i, {i, i + 100, i + 1000}}
++        end
++    end)
++end

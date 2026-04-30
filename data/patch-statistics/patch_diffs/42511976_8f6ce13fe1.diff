@@ -1,0 +1,183 @@
+From 5b151607e1faf27238e9dce6d3124741779dcc3a Mon Sep 17 00:00:00 2001
+From: Tom de Vries <tdevries@suse.de>
+Date: Thu, 28 Oct 2021 10:43:34 +0200
+Subject: [PATCH] [gdb/symtab] Handle DW_AT_string_length with location list
+
+Consider a fortran routine where a string variable s is modified:
+...
+subroutine f(s)
+  character*(*) s
+  print *, s
+  s(1:3) = 'oof'
+  print *, s
+end subroutine f
+...
+
+When compiling with optimization level -O1 and printing the type of
+variable s we get:
+...
+$ gdb -q -batch outputs/gdb.opt/fortran-string/fortran-string \
+  -ex "b f" \
+  -ex run \
+  -ex "ptype s"
+Breakpoint 1 at 0x4006f7: file fortran-string.f90, line 21.
+
+Breakpoint 1, f (s=..., _s=_s@entry=3) at fortran-string.f90:21
+21      subroutine f(s)
+type = character*1
+...
+while with -O0 we have instead:
+...
+type = character (3)
+...
+
+The problem is that the type of s is:
+...
+ <1><2d6>: Abbrev Number: 21 (DW_TAG_string_type)
+    <2d7>   DW_AT_string_length: 0xbf (location list)
+    <2db>   DW_AT_byte_size   : 4
+...
+where the DW_AT_string_length is a location list, a case that is not handled
+by attr_to_dynamic_prop.
+
+Fix this by handling attr->form_is_section_offset () in attr_to_dynamic_prop.
+
+Tested on x86_64-linux.
+
+The test-case is based on gdb.opt/fortran-string.exp from
+https://src.fedoraproject.org/rpms/gdb/raw/f32/f/gdb-archer-vla-tests.patch .
+I've updated the copyrights to stretch to 2021.
+
+[ I've tried to create a dwarf assembly test-case for this, but didn't
+manage. ]
+
+Co-Authored-By: Jan Kratochvil <jan.kratochvil@redhat.com>
+
+Bug: https://sourceware.org/bugzilla/show_bug.cgi?id=26910
+---
+ gdb/dwarf2/read.c                        | 24 ++++++++++++---
+ gdb/testsuite/gdb.opt/fortran-string.exp | 38 ++++++++++++++++++++++++
+ gdb/testsuite/gdb.opt/fortran-string.f90 | 27 +++++++++++++++++
+ 3 files changed, 85 insertions(+), 4 deletions(-)
+ create mode 100644 gdb/testsuite/gdb.opt/fortran-string.exp
+ create mode 100644 gdb/testsuite/gdb.opt/fortran-string.f90
+
+diff --git a/gdb/dwarf2/read.c b/gdb/dwarf2/read.c
+index bd0754618d0..af184d4d1fd 100644
+--- a/gdb/dwarf2/read.c
++++ b/gdb/dwarf2/read.c
+@@ -18468,14 +18468,30 @@ attr_to_dynamic_prop (const struct attribute *attr, struct die_info *die,
+     }
+   else if (attr->form_is_constant ())
+     prop->set_const_val (attr->constant_value (0));
+-  else
++  else if (attr->form_is_section_offset ())
+     {
+-      dwarf2_invalid_attrib_class_complaint (dwarf_form_name (attr->form),
+-					     dwarf2_name (die, cu));
+-      return 0;
++      switch (attr->name)
++	{
++	case DW_AT_string_length:
++	  baton = XOBNEW (obstack, struct dwarf2_property_baton);
++	  baton->property_type = default_type;
++	  fill_in_loclist_baton (cu, &baton->loclist, attr);
++	  prop->set_loclist (baton);
++	  gdb_assert (prop->baton () != NULL);
++	  break;
++	default:
++	  goto invalid;
++	}
+     }
++  else
++    goto invalid;
+ 
+   return 1;
++
++ invalid:
++  dwarf2_invalid_attrib_class_complaint (dwarf_form_name (attr->form),
++					 dwarf2_name (die, cu));
++  return 0;
+ }
+ 
+ /* See read.h.  */
+diff --git a/gdb/testsuite/gdb.opt/fortran-string.exp b/gdb/testsuite/gdb.opt/fortran-string.exp
+new file mode 100644
+index 00000000000..9bf6269f840
+--- /dev/null
++++ b/gdb/testsuite/gdb.opt/fortran-string.exp
+@@ -0,0 +1,38 @@
++# Copyright 2009-2021 Free Software Foundation, Inc.
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/> .
++
++# Test GDB can cope with Fortran strings having their length present in a CPU
++# register.  With -O0 the string length is passed on the stack.  To make this
++# test meaningful the follow assertion should pass.  It is not being checked
++# here as the "_s" symbol is compiler dependent:
++#   (gdb) info address _s
++#   Symbol "_s" is a variable in register XX.
++
++standard_testfile .f90
++
++if { [prepare_for_testing "prepare for testing" ${testfile} ${srcfile} \
++	  {debug f90 additional_flags=-O1}] } {
++    return -1
++}
++
++if ![runto f] then {
++    perror "couldn't run to f"
++    continue
++}
++
++gdb_test_no_output "set print frame-arguments all"
++gdb_test "frame" ".*s='foo'.*"
++gdb_test "ptype s" "type = character \\(3\\)"
++gdb_test "p s" "\\$\[0-9\]* = 'foo'"
+diff --git a/gdb/testsuite/gdb.opt/fortran-string.f90 b/gdb/testsuite/gdb.opt/fortran-string.f90
+new file mode 100644
+index 00000000000..71b6baea05a
+--- /dev/null
++++ b/gdb/testsuite/gdb.opt/fortran-string.f90
+@@ -0,0 +1,27 @@
++! Copyright 2009-2021 Free Software Foundation, Inc.
++!
++! This program is free software; you can redistribute it and/or modify
++! it under the terms of the GNU General Public License as published by
++! the Free Software Foundation; either version 3 of the License, or
++! (at your option) any later version.
++!
++! This program is distributed in the hope that it will be useful,
++! but WITHOUT ANY WARRANTY; without even the implied warranty of
++! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++! GNU General Public License for more details.
++!
++! You should have received a copy of the GNU General Public License
++! along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++subroutine f(s)
++  character*(*) s
++  print *, s
++  s(1:3) = 'oof'
++  print *, s
++end subroutine f
++
++program main
++  character*3 s;
++  s = 'foo'
++  call f (s)
++end program main
+-- 
+GitLab
+

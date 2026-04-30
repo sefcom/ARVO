@@ -1,0 +1,641 @@
+From 3803b028dda9d7f3bf06836b5ad4522ff1ae0cb3 Mon Sep 17 00:00:00 2001
+From: Anna Henningsen <anna.henningsen@mongodb.com>
+Date: Thu, 2 Mar 2023 15:31:08 +0100
+Subject: [PATCH] src: share common code paths for SEA and embedder script
+
+Since SEA is very similar in principle to embedding functionality,
+it makes sense to share code paths where possible. This commit does
+so and addresses a `TODO` while doing so.
+
+It also adds a utility to directly run CJS code to the embedder
+startup callback, which comes in handy for this purpose.
+
+Finally, this commit is breaking because it aligns the behavior
+of `require()`ing internal modules; previously, embedders could
+use the `require` function that they received to do so.
+(If this is not considered breaking because accessing internals
+is not covered by the API, then this would need ABI compatibility
+patches for becoming fully non-breaking.)
+
+PR-URL: https://github.com/nodejs/node/pull/46825
+Reviewed-By: Darshan Sen <raisinten@gmail.com>
+Reviewed-By: Joyee Cheung <joyeec9h3@gmail.com>
+Reviewed-By: James M Snell <jasnell@gmail.com>
+Reviewed-By: Minwoo Jung <nodecorelab@gmail.com>
+---
+ lib/internal/main/embedding.js                | 18 ++++++
+ lib/internal/main/environment.js              | 13 -----
+ lib/internal/main/mksnapshot.js               | 11 +++-
+ .../main/single_executable_application.js     | 55 -------------------
+ lib/internal/util/embedding.js                | 47 ++++++++++++++++
+ src/api/environment.cc                        | 16 +++---
+ src/env-inl.h                                 | 10 ++--
+ src/env.h                                     |  6 +-
+ src/node.cc                                   | 35 +++---------
+ src/node.h                                    |  4 +-
+ src/node_builtins.cc                          | 29 +++-------
+ src/node_main_instance.cc                     | 12 +++-
+ src/node_sea.cc                               | 52 ++++--------------
+ src/node_sea.h                                |  2 +
+ src/node_snapshotable.cc                      | 14 +++--
+ test/embedding/test-embedding.js              |  5 ++
+ 16 files changed, 145 insertions(+), 184 deletions(-)
+ create mode 100644 lib/internal/main/embedding.js
+ delete mode 100644 lib/internal/main/environment.js
+ delete mode 100644 lib/internal/main/single_executable_application.js
+ create mode 100644 lib/internal/util/embedding.js
+
+diff --git a/lib/internal/main/embedding.js b/lib/internal/main/embedding.js
+new file mode 100644
+index 00000000000000..aa3f06cca10f99
+--- /dev/null
++++ b/lib/internal/main/embedding.js
+@@ -0,0 +1,18 @@
++'use strict';
++const {
++  prepareMainThreadExecution,
++  markBootstrapComplete,
++} = require('internal/process/pre_execution');
++const { isSea } = internalBinding('sea');
++const { emitExperimentalWarning } = require('internal/util');
++const { embedderRequire, embedderRunCjs } = require('internal/util/embedding');
++const { getEmbedderEntryFunction } = internalBinding('mksnapshot');
++
++prepareMainThreadExecution(false, true);
++markBootstrapComplete();
++
++if (isSea()) {
++  emitExperimentalWarning('Single executable application');
++}
++
++return getEmbedderEntryFunction()(embedderRequire, embedderRunCjs);
+diff --git a/lib/internal/main/environment.js b/lib/internal/main/environment.js
+deleted file mode 100644
+index 0be982bfb6d25d..00000000000000
+--- a/lib/internal/main/environment.js
++++ /dev/null
+@@ -1,13 +0,0 @@
+-'use strict';
+-
+-// This runs necessary preparations to prepare a complete Node.js context
+-// that depends on run time states.
+-// It is currently only intended for preparing contexts for embedders.
+-
+-const {
+-  prepareMainThreadExecution,
+-  markBootstrapComplete
+-} = require('internal/process/pre_execution');
+-
+-prepareMainThreadExecution();
+-markBootstrapComplete();
+diff --git a/lib/internal/main/mksnapshot.js b/lib/internal/main/mksnapshot.js
+index 928b3fd13f91d4..08d483dcff4e76 100644
+--- a/lib/internal/main/mksnapshot.js
++++ b/lib/internal/main/mksnapshot.js
+@@ -119,16 +119,25 @@ function main() {
+   const {
+     prepareMainThreadExecution
+   } = require('internal/process/pre_execution');
++  const path = require('path');
+ 
+   let serializeMainFunction = getEmbedderEntryFunction();
+   const serializeMainArgs = [requireForUserSnapshot];
+ 
+   if (serializeMainFunction) { // embedded case
+     prepareMainThreadExecution(false, false);
++    // TODO(addaleax): Make this `embedderRunCjs` once require('module')
++    // is supported in snapshots.
++    const filename = process.execPath;
++    const dirname = path.dirname(filename);
++    function minimalRunCjs(source) {
++      const fn = compileSerializeMain(filename, source);
++      return fn(requireForUserSnapshot, filename, dirname);
++    }
++    serializeMainArgs.push(minimalRunCjs);
+   } else {
+     prepareMainThreadExecution(true, false);
+     const file = process.argv[1];
+-    const path = require('path');
+     const filename = path.resolve(file);
+     const dirname = path.dirname(filename);
+     const source = readFileSync(file, 'utf-8');
+diff --git a/lib/internal/main/single_executable_application.js b/lib/internal/main/single_executable_application.js
+deleted file mode 100644
+index d9604cff720d2f..00000000000000
+--- a/lib/internal/main/single_executable_application.js
++++ /dev/null
+@@ -1,55 +0,0 @@
+-'use strict';
+-const {
+-  prepareMainThreadExecution,
+-  markBootstrapComplete,
+-} = require('internal/process/pre_execution');
+-const { getSingleExecutableCode } = internalBinding('sea');
+-const { emitExperimentalWarning } = require('internal/util');
+-const { Module, wrapSafe } = require('internal/modules/cjs/loader');
+-const { codes: { ERR_UNKNOWN_BUILTIN_MODULE } } = require('internal/errors');
+-
+-prepareMainThreadExecution(false, true);
+-markBootstrapComplete();
+-
+-emitExperimentalWarning('Single executable application');
+-
+-// This is roughly the same as:
+-//
+-// const mod = new Module(filename);
+-// mod._compile(contents, filename);
+-//
+-// but the code has been duplicated because currently there is no way to set the
+-// value of require.main to module.
+-//
+-// TODO(RaisinTen): Find a way to deduplicate this.
+-
+-const filename = process.execPath;
+-const contents = getSingleExecutableCode();
+-const compiledWrapper = wrapSafe(filename, contents);
+-
+-const customModule = new Module(filename, null);
+-customModule.filename = filename;
+-customModule.paths = Module._nodeModulePaths(customModule.path);
+-
+-const customExports = customModule.exports;
+-
+-function customRequire(path) {
+-  if (!Module.isBuiltin(path)) {
+-    throw new ERR_UNKNOWN_BUILTIN_MODULE(path);
+-  }
+-
+-  return require(path);
+-}
+-
+-customRequire.main = customModule;
+-
+-const customFilename = customModule.filename;
+-
+-const customDirname = customModule.path;
+-
+-compiledWrapper(
+-  customExports,
+-  customRequire,
+-  customModule,
+-  customFilename,
+-  customDirname);
+diff --git a/lib/internal/util/embedding.js b/lib/internal/util/embedding.js
+new file mode 100644
+index 00000000000000..139d4c7a25fb7c
+--- /dev/null
++++ b/lib/internal/util/embedding.js
+@@ -0,0 +1,47 @@
++'use strict';
++const { codes: { ERR_UNKNOWN_BUILTIN_MODULE } } = require('internal/errors');
++const { Module, wrapSafe } = require('internal/modules/cjs/loader');
++
++// This is roughly the same as:
++//
++// const mod = new Module(filename);
++// mod._compile(contents, filename);
++//
++// but the code has been duplicated because currently there is no way to set the
++// value of require.main to module.
++//
++// TODO(RaisinTen): Find a way to deduplicate this.
++
++function embedderRunCjs(contents) {
++  const filename = process.execPath;
++  const compiledWrapper = wrapSafe(filename, contents);
++
++  const customModule = new Module(filename, null);
++  customModule.filename = filename;
++  customModule.paths = Module._nodeModulePaths(customModule.path);
++
++  const customExports = customModule.exports;
++
++  embedderRequire.main = customModule;
++
++  const customFilename = customModule.filename;
++
++  const customDirname = customModule.path;
++
++  return compiledWrapper(
++    customExports,
++    embedderRequire,
++    customModule,
++    customFilename,
++    customDirname);
++}
++
++function embedderRequire(path) {
++  if (!Module.isBuiltin(path)) {
++    throw new ERR_UNKNOWN_BUILTIN_MODULE(path);
++  }
++
++  return require(path);
++}
++
++module.exports = { embedderRequire, embedderRunCjs };
+diff --git a/src/api/environment.cc b/src/api/environment.cc
+index 8aa1385f548c4d..2f4d7a5c7fe3f1 100644
+--- a/src/api/environment.cc
++++ b/src/api/environment.cc
+@@ -528,17 +528,15 @@ MaybeLocal<Value> LoadEnvironment(
+   return StartExecution(env, cb);
+ }
+ 
+-MaybeLocal<Value> LoadEnvironment(
+-    Environment* env,
+-    const char* main_script_source_utf8) {
+-  CHECK_NOT_NULL(main_script_source_utf8);
++MaybeLocal<Value> LoadEnvironment(Environment* env,
++                                  std::string_view main_script_source_utf8) {
++  CHECK_NOT_NULL(main_script_source_utf8.data());
+   return LoadEnvironment(
+       env, [&](const StartExecutionCallbackInfo& info) -> MaybeLocal<Value> {
+-        std::string name = "embedder_main_" + std::to_string(env->thread_id());
+-        env->builtin_loader()->Add(name.c_str(), main_script_source_utf8);
+-        Realm* realm = env->principal_realm();
+-
+-        return realm->ExecuteBootstrapper(name.c_str());
++        Local<Value> main_script =
++            ToV8Value(env->context(), main_script_source_utf8).ToLocalChecked();
++        return info.run_cjs->Call(
++            env->context(), Null(env->isolate()), 1, &main_script);
+       });
+ }
+ 
+diff --git a/src/env-inl.h b/src/env-inl.h
+index 1d7a502b35aafd..68dfb3a4d57113 100644
+--- a/src/env-inl.h
++++ b/src/env-inl.h
+@@ -406,14 +406,12 @@ inline builtins::BuiltinLoader* Environment::builtin_loader() {
+   return &builtin_loader_;
+ }
+ 
+-inline const StartExecutionCallback&
+-Environment::embedder_mksnapshot_entry_point() const {
+-  return embedder_mksnapshot_entry_point_;
++inline const StartExecutionCallback& Environment::embedder_entry_point() const {
++  return embedder_entry_point_;
+ }
+ 
+-inline void Environment::set_embedder_mksnapshot_entry_point(
+-    StartExecutionCallback&& fn) {
+-  embedder_mksnapshot_entry_point_ = std::move(fn);
++inline void Environment::set_embedder_entry_point(StartExecutionCallback&& fn) {
++  embedder_entry_point_ = std::move(fn);
+ }
+ 
+ inline double Environment::new_async_id() {
+diff --git a/src/env.h b/src/env.h
+index 95ffa357ab05b4..c0e28d6c2ee751 100644
+--- a/src/env.h
++++ b/src/env.h
+@@ -948,8 +948,8 @@ class Environment : public MemoryRetainer {
+ 
+ #endif  // HAVE_INSPECTOR
+ 
+-  inline const StartExecutionCallback& embedder_mksnapshot_entry_point() const;
+-  inline void set_embedder_mksnapshot_entry_point(StartExecutionCallback&& fn);
++  inline const StartExecutionCallback& embedder_entry_point() const;
++  inline void set_embedder_entry_point(StartExecutionCallback&& fn);
+ 
+   inline void set_process_exit_handler(
+       std::function<void(Environment*, ExitCode)>&& handler);
+@@ -1133,7 +1133,7 @@ class Environment : public MemoryRetainer {
+   std::unique_ptr<Realm> principal_realm_ = nullptr;
+ 
+   builtins::BuiltinLoader builtin_loader_;
+-  StartExecutionCallback embedder_mksnapshot_entry_point_;
++  StartExecutionCallback embedder_entry_point_;
+ 
+   // Used by allocate_managed_buffer() and release_managed_buffer() to keep
+   // track of the BackingStore for a given pointer.
+diff --git a/src/node.cc b/src/node.cc
+index 3f1b28a8a1815f..2aba7333d92513 100644
+--- a/src/node.cc
++++ b/src/node.cc
+@@ -277,22 +277,17 @@ MaybeLocal<Value> StartExecution(Environment* env, StartExecutionCallback cb) {
+ 
+   if (cb != nullptr) {
+     EscapableHandleScope scope(env->isolate());
++    // TODO(addaleax): pass the callback to the main script more directly,
++    // e.g. by making StartExecution(env, builtin) parametrizable
++    env->set_embedder_entry_point(std::move(cb));
++    auto reset_entry_point =
++        OnScopeLeave([&]() { env->set_embedder_entry_point({}); });
+ 
+-    if (env->isolate_data()->options()->build_snapshot) {
+-      // TODO(addaleax): pass the callback to the main script more directly,
+-      // e.g. by making StartExecution(env, builtin) parametrizable
+-      env->set_embedder_mksnapshot_entry_point(std::move(cb));
+-      auto reset_entry_point =
+-          OnScopeLeave([&]() { env->set_embedder_mksnapshot_entry_point({}); });
++    const char* entry = env->isolate_data()->options()->build_snapshot
++                            ? "internal/main/mksnapshot"
++                            : "internal/main/embedding";
+ 
+-      return StartExecution(env, "internal/main/mksnapshot");
+-    }
+-
+-    if (StartExecution(env, "internal/main/environment").IsEmpty()) return {};
+-    return scope.EscapeMaybe(cb({
+-        env->process_object(),
+-        env->builtin_module_require(),
+-    }));
++    return scope.EscapeMaybe(StartExecution(env, entry));
+   }
+ 
+   // TODO(joyeecheung): move these conditions into JS land and let the
+@@ -312,18 +307,6 @@ MaybeLocal<Value> StartExecution(Environment* env, StartExecutionCallback cb) {
+     first_argv = env->argv()[1];
+   }
+ 
+-#ifndef DISABLE_SINGLE_EXECUTABLE_APPLICATION
+-  if (sea::IsSingleExecutable()) {
+-    // TODO(addaleax): Find a way to reuse:
+-    //
+-    // LoadEnvironment(Environment*, const char*)
+-    //
+-    // instead and not add yet another main entry point here because this
+-    // already duplicates existing code.
+-    return StartExecution(env, "internal/main/single_executable_application");
+-  }
+-#endif
+-
+   if (first_argv == "inspect") {
+     return StartExecution(env, "internal/main/inspect");
+   }
+diff --git a/src/node.h b/src/node.h
+index 635e5349f4ee88..c3a81076d54ed6 100644
+--- a/src/node.h
++++ b/src/node.h
+@@ -682,6 +682,7 @@ NODE_EXTERN std::unique_ptr<InspectorParentHandle> GetInspectorParentHandle(
+ struct StartExecutionCallbackInfo {
+   v8::Local<v8::Object> process_object;
+   v8::Local<v8::Function> native_require;
++  v8::Local<v8::Function> run_cjs;
+ };
+ 
+ using StartExecutionCallback =
+@@ -691,8 +692,7 @@ NODE_EXTERN v8::MaybeLocal<v8::Value> LoadEnvironment(
+     Environment* env,
+     StartExecutionCallback cb);
+ NODE_EXTERN v8::MaybeLocal<v8::Value> LoadEnvironment(
+-    Environment* env,
+-    const char* main_script_source_utf8);
++    Environment* env, std::string_view main_script_source_utf8);
+ NODE_EXTERN void FreeEnvironment(Environment* env);
+ 
+ // Set a callback that is called when process.exit() is called from JS,
+diff --git a/src/node_builtins.cc b/src/node_builtins.cc
+index e9bf8a5a0e0b7e..0439fff5115bd9 100644
+--- a/src/node_builtins.cc
++++ b/src/node_builtins.cc
+@@ -185,17 +185,14 @@ static std::string OnDiskFileName(const char* id) {
+ MaybeLocal<String> BuiltinLoader::LoadBuiltinSource(Isolate* isolate,
+                                                     const char* id) const {
+   auto source = source_.read();
+-#ifdef NODE_BUILTIN_MODULES_PATH
+-  if (strncmp(id, "embedder_main_", strlen("embedder_main_")) == 0) {
+-#endif  // NODE_BUILTIN_MODULES_PATH
+-    const auto source_it = source->find(id);
+-    if (UNLIKELY(source_it == source->end())) {
+-      fprintf(stderr, "Cannot find native builtin: \"%s\".\n", id);
+-      ABORT();
+-    }
+-    return source_it->second.ToStringChecked(isolate);
+-#ifdef NODE_BUILTIN_MODULES_PATH
++#ifndef NODE_BUILTIN_MODULES_PATH
++  const auto source_it = source->find(id);
++  if (UNLIKELY(source_it == source->end())) {
++    fprintf(stderr, "Cannot find native builtin: \"%s\".\n", id);
++    ABORT();
+   }
++  return source_it->second.ToStringChecked(isolate);
++#else   // !NODE_BUILTIN_MODULES_PATH
+   std::string filename = OnDiskFileName(id);
+ 
+   std::string contents;
+@@ -395,12 +392,6 @@ MaybeLocal<Function> BuiltinLoader::LookupAndCompile(Local<Context> context,
+         FIXED_ONE_BYTE_STRING(isolate, "internalBinding"),
+         FIXED_ONE_BYTE_STRING(isolate, "primordials"),
+     };
+-  } else if (strncmp(id, "embedder_main_", strlen("embedder_main_")) == 0) {
+-    // Synthetic embedder main scripts from LoadEnvironment(): process, require
+-    parameters = {
+-        FIXED_ONE_BYTE_STRING(isolate, "process"),
+-        FIXED_ONE_BYTE_STRING(isolate, "require"),
+-    };
+   } else {
+     // others: exports, require, module, process, internalBinding, primordials
+     parameters = {
+@@ -457,12 +448,6 @@ MaybeLocal<Value> BuiltinLoader::CompileAndCall(Local<Context> context,
+                  realm->builtin_module_require(),
+                  realm->internal_binding_loader(),
+                  realm->primordials()};
+-  } else if (strncmp(id, "embedder_main_", strlen("embedder_main_")) == 0) {
+-    // Synthetic embedder main scripts from LoadEnvironment(): process, require
+-    arguments = {
+-        realm->process_object(),
+-        realm->builtin_module_require(),
+-    };
+   } else {
+     // This should be invoked with the other CompileAndCall() methods, as
+     // we are unable to generate the arguments.
+diff --git a/src/node_main_instance.cc b/src/node_main_instance.cc
+index 5a4d127ffe3e43..f0dc6ca275b007 100644
+--- a/src/node_main_instance.cc
++++ b/src/node_main_instance.cc
+@@ -9,6 +9,7 @@
+ #include "node_internals.h"
+ #include "node_options-inl.h"
+ #include "node_realm.h"
++#include "node_sea.h"
+ #include "node_snapshot_builder.h"
+ #include "node_snapshotable.h"
+ #include "node_v8_platform-inl.h"
+@@ -86,7 +87,16 @@ ExitCode NodeMainInstance::Run() {
+ 
+ void NodeMainInstance::Run(ExitCode* exit_code, Environment* env) {
+   if (*exit_code == ExitCode::kNoFailure) {
+-    LoadEnvironment(env, StartExecutionCallback{});
++    bool is_sea = false;
++#ifndef DISABLE_SINGLE_EXECUTABLE_APPLICATION
++    if (sea::IsSingleExecutable()) {
++      is_sea = true;
++      LoadEnvironment(env, sea::FindSingleExecutableCode());
++    }
++#endif
++    if (!is_sea) {
++      LoadEnvironment(env, StartExecutionCallback{});
++    }
+ 
+     *exit_code =
+         SpinEventLoopInternal(env).FromMaybe(ExitCode::kGenericUserError);
+diff --git a/src/node_sea.cc b/src/node_sea.cc
+index 18b661ce4ff31d..b65620d1ff9684 100644
+--- a/src/node_sea.cc
++++ b/src/node_sea.cc
+@@ -4,8 +4,6 @@
+ #include "node_external_reference.h"
+ #include "node_internals.h"
+ #include "node_union_bytes.h"
+-#include "simdutf.h"
+-#include "v8.h"
+ 
+ // The POSTJECT_SENTINEL_FUSE macro is a string of random characters selected by
+ // the Node.js project that is present only once in the entire binary. It is
+@@ -19,7 +17,6 @@
+ #include <memory>
+ #include <string_view>
+ #include <tuple>
+-#include <vector>
+ 
+ #if !defined(DISABLE_SINGLE_EXECUTABLE_APPLICATION)
+ 
+@@ -29,9 +26,11 @@ using v8::Local;
+ using v8::Object;
+ using v8::Value;
+ 
+-namespace {
++namespace node {
++namespace sea {
+ 
+-const std::string_view FindSingleExecutableCode() {
++std::string_view FindSingleExecutableCode() {
++  CHECK(IsSingleExecutable());
+   static const std::string_view sea_code = []() -> std::string_view {
+     size_t size;
+ #ifdef __APPLE__
+@@ -49,44 +48,14 @@ const std::string_view FindSingleExecutableCode() {
+   return sea_code;
+ }
+ 
+-void GetSingleExecutableCode(const FunctionCallbackInfo<Value>& args) {
+-  node::Environment* env = node::Environment::GetCurrent(args);
+-
+-  static const std::string_view sea_code = FindSingleExecutableCode();
+-
+-  if (sea_code.empty()) {
+-    return;
+-  }
+-
+-  // TODO(joyeecheung): Use one-byte strings for ASCII-only source to save
+-  // memory/binary size - using UTF16 by default results in twice of the size
+-  // than necessary.
+-  static const node::UnionBytes sea_code_union_bytes =
+-      []() -> node::UnionBytes {
+-    size_t expected_u16_length =
+-        simdutf::utf16_length_from_utf8(sea_code.data(), sea_code.size());
+-    auto out = std::make_shared<std::vector<uint16_t>>(expected_u16_length);
+-    size_t u16_length = simdutf::convert_utf8_to_utf16(
+-        sea_code.data(),
+-        sea_code.size(),
+-        reinterpret_cast<char16_t*>(out->data()));
+-    out->resize(u16_length);
+-    return node::UnionBytes{out};
+-  }();
+-
+-  args.GetReturnValue().Set(
+-      sea_code_union_bytes.ToStringChecked(env->isolate()));
+-}
+-
+-}  // namespace
+-
+-namespace node {
+-namespace sea {
+-
+ bool IsSingleExecutable() {
+   return postject_has_resource();
+ }
+ 
++void IsSingleExecutable(const FunctionCallbackInfo<Value>& args) {
++  args.GetReturnValue().Set(IsSingleExecutable());
++}
++
+ std::tuple<int, char**> FixupArgsForSEA(int argc, char** argv) {
+   // Repeats argv[0] at position 1 on argv as a replacement for the missing
+   // entry point file path.
+@@ -113,12 +82,11 @@ void Initialize(Local<Object> target,
+                 Local<Value> unused,
+                 Local<Context> context,
+                 void* priv) {
+-  SetMethod(
+-      context, target, "getSingleExecutableCode", GetSingleExecutableCode);
++  SetMethod(context, target, "isSea", IsSingleExecutable);
+ }
+ 
+ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+-  registry->Register(GetSingleExecutableCode);
++  registry->Register(IsSingleExecutable);
+ }
+ 
+ }  // namespace sea
+diff --git a/src/node_sea.h b/src/node_sea.h
+index 97bf0115e0f0d4..aa0f20204743c0 100644
+--- a/src/node_sea.h
++++ b/src/node_sea.h
+@@ -5,12 +5,14 @@
+ 
+ #if !defined(DISABLE_SINGLE_EXECUTABLE_APPLICATION)
+ 
++#include <string_view>
+ #include <tuple>
+ 
+ namespace node {
+ namespace sea {
+ 
+ bool IsSingleExecutable();
++std::string_view FindSingleExecutableCode();
+ std::tuple<int, char**> FixupArgsForSEA(int argc, char** argv);
+ 
+ }  // namespace sea
+diff --git a/src/node_snapshotable.cc b/src/node_snapshotable.cc
+index e6323a128f5ba4..ee327867378952 100644
+--- a/src/node_snapshotable.cc
++++ b/src/node_snapshotable.cc
+@@ -1444,19 +1444,25 @@ void SerializeSnapshotableObjects(Realm* realm,
+ 
+ namespace mksnapshot {
+ 
++// NB: This is also used by the regular embedding codepath.
+ void GetEmbedderEntryFunction(const FunctionCallbackInfo<Value>& args) {
+   Environment* env = Environment::GetCurrent(args);
+   Isolate* isolate = env->isolate();
+-  if (!env->embedder_mksnapshot_entry_point()) return;
++  if (!env->embedder_entry_point()) return;
+   MaybeLocal<Function> jsfn =
+       Function::New(isolate->GetCurrentContext(),
+                     [](const FunctionCallbackInfo<Value>& args) {
+                       Environment* env = Environment::GetCurrent(args);
+                       Local<Value> require_fn = args[0];
++                      Local<Value> runcjs_fn = args[1];
+                       CHECK(require_fn->IsFunction());
+-                      CHECK(env->embedder_mksnapshot_entry_point());
+-                      env->embedder_mksnapshot_entry_point()(
+-                          {env->process_object(), require_fn.As<Function>()});
++                      CHECK(runcjs_fn->IsFunction());
++                      MaybeLocal<Value> retval = env->embedder_entry_point()(
++                          {env->process_object(),
++                           require_fn.As<Function>(),
++                           runcjs_fn.As<Function>()});
++                      if (!retval.IsEmpty())
++                        args.GetReturnValue().Set(retval.ToLocalChecked());
+                     });
+   if (!jsfn.IsEmpty()) args.GetReturnValue().Set(jsfn.ToLocalChecked());
+ }
+diff --git a/test/embedding/test-embedding.js b/test/embedding/test-embedding.js
+index 498c05fdebf377..9dfaad6c2ab27f 100644
+--- a/test/embedding/test-embedding.js
++++ b/test/embedding/test-embedding.js
+@@ -40,6 +40,11 @@ assert.strictEqual(
+   child_process.spawnSync(binary, ['throw new Error()']).status,
+   1);
+ 
++// Cannot require internals anymore:
++assert.strictEqual(
++  child_process.spawnSync(binary, ['require("lib/internal/test/binding")']).status,
++  1);
++
+ assert.strictEqual(
+   child_process.spawnSync(binary, ['process.exitCode = 8']).status,
+   8);

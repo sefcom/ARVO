@@ -1,0 +1,1040 @@
+From abfac8aa4051ad6b74a059e717feb33c73218222 Mon Sep 17 00:00:00 2001
+From: cpq <valenok@gmail.com>
+Date: Wed, 9 Nov 2022 13:11:22 +0000
+Subject: [PATCH] Expose mip guts
+
+---
+ Makefile                                      |   3 +-
+ examples/arduino/w5500/w5500.ino              |  10 +-
+ examples/mip-pcap/main.c                      |   9 +-
+ examples/mip-tap/main.c                       |  15 +-
+ examples/stm32/nucleo-f429zi-baremetal/main.c |  11 +-
+ examples/stm32/nucleo-f746zg-baremetal/main.c |   9 +-
+ mip/mip.c                                     | 154 ++++++-----------
+ mip/mip.h                                     |  40 ++++-
+ mongoose.c                                    | 157 ++++++------------
+ mongoose.h                                    |  40 ++++-
+ src/mqtt.c                                    |   2 +-
+ src/net.c                                     |   1 -
+ test/driver_mock.c                            |   8 +-
+ test/fuzz.c                                   |  17 +-
+ test/mip_test.c                               |   4 +-
+ 15 files changed, 222 insertions(+), 258 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 18a25230f7..2c3226b6c3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -83,9 +83,10 @@ fuzz: mongoose.c mongoose.h Makefile test/fuzz.c
+ 	$(CC) test/fuzz.c $(OPTS) $(WARN) $(INCS) $(TFLAGS) $(ASAN) -o fuzzer
+ 	$(RUN) ./fuzzer
+ 
++FUZZDATA ?= /tmp/fuzzdata
+ fuzz2: mongoose.c mongoose.h Makefile test/fuzz.c
+ 	$(CC) test/fuzz.c -DMAIN $(OPTS) $(WARN) $(ASAN) $(INCS) -o fuzzer
+-	$(RUN) ./fuzzer /tmp/fuzzdata
++	$(RUN) ./fuzzer $(FUZZDATA)
+ 
+ test: Makefile mongoose.h $(SRCS)
+ 	$(CC) $(SRCS) $(CFLAGS) $(LDFLAGS) -o unit_test
+diff --git a/examples/arduino/w5500/w5500.ino b/examples/arduino/w5500/w5500.ino
+index 8231c0c0e9..503a531cb1 100644
+--- a/examples/arduino/w5500/w5500.ino
++++ b/examples/arduino/w5500/w5500.ino
+@@ -22,9 +22,13 @@ void setup() {
+   delay(3000);
+   MG_INFO(("Starting TCP/IP stack..."));
+ 
+-  // Init TCP/IP stack. Set MAC address. Set IP to 0, to enable DHCP
+-  struct mip_cfg c = {.mac = {0, 0, 1, 2, 3, 4}, .ip = 0, .mask = 0, .gw = 0};
+-  mip_init(&mgr, &c, &mip_driver_w5500, &spi);
++  struct mip_if mif = {
++      .mac = {0, 0, 1, 2, 3, 5},
++      .use_dhcp = true,
++      .driver = &mip_driver_w5500,
++      .driver_data = &spi,
++  };
++  mip_init(&mgr, &mif);
+ 
+   // Start a 5 sec timer, print status message periodically
+   mg_timer_add(
+diff --git a/examples/mip-pcap/main.c b/examples/mip-pcap/main.c
+index 44c502183a..b67a8672ea 100644
+--- a/examples/mip-pcap/main.c
++++ b/examples/mip-pcap/main.c
+@@ -95,12 +95,11 @@ int main(int argc, char *argv[]) {
+   struct mg_mgr mgr;  // Event manager
+   mg_mgr_init(&mgr);  // Initialise event manager
+ 
+-  struct mip_cfg c = {.ip = 0, .mask = 0, .gw = 0};
+-  sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &c.mac[0], &c.mac[1], &c.mac[2],
+-         &c.mac[3], &c.mac[4], &c.mac[5]);
+-
+   struct mip_driver driver = {.tx = pcap_tx, .up = pcap_up, .rx = pcap_rx};
+-  mip_init(&mgr, &c, &driver, ph);
++  struct mip_if mif = {.use_dhcp = true, .driver = &driver, .driver_data = ph};
++  sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &mif.mac[0], &mif.mac[1],
++         &mif.mac[2], &mif.mac[3], &mif.mac[4], &mif.mac[5]);
++  mip_init(&mgr, &mif);
+   MG_INFO(("Init done, starting main loop"));
+ 
+   extern void device_dashboard_fn(struct mg_connection *, int, void *, void *);
+diff --git a/examples/mip-tap/main.c b/examples/mip-tap/main.c
+index b2fbeee6c8..d395c635b9 100644
+--- a/examples/mip-tap/main.c
++++ b/examples/mip-tap/main.c
+@@ -3,10 +3,10 @@
+ //
+ // example using MIP and a TUN/TAP interface
+ 
+-#include "mongoose.h"
+ #include <linux/if.h>
+ #include <linux/if_tun.h>
+ #include <sys/ioctl.h>
++#include "mongoose.h"
+ 
+ static int s_signo;
+ void signal_handler(int signo) {
+@@ -14,7 +14,7 @@ void signal_handler(int signo) {
+ }
+ 
+ static size_t tap_tx(const void *buf, size_t len, void *userdata) {
+-  ssize_t res = write((int) userdata, buf, len);
++  ssize_t res = write((int) (size_t) userdata, buf, len);
+   if (res < 0) {
+     MG_ERROR(("tap_tx failed: %d", errno));
+     return 0;
+@@ -27,7 +27,7 @@ static bool tap_up(void *userdata) {
+ }
+ 
+ static size_t tap_rx(void *buf, size_t len, void *userdata) {
+-  ssize_t received = read((int) userdata, buf, len);
++  ssize_t received = read(*(int *) userdata, buf, len);
+   usleep(1);  // This is to avoid 100% CPU
+   if (received < 0) return 0;
+   return (size_t) received;
+@@ -70,12 +70,11 @@ int main(int argc, char *argv[]) {
+   struct mg_mgr mgr;  // Event manager
+   mg_mgr_init(&mgr);  // Initialise event manager
+ 
+-  struct mip_cfg c = {.ip = 0, .mask = 0, .gw = 0};
+-  sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &c.mac[0], &c.mac[1], &c.mac[2],
+-         &c.mac[3], &c.mac[4], &c.mac[5]);
+-
+   struct mip_driver driver = {.tx = tap_tx, .up = tap_up, .rx = tap_rx};
+-  mip_init(&mgr, &c, &driver, (void *) (size_t) fd);
++  struct mip_if mif = {.use_dhcp = true, .driver = &driver, .driver_data = &fd};
++  sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &mif.mac[0], &mif.mac[1],
++         &mif.mac[2], &mif.mac[3], &mif.mac[4], &mif.mac[5]);
++  mip_init(&mgr, &mif);
+   MG_INFO(("Init done, starting main loop"));
+ 
+   extern void device_dashboard_fn(struct mg_connection *, int, void *, void *);
+diff --git a/examples/stm32/nucleo-f429zi-baremetal/main.c b/examples/stm32/nucleo-f429zi-baremetal/main.c
+index ad244c2151..66bb9be359 100644
+--- a/examples/stm32/nucleo-f429zi-baremetal/main.c
++++ b/examples/stm32/nucleo-f429zi-baremetal/main.c
+@@ -70,11 +70,16 @@ int main(void) {
+   // Initialise Mongoose network stack
+   // Specify MAC address, and use 0 for IP, mask, GW - i.e. use DHCP
+   // For static configuration, specify IP/mask/GW in network byte order
+-  struct mip_cfg c = {.mac = {0, 0, 1, 2, 3, 5}, .ip = 0, .mask = 0, .gw = 0};
+   struct mip_driver_stm32 driver_data = {.mdc_cr = 4};  // See driver_stm32.h
+-  mip_init(&mgr, &c, &mip_driver_stm32, &driver_data);
+-  MG_INFO(("Init done, starting main loop"));
++  struct mip_if mif = {
++      .mac = {0, 0, 1, 2, 3, 5},
++      .use_dhcp = true,
++      .driver = &mip_driver_stm32,
++      .driver_data = &driver_data,
++  };
++  mip_init(&mgr, &mif);
+ 
++  MG_INFO(("Init done, starting main loop"));
+   extern void device_dashboard_fn(struct mg_connection *, int, void *, void *);
+   mg_http_listen(&mgr, "http://0.0.0.0", device_dashboard_fn, &mgr);
+   for (;;) mg_mgr_poll(&mgr, 0);  // Infinite event loop
+diff --git a/examples/stm32/nucleo-f746zg-baremetal/main.c b/examples/stm32/nucleo-f746zg-baremetal/main.c
+index 24035d855b..71b99d71d0 100644
+--- a/examples/stm32/nucleo-f746zg-baremetal/main.c
++++ b/examples/stm32/nucleo-f746zg-baremetal/main.c
+@@ -70,9 +70,14 @@ int main(void) {
+   // Initialise Mongoose network stack
+   // Specify MAC address, and use 0 for IP, mask, GW - i.e. use DHCP
+   // For static configuration, specify IP/mask/GW in network byte order
+-  struct mip_cfg c = {.mac = {0, 0, 1, 2, 3, 4}, .ip = 0, .mask = 0, .gw = 0};
+   struct mip_driver_stm32 driver_data = {.mdc_cr = 4};  // See driver_stm32.h
+-  mip_init(&mgr, &c, &mip_driver_stm32, &driver_data);
++  struct mip_if mif = {
++      .mac = {0, 0, 1, 2, 3, 5},
++      .use_dhcp = true,
++      .driver = &mip_driver_stm32,
++      .driver_data = &driver_data,
++  };
++  mip_init(&mgr, &mif);
+   MG_INFO(("Init done, starting main loop"));
+ 
+   extern void device_dashboard_fn(struct mg_connection *, int, void *, void *);
+diff --git a/mip/mip.c b/mip/mip.c
+index 2e83c2309d..a5232ce052 100644
+--- a/mip/mip.c
++++ b/mip/mip.c
+@@ -6,10 +6,6 @@
+ #define U16(ptr) ((((uint16_t) (ptr)[0]) << 8) | (ptr)[1])
+ #define PDIFF(a, b) ((size_t) (((char *) (b)) - ((char *) (a))))
+ 
+-#ifndef MIP_ARP_ENTRIES
+-#define MIP_ARP_ENTRIES 5  // Number of ARP cache entries. Maximum 21
+-#endif
+-
+ #ifndef MIP_QSIZE
+ #define MIP_QSIZE (16 * 1024)  // Queue size
+ #endif
+@@ -18,8 +14,7 @@
+ #define MIP_TCP_KEEPALIVE_MS 45000  // TCP keep-alive period, ms
+ #endif
+ 
+-#define MIP_ARP_CS (2 + 12 * MIP_ARP_ENTRIES)  // ARP cache size
+-#define MIP_TCP_ACK_MS 150                     // Timeout for ACKing
++#define MIP_TCP_ACK_MS 150  // Timeout for ACKing
+ 
+ struct connstate {
+   uint32_t seq, ack;           // TCP seq/ack counters
+@@ -32,45 +27,6 @@ struct connstate {
+   struct mg_iobuf raw;         // For TLS only. Incoming raw data
+ };
+ 
+-struct str {
+-  uint8_t *buf;
+-  size_t len;
+-};
+-
+-// Receive queue - single producer, single consumer queue.  Interrupt-based
+-// drivers copy received frames to the queue in interrupt context. mip_poll()
+-// function runs in event loop context, reads from the queue
+-struct queue {
+-  uint8_t *buf;
+-  size_t len;
+-  volatile size_t tail, head;
+-};
+-
+-// Network interface
+-struct mip_if {
+-  uint8_t mac[6];             // MAC address. Must be set to a valid MAC
+-  uint32_t ip, mask, gw;      // IP address, mask, default gateway. Can be 0
+-  struct str rx;              // Output (TX) buffer
+-  struct str tx;              // Input (RX) buffer
+-  bool use_dhcp;              // Enable DCHP
+-  struct mip_driver *driver;  // Low level driver
+-  void *driver_data;          // Driver-specific data
+-  struct mg_mgr *mgr;         // Mongoose event manager
+-
+-  // Internal state, user can use it but should not change it
+-  uint64_t now;                   // Current time
+-  uint64_t timer_1000ms;          // 1000 ms timer: for DHCP and link state
+-  uint64_t lease_expire;          // Lease expiration time
+-  uint8_t arp_cache[MIP_ARP_CS];  // Each entry is 12 bytes
+-  uint16_t eport;                 // Next ephemeral port
+-  uint16_t dropped;               // Number of dropped frames
+-  uint8_t state;                  // Current state
+-#define MIP_STATE_DOWN 0          // Interface is down
+-#define MIP_STATE_UP 1            // Interface is up
+-#define MIP_STATE_READY 2         // Interface is up and has IP
+-  struct queue queue;             // Receive queue
+-};
+-
+ #pragma pack(push, 1)
+ 
+ struct lcp {
+@@ -164,8 +120,8 @@ struct dhcp {
+ #pragma pack(pop)
+ 
+ struct pkt {
+-  struct str raw;  // Raw packet data
+-  struct str pay;  // Payload data
++  struct mg_str raw;  // Raw packet data
++  struct mg_str pay;  // Payload data
+   struct eth *eth;
+   struct llc *llc;
+   struct arp *arp;
+@@ -202,9 +158,11 @@ static bool q_write(struct queue *q, const void *buf, size_t len) {
+   return success;
+ }
+ 
++#ifdef MIP_QPROFILE
+ static inline size_t q_space(struct queue *q) {
+   return q->tail > q->head ? q->tail - q->head : q->tail + (q->len - q->head);
+ }
++#endif
+ 
+ static inline size_t q_avail(struct queue *q) {
+   size_t n = 0;
+@@ -221,13 +179,13 @@ static size_t q_read(struct queue *q, void *buf) {
+   return n;
+ }
+ 
+-static struct str mkstr(void *buf, size_t len) {
+-  struct str str = {(uint8_t *) buf, len};
++static struct mg_str mkstr(void *buf, size_t len) {
++  struct mg_str str = {(char *) buf, len};
+   return str;
+ }
+ 
+ static void mkpay(struct pkt *pkt, void *p) {
+-  pkt->pay = mkstr(p, (size_t) (&pkt->raw.buf[pkt->raw.len] - (uint8_t *) p));
++  pkt->pay = mkstr(p, (size_t) (&pkt->raw.ptr[pkt->raw.len] - (char *) p));
+ }
+ 
+ static uint32_t csumup(uint32_t sum, const void *buf, size_t len) {
+@@ -298,13 +256,13 @@ static void arp_cache_add(struct mip_if *ifp, uint32_t ip, uint8_t mac[6]) {
+ 
+ static size_t ether_output(struct mip_if *ifp, size_t len) {
+   // size_t min = 64;  // Pad short frames to 64 bytes (minimum Ethernet size)
+-  // if (len < min) memset(ifp->tx.buf + len, 0, min - len), len = min;
+-  // mg_hexdump(ifp->tx.buf, len);
+-  return ifp->driver->tx(ifp->tx.buf, len, ifp->driver_data);
++  // if (len < min) memset(ifp->tx.ptr + len, 0, min - len), len = min;
++  // mg_hexdump(ifp->tx.ptr, len);
++  return ifp->driver->tx(ifp->tx.ptr, len, ifp->driver_data);
+ }
+ 
+ static void arp_ask(struct mip_if *ifp, uint32_t ip) {
+-  struct eth *eth = (struct eth *) ifp->tx.buf;
++  struct eth *eth = (struct eth *) ifp->tx.ptr;
+   struct arp *arp = (struct arp *) (eth + 1);
+   memset(eth->dst, 255, sizeof(eth->dst));
+   memcpy(eth->src, ifp->mac, sizeof(eth->src));
+@@ -338,7 +296,7 @@ static void onstatechange(struct mip_if *ifp) {
+ 
+ static struct ip *tx_ip(struct mip_if *ifp, uint8_t proto, uint32_t ip_src,
+                         uint32_t ip_dst, size_t plen) {
+-  struct eth *eth = (struct eth *) ifp->tx.buf;
++  struct eth *eth = (struct eth *) ifp->tx.ptr;
+   struct ip *ip = (struct ip *) (eth + 1);
+   uint8_t *mac = arp_cache_find(ifp, ip_dst);  // Dst IP in ARP cache ?
+   if (!mac && (ip_dst & ifp->mask)) arp_ask(ifp, ip_dst);  // Same net, lookup
+@@ -417,7 +375,7 @@ static void tx_dhcp_discover(struct mip_if *ifp) {
+ static void rx_arp(struct mip_if *ifp, struct pkt *pkt) {
+   if (pkt->arp->op == mg_htons(1) && pkt->arp->tpa == ifp->ip) {
+     // ARP request. Make a response, then send
+-    struct eth *eth = (struct eth *) ifp->tx.buf;
++    struct eth *eth = (struct eth *) ifp->tx.ptr;
+     struct arp *arp = (struct arp *) (eth + 1);
+     MG_DEBUG(("ARP op %d %#x %#x", mg_htons(arp->op), arp->spa, arp->tpa));
+     memcpy(eth->dst, pkt->eth->src, sizeof(eth->dst));
+@@ -448,7 +406,7 @@ static void rx_icmp(struct mip_if *ifp, struct pkt *pkt) {
+         tx_ip(ifp, 1, ifp->ip, pkt->ip->src, sizeof(struct icmp) + plen);
+     struct icmp *icmp = (struct icmp *) (ip + 1);
+     memset(icmp, 0, sizeof(*icmp));        // Set csum to 0
+-    memcpy(icmp + 1, pkt->pay.buf, plen);  // Copy RX payload to TX
++    memcpy(icmp + 1, pkt->pay.ptr, plen);  // Copy RX payload to TX
+     icmp->csum = ipcsum(icmp, sizeof(*icmp) + plen);
+     ether_output(ifp, hlen + plen);
+   }
+@@ -456,7 +414,8 @@ static void rx_icmp(struct mip_if *ifp, struct pkt *pkt) {
+ 
+ static void rx_dhcp(struct mip_if *ifp, struct pkt *pkt) {
+   uint32_t ip = 0, gw = 0, mask = 0;
+-  uint8_t *p = pkt->dhcp->options, *end = &pkt->raw.buf[pkt->raw.len];
++  uint8_t *p = pkt->dhcp->options,
++          *end = (uint8_t *) &pkt->raw.ptr[pkt->raw.len];
+   if (end < (uint8_t *) (pkt->dhcp + 1)) return;
+   while (p + 1 < end && p[0] != 255) {  // Parse options
+     if (p[0] == 1 && p[1] == sizeof(ifp->mask) && p + 6 < end) {  // Mask
+@@ -472,7 +431,7 @@ static void rx_dhcp(struct mip_if *ifp, struct pkt *pkt) {
+     p += p[1] + 2;
+   }
+   if (ip && mask && gw && ifp->ip == 0) {
+-    arp_cache_add(ifp, pkt->dhcp->siaddr, ((struct eth *) pkt->raw.buf)->src);
++    arp_cache_add(ifp, pkt->dhcp->siaddr, ((struct eth *) pkt->raw.ptr)->src);
+     ifp->ip = ip, ifp->gw = gw, ifp->mask = mask;
+     ifp->state = MIP_STATE_READY;
+     onstatechange(ifp);
+@@ -505,7 +464,7 @@ static void rx_udp(struct mip_if *ifp, struct pkt *pkt) {
+                !mg_iobuf_resize(&c->recv, c->recv.len + pkt->pay.len)) {
+       mg_error(c, "oom");
+     } else {
+-      memcpy(&c->recv.buf[c->recv.len], pkt->pay.buf, pkt->pay.len);
++      memcpy(&c->recv.buf[c->recv.len], pkt->pay.ptr, pkt->pay.len);
+       c->recv.len += pkt->pay.len;
+       mg_call(c, MG_EV_READ, &pkt->pay.len);
+     }
+@@ -534,7 +493,7 @@ static size_t tx_tcp(struct mip_if *ifp, uint32_t dst_ip, uint8_t flags,
+   cs = csumup(cs, &ip->dst, sizeof(ip->dst));
+   cs = csumup(cs, pseudo, sizeof(pseudo));
+   tcp->csum = csumfin(cs);
+-  return ether_output(ifp, PDIFF(ifp->tx.buf, tcp + 1) + len);
++  return ether_output(ifp, PDIFF(ifp->tx.ptr, tcp + 1) + len);
+ }
+ 
+ static size_t tx_tcp_pkt(struct mip_if *ifp, struct pkt *pkt, uint8_t flags,
+@@ -623,7 +582,7 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
+     // therefore we copy that encrypted data to the s->raw iobuffer instead,
+     // and then call mg_tls_recv() to decrypt it. NOTE: mg_tls_recv() will
+     // call back mg_io_recv() which grabs raw data from s->raw
+-    memcpy(&io->buf[io->len], pkt->pay.buf, pkt->pay.len);
++    memcpy(&io->buf[io->len], pkt->pay.ptr, pkt->pay.len);
+     io->len += pkt->pay.len;
+ 
+     MG_DEBUG(("%lu SEQ %x -> %x", c->id, mg_htonl(pkt->tcp->seq), s->ack));
+@@ -664,7 +623,7 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
+ 
+ static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
+   struct mg_connection *c = getpeer(ifp->mgr, pkt, false);
+-  struct connstate *s = (struct connstate *) (c + 1);
++  struct connstate *s = c == NULL ? NULL : (struct connstate *) (c + 1);
+ 
+   if (c != NULL && s->ttype == MIP_TTYPE_KEEPALIVE) {
+     s->tmiss = 0;                      // Reset missed keep-alive counter
+@@ -755,7 +714,7 @@ static void mip_rx(struct mip_if *ifp, void *buf, size_t len) {
+   // struct pkt pkt = {.raw = {.buf = (uint8_t *) buf, .len = len}};
+   struct pkt pkt;
+   memset(&pkt, 0, sizeof(pkt));
+-  pkt.raw.buf = (uint8_t *) buf;
++  pkt.raw.ptr = (char *) buf;
+   pkt.raw.len = len;
+   pkt.eth = (struct eth *) buf;
+   if (pkt.raw.len < sizeof(*pkt.eth)) return;  // Truncated - runt?
+@@ -775,11 +734,12 @@ static void mip_rx(struct mip_if *ifp, void *buf, size_t len) {
+   } else if (pkt.eth->type == mg_htons(0x800)) {
+     pkt.ip = (struct ip *) (pkt.eth + 1);
+     if (pkt.raw.len < sizeof(*pkt.eth) + sizeof(*pkt.ip)) return;  // Truncated
+-    if ((pkt.ip->ver >> 4) != 4) return;                           // Not IP
+     // Truncate frame to what IP header tells us
+     if ((size_t) mg_ntohs(pkt.ip->len) + sizeof(struct eth) < pkt.raw.len) {
+       pkt.raw.len = (size_t) mg_ntohs(pkt.ip->len) + sizeof(struct eth);
+     }
++    if (pkt.raw.len < sizeof(*pkt.eth) + sizeof(*pkt.ip)) return;  // Truncated
++    if ((pkt.ip->ver >> 4) != 4) return;                           // Not IP
+     mkpay(&pkt, pkt.ip + 1);
+     rx_ip(ifp, &pkt);
+   } else {
+@@ -815,15 +775,13 @@ static void mip_poll(struct mip_if *ifp, uint64_t uptime_ms) {
+   }
+ 
+   // Read data from the network
+-  for (;;) {
+-    size_t len = ifp->queue.len > 0 ? q_read(&ifp->queue, ifp->rx.buf)
+-                                    : ifp->driver->rx(ifp->rx.buf, ifp->rx.len,
+-                                                      ifp->driver_data);
+-    if (len == 0) break;
+-    qp_mark(QP_FRAMEPOPPED, (int) q_space(&ifp->queue));
+-    mip_rx(ifp, ifp->rx.buf, len);
+-    qp_mark(QP_FRAMEDONE, (int) q_space(&ifp->queue));
+-  }
++  size_t len = ifp->queue.len > 0
++    ? q_read(&ifp->queue, (void *) ifp->rx.ptr)
++    : ifp->driver->rx((void *) ifp->rx.ptr, ifp->rx.len,
++        ifp->driver_data);
++  qp_mark(QP_FRAMEPOPPED, (int) q_space(&ifp->queue));
++  mip_rx(ifp, (void *) ifp->rx.ptr, len);
++  qp_mark(QP_FRAMEDONE, (int) q_space(&ifp->queue));
+ 
+   // Process timeouts
+   for (struct mg_connection *c = ifp->mgr->conns; c != NULL; c = c->next) {
+@@ -863,38 +821,26 @@ static void on_rx(void *buf, size_t len, void *userdata) {
+   }
+ }
+ 
+-static void if_init(struct mip_if *ifp, struct mg_mgr *mgr,
+-                    struct mip_cfg *ipcfg, struct mip_driver *driver,
+-                    void *driver_data, size_t maxpktsize, size_t qlen) {
+-  memcpy(ifp->mac, ipcfg->mac, sizeof(ifp->mac));
+-  ifp->use_dhcp = ipcfg->ip == 0;
+-  ifp->ip = ipcfg->ip, ifp->mask = ipcfg->mask, ifp->gw = ipcfg->gw;
+-  ifp->rx.buf = (uint8_t *) (ifp + 1), ifp->rx.len = maxpktsize;
+-  ifp->tx.buf = ifp->rx.buf + maxpktsize, ifp->tx.len = maxpktsize;
+-  ifp->driver = driver;
+-  ifp->driver_data = driver_data;
+-  ifp->mgr = mgr;
+-  ifp->queue.buf = ifp->tx.buf + maxpktsize;
+-  ifp->queue.len = qlen;
+-  ifp->timer_1000ms = mg_millis();
+-  arp_cache_init(ifp->arp_cache, MIP_ARP_ENTRIES, 12);
+-  if (driver->setrx) driver->setrx(on_rx, ifp);
+-  mgr->priv = ifp;
+-  mgr->extraconnsize = sizeof(struct connstate);
+-#ifdef MIP_QPROFILE
+-  qp_init();
+-#endif
+-}
+-
+-void mip_init(struct mg_mgr *mgr, struct mip_cfg *ipcfg,
+-              struct mip_driver *driver, void *driver_data) {
+-  if (driver->init && !driver->init(ipcfg->mac, driver_data)) {
++void mip_init(struct mg_mgr *mgr, struct mip_if *ifp) {
++  if (ifp->driver->init && !ifp->driver->init(ifp->mac, ifp->driver_data)) {
+     MG_ERROR(("driver init failed"));
+   } else {
+-    size_t maxpktsize = 1540, qlen = driver->setrx ? MIP_QSIZE : 0;
+-    struct mip_if *ifp =
+-        (struct mip_if *) calloc(1, sizeof(*ifp) + 2 * maxpktsize + qlen);
+-    if_init(ifp, mgr, ipcfg, driver, driver_data, maxpktsize, qlen);
++    size_t maxpktsize = 1540;
++    ifp->rx.ptr = (char *) calloc(1, maxpktsize), ifp->rx.len = maxpktsize;
++    ifp->tx.ptr = (char *) calloc(1, maxpktsize), ifp->tx.len = maxpktsize;
++    if (ifp->driver->setrx) {
++      ifp->queue.len = MIP_QSIZE;
++      ifp->queue.buf = (uint8_t *) calloc(1, ifp->queue.len);
++      ifp->driver->setrx(on_rx, ifp);
++    }
++    ifp->timer_1000ms = mg_millis();
++    arp_cache_init(ifp->arp_cache, MIP_ARP_ENTRIES, 12);
++    mgr->priv = ifp;
++    ifp->mgr = mgr;
++    mgr->extraconnsize = sizeof(struct connstate);
++#ifdef MIP_QPROFILE
++    qp_init();
++#endif
+   }
+ }
+ 
+diff --git a/mip/mip.h b/mip/mip.h
+index 0c9fd5d4a3..9ff58da13a 100644
+--- a/mip/mip.h
++++ b/mip/mip.h
+@@ -12,12 +12,44 @@ struct mip_driver {
+   void (*setrx)(void (*fn)(void *buf, size_t len, void *rxdata), void *rxdata);
+ };
+ 
+-struct mip_cfg {
+-  uint8_t mac[6];         // MAC address. Must not be 0
+-  uint32_t ip, mask, gw;  // IP, netmask, GW. If IP is 0, DHCP is used
++// Receive queue - single producer, single consumer queue.  Interrupt-based
++// drivers copy received frames to the queue in interrupt context. mip_poll()
++// function runs in event loop context, reads from the queue
++struct queue {
++  uint8_t *buf;
++  size_t len;
++  volatile size_t tail, head;
+ };
+ 
+-void mip_init(struct mg_mgr *, struct mip_cfg *, struct mip_driver *, void *);
++#define MIP_ARP_ENTRIES 5  // Number of ARP cache entries. Maximum 21
++#define MIP_ARP_CS (2 + 12 * MIP_ARP_ENTRIES)  // ARP cache size
++
++// Network interface
++struct mip_if {
++  uint8_t mac[6];             // MAC address. Must be set to a valid MAC
++  uint32_t ip, mask, gw;      // IP address, mask, default gateway. Can be 0
++  struct mg_str rx;           // Output (TX) buffer
++  struct mg_str tx;           // Input (RX) buffer
++  bool use_dhcp;              // Enable DCHP
++  struct mip_driver *driver;  // Low level driver
++  void *driver_data;          // Driver-specific data
++  struct mg_mgr *mgr;         // Mongoose event manager
++
++  // Internal state, user can use it but should not change it
++  uint64_t now;                   // Current time
++  uint64_t timer_1000ms;          // 1000 ms timer: for DHCP and link state
++  uint64_t lease_expire;          // Lease expiration time
++  uint8_t arp_cache[MIP_ARP_CS];  // Each entry is 12 bytes
++  uint16_t eport;                 // Next ephemeral port
++  uint16_t dropped;               // Number of dropped frames
++  uint8_t state;                  // Current state
++#define MIP_STATE_DOWN 0          // Interface is down
++#define MIP_STATE_UP 1            // Interface is up
++#define MIP_STATE_READY 2         // Interface is up and has IP
++  struct queue queue;             // Receive queue
++};
++
++void mip_init(struct mg_mgr *, struct mip_if *);
+ 
+ extern struct mip_driver mip_driver_stm32;
+ extern struct mip_driver mip_driver_enc28j60;
+diff --git a/mongoose.c b/mongoose.c
+index f74bcfbc14..51a8307b92 100644
+--- a/mongoose.c
++++ b/mongoose.c
+@@ -3196,7 +3196,7 @@ int mg_mqtt_parse(const uint8_t *buf, size_t len, uint8_t version,
+         p += 2;
+       }
+       if (p > end) return MQTT_MALFORMED;
+-      if (version == 5) p += 1 + p[0];  // Skip options
++      if (version == 5 && p + 1 < end) p += 1 + p[0];  // Skip options
+       if (p > end) return MQTT_MALFORMED;
+       m->data.ptr = (char *) p;
+       m->data.len = (size_t) (end - p);
+@@ -3536,7 +3536,6 @@ void mg_mgr_free(struct mg_mgr *mgr) {
+ #if MG_ENABLE_EPOLL
+   if (mgr->epoll_fd >= 0) close(mgr->epoll_fd), mgr->epoll_fd = -1;
+ #endif
+-  free(mgr->priv);
+ }
+ 
+ void mg_mgr_init(struct mg_mgr *mgr) {
+@@ -6294,10 +6293,6 @@ struct mip_driver mip_driver_w5500 = {w5500_init, w5500_tx, w5500_rx, w5500_up,
+ #define U16(ptr) ((((uint16_t) (ptr)[0]) << 8) | (ptr)[1])
+ #define PDIFF(a, b) ((size_t) (((char *) (b)) - ((char *) (a))))
+ 
+-#ifndef MIP_ARP_ENTRIES
+-#define MIP_ARP_ENTRIES 5  // Number of ARP cache entries. Maximum 21
+-#endif
+-
+ #ifndef MIP_QSIZE
+ #define MIP_QSIZE (16 * 1024)  // Queue size
+ #endif
+@@ -6306,8 +6301,7 @@ struct mip_driver mip_driver_w5500 = {w5500_init, w5500_tx, w5500_rx, w5500_up,
+ #define MIP_TCP_KEEPALIVE_MS 45000  // TCP keep-alive period, ms
+ #endif
+ 
+-#define MIP_ARP_CS (2 + 12 * MIP_ARP_ENTRIES)  // ARP cache size
+-#define MIP_TCP_ACK_MS 150                     // Timeout for ACKing
++#define MIP_TCP_ACK_MS 150  // Timeout for ACKing
+ 
+ struct connstate {
+   uint32_t seq, ack;           // TCP seq/ack counters
+@@ -6320,45 +6314,6 @@ struct connstate {
+   struct mg_iobuf raw;         // For TLS only. Incoming raw data
+ };
+ 
+-struct str {
+-  uint8_t *buf;
+-  size_t len;
+-};
+-
+-// Receive queue - single producer, single consumer queue.  Interrupt-based
+-// drivers copy received frames to the queue in interrupt context. mip_poll()
+-// function runs in event loop context, reads from the queue
+-struct queue {
+-  uint8_t *buf;
+-  size_t len;
+-  volatile size_t tail, head;
+-};
+-
+-// Network interface
+-struct mip_if {
+-  uint8_t mac[6];             // MAC address. Must be set to a valid MAC
+-  uint32_t ip, mask, gw;      // IP address, mask, default gateway. Can be 0
+-  struct str rx;              // Output (TX) buffer
+-  struct str tx;              // Input (RX) buffer
+-  bool use_dhcp;              // Enable DCHP
+-  struct mip_driver *driver;  // Low level driver
+-  void *driver_data;          // Driver-specific data
+-  struct mg_mgr *mgr;         // Mongoose event manager
+-
+-  // Internal state, user can use it but should not change it
+-  uint64_t now;                   // Current time
+-  uint64_t timer_1000ms;          // 1000 ms timer: for DHCP and link state
+-  uint64_t lease_expire;          // Lease expiration time
+-  uint8_t arp_cache[MIP_ARP_CS];  // Each entry is 12 bytes
+-  uint16_t eport;                 // Next ephemeral port
+-  uint16_t dropped;               // Number of dropped frames
+-  uint8_t state;                  // Current state
+-#define MIP_STATE_DOWN 0          // Interface is down
+-#define MIP_STATE_UP 1            // Interface is up
+-#define MIP_STATE_READY 2         // Interface is up and has IP
+-  struct queue queue;             // Receive queue
+-};
+-
+ #pragma pack(push, 1)
+ 
+ struct lcp {
+@@ -6452,8 +6407,8 @@ struct dhcp {
+ #pragma pack(pop)
+ 
+ struct pkt {
+-  struct str raw;  // Raw packet data
+-  struct str pay;  // Payload data
++  struct mg_str raw;  // Raw packet data
++  struct mg_str pay;  // Payload data
+   struct eth *eth;
+   struct llc *llc;
+   struct arp *arp;
+@@ -6490,9 +6445,11 @@ static bool q_write(struct queue *q, const void *buf, size_t len) {
+   return success;
+ }
+ 
++#ifdef MIP_QPROFILE
+ static inline size_t q_space(struct queue *q) {
+   return q->tail > q->head ? q->tail - q->head : q->tail + (q->len - q->head);
+ }
++#endif
+ 
+ static inline size_t q_avail(struct queue *q) {
+   size_t n = 0;
+@@ -6509,13 +6466,13 @@ static size_t q_read(struct queue *q, void *buf) {
+   return n;
+ }
+ 
+-static struct str mkstr(void *buf, size_t len) {
+-  struct str str = {(uint8_t *) buf, len};
++static struct mg_str mkstr(void *buf, size_t len) {
++  struct mg_str str = {(char *) buf, len};
+   return str;
+ }
+ 
+ static void mkpay(struct pkt *pkt, void *p) {
+-  pkt->pay = mkstr(p, (size_t) (&pkt->raw.buf[pkt->raw.len] - (uint8_t *) p));
++  pkt->pay = mkstr(p, (size_t) (&pkt->raw.ptr[pkt->raw.len] - (char *) p));
+ }
+ 
+ static uint32_t csumup(uint32_t sum, const void *buf, size_t len) {
+@@ -6586,13 +6543,13 @@ static void arp_cache_add(struct mip_if *ifp, uint32_t ip, uint8_t mac[6]) {
+ 
+ static size_t ether_output(struct mip_if *ifp, size_t len) {
+   // size_t min = 64;  // Pad short frames to 64 bytes (minimum Ethernet size)
+-  // if (len < min) memset(ifp->tx.buf + len, 0, min - len), len = min;
+-  // mg_hexdump(ifp->tx.buf, len);
+-  return ifp->driver->tx(ifp->tx.buf, len, ifp->driver_data);
++  // if (len < min) memset(ifp->tx.ptr + len, 0, min - len), len = min;
++  // mg_hexdump(ifp->tx.ptr, len);
++  return ifp->driver->tx(ifp->tx.ptr, len, ifp->driver_data);
+ }
+ 
+ static void arp_ask(struct mip_if *ifp, uint32_t ip) {
+-  struct eth *eth = (struct eth *) ifp->tx.buf;
++  struct eth *eth = (struct eth *) ifp->tx.ptr;
+   struct arp *arp = (struct arp *) (eth + 1);
+   memset(eth->dst, 255, sizeof(eth->dst));
+   memcpy(eth->src, ifp->mac, sizeof(eth->src));
+@@ -6626,7 +6583,7 @@ static void onstatechange(struct mip_if *ifp) {
+ 
+ static struct ip *tx_ip(struct mip_if *ifp, uint8_t proto, uint32_t ip_src,
+                         uint32_t ip_dst, size_t plen) {
+-  struct eth *eth = (struct eth *) ifp->tx.buf;
++  struct eth *eth = (struct eth *) ifp->tx.ptr;
+   struct ip *ip = (struct ip *) (eth + 1);
+   uint8_t *mac = arp_cache_find(ifp, ip_dst);  // Dst IP in ARP cache ?
+   if (!mac && (ip_dst & ifp->mask)) arp_ask(ifp, ip_dst);  // Same net, lookup
+@@ -6705,7 +6662,7 @@ static void tx_dhcp_discover(struct mip_if *ifp) {
+ static void rx_arp(struct mip_if *ifp, struct pkt *pkt) {
+   if (pkt->arp->op == mg_htons(1) && pkt->arp->tpa == ifp->ip) {
+     // ARP request. Make a response, then send
+-    struct eth *eth = (struct eth *) ifp->tx.buf;
++    struct eth *eth = (struct eth *) ifp->tx.ptr;
+     struct arp *arp = (struct arp *) (eth + 1);
+     MG_DEBUG(("ARP op %d %#x %#x", mg_htons(arp->op), arp->spa, arp->tpa));
+     memcpy(eth->dst, pkt->eth->src, sizeof(eth->dst));
+@@ -6736,7 +6693,7 @@ static void rx_icmp(struct mip_if *ifp, struct pkt *pkt) {
+         tx_ip(ifp, 1, ifp->ip, pkt->ip->src, sizeof(struct icmp) + plen);
+     struct icmp *icmp = (struct icmp *) (ip + 1);
+     memset(icmp, 0, sizeof(*icmp));        // Set csum to 0
+-    memcpy(icmp + 1, pkt->pay.buf, plen);  // Copy RX payload to TX
++    memcpy(icmp + 1, pkt->pay.ptr, plen);  // Copy RX payload to TX
+     icmp->csum = ipcsum(icmp, sizeof(*icmp) + plen);
+     ether_output(ifp, hlen + plen);
+   }
+@@ -6744,7 +6701,8 @@ static void rx_icmp(struct mip_if *ifp, struct pkt *pkt) {
+ 
+ static void rx_dhcp(struct mip_if *ifp, struct pkt *pkt) {
+   uint32_t ip = 0, gw = 0, mask = 0;
+-  uint8_t *p = pkt->dhcp->options, *end = &pkt->raw.buf[pkt->raw.len];
++  uint8_t *p = pkt->dhcp->options,
++          *end = (uint8_t *) &pkt->raw.ptr[pkt->raw.len];
+   if (end < (uint8_t *) (pkt->dhcp + 1)) return;
+   while (p + 1 < end && p[0] != 255) {  // Parse options
+     if (p[0] == 1 && p[1] == sizeof(ifp->mask) && p + 6 < end) {  // Mask
+@@ -6760,7 +6718,7 @@ static void rx_dhcp(struct mip_if *ifp, struct pkt *pkt) {
+     p += p[1] + 2;
+   }
+   if (ip && mask && gw && ifp->ip == 0) {
+-    arp_cache_add(ifp, pkt->dhcp->siaddr, ((struct eth *) pkt->raw.buf)->src);
++    arp_cache_add(ifp, pkt->dhcp->siaddr, ((struct eth *) pkt->raw.ptr)->src);
+     ifp->ip = ip, ifp->gw = gw, ifp->mask = mask;
+     ifp->state = MIP_STATE_READY;
+     onstatechange(ifp);
+@@ -6793,7 +6751,7 @@ static void rx_udp(struct mip_if *ifp, struct pkt *pkt) {
+                !mg_iobuf_resize(&c->recv, c->recv.len + pkt->pay.len)) {
+       mg_error(c, "oom");
+     } else {
+-      memcpy(&c->recv.buf[c->recv.len], pkt->pay.buf, pkt->pay.len);
++      memcpy(&c->recv.buf[c->recv.len], pkt->pay.ptr, pkt->pay.len);
+       c->recv.len += pkt->pay.len;
+       mg_call(c, MG_EV_READ, &pkt->pay.len);
+     }
+@@ -6822,7 +6780,7 @@ static size_t tx_tcp(struct mip_if *ifp, uint32_t dst_ip, uint8_t flags,
+   cs = csumup(cs, &ip->dst, sizeof(ip->dst));
+   cs = csumup(cs, pseudo, sizeof(pseudo));
+   tcp->csum = csumfin(cs);
+-  return ether_output(ifp, PDIFF(ifp->tx.buf, tcp + 1) + len);
++  return ether_output(ifp, PDIFF(ifp->tx.ptr, tcp + 1) + len);
+ }
+ 
+ static size_t tx_tcp_pkt(struct mip_if *ifp, struct pkt *pkt, uint8_t flags,
+@@ -6911,7 +6869,7 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
+     // therefore we copy that encrypted data to the s->raw iobuffer instead,
+     // and then call mg_tls_recv() to decrypt it. NOTE: mg_tls_recv() will
+     // call back mg_io_recv() which grabs raw data from s->raw
+-    memcpy(&io->buf[io->len], pkt->pay.buf, pkt->pay.len);
++    memcpy(&io->buf[io->len], pkt->pay.ptr, pkt->pay.len);
+     io->len += pkt->pay.len;
+ 
+     MG_DEBUG(("%lu SEQ %x -> %x", c->id, mg_htonl(pkt->tcp->seq), s->ack));
+@@ -6952,7 +6910,7 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
+ 
+ static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
+   struct mg_connection *c = getpeer(ifp->mgr, pkt, false);
+-  struct connstate *s = (struct connstate *) (c + 1);
++  struct connstate *s = c == NULL ? NULL : (struct connstate *) (c + 1);
+ 
+   if (c != NULL && s->ttype == MIP_TTYPE_KEEPALIVE) {
+     s->tmiss = 0;                      // Reset missed keep-alive counter
+@@ -7043,7 +7001,7 @@ static void mip_rx(struct mip_if *ifp, void *buf, size_t len) {
+   // struct pkt pkt = {.raw = {.buf = (uint8_t *) buf, .len = len}};
+   struct pkt pkt;
+   memset(&pkt, 0, sizeof(pkt));
+-  pkt.raw.buf = (uint8_t *) buf;
++  pkt.raw.ptr = (char *) buf;
+   pkt.raw.len = len;
+   pkt.eth = (struct eth *) buf;
+   if (pkt.raw.len < sizeof(*pkt.eth)) return;  // Truncated - runt?
+@@ -7063,11 +7021,12 @@ static void mip_rx(struct mip_if *ifp, void *buf, size_t len) {
+   } else if (pkt.eth->type == mg_htons(0x800)) {
+     pkt.ip = (struct ip *) (pkt.eth + 1);
+     if (pkt.raw.len < sizeof(*pkt.eth) + sizeof(*pkt.ip)) return;  // Truncated
+-    if ((pkt.ip->ver >> 4) != 4) return;                           // Not IP
+     // Truncate frame to what IP header tells us
+     if ((size_t) mg_ntohs(pkt.ip->len) + sizeof(struct eth) < pkt.raw.len) {
+       pkt.raw.len = (size_t) mg_ntohs(pkt.ip->len) + sizeof(struct eth);
+     }
++    if (pkt.raw.len < sizeof(*pkt.eth) + sizeof(*pkt.ip)) return;  // Truncated
++    if ((pkt.ip->ver >> 4) != 4) return;                           // Not IP
+     mkpay(&pkt, pkt.ip + 1);
+     rx_ip(ifp, &pkt);
+   } else {
+@@ -7103,15 +7062,13 @@ static void mip_poll(struct mip_if *ifp, uint64_t uptime_ms) {
+   }
+ 
+   // Read data from the network
+-  for (;;) {
+-    size_t len = ifp->queue.len > 0 ? q_read(&ifp->queue, ifp->rx.buf)
+-                                    : ifp->driver->rx(ifp->rx.buf, ifp->rx.len,
+-                                                      ifp->driver_data);
+-    if (len == 0) break;
+-    qp_mark(QP_FRAMEPOPPED, (int) q_space(&ifp->queue));
+-    mip_rx(ifp, ifp->rx.buf, len);
+-    qp_mark(QP_FRAMEDONE, (int) q_space(&ifp->queue));
+-  }
++  size_t len = ifp->queue.len > 0
++    ? q_read(&ifp->queue, (void *) ifp->rx.ptr)
++    : ifp->driver->rx((void *) ifp->rx.ptr, ifp->rx.len,
++        ifp->driver_data);
++  qp_mark(QP_FRAMEPOPPED, (int) q_space(&ifp->queue));
++  mip_rx(ifp, (void *) ifp->rx.ptr, len);
++  qp_mark(QP_FRAMEDONE, (int) q_space(&ifp->queue));
+ 
+   // Process timeouts
+   for (struct mg_connection *c = ifp->mgr->conns; c != NULL; c = c->next) {
+@@ -7151,38 +7108,26 @@ static void on_rx(void *buf, size_t len, void *userdata) {
+   }
+ }
+ 
+-static void if_init(struct mip_if *ifp, struct mg_mgr *mgr,
+-                    struct mip_cfg *ipcfg, struct mip_driver *driver,
+-                    void *driver_data, size_t maxpktsize, size_t qlen) {
+-  memcpy(ifp->mac, ipcfg->mac, sizeof(ifp->mac));
+-  ifp->use_dhcp = ipcfg->ip == 0;
+-  ifp->ip = ipcfg->ip, ifp->mask = ipcfg->mask, ifp->gw = ipcfg->gw;
+-  ifp->rx.buf = (uint8_t *) (ifp + 1), ifp->rx.len = maxpktsize;
+-  ifp->tx.buf = ifp->rx.buf + maxpktsize, ifp->tx.len = maxpktsize;
+-  ifp->driver = driver;
+-  ifp->driver_data = driver_data;
+-  ifp->mgr = mgr;
+-  ifp->queue.buf = ifp->tx.buf + maxpktsize;
+-  ifp->queue.len = qlen;
+-  ifp->timer_1000ms = mg_millis();
+-  arp_cache_init(ifp->arp_cache, MIP_ARP_ENTRIES, 12);
+-  if (driver->setrx) driver->setrx(on_rx, ifp);
+-  mgr->priv = ifp;
+-  mgr->extraconnsize = sizeof(struct connstate);
+-#ifdef MIP_QPROFILE
+-  qp_init();
+-#endif
+-}
+-
+-void mip_init(struct mg_mgr *mgr, struct mip_cfg *ipcfg,
+-              struct mip_driver *driver, void *driver_data) {
+-  if (driver->init && !driver->init(ipcfg->mac, driver_data)) {
++void mip_init(struct mg_mgr *mgr, struct mip_if *ifp) {
++  if (ifp->driver->init && !ifp->driver->init(ifp->mac, ifp->driver_data)) {
+     MG_ERROR(("driver init failed"));
+   } else {
+-    size_t maxpktsize = 1540, qlen = driver->setrx ? MIP_QSIZE : 0;
+-    struct mip_if *ifp =
+-        (struct mip_if *) calloc(1, sizeof(*ifp) + 2 * maxpktsize + qlen);
+-    if_init(ifp, mgr, ipcfg, driver, driver_data, maxpktsize, qlen);
++    size_t maxpktsize = 1540;
++    ifp->rx.ptr = (char *) calloc(1, maxpktsize), ifp->rx.len = maxpktsize;
++    ifp->tx.ptr = (char *) calloc(1, maxpktsize), ifp->tx.len = maxpktsize;
++    if (ifp->driver->setrx) {
++      ifp->queue.len = MIP_QSIZE;
++      ifp->queue.buf = (uint8_t *) calloc(1, ifp->queue.len);
++      ifp->driver->setrx(on_rx, ifp);
++    }
++    ifp->timer_1000ms = mg_millis();
++    arp_cache_init(ifp->arp_cache, MIP_ARP_ENTRIES, 12);
++    mgr->priv = ifp;
++    ifp->mgr = mgr;
++    mgr->extraconnsize = sizeof(struct connstate);
++#ifdef MIP_QPROFILE
++    qp_init();
++#endif
+   }
+ }
+ 
+diff --git a/mongoose.h b/mongoose.h
+index 6d9ac8f993..f0dedcad59 100644
+--- a/mongoose.h
++++ b/mongoose.h
+@@ -1429,12 +1429,44 @@ struct mip_driver {
+   void (*setrx)(void (*fn)(void *buf, size_t len, void *rxdata), void *rxdata);
+ };
+ 
+-struct mip_cfg {
+-  uint8_t mac[6];         // MAC address. Must not be 0
+-  uint32_t ip, mask, gw;  // IP, netmask, GW. If IP is 0, DHCP is used
++// Receive queue - single producer, single consumer queue.  Interrupt-based
++// drivers copy received frames to the queue in interrupt context. mip_poll()
++// function runs in event loop context, reads from the queue
++struct queue {
++  uint8_t *buf;
++  size_t len;
++  volatile size_t tail, head;
+ };
+ 
+-void mip_init(struct mg_mgr *, struct mip_cfg *, struct mip_driver *, void *);
++#define MIP_ARP_ENTRIES 5  // Number of ARP cache entries. Maximum 21
++#define MIP_ARP_CS (2 + 12 * MIP_ARP_ENTRIES)  // ARP cache size
++
++// Network interface
++struct mip_if {
++  uint8_t mac[6];             // MAC address. Must be set to a valid MAC
++  uint32_t ip, mask, gw;      // IP address, mask, default gateway. Can be 0
++  struct mg_str rx;           // Output (TX) buffer
++  struct mg_str tx;           // Input (RX) buffer
++  bool use_dhcp;              // Enable DCHP
++  struct mip_driver *driver;  // Low level driver
++  void *driver_data;          // Driver-specific data
++  struct mg_mgr *mgr;         // Mongoose event manager
++
++  // Internal state, user can use it but should not change it
++  uint64_t now;                   // Current time
++  uint64_t timer_1000ms;          // 1000 ms timer: for DHCP and link state
++  uint64_t lease_expire;          // Lease expiration time
++  uint8_t arp_cache[MIP_ARP_CS];  // Each entry is 12 bytes
++  uint16_t eport;                 // Next ephemeral port
++  uint16_t dropped;               // Number of dropped frames
++  uint8_t state;                  // Current state
++#define MIP_STATE_DOWN 0          // Interface is down
++#define MIP_STATE_UP 1            // Interface is up
++#define MIP_STATE_READY 2         // Interface is up and has IP
++  struct queue queue;             // Receive queue
++};
++
++void mip_init(struct mg_mgr *, struct mip_if *);
+ 
+ extern struct mip_driver mip_driver_stm32;
+ extern struct mip_driver mip_driver_enc28j60;
+diff --git a/src/mqtt.c b/src/mqtt.c
+index 1dffea3e2b..0db5225628 100644
+--- a/src/mqtt.c
++++ b/src/mqtt.c
+@@ -173,7 +173,7 @@ int mg_mqtt_parse(const uint8_t *buf, size_t len, uint8_t version,
+         p += 2;
+       }
+       if (p > end) return MQTT_MALFORMED;
+-      if (version == 5) p += 1 + p[0];  // Skip options
++      if (version == 5 && p + 1 < end) p += 1 + p[0];  // Skip options
+       if (p > end) return MQTT_MALFORMED;
+       m->data.ptr = (char *) p;
+       m->data.len = (size_t) (end - p);
+diff --git a/src/net.c b/src/net.c
+index 21c345beea..b5ece99e75 100644
+--- a/src/net.c
++++ b/src/net.c
+@@ -244,7 +244,6 @@ void mg_mgr_free(struct mg_mgr *mgr) {
+ #if MG_ENABLE_EPOLL
+   if (mgr->epoll_fd >= 0) close(mgr->epoll_fd), mgr->epoll_fd = -1;
+ #endif
+-  free(mgr->priv);
+ }
+ 
+ void mg_mgr_init(struct mg_mgr *mgr) {
+diff --git a/test/driver_mock.c b/test/driver_mock.c
+index eeef942c0b..eb3bcdf9ad 100644
+--- a/test/driver_mock.c
++++ b/test/driver_mock.c
+@@ -1,10 +1,6 @@
+-static bool my_random(void) {
+-  return mg_millis() & 1;
+-}
+-
+ static bool mock_init(uint8_t *mac, void *data) {
+   (void) mac, (void) data;
+-  return my_random();
++  return true;
+ }
+ 
+ static size_t mock_tx(const void *buf, size_t len, void *data) {
+@@ -19,7 +15,7 @@ static size_t mock_rx(void *buf, size_t len, void *data) {
+ 
+ static bool mock_up(void *data) {
+   (void) data;
+-  return my_random();
++  return true;
+ }
+ 
+ struct mip_driver mip_driver_mock = {mock_init, mock_tx, mock_rx, mock_up, 0};
+diff --git a/test/fuzz.c b/test/fuzz.c
+index 8c4141ea9a..ab17102c73 100644
+--- a/test/fuzz.c
++++ b/test/fuzz.c
+@@ -58,13 +58,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+   mg_json_get(mg_str_n((char *) data, size), "$[0]", &n);
+ 
+   if (size > 0) {
+-    struct mip_cfg cfg = {{0,0,0,0,0,0}, 0x01020304, 255, 0x01010101};
+-    size_t pktlen = 1540;
+-    char t[sizeof(struct mip_if) + pktlen * 2 + 0 /* qlen */];
+-    struct mip_if *ifp = (struct mip_if *) t;
++    struct mip_if mif = {.ip = 0x01020304,
++                         .mask = 255,
++                         .gw = 0x01010101,
++                         .driver = &mip_driver_mock};
+     struct mg_mgr mgr;
+     mg_mgr_init(&mgr);
+-    if_init(ifp, &mgr, &cfg, &mip_driver_mock, NULL, pktlen, 0);
++    mip_init(&mgr, &mif);
+ 
+     // Make a copy of the random data, in order to modify it
+     void *pkt = malloc(size);
+@@ -73,15 +73,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+     if (size > sizeof(*eth)) {
+       static size_t i;
+       uint16_t eth_types[] = {0x800, 0x800, 0x806, 0x86dd};
+-      memcpy(eth->dst, ifp->mac, 6);  // Set valid destination MAC
++      memcpy(eth->dst, mif.mac, 6);  // Set valid destination MAC
+       eth->type = mg_htons(eth_types[i++]);
+       if (i >= sizeof(eth_types) / sizeof(eth_types[0])) i = 0;
+     }
+ 
+-    mip_rx(ifp, pkt, size);
+-    mgr.priv = NULL;  // Don't let Mongoose free() ifp
++    mip_rx(&mif, pkt, size);
+     mg_mgr_free(&mgr);
+     free(pkt);
++    free((char *) mif.rx.ptr);
++    free((char *) mif.tx.ptr);
+   }
+ 
+   return 0;
+diff --git a/test/mip_test.c b/test/mip_test.c
+index 851df89c41..4693a3a8fe 100644
+--- a/test/mip_test.c
++++ b/test/mip_test.c
+@@ -39,12 +39,12 @@ static void test_queue(void) {
+ }
+ 
+ static void test_statechange(void) {
+-  uint8_t tx[1540];
++  char tx[1540];
+   struct mip_if iface;
+   memset(&iface, 0, sizeof(iface));
+   iface.ip = mg_htonl(0x01020304);
+   iface.state = MIP_STATE_READY;
+-  iface.tx.buf = tx, iface.tx.len = sizeof(tx);
++  iface.tx.ptr = tx, iface.tx.len = sizeof(tx);
+   iface.driver = &mip_driver_mock;
+   onstatechange(&iface);
+ }

@@ -1,0 +1,185 @@
+From 02e62a08365ad11ae408fec3fbd2d6ee9822a325 Mon Sep 17 00:00:00 2001
+From: Tor Andersson <tor.andersson@artifex.com>
+Date: Tue, 1 Dec 2020 17:07:27 +0100
+Subject: [PATCH] Bug 703211: Pass scissor by value to avoid pointer aliasing
+ issues.
+
+---
+ source/fitz/draw-device.c    | 18 +++++++++---------
+ source/fitz/draw-imp.h       |  6 +++---
+ source/fitz/draw-path.c      | 19 +++++++++----------
+ source/fitz/draw-rasterize.c |  1 +
+ 4 files changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/source/fitz/draw-device.c b/source/fitz/draw-device.c
+index a46d3ae591..1e2399d424 100644
+--- a/source/fitz/draw-device.c
++++ b/source/fitz/draw-device.c
+@@ -624,7 +624,7 @@ fz_draw_fill_path(fz_context *ctx, fz_device *devp, const fz_path *path, int eve
+ 		flatness = 0.001f;
+ 
+ 	bbox = fz_intersect_irect(fz_pixmap_bbox(ctx, state->dest), state->scissor);
+-	if (fz_flatten_fill_path(ctx, rast, path, ctm, flatness, &bbox, &bbox))
++	if (fz_flatten_fill_path(ctx, rast, path, ctm, flatness, bbox, &bbox))
+ 		return;
+ 
+ 	if (state->blendmode & FZ_BLEND_KNOCKOUT)
+@@ -636,7 +636,7 @@ fz_draw_fill_path(fz_context *ctx, fz_device *devp, const fz_path *path, int eve
+ 	if (state->shape)
+ 	{
+ 		if (!rast->fns.reusable)
+-			fz_flatten_fill_path(ctx, rast, path, ctm, flatness, &bbox, NULL);
++			fz_flatten_fill_path(ctx, rast, path, ctm, flatness, bbox, NULL);
+ 
+ 		colorbv[0] = 255;
+ 		fz_convert_rasterizer(ctx, rast, even_odd, state->shape, colorbv, 0);
+@@ -644,7 +644,7 @@ fz_draw_fill_path(fz_context *ctx, fz_device *devp, const fz_path *path, int eve
+ 	if (state->group_alpha)
+ 	{
+ 		if (!rast->fns.reusable)
+-			fz_flatten_fill_path(ctx, rast, path, ctm, flatness, &bbox, NULL);
++			fz_flatten_fill_path(ctx, rast, path, ctm, flatness, bbox, NULL);
+ 
+ 		colorbv[0] = alpha * 255;
+ 		fz_convert_rasterizer(ctx, rast, even_odd, state->group_alpha, colorbv, 0);
+@@ -687,7 +687,7 @@ fz_draw_stroke_path(fz_context *ctx, fz_device *devp, const fz_path *path, const
+ 		flatness = 0.001f;
+ 
+ 	bbox = fz_intersect_irect(fz_pixmap_bbox_no_ctx(state->dest), state->scissor);
+-	if (fz_flatten_stroke_path(ctx, rast, path, stroke, ctm, flatness, linewidth, &bbox, &bbox))
++	if (fz_flatten_stroke_path(ctx, rast, path, stroke, ctm, flatness, linewidth, bbox, &bbox))
+ 		return;
+ 
+ 	if (state->blendmode & FZ_BLEND_KNOCKOUT)
+@@ -708,7 +708,7 @@ fz_draw_stroke_path(fz_context *ctx, fz_device *devp, const fz_path *path, const
+ 	if (state->shape)
+ 	{
+ 		if (!rast->fns.reusable)
+-			(void)fz_flatten_stroke_path(ctx, rast, path, stroke, ctm, flatness, linewidth, &bbox, NULL);
++			(void)fz_flatten_stroke_path(ctx, rast, path, stroke, ctm, flatness, linewidth, bbox, NULL);
+ 
+ 		colorbv[0] = 255;
+ 		fz_convert_rasterizer(ctx, rast, 0, state->shape, colorbv, 0);
+@@ -716,7 +716,7 @@ fz_draw_stroke_path(fz_context *ctx, fz_device *devp, const fz_path *path, const
+ 	if (state->group_alpha)
+ 	{
+ 		if (!rast->fns.reusable)
+-			(void)fz_flatten_stroke_path(ctx, rast, path, stroke, ctm, flatness, linewidth, &bbox, NULL);
++			(void)fz_flatten_stroke_path(ctx, rast, path, stroke, ctm, flatness, linewidth, bbox, NULL);
+ 
+ 		colorbv[0] = 255 * alpha;
+ 		fz_convert_rasterizer(ctx, rast, 0, state->group_alpha, colorbv, 0);
+@@ -773,7 +773,7 @@ fz_draw_clip_path(fz_context *ctx, fz_device *devp, const fz_path *path, int eve
+ 		bbox = fz_intersect_irect(fz_pixmap_bbox(ctx, state->dest), state->scissor);
+ 	}
+ 
+-	if (fz_flatten_fill_path(ctx, rast, path, ctm, flatness, &bbox, &bbox) || fz_is_rect_rasterizer(ctx, rast))
++	if (fz_flatten_fill_path(ctx, rast, path, ctm, flatness, bbox, &bbox) || fz_is_rect_rasterizer(ctx, rast))
+ 	{
+ 		state[1].scissor = bbox;
+ 		state[1].mask = NULL;
+@@ -851,7 +851,7 @@ fz_draw_clip_stroke_path(fz_context *ctx, fz_device *devp, const fz_path *path,
+ 		bbox = fz_intersect_irect(fz_pixmap_bbox(ctx, state->dest), state->scissor);
+ 	}
+ 
+-	if (fz_flatten_stroke_path(ctx, rast, path, stroke, ctm, flatness, linewidth, &bbox, &bbox))
++	if (fz_flatten_stroke_path(ctx, rast, path, stroke, ctm, flatness, linewidth, bbox, &bbox))
+ 	{
+ 		state[1].scissor = bbox;
+ 		state[1].mask = NULL;
+@@ -3078,7 +3078,7 @@ fz_new_draw_device_type3(fz_context *ctx, fz_matrix transform, fz_pixmap *dest)
+ }
+ 
+ fz_irect *
+-fz_bound_path_accurate(fz_context *ctx, fz_irect *bbox, const fz_irect *scissor, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth)
++fz_bound_path_accurate(fz_context *ctx, fz_irect *bbox, fz_irect scissor, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth)
+ {
+ 	fz_rasterizer *rast = fz_new_rasterizer(ctx, NULL);
+ 
+diff --git a/source/fitz/draw-imp.h b/source/fitz/draw-imp.h
+index 43b641503b..3bb0663046 100644
+--- a/source/fitz/draw-imp.h
++++ b/source/fitz/draw-imp.h
+@@ -421,10 +421,10 @@ typedef enum
+ 
+ fz_rasterizer *fz_new_edgebuffer(fz_context *ctx, fz_edgebuffer_rule rule);
+ 
+-int fz_flatten_fill_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, fz_matrix ctm, float flatness, const fz_irect *irect, fz_irect *bounds);
+-int fz_flatten_stroke_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth, const fz_irect *irect, fz_irect *bounds);
++int fz_flatten_fill_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, fz_matrix ctm, float flatness, fz_irect scissor, fz_irect *bbox);
++int fz_flatten_stroke_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth, fz_irect scissor, fz_irect *bbox);
+ 
+-fz_irect *fz_bound_path_accurate(fz_context *ctx, fz_irect *bbox, const fz_irect *scissor, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth);
++fz_irect *fz_bound_path_accurate(fz_context *ctx, fz_irect *bbox, fz_irect scissor, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth);
+ 
+ typedef void (fz_solid_color_painter_t)(unsigned char * FZ_RESTRICT dp, int n, int w, const unsigned char * FZ_RESTRICT color, int da, const fz_overprint * FZ_RESTRICT eop);
+ 
+diff --git a/source/fitz/draw-path.c b/source/fitz/draw-path.c
+index 370fe83c18..1780adbb75 100644
+--- a/source/fitz/draw-path.c
++++ b/source/fitz/draw-path.c
+@@ -263,11 +263,11 @@ static const fz_path_walker flatten_proc =
+ };
+ 
+ int
+-fz_flatten_fill_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, fz_matrix ctm, float flatness, const fz_irect *scissor, fz_irect *bbox)
++fz_flatten_fill_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, fz_matrix ctm, float flatness, fz_irect scissor, fz_irect *bbox)
+ {
+ 	flatten_arg arg;
+ 
+-	if (fz_reset_rasterizer(ctx, rast, *scissor))
++	if (fz_reset_rasterizer(ctx, rast, scissor))
+ 	{
+ 		arg.rast = rast;
+ 		arg.ctm = ctm;
+@@ -298,7 +298,7 @@ fz_flatten_fill_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path,
+ 		return 0;
+ 
+ 	*bbox = fz_bound_rasterizer(ctx, rast);
+-	return fz_is_empty_irect(fz_intersect_irect(*bbox, *scissor));
++	return fz_is_empty_irect(fz_intersect_irect(*bbox, scissor));
+ }
+ 
+ enum {
+@@ -1416,7 +1416,7 @@ static const fz_path_walker dash_proc =
+ };
+ 
+ static int
+-do_flatten_stroke(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth, const fz_irect *scissor, fz_irect *bbox)
++do_flatten_stroke(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth, fz_irect *bbox)
+ {
+ 	struct sctx s;
+ 	const fz_path_walker *proc = &stroke_proc;
+@@ -1481,15 +1481,14 @@ do_flatten_stroke(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, con
+ }
+ 
+ int
+-fz_flatten_stroke_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth, const fz_irect *scissor, fz_irect *bbox)
++fz_flatten_stroke_path(fz_context *ctx, fz_rasterizer *rast, const fz_path *path, const fz_stroke_state *stroke, fz_matrix ctm, float flatness, float linewidth, fz_irect scissor, fz_irect *bbox)
+ {
+-	if (fz_reset_rasterizer(ctx, rast, *scissor))
++	if (fz_reset_rasterizer(ctx, rast, scissor))
+ 	{
+-		if (do_flatten_stroke(ctx, rast, path, stroke, ctm, flatness, linewidth, scissor, bbox))
+-			return 1;
++		if (do_flatten_stroke(ctx, rast, path, stroke, ctm, flatness, linewidth, bbox))
++			return 1; /* empty path, exit early */
+ 		fz_postindex_rasterizer(ctx, rast);
+-		bbox = NULL;
+ 	}
+ 
+-	return do_flatten_stroke(ctx, rast, path, stroke, ctm, flatness, linewidth, scissor, bbox);
++	return do_flatten_stroke(ctx, rast, path, stroke, ctm, flatness, linewidth, bbox);
+ }
+diff --git a/source/fitz/draw-rasterize.c b/source/fitz/draw-rasterize.c
+index 4174e36d2c..3803385b29 100644
+--- a/source/fitz/draw-rasterize.c
++++ b/source/fitz/draw-rasterize.c
+@@ -235,6 +235,7 @@ int fz_reset_rasterizer(fz_context *ctx, fz_rasterizer *rast, fz_irect clip)
+ 
+ 	rast->bbox.x0 = rast->bbox.y0 = BBOX_MAX;
+ 	rast->bbox.x1 = rast->bbox.y1 = BBOX_MIN;
++
+ 	if (rast->fns.reset)
+ 		return rast->fns.reset(ctx, rast);
+ 	return 0;

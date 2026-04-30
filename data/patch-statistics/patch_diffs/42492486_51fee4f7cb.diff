@@ -1,0 +1,490 @@
+From dd0e099a4cf51ec01064065778b1d3bfb314f201 Mon Sep 17 00:00:00 2001
+From: Francesc Alted <faltet@gmail.com>
+Date: Sun, 7 Feb 2021 13:37:26 +0100
+Subject: [PATCH] New frame type meta. Unifyied file extensions for frames.
+
+---
+ README_CFRAME_FORMAT.rst      | 23 ++++++++++++++----
+ README_SFRAME_FORMAT.rst      |  6 ++---
+ blosc/blosc2.h                |  1 +
+ blosc/frame.c                 | 44 +++++++++++++++++++++++------------
+ blosc/frame.h                 |  6 +++++
+ blosc/schunk.c                |  4 ++--
+ examples/sframe_simple.c      |  2 +-
+ tests/test_copy.c             | 12 +++++-----
+ tests/test_insert_chunk.c     |  6 ++---
+ tests/test_reorder_offsets.c  |  8 +++----
+ tests/test_sframe.c           |  8 +++----
+ tests/test_sframe_lazychunk.c |  4 ++--
+ tests/test_update_chunk.c     |  6 ++---
+ tests/test_zero_runlen.c      |  6 ++---
+ 14 files changed, 86 insertions(+), 50 deletions(-)
+
+diff --git a/README_CFRAME_FORMAT.rst b/README_CFRAME_FORMAT.rst
+index aab0ae58c..68adc8cd1 100644
+--- a/README_CFRAME_FORMAT.rst
++++ b/README_CFRAME_FORMAT.rst
+@@ -1,8 +1,8 @@
+ Blosc2 Contiguous Frame Format
+ ==============================
+ 
+-Blosc (as of version 2.0.0) has a contiguous frame format (cframe for short) that allows for the storage of different Blosc data chunks contiguously,
+-either in-memory or on-disk.
++Blosc (as of version 2.0.0) has a contiguous frame format (cframe for short) that allows for the storage of
++different Blosc data chunks contiguously, either in-memory or on-disk.
+ 
+ The frame is composed of a header, a chunks section, and a trailer::
+ 
+@@ -42,7 +42,7 @@ The header contains information needed to decompress the Blosc chunks contained
+       |   |   |   |   |   +--[msgpack] int64
+       |   |   |   |   +-- reserved flags
+       |   |   |   +--codec_flags (see below)
+-      |   |   +---reserved flags
++      |   |   +---frame_type (see below)
+       |   +------general_flags (see below)
+       +---[msgpack] str with 4 elements (flags)
+ 
+@@ -112,6 +112,21 @@ using the msgpack format. Here is the format for the *metalayers*::
+     :``7``:
+         Reserved
+ 
++:frame_type:
++    (``uint8``) The type of frame.
++
++    :``0`` to ``3``:
++        Enumerated for the type of frame (up to 16).
++
++        :``0``:
++            ``Contiguous``
++        :``1``:
++            ``Sparse (directory)``
++        :``2 to 15``:
++            Reserved
++
++    :``4`` to ``7``: Reserved for user-defined frame types (up to 16)
++
+ :codec_flags:
+     (``uint8``) Compressor enumeration (defaults for all the chunks in storage).
+ 
+@@ -128,7 +143,7 @@ using the msgpack format. Here is the format for the *metalayers*::
+             ``zlib``
+         :``4``:
+             ``zstd``
+-        :``5``:
++        :``5 to 15``:
+             Reserved
+     :``4`` to ``7``: Compression level (up to 16)
+ 
+diff --git a/README_SFRAME_FORMAT.rst b/README_SFRAME_FORMAT.rst
+index 2eaedbb60..a102660d8 100644
+--- a/README_SFRAME_FORMAT.rst
++++ b/README_SFRAME_FORMAT.rst
+@@ -3,7 +3,7 @@ Blosc2 Sparse Frame Format
+ 
+ Blosc (as of version 2.0.0) has a sparse frame (sframe for short) format that allows for non-contiguous storage of Blosc data chunks on disk.
+ 
+-When creating an sparse frame one must denote the `storage.contiguous` as false and provide a name (which will be a directory) in `storage.urlpath` for the sframe to be stored. It is recommended to name the directory with the `.b2sframe` extension.
++When creating an sparse frame one must denote the `storage.contiguous` as false and provide a name (which represents a directory, but in the future it could be an arbitrary URL) in `storage.urlpath` for the sframe to be stored. It is recommended to name the directory with the `.b2frame` (or `.b2f` for short) extension.
+ 
+ An sframe is made up of a frame index file and the chunks stored in the same directory on-disk.  The frame file follows the format described in the `contiguous frame format <README_CFRAME_FORMAT.rst>`_ document, with the difference that the frame's chunks section is made up of multiple files (one per chunk). The frame index file name is always `chunks.b2frame`, and it also contains the metadata for the sframe.
+ 
+@@ -25,7 +25,7 @@ Structure example
+ ^^^^^^^^^^^^^^^^^
+ As shown below, an sframe of 4 chunks will be composed of a directory with each chunk file and the frame file::
+ 
+- dir.b2sframe/
++ dir.b2frame/
+  │
+  ├── 00000000.chunk
+  │
+@@ -44,7 +44,7 @@ When doing an insertion in the nth position, in the same position of the index c
+ 
+  Before                                 After
+ 
+- dir.b2sframe/                          dir.b2sframe/
++ dir.b2frame/                          dir.b2frame/
+  │                                      │
+  ├── 00000000.chunk                     ├── 00000000.chunk
+  │                                      │
+diff --git a/blosc/blosc2.h b/blosc/blosc2.h
+index c6d41f6e4..ca36722ea 100644
+--- a/blosc/blosc2.h
++++ b/blosc/blosc2.h
+@@ -273,6 +273,7 @@ enum {
+   BLOSC2_ERROR_CHUNK_UPDATE = -21,    //!< Chunk update failure
+   BLOSC2_ERROR_2GB_LIMIT = -22,       //!< Sizes larger than 2gb not supported
+   BLOSC2_ERROR_SCHUNK_COPY = -23,     //!< Super-chunk copy failure
++  BLOSC2_ERROR_FRAME_TYPE = -24,      //!< Wrong type for frame
+ };
+ 
+ /**
+diff --git a/blosc/frame.c b/blosc/frame.c
+index 90f447921..f7c4dde87 100644
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -166,7 +166,9 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+     return NULL;
+   }
+ 
+-  // Reserved flags
++  // Frame type
++  // We only support contiguous and sparse directories frames currently
++  *h2p = frame->sframe ? 1 : 0;
+   h2p += 1;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+@@ -416,6 +418,18 @@ int get_header_info(blosc2_frame_s *frame, int32_t *header_len, int64_t *frame_l
+     framep = header;
+   }
+ 
++  // Consistency check for frame type
++  uint8_t frame_type = framep[FRAME_TYPE];
++  if (frame->sframe) {
++    if (frame_type != FRAME_DIRECTORY_TYPE) {
++      return BLOSC2_ERROR_FRAME_TYPE;
++    }
++  } else {
++    if (frame_type != FRAME_CONTIGUOUS_TYPE) {
++      return BLOSC2_ERROR_FRAME_TYPE;
++    }
++  }
++
+   // Fetch some internal lengths
+   swap_store(header_len, framep + FRAME_HEADER_LEN, sizeof(*header_len));
+   swap_store(frame_len, framep + FRAME_LEN, sizeof(*frame_len));
+@@ -914,7 +928,7 @@ uint8_t* get_coffsets(blosc2_frame_s *frame, int32_t header_len, int64_t cbytes,
+   size_t rbytes = fread(coffsets, 1, (size_t)coffsets_cbytes, fp);
+   fclose(fp);
+   if (rbytes != (size_t)coffsets_cbytes) {
+-    BLOSC_TRACE_ERROR("Cannot read the offsets out of the fileframe.");
++    BLOSC_TRACE_ERROR("Cannot read the offsets out of the frame.");
+     free(coffsets);
+     return NULL;
+   }
+@@ -1052,7 +1066,7 @@ int32_t frame_get_usermeta(blosc2_frame_s* frame, uint8_t** usermeta) {
+     size_t rbytes = fread(&usermeta_len_network, 1, sizeof(int32_t), fp);
+     fclose(fp);
+     if (rbytes != sizeof(int32_t)) {
+-      BLOSC_TRACE_ERROR("Cannot access the usermeta_len out of the fileframe.");
++      BLOSC_TRACE_ERROR("Cannot access the usermeta_len out of the frame.");
+       return BLOSC2_ERROR_READ_BUFFER;
+     }
+   }
+@@ -1244,7 +1258,7 @@ int frame_get_metalayers(blosc2_frame_s* frame, blosc2_schunk* schunk) {
+       fclose(fp);
+     }
+     if (rbytes != (size_t) header_len) {
+-      BLOSC_TRACE_ERROR("Cannot access the header out of the fileframe.");
++      BLOSC_TRACE_ERROR("Cannot access the header out of the frame.");
+       free(header);
+       return BLOSC2_ERROR_FILE_READ;
+     }
+@@ -1605,7 +1619,7 @@ int frame_get_chunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool *ne
+     fseek(fp, header_len + offset + BLOSC2_CHUNK_CBYTES, SEEK_SET);
+     size_t rbytes = fread(&chunk_cbytes, 1, sizeof(chunk_cbytes), fp);
+     if (rbytes != sizeof(chunk_cbytes)) {
+-      BLOSC_TRACE_ERROR("Cannot read the cbytes for chunk in the fileframe.");
++      BLOSC_TRACE_ERROR("Cannot read the cbytes for chunk in the frame.");
+       fclose(fp);
+       return BLOSC2_ERROR_FILE_READ;
+     }
+@@ -1615,7 +1629,7 @@ int frame_get_chunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool *ne
+     rbytes = fread(*chunk, 1, (size_t)chunk_cbytes, fp);
+     fclose(fp);
+     if (rbytes != (size_t)chunk_cbytes) {
+-      BLOSC_TRACE_ERROR("Cannot read the chunk out of the fileframe.");
++      BLOSC_TRACE_ERROR("Cannot read the chunk out of the frame.");
+       return BLOSC2_ERROR_FILE_READ;
+     }
+     *needs_free = true;
+@@ -1700,7 +1714,7 @@ int frame_get_lazychunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool
+     }
+     size_t rbytes = fread(header, 1, BLOSC_MIN_HEADER_LENGTH, fp);
+     if (rbytes != BLOSC_MIN_HEADER_LENGTH) {
+-      BLOSC_TRACE_ERROR("Cannot read the header for chunk in the fileframe.");
++      BLOSC_TRACE_ERROR("Cannot read the header for chunk in the frame.");
+       fclose(fp);
+       return BLOSC2_ERROR_FILE_READ;
+     }
+@@ -1724,7 +1738,7 @@ int frame_get_lazychunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool
+     rbytes = fread(*chunk, 1, trailer_offset, fp);
+     fclose(fp);
+     if (rbytes != trailer_offset) {
+-      BLOSC_TRACE_ERROR("Cannot read the (lazy) chunk out of the fileframe.");
++      BLOSC_TRACE_ERROR("Cannot read the (lazy) chunk out of the frame.");
+       return BLOSC2_ERROR_FILE_READ;
+     }
+ 
+@@ -1945,7 +1959,7 @@ void* frame_append_chunk(blosc2_frame_s* frame, void* chunk, blosc2_schunk* schu
+       fseek(fp, header_len + cbytes, SEEK_SET);
+       wbytes = fwrite(chunk, 1, (size_t)cbytes_chunk, fp);  // the new chunk
+       if (wbytes != (size_t)cbytes_chunk) {
+-        BLOSC_TRACE_ERROR("Cannot write the full chunk to fileframe.");
++        BLOSC_TRACE_ERROR("Cannot write the full chunk to frame.");
+         fclose(fp);
+         return NULL;
+       }
+@@ -1953,7 +1967,7 @@ void* frame_append_chunk(blosc2_frame_s* frame, void* chunk, blosc2_schunk* schu
+     }
+     fclose(fp);
+     if (wbytes != (size_t)new_off_cbytes) {
+-      BLOSC_TRACE_ERROR("Cannot write the offsets to fileframe.");
++      BLOSC_TRACE_ERROR("Cannot write the offsets to frame.");
+       return NULL;
+     }
+   }
+@@ -2120,7 +2134,7 @@ void* frame_insert_chunk(blosc2_frame_s* frame, int nchunk, void* chunk, blosc2_
+       fseek(fp, header_len + cbytes, SEEK_SET);
+       wbytes = fwrite(chunk, 1, (size_t)cbytes_chunk, fp);  // the new chunk
+       if (wbytes != (size_t)cbytes_chunk) {
+-        BLOSC_TRACE_ERROR("Cannot write the full chunk to fileframe.");
++        BLOSC_TRACE_ERROR("Cannot write the full chunk to frame.");
+         fclose(fp);
+         return NULL;
+       }
+@@ -2128,7 +2142,7 @@ void* frame_insert_chunk(blosc2_frame_s* frame, int nchunk, void* chunk, blosc2_
+     wbytes = fwrite(off_chunk, 1, (size_t)new_off_cbytes, fp);  // the new offsets
+     fclose(fp);
+     if (wbytes != (size_t)new_off_cbytes) {
+-      BLOSC_TRACE_ERROR("Cannot write the offsets to fileframe.");
++      BLOSC_TRACE_ERROR("Cannot write the offsets to frame.");
+       return NULL;
+     }
+     // Invalidate the cache for chunk offsets
+@@ -2288,7 +2302,7 @@ void* frame_update_chunk(blosc2_frame_s* frame, int nchunk, void* chunk, blosc2_
+       fseek(fp, header_len + cbytes, SEEK_SET);
+       wbytes = fwrite(chunk, 1, (size_t)cbytes_chunk, fp);  // the new chunk
+       if (wbytes != (size_t)cbytes_chunk) {
+-        BLOSC_TRACE_ERROR("Cannot write the full chunk to fileframe.");
++        BLOSC_TRACE_ERROR("Cannot write the full chunk to frame.");
+         fclose(fp);
+         return NULL;
+       }
+@@ -2296,7 +2310,7 @@ void* frame_update_chunk(blosc2_frame_s* frame, int nchunk, void* chunk, blosc2_
+     wbytes = fwrite(off_chunk, 1, (size_t)new_off_cbytes, fp);  // the new offsets
+     fclose(fp);
+     if (wbytes != (size_t)new_off_cbytes) {
+-      BLOSC_TRACE_ERROR("Cannot write the offsets to fileframe.");
++      BLOSC_TRACE_ERROR("Cannot write the offsets to frame.");
+       return NULL;
+     }
+     // Invalidate the cache for chunk offsets
+@@ -2423,7 +2437,7 @@ int frame_reorder_offsets(blosc2_frame_s* frame, const int* offsets_order, blosc
+     size_t wbytes = fwrite(off_chunk, 1, (size_t)new_off_cbytes, fp);  // the new offsets
+     fclose(fp);
+     if (wbytes != (size_t)new_off_cbytes) {
+-      BLOSC_TRACE_ERROR("Cannot write the offsets to fileframe.");
++      BLOSC_TRACE_ERROR("Cannot write the offsets to frame.");
+       return BLOSC2_ERROR_FILE_WRITE;
+     }
+   }
+diff --git a/blosc/frame.h b/blosc/frame.h
+index 9fd19740b..964db93af 100644
+--- a/blosc/frame.h
++++ b/blosc/frame.h
+@@ -12,11 +12,17 @@
+ #include <stdio.h>
+ #include <stdint.h>
+ 
++// Different types of frames
++#define FRAME_CONTIGUOUS_TYPE 0
++#define FRAME_DIRECTORY_TYPE 1
++
++
+ // Constants for metadata placement in header
+ #define FRAME_HEADER_MAGIC 2
+ #define FRAME_HEADER_LEN (FRAME_HEADER_MAGIC + 8 + 1)  // 11
+ #define FRAME_LEN (FRAME_HEADER_LEN + 4 + 1)  // 16
+ #define FRAME_FLAGS (FRAME_LEN + 8 + 1)  // 25
++#define FRAME_TYPE (FRAME_FLAGS + 1)  // 26
+ #define FRAME_CODECS (FRAME_FLAGS + 2)  // 27
+ #define FRAME_NBYTES (FRAME_FLAGS + 4 + 1)  // 30
+ #define FRAME_CBYTES (FRAME_NBYTES + 8 + 1)  // 39
+diff --git a/blosc/schunk.c b/blosc/schunk.c
+index a7c81c963..22036ee81 100644
+--- a/blosc/schunk.c
++++ b/blosc/schunk.c
+@@ -131,7 +131,7 @@ blosc2_schunk* blosc2_schunk_new(const blosc2_storage storage) {
+       BLOSC_TRACE_ERROR("Error during the creation of the directory, maybe it already exists.");
+       return NULL;
+     }
+-    // We want a frame as storage
++    // We want a sparse (directory) frame as storage
+     blosc2_frame_s* frame = frame_new(urlpath);
+     free(urlpath);
+     frame->sframe = true;
+@@ -144,7 +144,7 @@ blosc2_schunk* blosc2_schunk_new(const blosc2_storage storage) {
+     schunk->frame = (blosc2_frame*)frame;
+   }
+   if (storage.contiguous){
+-    // We want a frame as storage
++    // We want a contiguous frame as storage
+     blosc2_frame_s* frame = frame_new(storage.urlpath);
+     frame->sframe = false;
+     // Initialize frame (basically, encode the header)
+diff --git a/examples/sframe_simple.c b/examples/sframe_simple.c
+index e7d837589..c8125402b 100644
+--- a/examples/sframe_simple.c
++++ b/examples/sframe_simple.c
+@@ -45,7 +45,7 @@ int main(void) {
+   cparams.clevel = 9;
+   cparams.nthreads = NTHREADS;
+   dparams.nthreads = NTHREADS;
+-  blosc2_storage storage = {false, "dir1.b2sframe", .cparams=&cparams, .dparams=&dparams};
++  blosc2_storage storage = {false, "dir1.b2frame", .cparams=&cparams, .dparams=&dparams};
+   schunk = blosc2_schunk_new(storage);
+ 
+   blosc_set_timestamp(&last);
+diff --git a/tests/test_copy.c b/tests/test_copy.c
+index 11cfad177..f86831f63 100644
+--- a/tests/test_copy.c
++++ b/tests/test_copy.c
+@@ -70,15 +70,15 @@ CUTEST_TEST_SETUP(copy) {
+   ));
+   CUTEST_PARAMETRIZE(backend, test_copy_backend, CUTEST_DATA(
+       {false, NULL},  // memory - schunk
+-      {true, NULL},  // memory - frame
+-      {true, "test_copy.b2frame"}, // disk - frame
+-      {false, "test_copy.b2sframe"}, // disk - sframe
++      {true, NULL},  // memory - cframe
++      {true, "test_copy.b2frame"}, // disk - cframe
++      {false, "test_copy_s.b2frame"}, // disk - sframe
+   ));
+   CUTEST_PARAMETRIZE(backend2, test_copy_backend, CUTEST_DATA(
+       {false, NULL},  // memory - schunk
+-      {true, NULL},  // memory - frame
+-      {true, "test_copy2.b2frame"}, // disk - frame
+-      {false, "test_copy2.b2sframe"}, // disk - sframe
++      {true, NULL},  // memory - cframe
++      {true, "test_copy2.b2frame"}, // disk - cframe
++      {false, "test_copy2_s.b2frame"}, // disk - sframe
+   ));
+ }
+ 
+diff --git a/tests/test_insert_chunk.c b/tests/test_insert_chunk.c
+index 30390ead7..a0384fbf6 100644
+--- a/tests/test_insert_chunk.c
++++ b/tests/test_insert_chunk.c
+@@ -49,9 +49,9 @@ typedef struct {
+ 
+ test_storage tstorage[] = {
+     {false, NULL},  // memory - schunk
+-    {true, NULL},  // memory - frame
+-    {true, "test_insert_chunk.b2frame"}, // disk - frame
+-    {false, "test_insert_chunk.b2sframe"}, // disk - sframe
++    {true, NULL},  // memory - cframe
++    {true, "test_insert_chunk.b2frame"}, // disk - cframe
++    {false, "test_insert_chunk_s.b2frame"}, // disk - sframe
+ };
+ 
+ bool tcopy[] = {
+diff --git a/tests/test_reorder_offsets.c b/tests/test_reorder_offsets.c
+index c0ba03f8f..345f479f0 100644
+--- a/tests/test_reorder_offsets.c
++++ b/tests/test_reorder_offsets.c
+@@ -33,10 +33,10 @@ typedef struct {
+ }test_storage;
+ 
+ test_storage tstorage[] = {
+-    // {false, NULL},  // memory - schunk
+-    // {true, NULL},  // memory - frame
+-    // {true, "test_reorder_offsets.b2frame"}, // disk - frame
+-    {false, "test_reorder_offsets.b2sframe"}, // disk - sframe
++    {false, NULL},  // memory - schunk
++    {true, NULL},  // memory - frame
++    {true, "test_reorder_offsets.b2frame"}, // disk - cframe
++    {false, "test_reorder_offsets_s.b2frame"}, // disk - sframe
+ };
+ 
+ int32_t tnchunks[] = {5, 12, 24, 33, 1};
+diff --git a/tests/test_sframe.c b/tests/test_sframe.c
+index 19e9feee1..4b4b97728 100644
+--- a/tests/test_sframe.c
++++ b/tests/test_sframe.c
+@@ -264,7 +264,7 @@ static char* test_sframe_simple(void) {
+ 
+ 
+ static char *all_tests(void) {
+-  directory = "dir1.b2sframe";
++  directory = "dir1.b2frame";
+ 
+   nchunks = 0;
+   mu_run_test(test_sframe_simple);
+@@ -279,7 +279,7 @@ static char *all_tests(void) {
+   mu_run_test(test_sframe_simple);
+ 
+   // Check directory with a trailing slash
+-  directory = "dir1.b2sframe/";
++  directory = "dir1.b2frame/";
+   nchunks = 0;
+   mu_run_test(test_sframe_simple);
+ 
+@@ -301,10 +301,10 @@ static char *all_tests(void) {
+                 filter_pipeline = (bool) ifilter_pipeline;
+                 metalayers = (bool) imetalayers;
+                 usermeta = (bool) iusermeta;
+-                snprintf(buf, sizeof(buf), "test_sframe_nc%d.b2sframe", nchunks);
++                snprintf(buf, sizeof(buf), "test_sframe_nc%d.b2frame", nchunks);
+                 directory = buf;
+                 mu_run_test(test_sframe);
+-                snprintf(buf, sizeof(buf), "test_sframe_nc%d.b2sframe/", nchunks);
++                snprintf(buf, sizeof(buf), "test_sframe_nc%d.b2frame/", nchunks);
+                 directory = buf;
+                 mu_run_test(test_sframe);
+               }
+diff --git a/tests/test_sframe_lazychunk.c b/tests/test_sframe_lazychunk.c
+index 9fe5f1327..45afa16b4 100644
+--- a/tests/test_sframe_lazychunk.c
++++ b/tests/test_sframe_lazychunk.c
+@@ -107,7 +107,7 @@ static char* test_lazy_chunk(void) {
+ }
+ 
+ static char *all_tests(void) {
+-  directory = "dir1.b2sframe/";
++  directory = "dir1.b2frame/";
+   nchunks = 0;
+   clevel = 5;
+   nthreads = 1;
+@@ -143,7 +143,7 @@ static char *all_tests(void) {
+   nthreads = 2;
+   mu_run_test(test_lazy_chunk);
+ 
+-  directory = "dir1.b2sframe";
++  directory = "dir1.b2frame";
+   nchunks = 0;
+   clevel = 5;
+   nthreads = 1;
+diff --git a/tests/test_update_chunk.c b/tests/test_update_chunk.c
+index c326171b6..a0d057981 100644
+--- a/tests/test_update_chunk.c
++++ b/tests/test_update_chunk.c
+@@ -46,9 +46,9 @@ typedef struct {
+ 
+ test_storage tstorage[] = {
+     {false, NULL},  // memory - schunk
+-    {true, NULL},  // memory - frame
+-    {true, "test_update_chunk.b2frame"}, // disk - frame
+-    {false, "test_update_chunk.b2sframe"}, // disk - sframe
++    {true, NULL},  // memory - cframe
++    {true, "test_update_chunk.b2frame"}, // disk - cframe
++    {false, "test_update_chunk_s.b2frame"}, // disk - sframe
+ };
+ 
+ static char* test_update_chunk(void) {
+diff --git a/tests/test_zero_runlen.c b/tests/test_zero_runlen.c
+index e9606c034..8caa473b3 100644
+--- a/tests/test_zero_runlen.c
++++ b/tests/test_zero_runlen.c
+@@ -58,9 +58,9 @@ CUTEST_TEST_SETUP(zero_runlen) {
+   ));
+   CUTEST_PARAMETRIZE(backend, test_zero_runlen_backend, CUTEST_DATA(
+       {false, NULL},  // memory - schunk
+-      {true, NULL},  // memory - frame
+-      {true, "test_zero_runlen.b2frame"}, // disk - frame
+-      {false, "test_zero_runlen.b2sframe"}, // disk - sframe
++      {true, NULL},  // memory - cframe
++      {true, "test_zero_runlen.b2frame"}, // disk - cframe
++      {false, "test_zero_runlen_s.b2frame"}, // disk - sframe
+   ));
+ }
+ 

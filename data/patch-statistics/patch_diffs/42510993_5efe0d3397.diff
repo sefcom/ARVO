@@ -1,0 +1,74 @@
+From 4e3f073be2453148af5f4da4d5d22ce9e6c2f7a5 Mon Sep 17 00:00:00 2001
+From: Aleks L <93376818+sashashura@users.noreply.github.com>
+Date: Thu, 28 Jul 2022 12:45:22 +0100
+Subject: [PATCH] Fixes Stack-buffer-overflow in dynapi_set_helper
+
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=46918
+
+`dwg_dynapi_header_set_value` in `json_HEADER` is called with a pointer to long:
+```cpp
+          long num = json_long (dat, tokens);
+          LOG_TRACE ("%s: %ld [%s]\n", key, num, f->type)
+          dwg_dynapi_header_set_value (dwg, key, &num, 0);
+```
+However the `f->size` is 255 which leads to stack overlow in `dynapi_set_helper` when `memcpy (old, value, f->size)` is called.
+---
+ src/in_json.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/in_json.c b/src/in_json.c
+index 420fa173d8..b493442f5c 100644
+--- a/src/in_json.c
++++ b/src/in_json.c
+@@ -1006,6 +1006,8 @@ json_HEADER (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
+         {
+           double num = json_float (dat, tokens);
+           LOG_TRACE ("%s: " FORMAT_RD " [%s]\n", key, num, f->type)
++          if (f->size > sizeof(num))
++            return DWG_ERR_INVALIDTYPE;
+           dwg_dynapi_header_set_value (dwg, key, &num, 0);
+         }
+       else if (t->type == JSMN_PRIMITIVE
+@@ -1018,6 +1020,8 @@ json_HEADER (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
+         {
+           long num = json_long (dat, tokens);
+           LOG_TRACE ("%s: %ld [%s]\n", key, num, f->type)
++          if (f->size > sizeof(num))
++            return DWG_ERR_INVALIDTYPE;
+           dwg_dynapi_header_set_value (dwg, key, &num, 0);
+         }
+       else if (t->type == JSMN_STRING
+@@ -1035,6 +1039,8 @@ json_HEADER (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
+         {
+           BITCODE_3DPOINT pt;
+           json_3DPOINT (dat, tokens, name, key, f->type, &pt);
++          if (f->size > sizeof(pt))
++            return DWG_ERR_INVALIDTYPE;
+           dwg_dynapi_header_set_value (dwg, key, &pt, 1);
+         }
+       else if (t->type == JSMN_ARRAY
+@@ -1044,18 +1050,24 @@ json_HEADER (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
+         {
+           BITCODE_2DPOINT pt;
+           json_2DPOINT (dat, tokens, name, key, f->type, &pt);
++          if (f->size > sizeof(pt))
++            return DWG_ERR_INVALIDTYPE;
+           dwg_dynapi_header_set_value (dwg, key, &pt, 1);
+         }
+       else if (strEQc (f->type, "TIMEBLL") || strEQc (f->type, "TIMERLL"))
+         {
+           static BITCODE_TIMEBLL date = { 0, 0, 0 };
+           json_TIMEBLL (dat, tokens, key, &date);
++          if (f->size > sizeof(date))
++            return DWG_ERR_INVALIDTYPE;
+           dwg_dynapi_header_set_value (dwg, key, &date, 0);
+         }
+       else if (strEQc (f->type, "CMC"))
+         {
+           BITCODE_CMC color = { 0, 0, 0 };
+           json_CMC (dat, dwg, tokens, name, key, &color);
++          if (f->size > sizeof(color))
++            return DWG_ERR_INVALIDTYPE;
+           dwg_dynapi_header_set_value (dwg, key, &color, 0);
+         }
+       else if (t->type == JSMN_ARRAY && strEQc (f->type, "H"))

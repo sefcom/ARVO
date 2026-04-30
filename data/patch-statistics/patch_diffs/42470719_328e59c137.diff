@@ -1,0 +1,45 @@
+From 25eb10d941f35c3223300583588b1e13debc9288 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Wed, 10 Oct 2018 23:43:27 +0200
+Subject: [PATCH] avcodec/ilbcdec: Limit indexes in create_augmented_vector()
+
+These limits are based on limiting done in WebRtcIlbcfix_CreateAugmentedVec()
+Fixes: out of array accesses
+Fixes: 10652/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_ILBC_fuzzer-5638941487661056
+Fixes: 10655/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_ILBC_fuzzer-5699970020147200
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/ilbcdec.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/libavcodec/ilbcdec.c b/libavcodec/ilbcdec.c
+index dc8f961bbc..76ecdf0e18 100644
+--- a/libavcodec/ilbcdec.c
++++ b/libavcodec/ilbcdec.c
+@@ -631,15 +631,16 @@ static void add_vector_and_shift(int16_t *out, const int16_t *in1,
+ static void create_augmented_vector(int index, int16_t *buffer, int16_t *cbVec)
+ {
+     int16_t cbVecTmp[4];
+-    int16_t ilow = index - 4;
++    int interpolation_length = FFMIN(4, index);
++    int16_t ilow = index - interpolation_length;
+ 
+     memcpy(cbVec, buffer - index, index * 2);
+ 
+-    vector_multiplication(&cbVec[ilow], buffer - index - 4, alpha, 4, 15);
+-    vector_rmultiplication(cbVecTmp, buffer - 4, &alpha[3], 4, 15);
+-    add_vector_and_shift(&cbVec[ilow], &cbVec[ilow], cbVecTmp, 4, 0);
++    vector_multiplication(&cbVec[ilow], buffer - index - interpolation_length, alpha, interpolation_length, 15);
++    vector_rmultiplication(cbVecTmp, buffer - interpolation_length, &alpha[interpolation_length - 1], interpolation_length, 15);
++    add_vector_and_shift(&cbVec[ilow], &cbVec[ilow], cbVecTmp, interpolation_length, 0);
+ 
+-    memcpy(cbVec + index, buffer - index, (SUBL - index) * sizeof(*cbVec));
++    memcpy(cbVec + index, buffer - index, FFMIN(SUBL - index, index) * sizeof(*cbVec));
+ }
+ 
+ static void get_codebook(int16_t * cbvec,   /* (o) Constructed codebook vector */
+-- 
+2.25.1
+

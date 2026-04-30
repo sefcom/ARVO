@@ -1,0 +1,65 @@
+From c6acf97bfbe5ad26db3c2f5dd4d379ac674d6fb3 Mon Sep 17 00:00:00 2001
+From: Philippe Antoine <contact@catenacyber.fr>
+Date: Thu, 19 Mar 2020 16:54:31 +0100
+Subject: [PATCH] Adds different checks against overflows
+
+---
+ src/lib/protocols/dns.c   | 2 +-
+ src/lib/protocols/fix.c   | 2 +-
+ src/lib/protocols/ssh.c   | 2 ++
+ src/lib/protocols/yahoo.c | 3 +++
+ 4 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib/protocols/dns.c b/src/lib/protocols/dns.c
+index 8290ca9dc8c..460117c9680 100644
+--- a/src/lib/protocols/dns.c
++++ b/src/lib/protocols/dns.c
+@@ -141,7 +141,7 @@ static int search_valid_dns(struct ndpi_detection_module_struct *ndpi_struct,
+       /* Leave the statement below commented necessary in case of call to ndpi_get_partial_detection() */
+       x++;
+ 
+-      if(flow->packet.payload[x] != '\0') {
++      if(x < flow->packet.payload_packet_len && flow->packet.payload[x] != '\0') {
+ 	while((x < flow->packet.payload_packet_len)
+ 	      && (flow->packet.payload[x] != '\0')) {
+ 	  x++;
+diff --git a/src/lib/protocols/fix.c b/src/lib/protocols/fix.c
+index c1f4d27005c..35cb1529b28 100644
+--- a/src/lib/protocols/fix.c
++++ b/src/lib/protocols/fix.c
+@@ -33,7 +33,7 @@ void ndpi_search_fix(struct ndpi_detection_module_struct *ndpi_struct, struct nd
+   struct ndpi_packet_struct *packet = &flow->packet;
+ 
+   NDPI_LOG_DBG(ndpi_struct, "search FIX\n");
+-  if(packet->tcp) {
++  if(packet->tcp && packet->payload_packet_len > 5) {
+     // 8=
+     if(packet->payload[0] == 0x38 && packet->payload[1] == 0x3d) {
+       // FIX.
+diff --git a/src/lib/protocols/ssh.c b/src/lib/protocols/ssh.c
+index f3b50b609ac..959b9c090d3 100644
+--- a/src/lib/protocols/ssh.c
++++ b/src/lib/protocols/ssh.c
+@@ -96,6 +96,8 @@ static void ndpi_int_ssh_add_connection(struct ndpi_detection_module_struct
+ static u_int16_t concat_hash_string(struct ndpi_packet_struct *packet,
+ 				   char *buf, u_int8_t client_hash) {
+   u_int16_t offset = 22, buf_out_len = 0;
++  if(offset+sizeof(u_int32_t) >= packet->payload_packet_len)
++    goto invalid_payload;
+   u_int32_t len = ntohl(*(u_int32_t*)&packet->payload[offset]);
+   offset += 4;
+ 
+diff --git a/src/lib/protocols/yahoo.c b/src/lib/protocols/yahoo.c
+index bd7f3ef6661..d80e9caee8c 100644
+--- a/src/lib/protocols/yahoo.c
++++ b/src/lib/protocols/yahoo.c
+@@ -76,6 +76,9 @@ u_int8_t check_ymsg(const u_int8_t * payload, u_int16_t payload_packet_len)
+     if(ylen >= payload_packet_len || yahoo_len_parsed >= payload_packet_len)
+       break;
+ 
++    if (payload_packet_len < yahoo_len_parsed + sizeof(struct ndpi_yahoo_header)) {
++      return 0;
++    }
+     yahoo = (struct ndpi_yahoo_header *) (payload + yahoo_len_parsed);
+   }
+   while(memcmp(yahoo->YMSG_str, "YMSG", 4) == 0);

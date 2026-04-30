@@ -1,0 +1,1424 @@
+From ab05e50ec44506dc81220a21fb8f5e8d048772e0 Mon Sep 17 00:00:00 2001
+From: Keith Winstein <keithw@cs.stanford.edu>
+Date: Wed, 6 Sep 2023 15:54:12 -0700
+Subject: [PATCH] Share reading/validation code between elem exprs & other
+ const exprs (#2288)
+
+This continues the work from #1783 and reduces special handling of elem
+exprs, by treating them the same as other const expressions (init
+expressions).
+---
+ include/wabt/binary-reader-logging.h          |   5 +-
+ include/wabt/binary-reader-nop.h              |   6 +-
+ include/wabt/binary-reader.h                  |   6 +-
+ include/wabt/interp/interp.h                  |  10 +-
+ include/wabt/shared-validator.h               |   3 -
+ include/wabt/type-checker.h                   |   2 +-
+ src/binary-reader-ir.cc                       |  31 ++----
+ src/binary-reader-logging.cc                  |   4 +-
+ src/binary-reader-objdump.cc                  | 105 +++++++++++-------
+ src/binary-reader.cc                          |  25 ++---
+ src/c-writer.cc                               |  13 ++-
+ src/interp/binary-reader-interp.cc            |  25 ++---
+ src/interp/interp.cc                          |  20 ++--
+ src/prebuilt/wasm2c_source_declarations.cc    |  36 +++++-
+ src/shared-validator.cc                       |  23 +---
+ src/template/wasm2c.declarations.c            |  23 +++-
+ src/type-checker.cc                           |  10 +-
+ src/validator.cc                              |  23 +---
+ test/dump/extended-const.txt                  |   2 +-
+ test/dump/extended-names.txt                  |   2 +-
+ test/dump/invalid-init-exprs.txt              |  25 +++++
+ test/dump/reference-types.txt                 |   2 +-
+ test/dump/relocations-all-features.txt        |   2 +-
+ test/dump/relocations.txt                     |   2 +-
+ test/dump/table-multi.txt                     |   4 +-
+ test/dump/table.txt                           |  12 +-
+ .../module/bad-table-invalid-function.txt     |   1 +
+ test/spec/binary.txt                          |   3 +-
+ test/spec/call_indirect.txt                   |   2 +-
+ test/spec/elem.txt                            |  23 ++--
+ test/spec/exception-handling/binary.txt       |   3 +-
+ test/spec/extended-const/elem.txt             |  23 ++--
+ test/spec/multi-memory/binary.txt             |   3 +-
+ test/spec/tail-call/return_call_indirect.txt  |   2 +-
+ test/strip/remove_section.txt                 |   1 +
+ test/wasm2c/add.txt                           |  23 +++-
+ test/wasm2c/check-imports.txt                 |  25 ++++-
+ test/wasm2c/export-names.txt                  |  23 +++-
+ test/wasm2c/hello.txt                         |  25 ++++-
+ test/wasm2c/minimal.txt                       |  29 +++--
+ wasm2c/examples/fac/fac.c                     |  23 +++-
+ 41 files changed, 369 insertions(+), 261 deletions(-)
+ create mode 100644 test/dump/invalid-init-exprs.txt
+
+diff --git a/include/wabt/binary-reader-logging.h b/include/wabt/binary-reader-logging.h
+index 9ce32aca5e..65c5ac66c6 100644
+--- a/include/wabt/binary-reader-logging.h
++++ b/include/wabt/binary-reader-logging.h
+@@ -273,9 +273,8 @@ class BinaryReaderLogging : public BinaryReaderDelegate {
+   Result EndElemSegmentInitExpr(Index index) override;
+   Result OnElemSegmentElemType(Index index, Type elem_type) override;
+   Result OnElemSegmentElemExprCount(Index index, Index count) override;
+-  Result OnElemSegmentElemExpr_RefNull(Index segment_index, Type type) override;
+-  Result OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                       Index func_index) override;
++  Result BeginElemExpr(Index elem_index, Index expr_index) override;
++  Result EndElemExpr(Index elem_index, Index expr_index) override;
+   Result EndElemSegment(Index index) override;
+   Result EndElemSection() override;
+ 
+diff --git a/include/wabt/binary-reader-nop.h b/include/wabt/binary-reader-nop.h
+index 0c9ebc6487..9d4a9a3972 100644
+--- a/include/wabt/binary-reader-nop.h
++++ b/include/wabt/binary-reader-nop.h
+@@ -370,12 +370,10 @@ class BinaryReaderNop : public BinaryReaderDelegate {
+   Result OnElemSegmentElemExprCount(Index index, Index count) override {
+     return Result::Ok;
+   }
+-  Result OnElemSegmentElemExpr_RefNull(Index segment_index,
+-                                       Type type) override {
++  Result BeginElemExpr(Index elem_index, Index expr_index) override {
+     return Result::Ok;
+   }
+-  Result OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                       Index func_index) override {
++  Result EndElemExpr(Index elem_index, Index expr_index) override {
+     return Result::Ok;
+   }
+   Result EndElemSegment(Index index) override { return Result::Ok; }
+diff --git a/include/wabt/binary-reader.h b/include/wabt/binary-reader.h
+index 825d562cb0..ac0be7b475 100644
+--- a/include/wabt/binary-reader.h
++++ b/include/wabt/binary-reader.h
+@@ -339,10 +339,8 @@ class BinaryReaderDelegate {
+   virtual Result EndElemSegmentInitExpr(Index index) = 0;
+   virtual Result OnElemSegmentElemType(Index index, Type elem_type) = 0;
+   virtual Result OnElemSegmentElemExprCount(Index index, Index count) = 0;
+-  virtual Result OnElemSegmentElemExpr_RefNull(Index segment_index,
+-                                               Type type) = 0;
+-  virtual Result OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                               Index func_index) = 0;
++  virtual Result BeginElemExpr(Index elem_index, Index expr_index) = 0;
++  virtual Result EndElemExpr(Index elem_index, Index expr_index) = 0;
+   virtual Result EndElemSegment(Index index) = 0;
+   virtual Result EndElemSection() = 0;
+ 
+diff --git a/include/wabt/interp/interp.h b/include/wabt/interp/interp.h
+index 6af605ac82..3dda44efeb 100644
+--- a/include/wabt/interp/interp.h
++++ b/include/wabt/interp/interp.h
+@@ -77,7 +77,6 @@ using ExternKind = ExternalKind;
+ enum class Mutability { Const, Var };
+ enum class TagAttr { Exception };
+ using SegmentMode = SegmentKind;
+-enum class ElemKind { RefNull, RefFunc };
+ 
+ enum class ObjectKind {
+   Null,
+@@ -359,13 +358,8 @@ struct DataDesc {
+   FuncDesc init_func;
+ };
+ 
+-struct ElemExpr {
+-  ElemKind kind;
+-  Index index;
+-};
+-
+ struct ElemDesc {
+-  std::vector<ElemExpr> elements;
++  std::vector<FuncDesc> elements;
+   ValueType type;
+   SegmentMode mode;
+   Index table_index;
+@@ -972,7 +966,7 @@ class Tag : public Extern {
+ 
+ class ElemSegment {
+  public:
+-  explicit ElemSegment(const ElemDesc*, RefPtr<Instance>&);
++  explicit ElemSegment(Store& store, const ElemDesc*, RefPtr<Instance>&);
+ 
+   bool IsValidRange(u32 offset, u32 size) const;
+   void Drop();
+diff --git a/include/wabt/shared-validator.h b/include/wabt/shared-validator.h
+index 37927802dd..f2e2bf9107 100644
+--- a/include/wabt/shared-validator.h
++++ b/include/wabt/shared-validator.h
+@@ -89,9 +89,6 @@ class SharedValidator {
+ 
+   Result OnElemSegment(const Location&, Var table_var, SegmentKind);
+   Result OnElemSegmentElemType(const Location&, Type elem_type);
+-  Result OnElemSegmentElemExpr_RefNull(const Location&, Type type);
+-  Result OnElemSegmentElemExpr_RefFunc(const Location&, Var func_var);
+-  Result OnElemSegmentElemExpr_Other(const Location&);
+ 
+   void OnDataCount(Index count);
+   Result OnDataSegment(const Location&, Var memory_var, SegmentKind);
+diff --git a/include/wabt/type-checker.h b/include/wabt/type-checker.h
+index 2b0ec092fe..7807e89eed 100644
+--- a/include/wabt/type-checker.h
++++ b/include/wabt/type-checker.h
+@@ -113,7 +113,7 @@ class TypeChecker {
+   Result OnTableGrow(Type elem_type);
+   Result OnTableSize();
+   Result OnTableFill(Type elem_type);
+-  Result OnRefFuncExpr(Index func_type);
++  Result OnRefFuncExpr(Index func_type, bool force_generic_funcref);
+   Result OnRefNullExpr(Type type);
+   Result OnRefIsNullExpr();
+   Result OnRethrow(Index depth);
+diff --git a/src/binary-reader-ir.cc b/src/binary-reader-ir.cc
+index 2eb2342b35..69ff72aaa9 100644
+--- a/src/binary-reader-ir.cc
++++ b/src/binary-reader-ir.cc
+@@ -289,9 +289,8 @@ class BinaryReaderIR : public BinaryReaderNop {
+   Result EndElemSegmentInitExpr(Index index) override;
+   Result OnElemSegmentElemType(Index index, Type elem_type) override;
+   Result OnElemSegmentElemExprCount(Index index, Index count) override;
+-  Result OnElemSegmentElemExpr_RefNull(Index segment_index, Type type) override;
+-  Result OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                       Index func_index) override;
++  Result BeginElemExpr(Index elem_index, Index expr_index) override;
++  Result EndElemExpr(Index elem_index, Index expr_index) override;
+ 
+   Result OnDataSegmentCount(Index count) override;
+   Result BeginDataSegment(Index index,
+@@ -1350,26 +1349,16 @@ Result BinaryReaderIR::OnElemSegmentElemExprCount(Index index, Index count) {
+   return Result::Ok;
+ }
+ 
+-Result BinaryReaderIR::OnElemSegmentElemExpr_RefNull(Index segment_index,
+-                                                     Type type) {
+-  assert(segment_index == module_->elem_segments.size() - 1);
+-  ElemSegment* segment = module_->elem_segments[segment_index];
+-  Location loc = GetLocation();
+-  ExprList init_expr;
+-  init_expr.push_back(std::make_unique<RefNullExpr>(type, loc));
+-  segment->elem_exprs.push_back(std::move(init_expr));
+-  return Result::Ok;
++Result BinaryReaderIR::BeginElemExpr(Index elem_index, Index expr_index) {
++  assert(elem_index == module_->elem_segments.size() - 1);
++  ElemSegment* segment = module_->elem_segments[elem_index];
++  assert(expr_index == segment->elem_exprs.size());
++  segment->elem_exprs.emplace_back();
++  return BeginInitExpr(&segment->elem_exprs.back());
+ }
+ 
+-Result BinaryReaderIR::OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                                     Index func_index) {
+-  assert(segment_index == module_->elem_segments.size() - 1);
+-  ElemSegment* segment = module_->elem_segments[segment_index];
+-  Location loc = GetLocation();
+-  ExprList init_expr;
+-  init_expr.push_back(std::make_unique<RefFuncExpr>(Var(func_index, loc), loc));
+-  segment->elem_exprs.push_back(std::move(init_expr));
+-  return Result::Ok;
++Result BinaryReaderIR::EndElemExpr(Index elem_index, Index expr_index) {
++  return EndInitExpr();
+ }
+ 
+ Result BinaryReaderIR::OnDataSegmentCount(Index count) {
+diff --git a/src/binary-reader-logging.cc b/src/binary-reader-logging.cc
+index 83a14e9ff7..bc2e58c964 100644
+--- a/src/binary-reader-logging.cc
++++ b/src/binary-reader-logging.cc
+@@ -850,8 +850,8 @@ DEFINE_INDEX(OnElemSegmentCount)
+ DEFINE_INDEX(BeginElemSegmentInitExpr)
+ DEFINE_INDEX(EndElemSegmentInitExpr)
+ DEFINE_INDEX_INDEX(OnElemSegmentElemExprCount, "index", "count")
+-DEFINE_INDEX_TYPE(OnElemSegmentElemExpr_RefNull)
+-DEFINE_INDEX_INDEX(OnElemSegmentElemExpr_RefFunc, "index", "func_index")
++DEFINE_INDEX_INDEX(BeginElemExpr, "elem_index", "expr_index")
++DEFINE_INDEX_INDEX(EndElemExpr, "elem_index", "expr_index")
+ DEFINE_INDEX(EndElemSegment)
+ DEFINE_END(EndElemSection)
+ 
+diff --git a/src/binary-reader-objdump.cc b/src/binary-reader-objdump.cc
+index d7643f3190..bca6a2b962 100644
+--- a/src/binary-reader-objdump.cc
++++ b/src/binary-reader-objdump.cc
+@@ -978,6 +978,7 @@ Result BinaryReaderObjdumpDisassemble::OnOpcodeBlockSig(Type sig_type) {
+ }
+ 
+ enum class InitExprType {
++  Invalid,
+   I32,
+   F32,
+   I64,
+@@ -1093,9 +1094,6 @@ class BinaryReaderObjdump : public BinaryReaderObjdumpBase {
+                           uint8_t flags) override;
+   Result OnElemSegmentElemType(Index index, Type elem_type) override;
+   Result OnElemSegmentElemExprCount(Index index, Index count) override;
+-  Result OnElemSegmentElemExpr_RefNull(Index segment_index, Type type) override;
+-  Result OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                       Index func_index) override;
+ 
+   void BeginInitExpr() { current_init_expr_.insts.clear(); }
+ 
+@@ -1123,6 +1121,18 @@ class BinaryReaderObjdump : public BinaryReaderObjdumpBase {
+ 
+   Result EndGlobalInitExpr(Index index) override { return EndInitExpr(); }
+ 
++  Result BeginElemExpr(Index elem_index, Index expr_index) override {
++    reading_elem_expr_ = true;
++    elem_index_ = expr_index;
++    BeginInitExpr();
++    return Result::Ok;
++  }
++
++  Result EndElemExpr(Index elem_index, Index expr_index) override {
++    assert(expr_index == elem_index_);
++    return EndInitExpr();
++  }
++
+   Result OnDataSegmentCount(Index count) override;
+   Result BeginDataSegment(Index index,
+                           Index memory_index,
+@@ -1209,6 +1219,8 @@ class BinaryReaderObjdump : public BinaryReaderObjdumpBase {
+   Result OnI64ConstExpr(uint64_t value) override;
+   Result OnF32ConstExpr(uint32_t value) override;
+   Result OnF64ConstExpr(uint64_t value) override;
++  Result OnRefFuncExpr(Index func_index) override;
++  Result OnRefNullExpr(Type type) override;
+   Result OnGlobalGetExpr(Index global_index) override;
+   Result OnCodeMetadataCount(Index function_index, Index count) override;
+   Result OnCodeMetadata(Offset code_offset,
+@@ -1221,7 +1233,9 @@ class BinaryReaderObjdump : public BinaryReaderObjdumpBase {
+   void PrintDetails(const char* fmt, ...);
+   Result PrintSymbolFlags(uint32_t flags);
+   Result PrintSegmentFlags(uint32_t flags);
+-  void PrintInitExpr(const InitExpr& expr, bool as_unsigned = false);
++  void PrintInitExpr(const InitExpr& expr,
++                     bool as_unsigned = false,
++                     bool with_prefix = true);
+   Result OnCount(Index count);
+ 
+   std::unique_ptr<FileStream> out_stream_;
+@@ -1231,7 +1245,8 @@ class BinaryReaderObjdump : public BinaryReaderObjdumpBase {
+   bool reading_elem_init_expr_ = false;
+   bool reading_data_init_expr_ = false;
+   bool reading_global_init_expr_ = false;
+-  InitExpr current_init_expr_;
++  bool reading_elem_expr_ = false;
++  InitExpr current_init_expr_{};
+   uint8_t data_flags_ = 0;
+   uint8_t elem_flags_ = 0;
+   Index data_mem_index_ = 0;
+@@ -1240,7 +1255,7 @@ class BinaryReaderObjdump : public BinaryReaderObjdumpBase {
+ 
+   bool ReadingInitExpr() {
+     return reading_elem_init_expr_ || reading_data_init_expr_ ||
+-           reading_global_init_expr_;
++           reading_global_init_expr_ || reading_elem_expr_;
+   }
+ };
+ 
+@@ -1644,27 +1659,6 @@ Result BinaryReaderObjdump::OnExport(Index index,
+   return Result::Ok;
+ }
+ 
+-Result BinaryReaderObjdump::OnElemSegmentElemExpr_RefNull(Index segment_index,
+-                                                          Type type) {
+-  PrintDetails("  - elem[%" PRIu64 "] = ref.null %s\n",
+-               elem_offset_ + elem_index_, type.GetName().c_str());
+-  elem_index_++;
+-  return Result::Ok;
+-}
+-
+-Result BinaryReaderObjdump::OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                                          Index func_index) {
+-  PrintDetails("  - elem[%" PRIu64 "] = func[%" PRIindex "]",
+-               elem_offset_ + elem_index_, func_index);
+-  auto name = GetFunctionName(func_index);
+-  if (!name.empty()) {
+-    PrintDetails(" <" PRIstringview ">", WABT_PRINTF_STRING_VIEW_ARG(name));
+-  }
+-  PrintDetails("\n");
+-  elem_index_++;
+-  return Result::Ok;
+-}
+-
+ Result BinaryReaderObjdump::OnElemSegmentCount(Index count) {
+   return OnCount(count);
+ }
+@@ -1711,14 +1705,22 @@ Result BinaryReaderObjdump::BeginGlobal(Index index, Type type, bool mutable_) {
+ }
+ 
+ void BinaryReaderObjdump::PrintInitExpr(const InitExpr& expr,
+-                                        bool as_unsigned) {
+-  assert(expr.insts.size() > 0);
++                                        bool as_unsigned,
++                                        bool with_prefix) {
++  if (with_prefix) {
++    PrintDetails(" - init ");
++  }
++
++  if (expr.insts.empty()) {
++    PrintDetails("<EMPTY>\n");
++    return;
++  }
+ 
+   // We have two different way to print init expressions.  One for
+   // extended expressions involving more than one instruction, and
+   // a short form for the more traditional single instruction form.
+   if (expr.insts.size() > 1) {
+-    PrintDetails(" - init (");
++    PrintDetails("(");
+     bool first = true;
+     for (auto& inst : expr.insts) {
+       if (!first) {
+@@ -1765,39 +1767,39 @@ void BinaryReaderObjdump::PrintInitExpr(const InitExpr& expr,
+   switch (expr.type) {
+     case InitExprType::I32:
+       if (as_unsigned) {
+-        PrintDetails(" - init i32=%u\n", expr.insts[0].imm.i32);
++        PrintDetails("i32=%u\n", expr.insts[0].imm.i32);
+       } else {
+-        PrintDetails(" - init i32=%d\n", expr.insts[0].imm.i32);
++        PrintDetails("i32=%d\n", expr.insts[0].imm.i32);
+       }
+       break;
+     case InitExprType::I64:
+       if (as_unsigned) {
+-        PrintDetails(" - init i64=%" PRIu64 "\n", expr.insts[0].imm.i64);
++        PrintDetails("i64=%" PRIu64 "\n", expr.insts[0].imm.i64);
+       } else {
+-        PrintDetails(" - init i64=%" PRId64 "\n", expr.insts[0].imm.i64);
++        PrintDetails("i64=%" PRId64 "\n", expr.insts[0].imm.i64);
+       }
+       break;
+     case InitExprType::F64: {
+       char buffer[WABT_MAX_DOUBLE_HEX];
+       WriteDoubleHex(buffer, sizeof(buffer), expr.insts[0].imm.f64);
+-      PrintDetails(" - init f64=%s\n", buffer);
++      PrintDetails("f64=%s\n", buffer);
+       break;
+     }
+     case InitExprType::F32: {
+       char buffer[WABT_MAX_FLOAT_HEX];
+       WriteFloatHex(buffer, sizeof(buffer), expr.insts[0].imm.f32);
+-      PrintDetails(" - init f32=%s\n", buffer);
++      PrintDetails("f32=%s\n", buffer);
+       break;
+     }
+     case InitExprType::V128: {
+       PrintDetails(
+-          " - init v128=0x%08x 0x%08x 0x%08x 0x%08x \n",
++          "v128=0x%08x 0x%08x 0x%08x 0x%08x \n",
+           expr.insts[0].imm.v128_v.u32(0), expr.insts[0].imm.v128_v.u32(1),
+           expr.insts[0].imm.v128_v.u32(2), expr.insts[0].imm.v128_v.u32(3));
+       break;
+     }
+     case InitExprType::Global: {
+-      PrintDetails(" - init global=%" PRIindex, expr.insts[0].imm.index);
++      PrintDetails("global=%" PRIindex, expr.insts[0].imm.index);
+       std::string_view name = GetGlobalName(expr.insts[0].imm.index);
+       if (!name.empty()) {
+         PrintDetails(" <" PRIstringview ">", WABT_PRINTF_STRING_VIEW_ARG(name));
+@@ -1806,7 +1808,7 @@ void BinaryReaderObjdump::PrintInitExpr(const InitExpr& expr,
+       break;
+     }
+     case InitExprType::FuncRef: {
+-      PrintDetails(" - init ref.func:%" PRIindex, expr.insts[0].imm.index);
++      PrintDetails("ref.func:%" PRIindex, expr.insts[0].imm.index);
+       std::string_view name = GetFunctionName(expr.insts[0].imm.index);
+       if (!name.empty()) {
+         PrintDetails(" <" PRIstringview ">", WABT_PRINTF_STRING_VIEW_ARG(name));
+@@ -1815,8 +1817,10 @@ void BinaryReaderObjdump::PrintInitExpr(const InitExpr& expr,
+       break;
+     }
+     case InitExprType::NullRef:
+-      PrintDetails(" - init null\n");
++      PrintDetails("ref.null %s\n", expr.insts[0].imm.type.GetName().c_str());
+       break;
++    case InitExprType::Invalid:
++      PrintDetails("<INVALID>\n");
+       break;
+   }
+ }
+@@ -1846,6 +1850,11 @@ Result BinaryReaderObjdump::EndInitExpr() {
+   } else if (reading_global_init_expr_) {
+     reading_global_init_expr_ = false;
+     PrintInitExpr(current_init_expr_);
++  } else if (reading_elem_expr_) {
++    reading_elem_expr_ = false;
++    PrintDetails("  - elem[%" PRIu64 "] = ", elem_offset_ + elem_index_);
++    PrintInitExpr(current_init_expr_, /*as_unsigned=*/false,
++                  /*with_prefix=*/false);
+   } else {
+     WABT_UNREACHABLE;
+   }
+@@ -1884,6 +1893,22 @@ Result BinaryReaderObjdump::OnF64ConstExpr(uint64_t value) {
+   return Result::Ok;
+ }
+ 
++Result BinaryReaderObjdump::OnRefFuncExpr(Index func_index) {
++  if (ReadingInitExpr()) {
++    current_init_expr_.type = InitExprType::FuncRef;
++    current_init_expr_.insts.back().imm.index = func_index;
++  }
++  return Result::Ok;
++}
++
++Result BinaryReaderObjdump::OnRefNullExpr(Type type) {
++  if (ReadingInitExpr()) {
++    current_init_expr_.type = InitExprType::NullRef;
++    current_init_expr_.insts.back().imm.type = type;
++  }
++  return Result::Ok;
++}
++
+ Result BinaryReaderObjdump::OnOpcode(Opcode opcode) {
+   BinaryReaderObjdumpBase::OnOpcode(opcode);
+   if (ReadingInitExpr() && opcode != Opcode::End) {
+diff --git a/src/binary-reader.cc b/src/binary-reader.cc
+index 01e1c2cd66..1bdab2dd90 100644
+--- a/src/binary-reader.cc
++++ b/src/binary-reader.cc
+@@ -2711,29 +2711,18 @@ Result BinaryReader::ReadElemSection(Offset section_size) {
+ 
+     CALLBACK(OnElemSegmentElemExprCount, i, num_elem_exprs);
+     for (Index j = 0; j < num_elem_exprs; ++j) {
++      CALLBACK(BeginElemExpr, i, j);
+       if (flags & SegUseElemExprs) {
+-        Opcode opcode;
+-        CHECK_RESULT(ReadOpcode(&opcode, "elem expr opcode"));
+-        if (opcode == Opcode::RefNull) {
+-          Type type;
+-          CHECK_RESULT(ReadRefType(&type, "elem expr ref.null type"));
+-          CALLBACK(OnElemSegmentElemExpr_RefNull, i, type);
+-        } else if (opcode == Opcode::RefFunc) {
+-          Index func_index;
+-          CHECK_RESULT(ReadIndex(&func_index, "elem expr func index"));
+-          CALLBACK(OnElemSegmentElemExpr_RefFunc, i, func_index);
+-        } else {
+-          PrintError(
+-              "expected ref.null or ref.func in passive element segment");
+-        }
+-        CHECK_RESULT(ReadOpcode(&opcode, "opcode"));
+-        ERROR_UNLESS(opcode == Opcode::End,
+-                     "expected END opcode after element expression");
++        CHECK_RESULT(ReadInitExpr(j));
+       } else {
+         Index func_index;
+         CHECK_RESULT(ReadIndex(&func_index, "elem expr func index"));
+-        CALLBACK(OnElemSegmentElemExpr_RefFunc, i, func_index);
++        CALLBACK(OnOpcode, Opcode::RefFunc);
++        CALLBACK(OnRefFuncExpr, func_index);
++        CALLBACK(OnOpcodeUint32, func_index);
++        CALLBACK0(OnEndExpr);
+       }
++      CALLBACK(EndElemExpr, i, j);
+     }
+     CALLBACK(EndElemSegment, i);
+   }
+diff --git a/src/c-writer.cc b/src/c-writer.cc
+index 7076fdb54b..770fbfe083 100644
+--- a/src/c-writer.cc
++++ b/src/c-writer.cc
+@@ -2130,7 +2130,8 @@ void CWriter::WriteElemInitializers() {
+         case ExprType::RefFunc: {
+           const Func* func = module_->GetFunc(cast<RefFuncExpr>(&expr)->var);
+           const FuncType* func_type = module_->GetFuncType(func->decl.type_var);
+-          Write("{", FuncTypeExpr(func_type), ", (wasm_rt_function_ptr_t)",
++          Write("{RefFunc, ", FuncTypeExpr(func_type),
++                ", (wasm_rt_function_ptr_t)",
+                 ExternalRef(ModuleFieldType::Func, func->name), ", ");
+           if (IsImport(func->name)) {
+             Write("offsetof(", ModuleInstanceTypeName(), ", ",
+@@ -2143,8 +2144,16 @@ void CWriter::WriteElemInitializers() {
+           Write("},", Newline());
+         } break;
+         case ExprType::RefNull:
+-          Write("{NULL, NULL, 0},", Newline());
++          Write("{RefNull, NULL, NULL, 0},", Newline());
+           break;
++        case ExprType::GlobalGet: {
++          const Global* global =
++              module_->GetGlobal(cast<GlobalGetExpr>(&expr)->var);
++          assert(IsImport(global->name));
++          Write("{GlobalGet, NULL, NULL, offsetof(", ModuleInstanceTypeName(),
++                ", ", GlobalName(ModuleFieldType::Global, global->name), ")},",
++                Newline());
++        } break;
+         default:
+           WABT_UNREACHABLE;
+       }
+diff --git a/src/interp/binary-reader-interp.cc b/src/interp/binary-reader-interp.cc
+index d8426d3035..600bf51634 100644
+--- a/src/interp/binary-reader-interp.cc
++++ b/src/interp/binary-reader-interp.cc
+@@ -269,9 +269,8 @@ class BinaryReaderInterp : public BinaryReaderNop {
+   Result EndElemSegmentInitExpr(Index index) override;
+   Result OnElemSegmentElemType(Index index, Type elem_type) override;
+   Result OnElemSegmentElemExprCount(Index index, Index count) override;
+-  Result OnElemSegmentElemExpr_RefNull(Index segment_index, Type type) override;
+-  Result OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                       Index func_index) override;
++  Result BeginElemExpr(Index elem_index, Index expr_index) override;
++  Result EndElemExpr(Index elem_index, Index expr_index) override;
+ 
+   Result OnDataCount(Index count) override;
+   Result BeginDataSegmentInitExpr(Index index) override;
+@@ -739,21 +738,17 @@ Result BinaryReaderInterp::OnElemSegmentElemExprCount(Index index,
+   return Result::Ok;
+ }
+ 
+-Result BinaryReaderInterp::OnElemSegmentElemExpr_RefNull(Index segment_index,
+-                                                         Type type) {
+-  CHECK_RESULT(validator_.OnElemSegmentElemExpr_RefNull(GetLocation(), type));
++Result BinaryReaderInterp::BeginElemExpr(Index elem_index, Index expr_index) {
++  assert(elem_index == module_.elems.size() - 1);
+   ElemDesc& elem = module_.elems.back();
+-  elem.elements.push_back(ElemExpr{ElemKind::RefNull, 0});
+-  return Result::Ok;
++  elem.elements.push_back(
++      {FuncType{{}, {elem.type}}, {}, Istream::kInvalidOffset, {}});
++  assert(expr_index == elem.elements.size() - 1);
++  return BeginInitExpr(elem.type, &elem.elements.back());
+ }
+ 
+-Result BinaryReaderInterp::OnElemSegmentElemExpr_RefFunc(Index segment_index,
+-                                                         Index func_index) {
+-  CHECK_RESULT(validator_.OnElemSegmentElemExpr_RefFunc(
+-      GetLocation(), Var(func_index, GetLocation())));
+-  ElemDesc& elem = module_.elems.back();
+-  elem.elements.push_back(ElemExpr{ElemKind::RefFunc, func_index});
+-  return Result::Ok;
++Result BinaryReaderInterp::EndElemExpr(Index elem_index, Index expr_index) {
++  return EndInitExpr();
+ }
+ 
+ Result BinaryReaderInterp::OnDataCount(Index count) {
+diff --git a/src/interp/interp.cc b/src/interp/interp.cc
+index ff0883c1f0..ae1e7bb9e8 100644
+--- a/src/interp/interp.cc
++++ b/src/interp/interp.cc
+@@ -705,19 +705,19 @@ Result Tag::Match(Store& store,
+ }
+ 
+ //// ElemSegment ////
+-ElemSegment::ElemSegment(const ElemDesc* desc, Instance::Ptr& inst)
++ElemSegment::ElemSegment(Store& store,
++                         const ElemDesc* desc,
++                         Instance::Ptr& inst)
+     : desc_(desc) {
++  Trap::Ptr out_trap;
+   elements_.reserve(desc->elements.size());
+   for (auto&& elem_expr : desc->elements) {
+-    switch (elem_expr.kind) {
+-      case ElemKind::RefNull:
+-        elements_.emplace_back(Ref::Null);
+-        break;
+-
+-      case ElemKind::RefFunc:
+-        elements_.emplace_back(inst->funcs_[elem_expr.index]);
+-        break;
++    Value value;
++    Ref func_ref = DefinedFunc::New(store, inst.ref(), elem_expr).ref();
++    if (Failed(inst->CallInitFunc(store, func_ref, &value, &out_trap))) {
++      WABT_UNREACHABLE;  // valid const expression cannot trap
+     }
++    elements_.push_back(value.Get<Ref>());
+   }
+ }
+ 
+@@ -845,7 +845,7 @@ Instance::Ptr Instance::Instantiate(Store& store,
+ 
+   // Elems.
+   for (auto&& desc : mod->desc().elems) {
+-    inst->elems_.emplace_back(&desc, inst);
++    inst->elems_.emplace_back(store, &desc, inst);
+   }
+ 
+   // Datas.
+diff --git a/src/prebuilt/wasm2c_source_declarations.cc b/src/prebuilt/wasm2c_source_declarations.cc
+index 5970f9a386..23b24b4ea0 100644
+--- a/src/prebuilt/wasm2c_source_declarations.cc
++++ b/src/prebuilt/wasm2c_source_declarations.cc
+@@ -936,6 +936,8 @@ R"w2c_template(}
+ R"w2c_template(
+ typedef struct {
+ )w2c_template"
++R"w2c_template(  enum { RefFunc, RefNull, GlobalGet } expr_type;
++)w2c_template"
+ R"w2c_template(  wasm_rt_func_type_t type;
+ )w2c_template"
+ R"w2c_template(  wasm_rt_function_ptr_t func;
+@@ -969,20 +971,44 @@ R"w2c_template(    TRAP(OOB);
+ )w2c_template"
+ R"w2c_template(  for (u32 i = 0; i < n; i++) {
+ )w2c_template"
+-R"w2c_template(    const wasm_elem_segment_expr_t* src_expr = &src[src_addr + i];
++R"w2c_template(    const wasm_elem_segment_expr_t* const src_expr = &src[src_addr + i];
++)w2c_template"
++R"w2c_template(    wasm_rt_funcref_t* const dest_val = &(dest->data[dest_addr + i]);
++)w2c_template"
++R"w2c_template(    switch (src_expr->expr_type) {
++)w2c_template"
++R"w2c_template(      case RefFunc:
++)w2c_template"
++R"w2c_template(        *dest_val = (wasm_rt_funcref_t){
++)w2c_template"
++R"w2c_template(            src_expr->type, src_expr->func,
++)w2c_template"
++R"w2c_template(            (char*)module_instance + src_expr->module_offset};
++)w2c_template"
++R"w2c_template(        break;
++)w2c_template"
++R"w2c_template(      case RefNull:
++)w2c_template"
++R"w2c_template(        *dest_val = wasm_rt_funcref_null_value;
++)w2c_template"
++R"w2c_template(        break;
++)w2c_template"
++R"w2c_template(      case GlobalGet:
++)w2c_template"
++R"w2c_template(        *dest_val = **(wasm_rt_funcref_t**)((char*)module_instance +
+ )w2c_template"
+-R"w2c_template(    dest->data[dest_addr + i] =
++R"w2c_template(                                            src_expr->module_offset);
+ )w2c_template"
+-R"w2c_template(        (wasm_rt_funcref_t){src_expr->type, src_expr->func,
++R"w2c_template(        break;
+ )w2c_template"
+-R"w2c_template(                            (char*)module_instance + src_expr->module_offset};
++R"w2c_template(    }
+ )w2c_template"
+ R"w2c_template(  }
+ )w2c_template"
+ R"w2c_template(}
+ )w2c_template"
+ R"w2c_template(
+-// Currently Wasm only supports initializing externref tables with ref.null.
++// Currently wasm2c only supports initializing externref tables with ref.null.
+ )w2c_template"
+ R"w2c_template(static inline void externref_table_init(wasm_rt_externref_table_t* dest,
+ )w2c_template"
+diff --git a/src/shared-validator.cc b/src/shared-validator.cc
+index a36af478f1..9ac821818c 100644
+--- a/src/shared-validator.cc
++++ b/src/shared-validator.cc
+@@ -276,27 +276,6 @@ Result SharedValidator::OnElemSegmentElemType(const Location& loc,
+   return result;
+ }
+ 
+-Result SharedValidator::OnElemSegmentElemExpr_RefNull(const Location& loc,
+-                                                      Type type) {
+-  return CheckType(loc, type, elems_.back().element, "elem expression");
+-}
+-
+-Result SharedValidator::OnElemSegmentElemExpr_RefFunc(const Location& loc,
+-                                                      Var func_var) {
+-  Result result = Result::Ok;
+-  result |=
+-      CheckType(loc, Type::FuncRef, elems_.back().element, "elem expression");
+-  result |= CheckFuncIndex(func_var);
+-  declared_funcs_.insert(func_var.index());
+-  return result;
+-}
+-
+-Result SharedValidator::OnElemSegmentElemExpr_Other(const Location& loc) {
+-  return PrintError(loc,
+-                    "invalid elem expression expression; must be either "
+-                    "ref.null or ref.func.");
+-}
+-
+ void SharedValidator::OnDataCount(Index count) {
+   data_segments_ = count;
+ }
+@@ -1012,7 +991,7 @@ Result SharedValidator::OnRefFunc(const Location& loc, Var func_var) {
+       check_declared_funcs_.push_back(func_var);
+     }
+     Index func_type = GetFunctionTypeIndex(func_var.index());
+-    result |= typechecker_.OnRefFuncExpr(func_type);
++    result |= typechecker_.OnRefFuncExpr(func_type, in_init_expr_);
+   }
+   return result;
+ }
+diff --git a/src/template/wasm2c.declarations.c b/src/template/wasm2c.declarations.c
+index 8ea080ca99..cc9b2445ac 100644
+--- a/src/template/wasm2c.declarations.c
++++ b/src/template/wasm2c.declarations.c
+@@ -500,6 +500,7 @@ static inline void memory_init(wasm_rt_memory_t* dest,
+ }
+ 
+ typedef struct {
++  enum { RefFunc, RefNull, GlobalGet } expr_type;
+   wasm_rt_func_type_t type;
+   wasm_rt_function_ptr_t func;
+   size_t module_offset;
+@@ -517,14 +518,26 @@ static inline void funcref_table_init(wasm_rt_funcref_table_t* dest,
+   if (UNLIKELY(dest_addr + (uint64_t)n > dest->size))
+     TRAP(OOB);
+   for (u32 i = 0; i < n; i++) {
+-    const wasm_elem_segment_expr_t* src_expr = &src[src_addr + i];
+-    dest->data[dest_addr + i] =
+-        (wasm_rt_funcref_t){src_expr->type, src_expr->func,
+-                            (char*)module_instance + src_expr->module_offset};
++    const wasm_elem_segment_expr_t* const src_expr = &src[src_addr + i];
++    wasm_rt_funcref_t* const dest_val = &(dest->data[dest_addr + i]);
++    switch (src_expr->expr_type) {
++      case RefFunc:
++        *dest_val = (wasm_rt_funcref_t){
++            src_expr->type, src_expr->func,
++            (char*)module_instance + src_expr->module_offset};
++        break;
++      case RefNull:
++        *dest_val = wasm_rt_funcref_null_value;
++        break;
++      case GlobalGet:
++        *dest_val = **(wasm_rt_funcref_t**)((char*)module_instance +
++                                            src_expr->module_offset);
++        break;
++    }
+   }
+ }
+ 
+-// Currently Wasm only supports initializing externref tables with ref.null.
++// Currently wasm2c only supports initializing externref tables with ref.null.
+ static inline void externref_table_init(wasm_rt_externref_table_t* dest,
+                                         u32 src_size,
+                                         u32 dest_addr,
+diff --git a/src/type-checker.cc b/src/type-checker.cc
+index 79b4f60496..ff58968c78 100644
+--- a/src/type-checker.cc
++++ b/src/type-checker.cc
+@@ -777,8 +777,14 @@ Result TypeChecker::OnTableFill(Type elem_type) {
+   return PopAndCheck3Types(Type::I32, elem_type, Type::I32, "table.fill");
+ }
+ 
+-Result TypeChecker::OnRefFuncExpr(Index func_type) {
+-  if (features_.function_references_enabled()) {
++Result TypeChecker::OnRefFuncExpr(Index func_type, bool force_generic_funcref) {
++  /*
++   * In a const expression, treat ref.func as producing a generic funcref.
++   * This avoids having to implement funcref subtyping (for now) and matches
++   * the previous behavior where SharedValidator::OnElemSegmentElemExpr_RefFunc
++   * examined only the validity of the function index.
++   */
++  if (features_.function_references_enabled() && !force_generic_funcref) {
+     PushType(Type(Type::Reference, func_type));
+   } else {
+     PushType(Type::FuncRef);
+diff --git a/src/validator.cc b/src/validator.cc
+index d52efb97ef..a759ad24e4 100644
+--- a/src/validator.cc
++++ b/src/validator.cc
+@@ -834,24 +834,11 @@ Result Validator::CheckModule() {
+ 
+       // Element expr.
+       for (auto&& elem_expr : f->elem_segment.elem_exprs) {
+-        if (elem_expr.size() == 1) {
+-          const Expr* expr = &elem_expr.front();
+-          switch (expr->type()) {
+-            case ExprType::RefNull:
+-              result_ |= validator_.OnElemSegmentElemExpr_RefNull(
+-                  expr->loc, cast<RefNullExpr>(expr)->type);
+-              break;
+-            case ExprType::RefFunc:
+-              result_ |= validator_.OnElemSegmentElemExpr_RefFunc(
+-                  expr->loc, cast<RefFuncExpr>(expr)->var);
+-              break;
+-            default:
+-              result_ |= validator_.OnElemSegmentElemExpr_Other(expr->loc);
+-              break;
+-          }
+-        } else if (elem_expr.size() > 1) {
+-          result_ |= validator_.OnElemSegmentElemExpr_Other(field.loc);
+-        }
++        result_ |= validator_.BeginInitExpr(elem_expr.front().loc,
++                                            f->elem_segment.elem_type);
++        ExprVisitor visitor(this);
++        result_ |= visitor.VisitExprList(const_cast<ExprList&>(elem_expr));
++        result_ |= validator_.EndInitExpr();
+       }
+     }
+   }
+diff --git a/test/dump/extended-const.txt b/test/dump/extended-const.txt
+index cafd2dd51c..90fc44308b 100644
+--- a/test/dump/extended-const.txt
++++ b/test/dump/extended-const.txt
+@@ -179,7 +179,7 @@ Global[2]:
+  - global[2] i32 mutable=0 - init i32=45
+ Elem[1]:
+  - segment[0] flags=0 table=0 count=1 - init (i32.const 4, global.get 0 <g_import>, i32.mul)
+-  - elem[0] = func[0]
++  - elem[0] = ref.func:0
+ Code[1]:
+  - func[0] size=2
+ Data[1]:
+diff --git a/test/dump/extended-names.txt b/test/dump/extended-names.txt
+index c3c78f62e2..b90a3308a4 100644
+--- a/test/dump/extended-names.txt
++++ b/test/dump/extended-names.txt
+@@ -379,7 +379,7 @@ Global[2]:
+  - global[1] i32 mutable=0 <g2> - init i32=2
+ Elem[1]:
+  - segment[0] flags=1 table=0 count=1
+-  - elem[0] = func[0]
++  - elem[0] = ref.func:0
+ DataCount:
+  - data count: 1
+ Code[4]:
+diff --git a/test/dump/invalid-init-exprs.txt b/test/dump/invalid-init-exprs.txt
+new file mode 100644
+index 0000000000..7cc126d301
+--- /dev/null
++++ b/test/dump/invalid-init-exprs.txt
+@@ -0,0 +1,25 @@
++;;; TOOL: run-objdump-gen-wasm
++;;; ARGS1: -x
++;; TODO: wasm-objdump should handle the "<INVALID>" case more gracefully
++magic
++version
++section(ELEM) {
++  count[1]
++  flags[4]
++  offset[nop end]
++  elemcount[1]
++  end
++}
++(;; STDOUT ;;;
++
++invalid-init-exprs.wasm:	file format wasm 0x1
++
++Section Details:
++
++Elem[1]:
++ - segment[0] flags=4 table=0 count=1 - init <INVALID>
++  - elem[0] = <EMPTY>
++
++Code Disassembly:
++
++;;; STDOUT ;;)
+diff --git a/test/dump/reference-types.txt b/test/dump/reference-types.txt
+index 2fd082cce1..9d29b10af2 100644
+--- a/test/dump/reference-types.txt
++++ b/test/dump/reference-types.txt
+@@ -83,7 +83,7 @@ Table[3]:
+  - table[2] type=funcref initial=1
+ Elem[2]:
+  - segment[0] flags=2 table=2 count=1 - init i32=0
+-  - elem[0] = func[0]
++  - elem[0] = ref.func:0
+  - segment[1] flags=5 table=0 count=1
+   - elem[0] = ref.null funcref
+ Code[10]:
+diff --git a/test/dump/relocations-all-features.txt b/test/dump/relocations-all-features.txt
+index d85c6215ce..0b22b64184 100644
+--- a/test/dump/relocations-all-features.txt
++++ b/test/dump/relocations-all-features.txt
+@@ -51,7 +51,7 @@ Export[1]:
+  - func[2] <f> -> "f"
+ Elem[1]:
+  - segment[0] flags=0 table=0 count=1 - init i32=0
+-  - elem[0] = func[1] <__extern.bar>
++  - elem[0] = ref.func:1 <__extern.bar>
+ Code[1]:
+  - func[2] size=36 <f>
+ Custom:
+diff --git a/test/dump/relocations.txt b/test/dump/relocations.txt
+index cb3570b67f..9114e3562f 100644
+--- a/test/dump/relocations.txt
++++ b/test/dump/relocations.txt
+@@ -51,7 +51,7 @@ Export[1]:
+  - func[2] <f> -> "f"
+ Elem[1]:
+  - segment[0] flags=0 table=0 count=1 - init i32=0
+-  - elem[0] = func[1] <__extern.bar>
++  - elem[0] = ref.func:1 <__extern.bar>
+ Code[1]:
+  - func[2] size=36 <f>
+ Custom:
+diff --git a/test/dump/table-multi.txt b/test/dump/table-multi.txt
+index fc4555e0e2..d5bfd3c847 100644
+--- a/test/dump/table-multi.txt
++++ b/test/dump/table-multi.txt
+@@ -86,9 +86,9 @@ Table[2]:
+  - table[1] type=funcref initial=1 max=1
+ Elem[2]:
+  - segment[0] flags=0 table=0 count=1 - init i32=0
+-  - elem[0] = func[0]
++  - elem[0] = ref.func:0
+  - segment[1] flags=2 table=1 count=1 - init i32=0
+-  - elem[0] = func[0]
++  - elem[0] = ref.func:0
+ Code[1]:
+  - func[0] size=2
+ 
+diff --git a/test/dump/table.txt b/test/dump/table.txt
+index 10aadb5e66..b0184bfb8c 100644
+--- a/test/dump/table.txt
++++ b/test/dump/table.txt
+@@ -116,13 +116,13 @@ Table[1]:
+  - table[0] type=funcref initial=6 max=6
+ Elem[2]:
+  - segment[0] flags=0 table=0 count=2 - init i32=0
+-  - elem[0] = func[1]
+-  - elem[1] = func[1]
++  - elem[0] = ref.func:1
++  - elem[1] = ref.func:1
+  - segment[1] flags=0 table=0 count=4 - init i32=2
+-  - elem[2] = func[0]
+-  - elem[3] = func[0]
+-  - elem[4] = func[1]
+-  - elem[5] = func[2]
++  - elem[2] = ref.func:0
++  - elem[3] = ref.func:0
++  - elem[4] = ref.func:1
++  - elem[5] = ref.func:2
+ Code[3]:
+  - func[0] size=2
+  - func[1] size=2
+diff --git a/test/parse/module/bad-table-invalid-function.txt b/test/parse/module/bad-table-invalid-function.txt
+index 073835188a..d05f093e1c 100644
+--- a/test/parse/module/bad-table-invalid-function.txt
++++ b/test/parse/module/bad-table-invalid-function.txt
+@@ -8,4 +8,5 @@
+ out/test/parse/module/bad-table-invalid-function.txt:6:26: error: function variable out of range: 1 (max 1)
+   (elem (i32.const 0) $f 1))
+                          ^
++0:0: error: type mismatch in initializer expression, expected [funcref] but got []
+ ;;; STDERR ;;)
+diff --git a/test/spec/binary.txt b/test/spec/binary.txt
+index 084fe51619..b0bd5346d3 100644
+--- a/test/spec/binary.txt
++++ b/test/spec/binary.txt
+@@ -212,8 +212,7 @@ out/test/spec/binary.wast:1205: assert_malformed passed:
+ out/test/spec/binary.wast:1227: assert_malformed passed:
+   000001e: error: data.drop requires data count section
+ out/test/spec/binary.wast:1246: assert_malformed passed:
+-  0000024: error: expected ref.null or ref.func in passive element segment
+-  0000025: error: expected END opcode after element expression
++  0000024: error: unexpected opcode: 0xf3
+ out/test/spec/binary.wast:1272: assert_malformed passed:
+   0000022: error: table elem type must be a reference type
+ out/test/spec/binary.wast:1353: assert_malformed passed:
+diff --git a/test/spec/call_indirect.txt b/test/spec/call_indirect.txt
+index 3728e4adb8..a950b15e93 100644
+--- a/test/spec/call_indirect.txt
++++ b/test/spec/call_indirect.txt
+@@ -149,6 +149,6 @@ out/test/spec/call_indirect.wast:1004: assert_invalid passed:
+   0000026: error: OnCallIndirectExpr callback failed
+ out/test/spec/call_indirect.wast:1015: assert_invalid passed:
+   out/test/spec/call_indirect/call_indirect.34.wasm:0000018: error: function variable out of range: 0 (max 0)
+-  0000018: error: OnElemSegmentElemExpr_RefFunc callback failed
++  0000018: error: OnRefFuncExpr callback failed
+ 170/170 tests passed.
+ ;;; STDOUT ;;)
+diff --git a/test/spec/elem.txt b/test/spec/elem.txt
+index 34f10d7f66..f588e3a572 100644
+--- a/test/spec/elem.txt
++++ b/test/spec/elem.txt
+@@ -55,22 +55,23 @@ out/test/spec/elem.wast:484: assert_invalid passed:
+   out/test/spec/elem/elem.50.wasm:000002e: error: initializer expression cannot reference a mutable global
+   000002e: error: OnGlobalGetExpr callback failed
+ out/test/spec/elem.wast:495: assert_invalid passed:
+-  out/test/spec/elem/elem.51.wasm:0000018: error: type mismatch at elem expression. got externref, expected funcref
+-  0000018: error: OnElemSegmentElemExpr_RefNull callback failed
++  out/test/spec/elem/elem.51.wasm:0000018: error: type mismatch in initializer expression, expected [funcref] but got [externref]
++  0000019: error: EndElemExpr callback failed
+ out/test/spec/elem.wast:503: assert_invalid passed:
+-  0000019: error: expected END opcode after element expression
++  out/test/spec/elem/elem.52.wasm:000001a: error: type mismatch at end of initializer expression, expected [] but got [funcref]
++  000001b: error: EndElemExpr callback failed
+ out/test/spec/elem.wast:511: assert_invalid passed:
+-  0000017: error: expected ref.null or ref.func in passive element segment
+-  0000018: error: expected END opcode after element expression
++  out/test/spec/elem/elem.53.wasm:0000018: error: type mismatch in initializer expression, expected [funcref] but got [i32]
++  0000019: error: EndElemExpr callback failed
+ out/test/spec/elem.wast:519: assert_invalid passed:
+-  0000017: error: expected ref.null or ref.func in passive element segment
+-  0000018: error: expected END opcode after element expression
++  out/test/spec/elem/elem.54.wasm:0000018: error: type mismatch in initializer expression, expected [funcref] but got [i32]
++  0000019: error: EndElemExpr callback failed
+ out/test/spec/elem.wast:527: assert_invalid passed:
+-  0000022: error: expected ref.null or ref.func in passive element segment
+-  0000023: error: expected END opcode after element expression
++  out/test/spec/elem/elem.55.wasm:0000023: error: invalid initializer: instruction not valid in initializer expression: call
++  0000023: error: OnCallExpr callback failed
+ out/test/spec/elem.wast:536: assert_invalid passed:
+-  0000017: error: expected ref.null or ref.func in passive element segment
+-  0000018: error: expected END opcode after element expression
++  out/test/spec/elem/elem.56.wasm:000001b: error: invalid initializer: instruction not valid in initializer expression: i32.add
++  000001b: error: OnBinaryExpr callback failed
+ out/test/spec/elem.wast:593: assert_trap passed: uninitialized table element
+ out/test/spec/elem.wast:626: assert_invalid passed:
+   out/test/spec/elem/elem.62.wasm:000001f: error: type mismatch at elem segment. got externref, expected funcref
+diff --git a/test/spec/exception-handling/binary.txt b/test/spec/exception-handling/binary.txt
+index 240ee602fe..561c7918a5 100644
+--- a/test/spec/exception-handling/binary.txt
++++ b/test/spec/exception-handling/binary.txt
+@@ -213,8 +213,7 @@ out/test/spec/exception-handling/binary.wast:1205: assert_malformed passed:
+ out/test/spec/exception-handling/binary.wast:1227: assert_malformed passed:
+   000001e: error: data.drop requires data count section
+ out/test/spec/exception-handling/binary.wast:1246: assert_malformed passed:
+-  0000024: error: expected ref.null or ref.func in passive element segment
+-  0000025: error: expected END opcode after element expression
++  0000024: error: unexpected opcode: 0xf3
+ out/test/spec/exception-handling/binary.wast:1272: assert_malformed passed:
+   0000022: error: table elem type must be a reference type
+ out/test/spec/exception-handling/binary.wast:1353: assert_malformed passed:
+diff --git a/test/spec/extended-const/elem.txt b/test/spec/extended-const/elem.txt
+index d27b224fe1..75837f598d 100644
+--- a/test/spec/extended-const/elem.txt
++++ b/test/spec/extended-const/elem.txt
+@@ -56,22 +56,23 @@ out/test/spec/extended-const/elem.wast:484: assert_invalid passed:
+   out/test/spec/extended-const/elem/elem.50.wasm:000002e: error: initializer expression cannot reference a mutable global
+   000002e: error: OnGlobalGetExpr callback failed
+ out/test/spec/extended-const/elem.wast:495: assert_invalid passed:
+-  out/test/spec/extended-const/elem/elem.51.wasm:0000018: error: type mismatch at elem expression. got externref, expected funcref
+-  0000018: error: OnElemSegmentElemExpr_RefNull callback failed
++  out/test/spec/extended-const/elem/elem.51.wasm:0000018: error: type mismatch in initializer expression, expected [funcref] but got [externref]
++  0000019: error: EndElemExpr callback failed
+ out/test/spec/extended-const/elem.wast:503: assert_invalid passed:
+-  0000019: error: expected END opcode after element expression
++  out/test/spec/extended-const/elem/elem.52.wasm:000001a: error: type mismatch at end of initializer expression, expected [] but got [funcref]
++  000001b: error: EndElemExpr callback failed
+ out/test/spec/extended-const/elem.wast:511: assert_invalid passed:
+-  0000017: error: expected ref.null or ref.func in passive element segment
+-  0000018: error: expected END opcode after element expression
++  out/test/spec/extended-const/elem/elem.53.wasm:0000018: error: type mismatch in initializer expression, expected [funcref] but got [i32]
++  0000019: error: EndElemExpr callback failed
+ out/test/spec/extended-const/elem.wast:519: assert_invalid passed:
+-  0000017: error: expected ref.null or ref.func in passive element segment
+-  0000018: error: expected END opcode after element expression
++  out/test/spec/extended-const/elem/elem.54.wasm:0000018: error: type mismatch in initializer expression, expected [funcref] but got [i32]
++  0000019: error: EndElemExpr callback failed
+ out/test/spec/extended-const/elem.wast:527: assert_invalid passed:
+-  0000022: error: expected ref.null or ref.func in passive element segment
+-  0000023: error: expected END opcode after element expression
++  out/test/spec/extended-const/elem/elem.55.wasm:0000023: error: invalid initializer: instruction not valid in initializer expression: call
++  0000023: error: OnCallExpr callback failed
+ out/test/spec/extended-const/elem.wast:536: assert_invalid passed:
+-  0000022: error: expected ref.null or ref.func in passive element segment
+-  0000023: error: expected END opcode after element expression
++  out/test/spec/extended-const/elem/elem.56.wasm:0000023: error: invalid initializer: instruction not valid in initializer expression: call
++  0000023: error: OnCallExpr callback failed
+ out/test/spec/extended-const/elem.wast:594: assert_trap passed: uninitialized table element
+ out/test/spec/extended-const/elem.wast:627: assert_invalid passed:
+   out/test/spec/extended-const/elem/elem.62.wasm:000001f: error: type mismatch at elem segment. got externref, expected funcref
+diff --git a/test/spec/multi-memory/binary.txt b/test/spec/multi-memory/binary.txt
+index e7ae995982..6210d4dcb5 100644
+--- a/test/spec/multi-memory/binary.txt
++++ b/test/spec/multi-memory/binary.txt
+@@ -193,8 +193,7 @@ out/test/spec/multi-memory/binary.wast:1014: assert_malformed passed:
+ out/test/spec/multi-memory/binary.wast:1036: assert_malformed passed:
+   000001e: error: data.drop requires data count section
+ out/test/spec/multi-memory/binary.wast:1055: assert_malformed passed:
+-  0000024: error: expected ref.null or ref.func in passive element segment
+-  0000025: error: expected END opcode after element expression
++  0000024: error: unexpected opcode: 0xf3
+ out/test/spec/multi-memory/binary.wast:1081: assert_malformed passed:
+   0000022: error: table elem type must be a reference type
+ out/test/spec/multi-memory/binary.wast:1162: assert_malformed passed:
+diff --git a/test/spec/tail-call/return_call_indirect.txt b/test/spec/tail-call/return_call_indirect.txt
+index 1c3354c267..ee1bcf5511 100644
+--- a/test/spec/tail-call/return_call_indirect.txt
++++ b/test/spec/tail-call/return_call_indirect.txt
+@@ -115,6 +115,6 @@ out/test/spec/tail-call/return_call_indirect.wast:523: assert_invalid passed:
+   0000026: error: OnReturnCallIndirectExpr callback failed
+ out/test/spec/tail-call/return_call_indirect.wast:534: assert_invalid passed:
+   out/test/spec/tail-call/return_call_indirect/return_call_indirect.27.wasm:0000018: error: function variable out of range: 0 (max 0)
+-  0000018: error: OnElemSegmentElemExpr_RefFunc callback failed
++  0000018: error: OnRefFuncExpr callback failed
+ 75/75 tests passed.
+ ;;; STDOUT ;;)
+diff --git a/test/strip/remove_section.txt b/test/strip/remove_section.txt
+index 5a157f3ada..31a2fc380e 100644
+--- a/test/strip/remove_section.txt
++++ b/test/strip/remove_section.txt
+@@ -25,6 +25,7 @@ section("five") { "Ut enim ad minim veniam," }
+ remove_section_stripped.wasm:	file format wasm 0x1
+ 
+ Sections:
++
+    Custom start=0x0000000a end=0x0000002a (size=0x00000020) "two"
+    Custom start=0x0000002c end=0x00000052 (size=0x00000026) "three"
+    Custom start=0x00000054 end=0x0000007a (size=0x00000026) "four"
+diff --git a/test/wasm2c/add.txt b/test/wasm2c/add.txt
+index 783f443c6d..1d25c4164c 100644
+--- a/test/wasm2c/add.txt
++++ b/test/wasm2c/add.txt
+@@ -567,6 +567,7 @@ static inline void memory_init(wasm_rt_memory_t* dest,
+ }
+ 
+ typedef struct {
++  enum { RefFunc, RefNull, GlobalGet } expr_type;
+   wasm_rt_func_type_t type;
+   wasm_rt_function_ptr_t func;
+   size_t module_offset;
+@@ -584,14 +585,26 @@ static inline void funcref_table_init(wasm_rt_funcref_table_t* dest,
+   if (UNLIKELY(dest_addr + (uint64_t)n > dest->size))
+     TRAP(OOB);
+   for (u32 i = 0; i < n; i++) {
+-    const wasm_elem_segment_expr_t* src_expr = &src[src_addr + i];
+-    dest->data[dest_addr + i] =
+-        (wasm_rt_funcref_t){src_expr->type, src_expr->func,
+-                            (char*)module_instance + src_expr->module_offset};
++    const wasm_elem_segment_expr_t* const src_expr = &src[src_addr + i];
++    wasm_rt_funcref_t* const dest_val = &(dest->data[dest_addr + i]);
++    switch (src_expr->expr_type) {
++      case RefFunc:
++        *dest_val = (wasm_rt_funcref_t){
++            src_expr->type, src_expr->func,
++            (char*)module_instance + src_expr->module_offset};
++        break;
++      case RefNull:
++        *dest_val = wasm_rt_funcref_null_value;
++        break;
++      case GlobalGet:
++        *dest_val = **(wasm_rt_funcref_t**)((char*)module_instance +
++                                            src_expr->module_offset);
++        break;
++    }
+   }
+ }
+ 
+-// Currently Wasm only supports initializing externref tables with ref.null.
++// Currently wasm2c only supports initializing externref tables with ref.null.
+ static inline void externref_table_init(wasm_rt_externref_table_t* dest,
+                                         u32 src_size,
+                                         u32 dest_addr,
+diff --git a/test/wasm2c/check-imports.txt b/test/wasm2c/check-imports.txt
+index bae7f486a4..1401f7ce45 100644
+--- a/test/wasm2c/check-imports.txt
++++ b/test/wasm2c/check-imports.txt
+@@ -590,6 +590,7 @@ static inline void memory_init(wasm_rt_memory_t* dest,
+ }
+ 
+ typedef struct {
++  enum { RefFunc, RefNull, GlobalGet } expr_type;
+   wasm_rt_func_type_t type;
+   wasm_rt_function_ptr_t func;
+   size_t module_offset;
+@@ -607,14 +608,26 @@ static inline void funcref_table_init(wasm_rt_funcref_table_t* dest,
+   if (UNLIKELY(dest_addr + (uint64_t)n > dest->size))
+     TRAP(OOB);
+   for (u32 i = 0; i < n; i++) {
+-    const wasm_elem_segment_expr_t* src_expr = &src[src_addr + i];
+-    dest->data[dest_addr + i] =
+-        (wasm_rt_funcref_t){src_expr->type, src_expr->func,
+-                            (char*)module_instance + src_expr->module_offset};
++    const wasm_elem_segment_expr_t* const src_expr = &src[src_addr + i];
++    wasm_rt_funcref_t* const dest_val = &(dest->data[dest_addr + i]);
++    switch (src_expr->expr_type) {
++      case RefFunc:
++        *dest_val = (wasm_rt_funcref_t){
++            src_expr->type, src_expr->func,
++            (char*)module_instance + src_expr->module_offset};
++        break;
++      case RefNull:
++        *dest_val = wasm_rt_funcref_null_value;
++        break;
++      case GlobalGet:
++        *dest_val = **(wasm_rt_funcref_t**)((char*)module_instance +
++                                            src_expr->module_offset);
++        break;
++    }
+   }
+ }
+ 
+-// Currently Wasm only supports initializing externref tables with ref.null.
++// Currently wasm2c only supports initializing externref tables with ref.null.
+ static inline void externref_table_init(wasm_rt_externref_table_t* dest,
+                                         u32 src_size,
+                                         u32 dest_addr,
+@@ -703,7 +716,7 @@ static void init_memories(w2c_test* instance) {
+ }
+ 
+ static const wasm_elem_segment_expr_t elem_segment_exprs_w2c_test_e0[] = {
+-  {w2c_test_t1, (wasm_rt_function_ptr_t)w2c_test_f1, 0},
++  {RefFunc, w2c_test_t1, (wasm_rt_function_ptr_t)w2c_test_f1, 0},
+ };
+ 
+ static void init_tables(w2c_test* instance) {
+diff --git a/test/wasm2c/export-names.txt b/test/wasm2c/export-names.txt
+index 596db40236..3d0395a1c4 100644
+--- a/test/wasm2c/export-names.txt
++++ b/test/wasm2c/export-names.txt
+@@ -590,6 +590,7 @@ static inline void memory_init(wasm_rt_memory_t* dest,
+ }
+ 
+ typedef struct {
++  enum { RefFunc, RefNull, GlobalGet } expr_type;
+   wasm_rt_func_type_t type;
+   wasm_rt_function_ptr_t func;
+   size_t module_offset;
+@@ -607,14 +608,26 @@ static inline void funcref_table_init(wasm_rt_funcref_table_t* dest,
+   if (UNLIKELY(dest_addr + (uint64_t)n > dest->size))
+     TRAP(OOB);
+   for (u32 i = 0; i < n; i++) {
+-    const wasm_elem_segment_expr_t* src_expr = &src[src_addr + i];
+-    dest->data[dest_addr + i] =
+-        (wasm_rt_funcref_t){src_expr->type, src_expr->func,
+-                            (char*)module_instance + src_expr->module_offset};
++    const wasm_elem_segment_expr_t* const src_expr = &src[src_addr + i];
++    wasm_rt_funcref_t* const dest_val = &(dest->data[dest_addr + i]);
++    switch (src_expr->expr_type) {
++      case RefFunc:
++        *dest_val = (wasm_rt_funcref_t){
++            src_expr->type, src_expr->func,
++            (char*)module_instance + src_expr->module_offset};
++        break;
++      case RefNull:
++        *dest_val = wasm_rt_funcref_null_value;
++        break;
++      case GlobalGet:
++        *dest_val = **(wasm_rt_funcref_t**)((char*)module_instance +
++                                            src_expr->module_offset);
++        break;
++    }
+   }
+ }
+ 
+-// Currently Wasm only supports initializing externref tables with ref.null.
++// Currently wasm2c only supports initializing externref tables with ref.null.
+ static inline void externref_table_init(wasm_rt_externref_table_t* dest,
+                                         u32 src_size,
+                                         u32 dest_addr,
+diff --git a/test/wasm2c/hello.txt b/test/wasm2c/hello.txt
+index 752725e862..a4b9a0e37a 100644
+--- a/test/wasm2c/hello.txt
++++ b/test/wasm2c/hello.txt
+@@ -598,6 +598,7 @@ static inline void memory_init(wasm_rt_memory_t* dest,
+ }
+ 
+ typedef struct {
++  enum { RefFunc, RefNull, GlobalGet } expr_type;
+   wasm_rt_func_type_t type;
+   wasm_rt_function_ptr_t func;
+   size_t module_offset;
+@@ -615,14 +616,26 @@ static inline void funcref_table_init(wasm_rt_funcref_table_t* dest,
+   if (UNLIKELY(dest_addr + (uint64_t)n > dest->size))
+     TRAP(OOB);
+   for (u32 i = 0; i < n; i++) {
+-    const wasm_elem_segment_expr_t* src_expr = &src[src_addr + i];
+-    dest->data[dest_addr + i] =
+-        (wasm_rt_funcref_t){src_expr->type, src_expr->func,
+-                            (char*)module_instance + src_expr->module_offset};
++    const wasm_elem_segment_expr_t* const src_expr = &src[src_addr + i];
++    wasm_rt_funcref_t* const dest_val = &(dest->data[dest_addr + i]);
++    switch (src_expr->expr_type) {
++      case RefFunc:
++        *dest_val = (wasm_rt_funcref_t){
++            src_expr->type, src_expr->func,
++            (char*)module_instance + src_expr->module_offset};
++        break;
++      case RefNull:
++        *dest_val = wasm_rt_funcref_null_value;
++        break;
++      case GlobalGet:
++        *dest_val = **(wasm_rt_funcref_t**)((char*)module_instance +
++                                            src_expr->module_offset);
++        break;
++    }
+   }
+ }
+ 
+-// Currently Wasm only supports initializing externref tables with ref.null.
++// Currently wasm2c only supports initializing externref tables with ref.null.
+ static inline void externref_table_init(wasm_rt_externref_table_t* dest,
+                                         u32 src_size,
+                                         u32 dest_addr,
+@@ -719,7 +732,7 @@ static void init_data_instances(w2c_test *instance) {
+ }
+ 
+ static const wasm_elem_segment_expr_t elem_segment_exprs_w2c_test_e0[] = {
+-  {w2c_test_t0, (wasm_rt_function_ptr_t)w2c_wasi__snapshot__preview1_fd_write, offsetof(w2c_test, w2c_wasi__snapshot__preview1_instance)},
++  {RefFunc, w2c_test_t0, (wasm_rt_function_ptr_t)w2c_wasi__snapshot__preview1_fd_write, offsetof(w2c_test, w2c_wasi__snapshot__preview1_instance)},
+ };
+ 
+ static void init_tables(w2c_test* instance) {
+diff --git a/test/wasm2c/minimal.txt b/test/wasm2c/minimal.txt
+index 08c724012d..81012a906e 100644
+--- a/test/wasm2c/minimal.txt
++++ b/test/wasm2c/minimal.txt
+@@ -561,6 +561,7 @@ static inline void memory_init(wasm_rt_memory_t* dest,
+ }
+ 
+ typedef struct {
++  enum { RefFunc, RefNull, GlobalGet } expr_type;
+   wasm_rt_func_type_t type;
+   wasm_rt_function_ptr_t func;
+   size_t module_offset;
+@@ -578,14 +579,26 @@ static inline void funcref_table_init(wasm_rt_funcref_table_t* dest,
+   if (UNLIKELY(dest_addr + (uint64_t)n > dest->size))
+     TRAP(OOB);
+   for (u32 i = 0; i < n; i++) {
+-    const wasm_elem_segment_expr_t* src_expr = &src[src_addr + i];
+-    dest->data[dest_addr + i] =
+-        (wasm_rt_funcref_t){src_expr->type, src_expr->func,
+-                            (char*)module_instance + src_expr->module_offset};
+-  }
+-}
+-
+-// Currently Wasm only supports initializing externref tables with ref.null.
++    const wasm_elem_segment_expr_t* const src_expr = &src[src_addr + i];
++    wasm_rt_funcref_t* const dest_val = &(dest->data[dest_addr + i]);
++    switch (src_expr->expr_type) {
++      case RefFunc:
++        *dest_val = (wasm_rt_funcref_t){
++            src_expr->type, src_expr->func,
++            (char*)module_instance + src_expr->module_offset};
++        break;
++      case RefNull:
++        *dest_val = wasm_rt_funcref_null_value;
++        break;
++      case GlobalGet:
++        *dest_val = **(wasm_rt_funcref_t**)((char*)module_instance +
++                                            src_expr->module_offset);
++        break;
++    }
++  }
++}
++
++// Currently wasm2c only supports initializing externref tables with ref.null.
+ static inline void externref_table_init(wasm_rt_externref_table_t* dest,
+                                         u32 src_size,
+                                         u32 dest_addr,
+diff --git a/wasm2c/examples/fac/fac.c b/wasm2c/examples/fac/fac.c
+index 31bceb949a..153ab1fb21 100644
+--- a/wasm2c/examples/fac/fac.c
++++ b/wasm2c/examples/fac/fac.c
+@@ -519,6 +519,7 @@ static inline void memory_init(wasm_rt_memory_t* dest,
+ }
+ 
+ typedef struct {
++  enum { RefFunc, RefNull, GlobalGet } expr_type;
+   wasm_rt_func_type_t type;
+   wasm_rt_function_ptr_t func;
+   size_t module_offset;
+@@ -536,14 +537,26 @@ static inline void funcref_table_init(wasm_rt_funcref_table_t* dest,
+   if (UNLIKELY(dest_addr + (uint64_t)n > dest->size))
+     TRAP(OOB);
+   for (u32 i = 0; i < n; i++) {
+-    const wasm_elem_segment_expr_t* src_expr = &src[src_addr + i];
+-    dest->data[dest_addr + i] =
+-        (wasm_rt_funcref_t){src_expr->type, src_expr->func,
+-                            (char*)module_instance + src_expr->module_offset};
++    const wasm_elem_segment_expr_t* const src_expr = &src[src_addr + i];
++    wasm_rt_funcref_t* const dest_val = &(dest->data[dest_addr + i]);
++    switch (src_expr->expr_type) {
++      case RefFunc:
++        *dest_val = (wasm_rt_funcref_t){
++            src_expr->type, src_expr->func,
++            (char*)module_instance + src_expr->module_offset};
++        break;
++      case RefNull:
++        *dest_val = wasm_rt_funcref_null_value;
++        break;
++      case GlobalGet:
++        *dest_val = **(wasm_rt_funcref_t**)((char*)module_instance +
++                                            src_expr->module_offset);
++        break;
++    }
+   }
+ }
+ 
+-// Currently Wasm only supports initializing externref tables with ref.null.
++// Currently wasm2c only supports initializing externref tables with ref.null.
+ static inline void externref_table_init(wasm_rt_externref_table_t* dest,
+                                         u32 src_size,
+                                         u32 dest_addr,

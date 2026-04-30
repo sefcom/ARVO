@@ -1,0 +1,295 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1524923640 18000
+#      Sat Apr 28 08:54:00 2018 -0500
+# Node ID f60c430ff40aac855614760776095d68b3c28f36
+# Parent  9637a72ff22bf95ea2daa862cc0b9f07481ed754
+ReadDPXImage(): Move misplaced channel validation code. (Credit to OSS-Fuzz)
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,11 @@
++2018-04-28  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
++
++	* coders/dpx.c (ReadDPXImage): Move misplaced channel validation
++	code.  Fixes oss-fuzz 8041 "graphicsmagick/coder_DPX_fuzzer:
++	Use-of-uninitialized-value in WriteDPXImage" and oss-fuzz 8055
++	"graphicsmagick/enhance_fuzzer: Use-of-uninitialized-value in
++	EnhanceImage". (Credit to OSS-Fuzz)
++
+ 2018-04-27  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
+ 	* coders/xpm.c (StringToListMod): Algorithm fixes to fix use of
+diff --git a/VisualMagick/installer/inc/version.isx b/VisualMagick/installer/inc/version.isx
+--- a/VisualMagick/installer/inc/version.isx
++++ b/VisualMagick/installer/inc/version.isx
+@@ -10,5 +10,5 @@
+ 
+ #define public MagickPackageName "GraphicsMagick"
+ #define public MagickPackageVersion "1.4"
+-#define public MagickPackageVersionAddendum ".020180427"
+-#define public MagickPackageReleaseDate "snapshot-20180427"
++#define public MagickPackageVersionAddendum ".020180428"
++#define public MagickPackageReleaseDate "snapshot-20180428"
+diff --git a/coders/dpx.c b/coders/dpx.c
+--- a/coders/dpx.c
++++ b/coders/dpx.c
+@@ -2116,7 +2116,9 @@
+         max_bits_per_sample=Max(max_bits_per_sample,bits_per_sample);
+         max_samples_per_pixel=Max(max_samples_per_pixel,
+                                   DPXSamplesPerPixel(element_descriptor));
+-      }
++
++
++      } /* for (element=0; element < dpx_image_info.elements; element++) */
+ 
+     /*
+       Check if there were any supported elements
+@@ -2179,6 +2181,106 @@
+     ThrowDPXReaderException(ResourceLimitError,ImagePixelLimitExceeded,image);
+ 
+   /*
++    Validate that the elements provide all of the channels
++  */
++  {
++    /* Flags to use when updating channel_bits */
++#define RED_CHANNEL     (1U)
++#define GREEN_CHANNEL   (1U << 1U)
++#define BLUE_CHANNEL    (1U << 2U)
++#define OPACITY_CHANNEL (1U << 3U)
++
++    unsigned int
++      channel_bits; /* record of channels which were updated by elements */
++
++    channel_bits=0;
++    for (element=0; element < dpx_image_info.elements; element++)
++      {
++        element_descriptor=(DPXImageElementDescriptor)
++          dpx_image_info.element_info[element].descriptor;
++
++        /*
++          Tally channels which would be updated by this element.
++        */
++        switch (element_descriptor)
++          {
++          case ImageElementRed:
++            channel_bits |= RED_CHANNEL;
++            break;
++          case ImageElementGreen:
++            channel_bits |= GREEN_CHANNEL;
++            break;
++          case ImageElementBlue:
++            channel_bits |= BLUE_CHANNEL;
++            break;
++          case ImageElementAlpha:
++            channel_bits |= OPACITY_CHANNEL;
++            break;
++          case ImageElementUnspecified:
++          case ImageElementLuma:
++            if (IsYCbCrColorspace(image->colorspace))
++              {
++                channel_bits |= RED_CHANNEL;
++              }
++            else
++              {
++                channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL;
++                if (!image->matte)
++                  channel_bits |= OPACITY_CHANNEL;
++              }
++            break;
++          case ImageElementColorDifferenceCbCr:
++            channel_bits |= GREEN_CHANNEL | BLUE_CHANNEL;
++            break;
++          case ImageElementRGB:
++            channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL;
++            if (!image->matte)
++              channel_bits |= OPACITY_CHANNEL;
++            break;
++          case ImageElementRGBA:
++            channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL | OPACITY_CHANNEL;
++            break;
++          case ImageElementABGR:
++            channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL | OPACITY_CHANNEL;
++            break;
++          case ImageElementCbYCrY422:
++            channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL;
++            if (!image->matte)
++              channel_bits |= OPACITY_CHANNEL;
++            break;
++          case ImageElementCbYACrYA4224:
++            channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL | OPACITY_CHANNEL;
++            break;
++          case ImageElementCbYCr444:
++            channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL;
++            if (!image->matte)
++              channel_bits |= OPACITY_CHANNEL;
++            break;
++          case ImageElementCbYCrA4444:
++            channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL | OPACITY_CHANNEL;
++            break;
++          default:
++            break;
++          }
++      }
++
++    if (image->logging)
++      (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                            "Channels updated: %s%s%s%s",
++                            channel_bits & RED_CHANNEL ? "R" : "",
++                            channel_bits & GREEN_CHANNEL ? "G" : "",
++                            channel_bits & BLUE_CHANNEL ? "B" : "",
++                            channel_bits & OPACITY_CHANNEL ? "O" : "");
++
++    if (!(channel_bits & OPACITY_CHANNEL))
++      matte_init = MagickTrue;
++
++    if ((channel_bits & (RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL))
++        != (RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL))
++      ThrowDPXReaderException(CorruptImageError,MissingImageChannel,image);
++  }
++
++  /*
+     Validate file size if using a seekable blob
+   */
+   if (BlobIsSeekable(image))
+@@ -2531,105 +2633,6 @@
+                                     samples_per_row, (unsigned long) row_octets,
+                                     (unsigned long) element_size);
+             }
+-          /*
+-            Validate that the elements provide all of the channels
+-          */
+-          {
+-            /* Flags to use when updating channel_bits */
+-#define RED_CHANNEL     (1U)
+-#define GREEN_CHANNEL   (1U << 1U)
+-#define BLUE_CHANNEL    (1U << 2U)
+-#define OPACITY_CHANNEL (1U << 3U)
+-
+-            unsigned int
+-              channel_bits; /* record of channels which were updated by elements */
+-
+-            channel_bits=0;
+-            for (element=0; element < dpx_image_info.elements; element++)
+-              {
+-                element_descriptor=(DPXImageElementDescriptor)
+-                  dpx_image_info.element_info[element].descriptor;
+-
+-                /*
+-                  Tally channels which would be updated by this element.
+-                */
+-                switch (element_descriptor)
+-                  {
+-                  case ImageElementRed:
+-                    channel_bits |= RED_CHANNEL;
+-                    break;
+-                  case ImageElementGreen:
+-                    channel_bits |= GREEN_CHANNEL;
+-                    break;
+-                  case ImageElementBlue:
+-                    channel_bits |= BLUE_CHANNEL;
+-                    break;
+-                  case ImageElementAlpha:
+-                    channel_bits |= OPACITY_CHANNEL;
+-                    break;
+-                  case ImageElementUnspecified:
+-                  case ImageElementLuma:
+-                    if (IsYCbCrColorspace(image->colorspace))
+-                      {
+-                        channel_bits |= RED_CHANNEL;
+-                      }
+-                    else
+-                      {
+-                        channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL;
+-                        if (!image->matte)
+-                          channel_bits |= OPACITY_CHANNEL;
+-                      }
+-                    break;
+-                  case ImageElementColorDifferenceCbCr:
+-                    channel_bits |= GREEN_CHANNEL | BLUE_CHANNEL;
+-                    break;
+-                  case ImageElementRGB:
+-                    channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL;
+-                    if (!image->matte)
+-                      channel_bits |= OPACITY_CHANNEL;
+-                    break;
+-                  case ImageElementRGBA:
+-                    channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL | OPACITY_CHANNEL;
+-                    break;
+-                  case ImageElementABGR:
+-                    channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL | OPACITY_CHANNEL;
+-                    break;
+-                  case ImageElementCbYCrY422:
+-                    channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL;
+-                    if (!image->matte)
+-                      channel_bits |= OPACITY_CHANNEL;
+-                    break;
+-                  case ImageElementCbYACrYA4224:
+-                    channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL | OPACITY_CHANNEL;
+-                    break;
+-                  case ImageElementCbYCr444:
+-                    channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL;
+-                    if (!image->matte)
+-                      channel_bits |= OPACITY_CHANNEL;
+-                    break;
+-                  case ImageElementCbYCrA4444:
+-                    channel_bits |= RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL | OPACITY_CHANNEL;
+-                    break;
+-                  default:
+-                    break;
+-                  }
+-              }
+-
+-            if (image->logging)
+-              (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+-                                    "Channels updated: %s%s%s%s",
+-                                    channel_bits & RED_CHANNEL ? "R" : "",
+-                                    channel_bits & GREEN_CHANNEL ? "G" : "",
+-                                    channel_bits & BLUE_CHANNEL ? "B" : "",
+-                                    channel_bits & OPACITY_CHANNEL ? "O" : "");
+-
+-            if (!(channel_bits & OPACITY_CHANNEL))
+-              matte_init = MagickTrue;
+-
+-            if ((channel_bits & (RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL))
+-                != (RED_CHANNEL | GREEN_CHANNEL | BLUE_CHANNEL))
+-              ThrowDPXReaderException(CorruptImageError,MissingImageChannel,image);
+-          }
+ 
+           /*
+             Read element data.
+diff --git a/magick/version.h b/magick/version.h
+--- a/magick/version.h
++++ b/magick/version.h
+@@ -38,8 +38,8 @@
+ #define MagickLibVersion  0x201702
+ #define MagickLibVersionText  "1.4"
+ #define MagickLibVersionNumber 20,17,2
+-#define MagickChangeDate   "20180427"
+-#define MagickReleaseDate  "snapshot-20180427"
++#define MagickChangeDate   "20180428"
++#define MagickReleaseDate  "snapshot-20180428"
+ 	
+ /*
+   The MagickLibInterfaceNewest and MagickLibInterfaceOldest defines
+diff --git a/www/Changelog.html b/www/Changelog.html
+--- a/www/Changelog.html
++++ b/www/Changelog.html
+@@ -35,6 +35,16 @@
+ <div class="document">
+ 
+ 
++<p>2018-04-28  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
++<blockquote>
++<ul class="simple">
++<li>coders/dpx.c (ReadDPXImage): Move misplaced channel validation
++code.  Fixes oss-fuzz 8041 &quot;graphicsmagick/coder_DPX_fuzzer:
++Use-of-uninitialized-value in WriteDPXImage&quot; and oss-fuzz 8055
++&quot;graphicsmagick/enhance_fuzzer: Use-of-uninitialized-value in
++EnhanceImage&quot;. (Credit to OSS-Fuzz)</li>
++</ul>
++</blockquote>
+ <p>2018-04-27  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
+ <blockquote>
+ <ul class="simple">

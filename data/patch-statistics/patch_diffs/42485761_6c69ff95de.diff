@@ -1,0 +1,32 @@
+From c733067d6d52acc8031792316c0ee58990cdd0e8 Mon Sep 17 00:00:00 2001
+From: Luca Boccassi <bluca@debian.org>
+Date: Sat, 15 Aug 2020 14:30:33 +0100
+Subject: [PATCH] Problem: use-after-free in WS
+
+Solution: bail out of the stream engine out_event if ws_engine raises
+an error
+---
+ src/stream_engine_base.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/stream_engine_base.cpp b/src/stream_engine_base.cpp
+index 275be24d94..9b9563a9bc 100644
+--- a/src/stream_engine_base.cpp
++++ b/src/stream_engine_base.cpp
+@@ -344,8 +344,14 @@ void zmq::stream_engine_base_t::out_event ()
+         _outsize = _encoder->encode (&_outpos, 0);
+ 
+         while (_outsize < static_cast<size_t> (_options.out_batch_size)) {
+-            if ((this->*_next_msg) (&_tx_msg) == -1)
+-                break;
++            if ((this->*_next_msg) (&_tx_msg) == -1) {
++                //  ws_engine can cause an engine error and delete it, so
++                //  bail out immediately to avoid use-after-free
++                if (errno == ECONNRESET)
++                    return;
++                else
++                    break;
++            }
+             _encoder->load_msg (&_tx_msg);
+             unsigned char *bufptr = _outpos + _outsize;
+             const size_t n =

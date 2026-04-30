@@ -1,0 +1,138 @@
+From d97206301f980637f454d34e39d2e5fdfdf9a86c Mon Sep 17 00:00:00 2001
+From: Julius Pfrommer <julius.pfrommer@web.de>
+Date: Sun, 15 Jun 2025 22:51:03 +0200
+Subject: [PATCH] fix(core): Fix decoding of unknown JSON structures in
+ ExtensionObjects
+
+---
+ src/ua_types_encoding_json_105.c | 33 ++++++++++++++++++--------------
+ tests/check_types_builtin_json.c | 33 ++++++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 14 deletions(-)
+
+diff --git a/src/ua_types_encoding_json_105.c b/src/ua_types_encoding_json_105.c
+index d36d8b2ac19..d51eac8f51d 100644
+--- a/src/ua_types_encoding_json_105.c
++++ b/src/ua_types_encoding_json_105.c
+@@ -1952,18 +1952,19 @@ tokenToByteString(ParseCtx *ctx, UA_ByteString *p) {
+  * verbatim into the encoding ByteString. tokenIndex points to the field (after
+  * the field name) that shall be removed. */
+ static void
+-removeFieldFromEncoding(ParseCtx *ctx, UA_ByteString *encoding, size_t tokenIndex) {
++removeFieldFromEncoding(ParseCtx *ctx, UA_ByteString *encoding,
++                        size_t parentIndex, size_t tokenIndex) {
+     /* Which part of the encoding to cut out */
+-    unsigned objStart = ctx->tokens[ctx->index].start;
+-    unsigned objEnd = ctx->tokens[ctx->index].end;
++    unsigned objStart = ctx->tokens[parentIndex].start;
++    unsigned objEnd = ctx->tokens[parentIndex].end;
+     unsigned start = ctx->tokens[tokenIndex-1].start;
+     unsigned end = ctx->tokens[tokenIndex].end + 1; /* One char after */
+ 
+-    UA_Boolean haveBefore = (ctx->index < tokenIndex - 2);
++    UA_Boolean haveBefore = (parentIndex < tokenIndex - 2);
+     if(haveBefore) {
+         /* Find where the previous token ended. This also removes the comma
+          * between the previous and the current element. */
+-        for(size_t i = ctx->index + 2; i < tokenIndex - 1; i++) {
++        for(size_t i = parentIndex + 2; i < tokenIndex - 1; i++) {
+             if(ctx->tokens[i].end + 1 > start)
+                 start = ctx->tokens[i].end + 1;
+         }
+@@ -1988,15 +1989,18 @@ removeFieldFromEncoding(ParseCtx *ctx, UA_ByteString *encoding, size_t tokenInde
+         ctx->index = oldIndex;
+     }
+ 
+-    /* Subtract the offset between ctx->json5 end encoding */
++    UA_assert(end > start);
++    UA_assert(start > objStart);
++
++    /* Move the offset from ctx->json5 to encoding->data */
+     start -= objStart;
+     end -= objStart;
+-    /* Fix: Bounds and sanity check */
+-    if(end < start || end > encoding->length || start > encoding->length)
+-        return;
++
++    UA_assert(end <= encoding->length);
++
+     /* Cut out the field we want to remove */
+-    size_t remaining = encoding->length - end;
+-    memmove(encoding->data + start, encoding->data + end, remaining);
++    size_t after_len = encoding->length - end;
++    memmove(encoding->data + start, encoding->data + end, after_len);
+     encoding->length -= (end - start);
+ }
+ 
+@@ -2062,6 +2066,7 @@ DECODE_JSON(ExtensionObject) {
+                 return UA_STATUSCODE_BADDECODINGERROR;
+ 
+             /* Extract the entire ExtensionObject object as the body */
++            size_t parentIndex = ctx->index;
+             ret = tokenToByteString(ctx, &dst->content.encoded.body);
+             if(ret != UA_STATUSCODE_GOOD)
+                 return ret;
+@@ -2069,10 +2074,10 @@ DECODE_JSON(ExtensionObject) {
+             /* Remove the UaEncoding and UaTypeId field from the encoding.
+              * Remove the later field first. */
+             if(encIndex != 0 && encIndex > typeIdIndex)
+-                removeFieldFromEncoding(ctx, &dst->content.encoded.body, encIndex);
+-            removeFieldFromEncoding(ctx, &dst->content.encoded.body, typeIdIndex);
++                removeFieldFromEncoding(ctx, &dst->content.encoded.body, parentIndex, encIndex);
++            removeFieldFromEncoding(ctx, &dst->content.encoded.body, parentIndex, typeIdIndex);
+             if(encIndex != 0 && encIndex < typeIdIndex)
+-                removeFieldFromEncoding(ctx, &dst->content.encoded.body, encIndex);
++                removeFieldFromEncoding(ctx, &dst->content.encoded.body, parentIndex, encIndex);
+ 
+             return UA_STATUSCODE_GOOD;
+         }
+diff --git a/tests/check_types_builtin_json.c b/tests/check_types_builtin_json.c
+index 61f028c5725..d0c0329f9e9 100644
+--- a/tests/check_types_builtin_json.c
++++ b/tests/check_types_builtin_json.c
+@@ -4841,6 +4841,38 @@ START_TEST(UA_ExtensionObject_Unkown_json_decode) {
+ 
+     //{"unknown":"body","saveas":"Bytestring"}Q
+     ck_assert_uint_eq(out.content.encoded.body.length, 40);
++    ck_assert_int_eq(out.content.encoded.body.data[0], '{');
++    ck_assert_int_eq(out.content.encoded.body.data[1], '\"');
++    ck_assert_int_eq(out.content.encoded.body.data[2], 'u');
++    ck_assert_int_eq(out.content.encoded.body.data[3], 'n');
++    ck_assert_int_eq(out.content.encoded.body.data[4], 'k');
++    ck_assert_int_eq(out.content.encoded.body.data[5], 'n');
++    ck_assert_int_eq(out.content.encoded.body.data[6], 'o');
++    ck_assert_int_eq(out.content.encoded.body.data[7], 'w');
++    UA_ExtensionObject_clear(&out);
++}
++END_TEST
++
++/* JSON structure that contains UaTypeId "in situ" */
++START_TEST(UA_ExtensionObject_Unkown_Nobody_json_decode) {
++    // given
++
++    UA_ExtensionObject out;
++    UA_ExtensionObject_init(&out);
++    UA_ByteString buf = UA_STRING("{\"UaTypeId\":\"i=4711\",\"unknown\":\"body\",\"saveas\":\"Bytestring\"}");
++
++    // when
++    UA_StatusCode retval = UA_decodeJson(&buf, &out, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT], NULL);
++    ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
++
++    // then
++    ck_assert_int_eq(out.encoding, UA_EXTENSIONOBJECT_ENCODED_BYTESTRING);
++    ck_assert_int_eq(out.content.encoded.typeId.identifier.numeric, 4711);
++
++    //{"unknown":"body","saveas":"Bytestring"}Q
++    ck_assert_uint_eq(out.content.encoded.body.length, 40);
++    ck_assert_int_eq(out.content.encoded.body.data[0], '{');
++    ck_assert_int_eq(out.content.encoded.body.data[1], '\"');
+     ck_assert_int_eq(out.content.encoded.body.data[2], 'u');
+     ck_assert_int_eq(out.content.encoded.body.data[3], 'n');
+     ck_assert_int_eq(out.content.encoded.body.data[4], 'k');
+@@ -5706,6 +5738,7 @@ static Suite *testSuite_builtin_json(void) {
+     tcase_add_test(tc_json_decode, UA_ExtensionObject_EncodedByteString_json_decode);
+     tcase_add_test(tc_json_decode, UA_ExtensionObject_EncodedXml_json_decode);
+     tcase_add_test(tc_json_decode, UA_ExtensionObject_Unkown_json_decode);
++    tcase_add_test(tc_json_decode, UA_ExtensionObject_Unkown_Nobody_json_decode);
+ 
+     //Others
+     tcase_add_test(tc_json_decode, UA_wrongBoolean_json_decode);

@@ -1,0 +1,100 @@
+
+# HG changeset patch
+# User Dmitry Volyntsev <xeioex@nginx.com>
+# Date 1716936579 25200
+# Node ID cb1baa3906f8f42f4bf69daba5b96d0377fd8163
+# Parent  29ffafd582a7e74cfa95672845faadfe4f735276
+Fixed RegExp.prototype[@@replace]().
+
+With replacement containing "$'", "$\`" and Unicode characters.
+
+The similar issue was fixed for String.prototype.replace() in
+10127d70e941 (0.7.11).
+
+Found by OSS-Fuzz.
+
+diff -r 29ffafd582a7 -r cb1baa3906f8 src/njs_regexp.c
+--- a/src/njs_regexp.c	Fri Apr 05 13:27:37 2024 -0700
++++ b/src/njs_regexp.c	Tue May 28 15:49:39 2024 -0700
+@@ -1330,7 +1330,8 @@
+ njs_regexp_prototype_symbol_replace(njs_vm_t *vm, njs_value_t *args,
+     njs_uint_t nargs, njs_index_t unused, njs_value_t *retval)
+ {
+-    int64_t            n, last_index, ncaptures, pos, next_pos, length;
++    int64_t            n, last_index, ncaptures, pos, length;
++    const u_char       *p, *next;
+     njs_str_t          rep, m;
+     njs_int_t          ret;
+     njs_arr_t          results;
+@@ -1461,8 +1462,8 @@
+     }
+ 
+     i = 0;
+-    pos = 0;
+-    next_pos = 0;
++    p = s.start;
++    next = p;
+ 
+     while (i < results.items) {
+         r = njs_arr_item(&results, i++);
+@@ -1491,13 +1492,7 @@
+             goto exception;
+         }
+ 
+-        if ((size_t) length != s.size) {
+-            /* UTF-8 string. */
+-            pos = njs_string_utf8_offset(s.start, s.start + s.size, pos)
+-                  - s.start;
+-        }
+-
+-        pos = njs_max(njs_min(pos, (int64_t) s.size), 0);
++        pos = njs_max(njs_min(pos, (int64_t) length), 0);
+ 
+         ret = njs_object_length(vm, r, &ncaptures);
+         if (njs_slow_path(ret != NJS_OK)) {
+@@ -1578,15 +1573,17 @@
+             goto exception;
+         }
+ 
+-        if (pos >= next_pos) {
+-            njs_chb_append(&chain, &s.start[next_pos], pos - next_pos);
++        p = njs_string_offset(&s, pos);
++
++        if (p >= next) {
++            njs_chb_append(&chain, next, p - next);
+ 
+             njs_string_get(retval, &rep);
+             njs_chb_append_str(&chain, &rep);
+ 
+             njs_string_get(&matched, &m);
+ 
+-            next_pos = pos + (int64_t) m.length;
++            next = p + m.length;
+         }
+ 
+         if (!func_replace && njs_object_slots(r)) {
+@@ -1599,8 +1596,8 @@
+         }
+     }
+ 
+-    if (next_pos < (int64_t) s.size) {
+-        njs_chb_append(&chain, &s.start[next_pos], s.size - next_pos);
++    if (next < s.start + s.size) {
++        njs_chb_append(&chain, next, s.start + s.size - next);
+     }
+ 
+     ret = njs_string_create_chb(vm, retval, &chain);
+diff -r 29ffafd582a7 -r cb1baa3906f8 src/test/njs_unit_test.c
+--- a/src/test/njs_unit_test.c	Fri Apr 05 13:27:37 2024 -0700
++++ b/src/test/njs_unit_test.c	Tue May 28 15:49:39 2024 -0700
+@@ -9321,6 +9321,9 @@
+     { njs_str("'ABCB'.replaceAll(/(?<b>B)/g, '|$<BB$$|>@')"),
+       njs_str("A|@C|@") },
+ 
++    { njs_str("'α'.repeat(8).replace(/()/g, '$`') == 'α'.repeat(44)"),
++      njs_str("true") },
++
+     { njs_str("('β' + 'α'.repeat(33)+'β').replace(/(α+)(β+)/, (m, p1) => p1[32])"),
+       njs_str("βα") },
+ 
+

@@ -1,0 +1,189 @@
+From 344e1661e18234c9a3c56d7108aad06987b82b5a Mon Sep 17 00:00:00 2001
+From: Daniel Pouzzner <douzzer@wolfssl.com>
+Date: Wed, 6 Sep 2023 14:53:19 -0500
+Subject: [PATCH] wolfcrypt/src/{hmac.c,sha256.c,sha512.c,kdf.c}: ForceZero()
+ smallstack buffers before freeing them, and ForceZero() the Hmac, wc_Sha512,
+ wc_Sha384, wc_Sha256, and wc_Sha224 structures at the end of their respective
+ freeing routines.  also, remove superseded ForceZero() calls in
+ wc_HKDF_Expand(), wc_SSH_KDF(), and wc_HKDF_Extract().
+
+---
+ wolfcrypt/src/hmac.c   |  4 ++--
+ wolfcrypt/src/kdf.c    |  1 -
+ wolfcrypt/src/sha256.c | 23 +++++++++++++++--------
+ wolfcrypt/src/sha512.c |  9 +++++++++
+ 4 files changed, 26 insertions(+), 11 deletions(-)
+
+diff --git a/wolfcrypt/src/hmac.c b/wolfcrypt/src/hmac.c
+index 4f1b68c7d72..83e693b257e 100644
+--- a/wolfcrypt/src/hmac.c
++++ b/wolfcrypt/src/hmac.c
+@@ -1173,6 +1173,8 @@ void wc_HmacFree(Hmac* hmac)
+         default:
+             break;
+     }
++
++    ForceZero(hmac, sizeof(*hmac));
+ }
+ #endif /* WOLFSSL_KCAPI_HMAC */
+ 
+@@ -1233,7 +1235,6 @@ int wolfSSL_GetHmacMaxSize(void)
+                 ret = wc_HmacUpdate(myHmac, inKey, inKeySz);
+             if (ret == 0)
+                 ret = wc_HmacFinal(myHmac,  out);
+-            ForceZero(myHmac, sizeof(Hmac));
+             wc_HmacFree(myHmac);
+         }
+     #ifdef WOLFSSL_SMALL_STACK
+@@ -1325,7 +1326,6 @@ int wolfSSL_GetHmacMaxSize(void)
+             n++;
+         }
+ 
+-        ForceZero(myHmac, sizeof(Hmac));
+         wc_HmacFree(myHmac);
+     #ifdef WOLFSSL_SMALL_STACK
+         XFREE(myHmac, NULL, DYNAMIC_TYPE_HMAC);
+diff --git a/wolfcrypt/src/kdf.c b/wolfcrypt/src/kdf.c
+index 0223817b2cc..2568c444c98 100644
+--- a/wolfcrypt/src/kdf.c
++++ b/wolfcrypt/src/kdf.c
+@@ -863,7 +863,6 @@ int wc_SSH_KDF(byte hashId, byte keyId, byte* key, word32 keySz,
+         }
+     }
+ 
+-    ForceZero(&hash, sizeof(hash));
+     _HashFree(enmhashId, &hash);
+ 
+     return ret;
+diff --git a/wolfcrypt/src/sha256.c b/wolfcrypt/src/sha256.c
+index e17ba65ac41..747d3dd46f5 100644
+--- a/wolfcrypt/src/sha256.c
++++ b/wolfcrypt/src/sha256.c
+@@ -931,6 +931,7 @@ static int InitSha256(wc_Sha256* sha256)
+         }
+ 
+     #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_SMALL_STACK_CACHE)
++        ForceZero(W, sizeof(word32) * WC_SHA256_BLOCK_SIZE);
+         XFREE(W, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+     #endif
+         return 0;
+@@ -1690,10 +1691,11 @@ static int InitSha256(wc_Sha256* sha256)
+             return;
+ 
+ #ifdef WOLFSSL_SMALL_STACK_CACHE
+-    if (sha224->W != NULL) {
+-        XFREE(sha224->W, NULL, DYNAMIC_TYPE_DIGEST);
+-        sha224->W = NULL;
+-    }
++        if (sha224->W != NULL) {
++            ForceZero(sha224->W, sizeof(word32) * WC_SHA224_BLOCK_SIZE);
++            XFREE(sha224->W, NULL, DYNAMIC_TYPE_DIGEST);
++            sha224->W = NULL;
++        }
+ #endif
+ 
+     #if defined(WOLFSSL_ASYNC_CRYPT) && defined(WC_ASYNC_ENABLE_SHA224)
+@@ -1707,11 +1709,13 @@ static int InitSha256(wc_Sha256* sha256)
+         KcapiHashFree(&sha224->kcapi);
+     #endif
+     #if defined(WOLFSSL_RENESAS_RX64_HASH)
+-    if (sha224->msg != NULL) {
+-        XFREE(sha224->msg, sha224->heap, DYNAMIC_TYPE_TMP_BUFFER);
+-        sha224->msg = NULL;
+-    }
++        if (sha224->msg != NULL) {
++            ForceZero(sha224->msg, sha224->len);
++            XFREE(sha224->msg, sha224->heap, DYNAMIC_TYPE_TMP_BUFFER);
++            sha224->msg = NULL;
++        }
+     #endif
++        ForceZero(sha224, sizeof(*sha224));
+     }
+ #endif /* WOLFSSL_SHA224 */
+ #endif /* !defined(WOLFSSL_HAVE_PSA) || defined(WOLFSSL_PSA_NO_HASH) */
+@@ -1737,6 +1741,7 @@ void wc_Sha256Free(wc_Sha256* sha256)
+ 
+ #ifdef WOLFSSL_SMALL_STACK_CACHE
+     if (sha256->W != NULL) {
++        ForceZero(sha256->W, sizeof(word32) * WC_SHA256_BLOCK_SIZE);
+         XFREE(sha256->W, NULL, DYNAMIC_TYPE_DIGEST);
+         sha256->W = NULL;
+     }
+@@ -1772,6 +1777,7 @@ void wc_Sha256Free(wc_Sha256* sha256)
+     defined(WOLFSSL_HASH_KEEP)
+ 
+     if (sha256->msg != NULL) {
++        ForceZero(sha256->msg, sha256->len);
+         XFREE(sha256->msg, sha256->heap, DYNAMIC_TYPE_TMP_BUFFER);
+         sha256->msg = NULL;
+     }
+@@ -1813,6 +1819,7 @@ void wc_Sha256Free(wc_Sha256* sha256)
+         ESP_LOGV(TAG, "Hardware unlock not needed in wc_Sha256Free.");
+     }
+ #endif
++    ForceZero(sha256, sizeof(*sha256));
+ }
+ 
+ #endif /* !defined(WOLFSSL_HAVE_PSA) || defined(WOLFSSL_PSA_NO_HASH) */
+diff --git a/wolfcrypt/src/sha512.c b/wolfcrypt/src/sha512.c
+index 0c2750a9028..83af39c4b00 100644
+--- a/wolfcrypt/src/sha512.c
++++ b/wolfcrypt/src/sha512.c
+@@ -1126,6 +1126,7 @@ void wc_Sha512Free(wc_Sha512* sha512)
+ 
+ #ifdef WOLFSSL_SMALL_STACK_CACHE
+     if (sha512->W != NULL) {
++        ForceZero(sha512->W, sizeof(word64) * 16);
+         XFREE(sha512->W, sha512->heap, DYNAMIC_TYPE_TMP_BUFFER);
+         sha512->W = NULL;
+     }
+@@ -1137,6 +1138,7 @@ void wc_Sha512Free(wc_Sha512* sha512)
+ 
+ #if defined(WOLFSSL_HASH_KEEP)
+     if (sha512->msg != NULL) {
++        ForceZero(sha512->msg, sha512->len);
+         XFREE(sha512->msg, sha512->heap, DYNAMIC_TYPE_TMP_BUFFER);
+         sha512->msg = NULL;
+     }
+@@ -1145,6 +1147,8 @@ void wc_Sha512Free(wc_Sha512* sha512)
+ #if defined(WOLFSSL_ASYNC_CRYPT) && defined(WC_ASYNC_ENABLE_SHA512)
+     wolfAsync_DevCtxFree(&sha512->asyncDev, WOLFSSL_ASYNC_MARKER_SHA512);
+ #endif /* WOLFSSL_ASYNC_CRYPT */
++
++    ForceZero(sha512, sizeof(*sha512));
+ }
+ #if (defined(OPENSSL_EXTRA) || defined(HAVE_CURL)) \
+     && !defined(WOLFSSL_KCAPI_HASH)
+@@ -1197,6 +1201,7 @@ int wc_Sha512Transform(wc_Sha512* sha, const unsigned char* data)
+ 
+     XMEMCPY(sha->buffer, buffer, WC_SHA512_BLOCK_SIZE);
+ #ifdef WOLFSSL_SMALL_STACK
++    ForceZero(buffer, WC_SHA512_BLOCK_SIZE);
+     XFREE(buffer, sha->heap, DYNAMIC_TYPE_TMP_BUFFER);
+ #endif
+     return ret;
+@@ -1446,6 +1451,7 @@ void wc_Sha384Free(wc_Sha384* sha384)
+ 
+ #ifdef WOLFSSL_SMALL_STACK_CACHE
+     if (sha384->W != NULL) {
++        ForceZero(sha384->W, sizeof(word64) * 16);
+         XFREE(sha384->W, sha384->heap, DYNAMIC_TYPE_TMP_BUFFER);
+         sha384->W = NULL;
+     }
+@@ -1457,6 +1463,7 @@ void wc_Sha384Free(wc_Sha384* sha384)
+ 
+ #if defined(WOLFSSL_HASH_KEEP)
+     if (sha384->msg != NULL) {
++        ForceZero(sha384->msg, sha384->len);
+         XFREE(sha384->msg, sha384->heap, DYNAMIC_TYPE_TMP_BUFFER);
+         sha384->msg = NULL;
+     }
+@@ -1476,6 +1483,8 @@ void wc_Sha384Free(wc_Sha384* sha384)
+         sha384->hSession = NULL;
+     }
+ #endif
++
++    ForceZero(sha384, sizeof(*sha384));
+ }
+ 
+ #endif /* WOLFSSL_SHA384 */

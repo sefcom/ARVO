@@ -1,0 +1,363 @@
+From 2a07da897eb13557b83a5439a1018e91c03aa3ab Mon Sep 17 00:00:00 2001
+From: Roman Lebedev <lebedev.ri@gmail.com>
+Date: Mon, 19 May 2025 13:11:26 +0300
+Subject: [PATCH] PanasonicV8Decompressor: sink out tile calculation back into
+ decompressor
+
+---
+ .../decompressors/PanasonicV8Decompressor.cpp | 67 ++++++-------------
+ src/librawspeed/adt/Array1DRefExtras.h        |  1 +
+ src/librawspeed/decoders/Rw2Decoder.cpp       | 43 ++----------
+ .../decompressors/PanasonicV8Decompressor.cpp | 36 ++++++++--
+ .../decompressors/PanasonicV8Decompressor.h   | 43 +++++++++++-
+ src/librawspeed/io/ByteStream.h               | 10 +++
+ 6 files changed, 110 insertions(+), 90 deletions(-)
+
+diff --git a/fuzz/librawspeed/decompressors/PanasonicV8Decompressor.cpp b/fuzz/librawspeed/decompressors/PanasonicV8Decompressor.cpp
+index b49a190ce..a720b240b 100644
+--- a/fuzz/librawspeed/decompressors/PanasonicV8Decompressor.cpp
++++ b/fuzz/librawspeed/decompressors/PanasonicV8Decompressor.cpp
+@@ -22,7 +22,6 @@
+ #include "MemorySanitizer.h"
+ #include "adt/Array1DRef.h"
+ #include "adt/Array1DRefExtras.h"
+-#include "adt/Array2DRef.h"
+ #include "adt/Casts.h"
+ #include "adt/CroppedArray2DRef.h"
+ #include "adt/Invariant.h"
+@@ -75,11 +74,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
+     RawImage mRaw(CreateRawImage(bs));
+ 
+     uint32_t numStrips = bs.getU32();
+-    uint32_t numOutTiles = bs.getU32();
++    uint32_t numStripLineOffsets = bs.getU32();
++    uint32_t numStripWidths = bs.getU32();
++    uint32_t numStripHeights = bs.getU32();
+     uint32_t numHuffmanLUTEntries = bs.getU32();
+ 
+     auto stripSizes = bs.getStream(numStrips, sizeof(uint32_t));
+-    auto outTileSizes = bs.getStream(numOutTiles, 4 * sizeof(int32_t));
++    auto stripLineOffsetsInput =
++        bs.getStream(numStripLineOffsets, sizeof(uint32_t));
++    auto stripWidthsInput = bs.getStream(numStripWidths, sizeof(uint16_t));
++    auto stripHeightsInput = bs.getStream(numStripHeights, sizeof(uint16_t));
+     auto huffmanLUTEntriesInput =
+         bs.getStream(numHuffmanLUTEntries, 2 * sizeof(uint8_t));
+     const auto initialPrediction = bs.getArray<uint16_t, 4>();
+@@ -101,44 +105,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
+       ThrowRDE("Unexpected component count / data type");
+     }
+ 
++    auto stripLineOffsets =
++        stripLineOffsetsInput.getVector<uint32_t>(numStripLineOffsets);
++    stripLineOffsets.reserve(1); // Array1DRef does not like nullptr's.
++    auto stripWidths = stripWidthsInput.getVector<uint16_t>(numStripWidths);
++    stripWidths.reserve(1); // Array1DRef does not like nullptr's.
++    auto stripHeights = stripHeightsInput.getVector<uint16_t>(numStripHeights);
++    stripHeights.reserve(1); // Array1DRef does not like nullptr's.
++
+     mRaw->createData();
+ 
+-    const auto img = mRaw->getU16DataAsUncroppedArray2DRef();
+-
+-    const auto superRect = iRectangle2D{
+-        /*pos=*/iPoint2D{0, 0}, /*dim=*/iPoint2D{img.width(), img.height()}};
+-
+-    std::vector<CroppedArray2DRef<uint16_t>> outTiles;
+-    outTiles.reserve(std::max(1U, numOutTiles));
+-    for (uint32_t stripIdx = 0; stripIdx < numOutTiles; ++stripIdx) {
+-      auto stripXBegin = outTileSizes.get<int32_t>();
+-      auto stripYBegin = outTileSizes.get<int32_t>();
+-      auto stripXEnd = outTileSizes.get<int32_t>();
+-      auto stripYEnd = outTileSizes.get<int32_t>();
+-
+-      const auto topLeft = iPoint2D{stripXBegin, stripYBegin};
+-      const auto bottomRight = iPoint2D{stripXEnd, stripYEnd};
+-      if (!superRect.isPointInside(topLeft) ||
+-          !superRect.isPointInsideInclusive(bottomRight))
+-        ThrowRDE("Inner tile not inside outer tile");
+-
+-      auto rect = iRectangle2D();
+-      rect.setTopLeft(topLeft);
+-      rect.setBottomRightAbsolute(bottomRight);
+-
+-      if (!rect.hasPositiveArea())
+-        ThrowRDE("Empty tile");
+-      invariant(rect.isThisInside(superRect));
+-
+-      const auto out =
+-          CroppedArray2DRef<uint16_t>(mRaw->getU16DataAsUncroppedArray2DRef(),
+-                                      /*offsetCols=*/stripXBegin,
+-                                      /*offsetRows=*/stripYBegin,
+-                                      /*croppedWidth=*/stripXEnd,
+-                                      /*croppedHeight=*/stripYEnd);
+-      outTiles.emplace_back(out);
+-    }
+-    invariant(outTileSizes.getRemainSize() == 0);
++    PanasonicV8Decompressor::DecompressorParamsBuilder builder(
++        mRaw->getU16DataAsUncroppedArray2DRef(), initialPrediction,
++        getAsArray1DRef(strips), getAsArray1DRef(stripLineOffsets),
++        getAsArray1DRef(stripWidths), getAsArray1DRef(stripHeights));
+ 
+     std::vector<PanasonicV8Decompressor::HuffmanLUTEntry> huffmanLUT;
+     huffmanLUT.reserve(std::max(1U, numHuffmanLUTEntries));
+@@ -151,13 +131,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
+     }
+     invariant(huffmanLUTEntriesInput.getRemainSize() == 0);
+ 
+-    PanasonicV8Decompressor::DecompressorParams params{
+-        .mStrips = getAsArray1DRef(strips),
+-        .mOutTiles = getAsArray1DRef(outTiles),
+-        .initialPrediction = initialPrediction,
+-    };
+-
+-    PanasonicV8Decompressor v8(mRaw, params, getAsArray1DRef(huffmanLUT));
++    PanasonicV8Decompressor v8(mRaw, builder.getDecompressorParams(),
++                               getAsArray1DRef(huffmanLUT));
+     v8.decompress();
+     MSan::CheckMemIsInitialized(mRaw->getByteDataAsUncroppedArray2DRef());
+   } catch (const RawspeedException&) { // NOLINT(bugprone-empty-catch)
+diff --git a/src/librawspeed/adt/Array1DRefExtras.h b/src/librawspeed/adt/Array1DRefExtras.h
+index fba7bda31..cad2dfea8 100644
+--- a/src/librawspeed/adt/Array1DRefExtras.h
++++ b/src/librawspeed/adt/Array1DRefExtras.h
+@@ -21,6 +21,7 @@
+ #pragma once
+ 
+ #include "adt/Array1DRef.h"
++#include "adt/Casts.h"
+ #include <vector>
+ 
+ namespace rawspeed {
+diff --git a/src/librawspeed/decoders/Rw2Decoder.cpp b/src/librawspeed/decoders/Rw2Decoder.cpp
+index 5aa942680..80ce641e0 100644
+--- a/src/librawspeed/decoders/Rw2Decoder.cpp
++++ b/src/librawspeed/decoders/Rw2Decoder.cpp
+@@ -23,7 +23,6 @@
+ #include "adt/Array1DRef.h"
+ #include "adt/Array1DRefExtras.h"
+ #include "adt/Array2DRef.h"
+-#include "adt/CroppedArray2DRef.h"
+ #include "adt/Point.h"
+ #include "bitstreams/BitStreams.h"
+ #include "common/BayerPhase.h"
+@@ -278,32 +277,6 @@ getInputStrips(const DecompressorV8Params& mParams, Buffer mInputFile) {
+   return mStrips;
+ }
+ 
+-std::vector<CroppedArray2DRef<uint16_t>>
+-getOutputTiles(const DecompressorV8Params& mParams,
+-               const Array2DRef<uint16_t> img) {
+-  std::vector<CroppedArray2DRef<uint16_t>> mOutTiles;
+-
+-  const int totalStrips =
+-      mParams.horizontalStripCount * mParams.verticalStripCount;
+-
+-  for (int stripIdx = 0; stripIdx < totalStrips; ++stripIdx) {
+-    const uint32_t stripWidth = mParams.stripWidths[stripIdx];
+-    const uint32_t stripHeight = mParams.stripHeights[stripIdx];
+-    const uint32_t stripOutputX = mParams.stripLineOffsets[stripIdx] & 0xFFFF;
+-    const uint32_t stripOutputY = mParams.stripLineOffsets[stripIdx] >> 16;
+-
+-    const auto out =
+-        CroppedArray2DRef<uint16_t>(img, /*offsetCols=*/stripOutputX,
+-                                    /*offsetRows=*/stripOutputY,
+-                                    /*croppedWidth=*/stripWidth,
+-                                    /*croppedHeight=*/stripHeight);
+-
+-    mOutTiles.emplace_back(out);
+-  }
+-
+-  return mOutTiles;
+-}
+-
+ } // namespace
+ 
+ RawImage Rw2Decoder::decodeRawV8(const TiffIFD& raw) const {
+@@ -320,16 +293,14 @@ RawImage Rw2Decoder::decodeRawV8(const TiffIFD& raw) const {
+ 
+   mRaw->createData();
+ 
+-  const auto mOutTiles =
+-      getOutputTiles(mParams, mRaw->getU16DataAsUncroppedArray2DRef());
+-
+-  PanasonicV8Decompressor::DecompressorParams mParams2{
+-      .mStrips = getAsArray1DRef(mStrips),
+-      .mOutTiles = getAsArray1DRef(mOutTiles),
+-      .initialPrediction = mParams.initialPrediction,
+-  };
++  PanasonicV8Decompressor::DecompressorParamsBuilder b(
++      mRaw->getU16DataAsUncroppedArray2DRef(), mParams.initialPrediction,
++      getAsArray1DRef(mStrips), getAsArray1DRef(mParams.stripLineOffsets),
++      getAsArray1DRef(mParams.stripWidths),
++      getAsArray1DRef(mParams.stripHeights));
+ 
+-  PanasonicV8Decompressor v8(mRaw, mParams2, getAsArray1DRef(mHuffmanLUT));
++  PanasonicV8Decompressor v8(mRaw, b.getDecompressorParams(),
++                             getAsArray1DRef(mHuffmanLUT));
+   v8.decompress();
+   return mRaw;
+ }
+diff --git a/src/librawspeed/decompressors/PanasonicV8Decompressor.cpp b/src/librawspeed/decompressors/PanasonicV8Decompressor.cpp
+index 4b9b350cf..3cc0bc23d 100644
+--- a/src/librawspeed/decompressors/PanasonicV8Decompressor.cpp
++++ b/src/librawspeed/decompressors/PanasonicV8Decompressor.cpp
+@@ -23,6 +23,7 @@
+ #include "rawspeedconfig.h"
+ #include "decompressors/PanasonicV8Decompressor.h"
+ #include "adt/Array1DRef.h"
++#include "adt/Array1DRefExtras.h"
+ #include "adt/Array2DRef.h"
+ #include "adt/CroppedArray2DRef.h"
+ #include "adt/Invariant.h"
+@@ -44,6 +45,7 @@
+ #include <cstdint>
+ #include <limits>
+ #include <utility>
++#include <vector>
+ 
+ namespace rawspeed {
+ 
+@@ -198,13 +200,34 @@ void isValidImageGrid(Array2DRef<uint16_t> img,
+ 
+ } // namespace
+ 
+-void PanasonicV8Decompressor::DecompressorParams::validate(
+-    Array2DRef<uint16_t> img) const {
+-  if (mOutTiles.size() != mStrips.size())
+-    ThrowRDE("Strip byte buffer array does not have enough entries for the "
+-             "number of strips!");
++std::vector<CroppedArray2DRef<uint16_t>>
++PanasonicV8Decompressor::DecompressorParamsBuilder::getOutTiles(
++    Array2DRef<uint16_t> img, Array1DRef<const uint32_t> stripLineOffsets,
++    Array1DRef<const uint16_t> stripWidths,
++    Array1DRef<const uint16_t> stripHeights) {
++  const int totalStrips = stripLineOffsets.size();
++  invariant(stripWidths.size() == totalStrips &&
++            stripHeights.size() == totalStrips);
++
++  std::vector<CroppedArray2DRef<uint16_t>> mOutTiles;
++
++  for (int stripIdx = 0; stripIdx < totalStrips; ++stripIdx) {
++    const uint32_t stripWidth = stripWidths(stripIdx);
++    const uint32_t stripHeight = stripHeights(stripIdx);
++    const uint32_t stripOutputX = stripLineOffsets(stripIdx) & 0xFFFF;
++    const uint32_t stripOutputY = stripLineOffsets(stripIdx) >> 16;
++
++    const auto out =
++        CroppedArray2DRef<uint16_t>(img, /*offsetCols=*/stripOutputX,
++                                    /*offsetRows=*/stripOutputY,
++                                    /*croppedWidth=*/stripWidth,
++                                    /*croppedHeight=*/stripHeight);
++
++    mOutTiles.emplace_back(out);
++  }
+ 
+-  isValidImageGrid(img, mOutTiles);
++  isValidImageGrid(img, getAsArray1DRef(mOutTiles));
++  return mOutTiles;
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -219,7 +242,6 @@ PanasonicV8Decompressor::PanasonicV8Decompressor(
+       mRawOutput->getBpp() != sizeof(uint16_t)) {
+     ThrowRDE("Unexpected component count / data type");
+   }
+-  mParams.validate(mRawOutput->getU16DataAsUncroppedArray2DRef());
+ }
+ 
+ void PanasonicV8Decompressor::decompress() const {
+diff --git a/src/librawspeed/decompressors/PanasonicV8Decompressor.h b/src/librawspeed/decompressors/PanasonicV8Decompressor.h
+index f6ccbda5e..7936451c2 100644
+--- a/src/librawspeed/decompressors/PanasonicV8Decompressor.h
++++ b/src/librawspeed/decompressors/PanasonicV8Decompressor.h
+@@ -23,12 +23,14 @@
+ #pragma once
+ 
+ #include "adt/Array1DRef.h"
++#include "adt/Array1DRefExtras.h"
+ #include "adt/Array2DRef.h"
+ #include "adt/CroppedArray2DRef.h"
+ #include "common/RawImage.h"
+ #include "decompressors/AbstractDecompressor.h"
+ #include <array>
+ #include <cstdint>
++#include <vector>
+ 
+ namespace rawspeed {
+ 
+@@ -51,13 +53,52 @@ class PanasonicV8Decompressor final : public AbstractDecompressor {
+ 
+   /// Decompressor parameters populated from tags. They remain constant after
+   /// construction.
++  struct DecompressorParamsBuilder;
++
+   struct DecompressorParams {
+     const Array1DRef<const Array1DRef<const uint8_t>> mStrips;
+     const Array1DRef<const CroppedArray2DRef<uint16_t>> mOutTiles;
+ 
+     const Bayer2x2 initialPrediction;
+ 
+-    void validate(Array2DRef<uint16_t> img) const;
++    DecompressorParams() = delete;
++
++  private:
++    friend struct DecompressorParamsBuilder;
++
++    DecompressorParams(Array1DRef<const Array1DRef<const uint8_t>> mStrips_,
++                       Array1DRef<const CroppedArray2DRef<uint16_t>> mOutTiles_,
++                       Bayer2x2 initialPrediction_)
++        : mStrips(mStrips_), mOutTiles(mOutTiles_),
++          initialPrediction(initialPrediction_) {
++      invariant(mStrips.size() == mOutTiles.size());
++    }
++  };
++
++  struct DecompressorParamsBuilder {
++    const Array1DRef<const Array1DRef<const uint8_t>> mStrips;
++    const Bayer2x2 initialPrediction;
++
++    const std::vector<CroppedArray2DRef<uint16_t>> mOutTiles;
++
++    std::vector<CroppedArray2DRef<uint16_t>> static getOutTiles(
++        Array2DRef<uint16_t> img, Array1DRef<const uint32_t> stripLineOffsets,
++        Array1DRef<const uint16_t> stripWidths,
++        Array1DRef<const uint16_t> stripHeights);
++
++    DecompressorParamsBuilder(
++        Array2DRef<uint16_t> img, Bayer2x2 initialPrediction_,
++        Array1DRef<const Array1DRef<const uint8_t>> mStrips_,
++        Array1DRef<const uint32_t> stripLineOffsets,
++        Array1DRef<const uint16_t> stripWidths,
++        Array1DRef<const uint16_t> stripHeights)
++        : mStrips(mStrips_), initialPrediction(initialPrediction_),
++          mOutTiles(
++              getOutTiles(img, stripLineOffsets, stripWidths, stripHeights)) {}
++
++    [[nodiscard]] DecompressorParams getDecompressorParams() const {
++      return {mStrips, getAsArray1DRef(mOutTiles), initialPrediction};
++    }
+   };
+ 
+   // Pre-cached Huffman decoded values for rapid lookup.
+diff --git a/src/librawspeed/io/ByteStream.h b/src/librawspeed/io/ByteStream.h
+index c57e568a6..5ef018071 100644
+--- a/src/librawspeed/io/ByteStream.h
++++ b/src/librawspeed/io/ByteStream.h
+@@ -170,6 +170,16 @@ class ByteStream final : public DataBuffer {
+     return out;
+   }
+ 
++  template <typename T> std::vector<T> getVector(int nElt) {
++    std::vector<T> out;
++    auto bs = getStream(nElt, sizeof(T));
++    out.reserve(nElt);
++    std::generate_n(std::back_inserter(out), nElt,
++                    [&bs]() { return bs.get<T>(); });
++    invariant(bs.getRemainSize() == 0);
++    return out;
++  }
++
+   [[nodiscard]] uint8_t peekByte(size_type i = 0) const {
+     return peek<uint8_t>(i);
+   }

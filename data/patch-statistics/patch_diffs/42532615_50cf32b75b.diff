@@ -1,0 +1,75 @@
+From e1e5c0e982767d192c3b4d235886898af5c3fd7e Mon Sep 17 00:00:00 2001
+From: Mike Pall <mike>
+Date: Mon, 2 May 2022 22:33:35 +0200
+Subject: [PATCH] Fix recording of __concat metamethod.
+
+Reported by Elias Oelschner. Analyzed by XmiliaH.
+
+(cherry-picked from commit 3ee3c9cfa988339f1bf3068530515e2a6fb179d2)
+
+During the recording of `__concat` methametod, the `rec_mm_arith`
+function overrides stack slots that are not restored for GC64
+mode later after the call. This leads to a segmentation fault
+later on. This patch fixes the issue by accounting for those
+additional slots in the array used for restoring stack values.
+
+Maxim Kokryashkin:
+* added the description and the test for the problem
+
+Part of tarantool/tarantool#9145
+
+Reviewed-by: Sergey Bronnikov <sergeyb@tarantool.org>
+Reviewed-by: Sergey Kaplun <skaplun@tarantool.org>
+Signed-off-by: Igor Munkin <imun@tarantool.org>
+---
+ src/lj_record.c                               |  2 +-
+ .../lj-839-concat-recording.test.lua          | 27 +++++++++++++++++++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+ create mode 100644 test/tarantool-tests/lj-839-concat-recording.test.lua
+
+diff --git a/src/lj_record.c b/src/lj_record.c
+index 919e7169da..8dbc4778f2 100644
+--- a/src/lj_record.c
++++ b/src/lj_record.c
+@@ -1932,7 +1932,7 @@ static TRef rec_tnew(jit_State *J, uint32_t ah)
+ static TRef rec_cat(jit_State *J, BCReg baseslot, BCReg topslot)
+ {
+   TRef *top = &J->base[topslot];
+-  TValue savetv[5];
++  TValue savetv[5+LJ_FR2];
+   BCReg s;
+   RecordIndex ix;
+   lj_assertJ(baseslot < topslot, "bad CAT arg");
+diff --git a/test/tarantool-tests/lj-839-concat-recording.test.lua b/test/tarantool-tests/lj-839-concat-recording.test.lua
+new file mode 100644
+index 0000000000..db82ffc09f
+--- /dev/null
++++ b/test/tarantool-tests/lj-839-concat-recording.test.lua
+@@ -0,0 +1,27 @@
++local tap = require('tap')
++local test = tap.test('lj-839-concat-recording'):skipcond({
++  ['Test requires JIT enabled'] = not jit.status(),
++})
++test:plan(1)
++
++-- Test file to demonstrate LuaJIT overriding stack slots without
++-- restoration during the recording of the concat metamethod.
++-- See also: https://github.com/LuaJIT/LuaJIT/issues/839.
++
++-- Setup value with the `__concat` metamethod.
++local v1 = setmetatable({}, {
++  __concat = function(_, op2) return op2 end,
++});
++
++jit.opt.start('hotloop=1')
++local result
++for _ = 1, 4 do
++  -- `savetv` in `rec_cat` handles only up to 5 slots.
++  result = v1 .. '' .. '' .. '' .. '' .. 'canary'
++end
++
++-- Failure results in a LuaJIT assertion failure.
++-- The issue is GC64-specific, yet it is still being tested for
++-- other builds.
++test:is(result, 'canary', 'correct stack restoration')
++test:done(true)

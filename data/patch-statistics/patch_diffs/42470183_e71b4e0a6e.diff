@@ -1,0 +1,87 @@
+From 38657fad58034ff5557caef10ef679b4ac404dbd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Stig=20Bj=C3=B8rlykke?= <stig@bjorlykke.org>
+Date: Tue, 4 Sep 2018 13:35:31 +0200
+Subject: [PATCH] epan: Restrict detect trailing stray characters in strings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Only detect trailing string characters in FT_STRING, FT_STRINGZ and
+FT_STRINGZPAD, and when ENC_ASCII or ENC_UTF_8 (for now).
+
+Support for checking other encodings can be added later.
+
+Bug: 15105
+Change-Id: Ib7b61f65e4f99f85998937e843ad5312c6b03a28
+Reviewed-on: https://code.wireshark.org/review/29411
+Petri-Dish: Stig Bjørlykke <stig@bjorlykke.org>
+Tested-by: Petri Dish Buildbot
+Reviewed-by: Peter Wu <peter@lekensteyn.nl>
+Reviewed-by: Stig Bjørlykke <stig@bjorlykke.org>
+---
+ epan/proto.c | 34 +++++++++++++++++++++-------------
+ 1 file changed, 21 insertions(+), 13 deletions(-)
+
+diff --git a/epan/proto.c b/epan/proto.c
+index df7247d0606..6188f653bfb 100644
+--- a/epan/proto.c
++++ b/epan/proto.c
+@@ -2259,15 +2259,29 @@ test_length(header_field_info *hfinfo, tvbuff_t *tvb,
+ }
+ 
+ static void
+-detect_trailing_stray_characters(const char *string, gint length, proto_item *pi)
++detect_trailing_stray_characters(enum ftenum type, guint encoding, const char *string, gint length, proto_item *pi)
+ {
+ 	gboolean found_stray_character = FALSE;
+ 
+-	for (gint i = (gint)strlen(string); i < length; i++) {
+-		if (string[i] != '\0') {
+-			found_stray_character = TRUE;
++	if (!string)
++		return;
++
++	if (type != FT_STRING && type != FT_STRINGZ && type != FT_STRINGZPAD)
++		return;
++
++	switch (encoding & ENC_CHARENCODING_MASK) {
++		case ENC_ASCII:
++		case ENC_UTF_8:
++			for (gint i = (gint)strlen(string); i < length; i++) {
++				if (string[i] != '\0') {
++					found_stray_character = TRUE;
++					break;
++				}
++			}
++			break;
++
++		default:
+ 			break;
+-		}
+ 	}
+ 
+ 	if (found_stray_character) {
+@@ -2724,10 +2738,7 @@ proto_tree_new_item(field_info *new_fi, proto_tree *tree,
+ 	 *      to know which item caused exception? */
+ 	pi = proto_tree_add_node(tree, new_fi);
+ 
+-	if (stringval) {
+-		/* Detect trailing stray characters */
+-		detect_trailing_stray_characters(stringval, length, pi);
+-	}
++	detect_trailing_stray_characters(new_fi->hfinfo->type, encoding, stringval, length, pi);
+ 
+ 	return pi;
+ }
+@@ -3301,10 +3312,7 @@ proto_tree_add_item_ret_string_and_length(proto_tree *tree, int hfindex,
+ 
+ 	pi = proto_tree_add_node(tree, new_fi);
+ 
+-	if (value) {
+-		/* Detect trailing stray characters */
+-		detect_trailing_stray_characters(value, length, pi);
+-	}
++	detect_trailing_stray_characters(hfinfo->type, encoding, value, length, pi);
+ 
+ 	return pi;
+ }

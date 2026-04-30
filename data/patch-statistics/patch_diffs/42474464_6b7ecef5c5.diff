@@ -1,0 +1,668 @@
+diff --git a/src/gpu/ccpr/GrCCConicShader.cpp b/src/gpu/ccpr/GrCCConicShader.cpp
+index 8b136e9..3d5a6c0 100644
+--- a/src/gpu/ccpr/GrCCConicShader.cpp
++++ b/src/gpu/ccpr/GrCCConicShader.cpp
+@@ -10,8 +10,8 @@
+ #include "glsl/GrGLSLFragmentShaderBuilder.h"
+ #include "glsl/GrGLSLVertexGeoBuilder.h"
+ 
+-void GrCCConicShader::emitSetupCode(GrGLSLVertexGeoBuilder* s, const char* pts, const char* wind,
+-                                    const char** outHull4) const {
++void GrCCConicShader::emitSetupCode(
++        GrGLSLVertexGeoBuilder* s, const char* pts, const char** outHull4) const {
+     // K is distance from the line P2 -> P0. L is distance from the line P0 -> P1, scaled by 2w.
+     // M is distance from the line P1 -> P2, scaled by 2w. We do this in a space where P1=0.
+     s->declareGlobal(fKLMMatrix);
+@@ -25,10 +25,11 @@
+     s->declareGlobal(fControlPoint);
+     s->codeAppendf("%s = %s[1];", fControlPoint.c_str(), pts);
+ 
+-    // Scale KLM by the inverse Manhattan width of K. This allows K to double as the flat opposite
+-    // edge AA. kwidth will not be 0 because we cull degenerate conics on the CPU.
+-    s->codeAppendf("float kwidth = 2*bloat * %s * (abs(%s[0].x) + abs(%s[0].y));",
+-                   wind, fKLMMatrix.c_str(), fKLMMatrix.c_str());
++    // Scale KLM by the inverse Manhattan width of K, and make sure K is positive. This allows K to
++    // double as the flat opposite edge AA. kwidth will not be 0 because we cull degenerate conics
++    // on the CPU.
++    s->codeAppendf("float kwidth = 2*bloat * (abs(%s[0].x) + abs(%s[0].y)) * sign(%s[0].z);",
++                   fKLMMatrix.c_str(), fKLMMatrix.c_str(), fKLMMatrix.c_str());
+     s->codeAppendf("%s *= 1/kwidth;", fKLMMatrix.c_str());
+ 
+     if (outHull4) {
+@@ -46,16 +47,15 @@
+     }
+ }
+ 
+-void GrCCConicShader::onEmitVaryings(GrGLSLVaryingHandler* varyingHandler,
+-                                     GrGLSLVarying::Scope scope, SkString* code,
+-                                     const char* position, const char* coverage,
+-                                     const char* cornerCoverage) {
+-    fKLM_fWind.reset(kFloat4_GrSLType, scope);
+-    varyingHandler->addVarying("klm_and_wind", &fKLM_fWind);
++void GrCCConicShader::onEmitVaryings(
++        GrGLSLVaryingHandler* varyingHandler, GrGLSLVarying::Scope scope, SkString* code,
++        const char* position, const char* coverage, const char* cornerCoverage, const char* wind) {
+     code->appendf("float3 klm = float3(%s - %s, 1) * %s;",
+                   position, fControlPoint.c_str(), fKLMMatrix.c_str());
++    fKLM_fWind.reset(kFloat4_GrSLType, scope);
++    varyingHandler->addVarying("klm_and_wind", &fKLM_fWind);
+     code->appendf("%s.xyz = klm;", OutName(fKLM_fWind));
+-    code->appendf("%s.w = %s;", OutName(fKLM_fWind), coverage); // coverage == wind.
++    code->appendf("%s.w = %s;", OutName(fKLM_fWind), wind);
+ 
+     fGrad_fCorner.reset(cornerCoverage ? kFloat4_GrSLType : kFloat2_GrSLType, scope);
+     varyingHandler->addVarying(cornerCoverage ? "grad_and_corner" : "grad", &fGrad_fCorner);
+@@ -63,6 +63,7 @@
+                   OutName(fGrad_fCorner), fKLMMatrix.c_str());
+ 
+     if (cornerCoverage) {
++        SkASSERT(coverage);
+         code->appendf("half hull_coverage;");
+         this->calcHullCoverage(code, "klm", OutName(fGrad_fCorner), "hull_coverage");
+         code->appendf("%s.zw = half2(hull_coverage, 1) * %s;",
+@@ -74,10 +75,10 @@
+                                          const char* outputCoverage) const {
+     this->calcHullCoverage(&AccessCodeString(f), fKLM_fWind.fsIn(), fGrad_fCorner.fsIn(),
+                            outputCoverage);
+-    f->codeAppendf("%s *= half(%s.w);", outputCoverage, fKLM_fWind.fsIn()); // Wind.
++    f->codeAppendf("%s *= half(%s.w);", outputCoverage, fKLM_fWind.fsIn());  // Wind.
+ 
+     if (kFloat4_GrSLType == fGrad_fCorner.type()) {
+-        f->codeAppendf("%s = fma(half(%s.z), half(%s.w), %s);", // Attenuated corner coverage.
++        f->codeAppendf("%s = fma(half(%s.z), half(%s.w), %s);",  // Attenuated corner coverage.
+                        outputCoverage, fGrad_fCorner.fsIn(), fGrad_fCorner.fsIn(),
+                        outputCoverage);
+     }
+diff --git a/src/gpu/ccpr/GrCCConicShader.h b/src/gpu/ccpr/GrCCConicShader.h
+index 16b70e7..2ae3ac5 100644
+--- a/src/gpu/ccpr/GrCCConicShader.h
++++ b/src/gpu/ccpr/GrCCConicShader.h
+@@ -22,12 +22,14 @@
+  */
+ class GrCCConicShader : public GrCCCoverageProcessor::Shader {
+ public:
+-    void emitSetupCode(GrGLSLVertexGeoBuilder*, const char* pts, const char* wind,
+-                       const char** outHull4) const override;
++    bool calculatesOwnEdgeCoverage() const override { return true; }
+ 
+-    void onEmitVaryings(GrGLSLVaryingHandler*, GrGLSLVarying::Scope, SkString* code,
+-                        const char* position, const char* coverage,
+-                        const char* cornerCoverage) override;
++    void emitSetupCode(
++            GrGLSLVertexGeoBuilder*, const char* pts, const char** outHull4) const override;
++
++    void onEmitVaryings(
++            GrGLSLVaryingHandler*, GrGLSLVarying::Scope, SkString* code, const char* position,
++            const char* coverage, const char* cornerCoverage, const char* wind) override;
+ 
+     void onEmitFragmentCode(GrGLSLFPFragmentBuilder*, const char* outputCoverage) const override;
+ 
+diff --git a/src/gpu/ccpr/GrCCCoverageProcessor.cpp b/src/gpu/ccpr/GrCCCoverageProcessor.cpp
+index 0be4c08..06d2003 100644
+--- a/src/gpu/ccpr/GrCCCoverageProcessor.cpp
++++ b/src/gpu/ccpr/GrCCCoverageProcessor.cpp
+@@ -18,9 +18,10 @@
+ #include "glsl/GrGLSLVertexGeoBuilder.h"
+ 
+ class GrCCCoverageProcessor::TriangleShader : public GrCCCoverageProcessor::Shader {
+-    void onEmitVaryings(GrGLSLVaryingHandler* varyingHandler, GrGLSLVarying::Scope scope,
+-                        SkString* code, const char* position, const char* coverage,
+-                        const char* cornerCoverage) override {
++    void onEmitVaryings(
++            GrGLSLVaryingHandler* varyingHandler, GrGLSLVarying::Scope scope, SkString* code,
++            const char* position, const char* coverage, const char* cornerCoverage,
++            const char* /*wind*/) override {
+         if (!cornerCoverage) {
+             fCoverages.reset(kHalf_GrSLType, scope);
+             varyingHandler->addVarying("coverage", &fCoverages);
+@@ -75,19 +76,6 @@
+     }
+ }
+ 
+-void GrCCCoverageProcessor::Shader::EmitEdgeDistanceEquation(GrGLSLVertexGeoBuilder* s,
+-                                                             const char* leftPt,
+-                                                             const char* rightPt,
+-                                                             const char* outputDistanceEquation) {
+-    s->codeAppendf("float2 n = float2(%s.y - %s.y, %s.x - %s.x);",
+-                   rightPt, leftPt, leftPt, rightPt);
+-    s->codeAppend ("float nwidth = (abs(n.x) + abs(n.y)) * (bloat * 2);");
+-    // When nwidth=0, wind must also be 0 (and coverage * wind = 0). So it doesn't matter what we
+-    // come up with here as long as it isn't NaN or Inf.
+-    s->codeAppend ("n /= (0 != nwidth) ? nwidth : 1;");
+-    s->codeAppendf("%s = float3(-n, dot(n, %s) - .5);", outputDistanceEquation, leftPt);
+-}
+-
+ void GrCCCoverageProcessor::Shader::CalcEdgeCoverageAtBloatVertex(GrGLSLVertexGeoBuilder* s,
+                                                                   const char* leftPt,
+                                                                   const char* rightPt,
+diff --git a/src/gpu/ccpr/GrCCCoverageProcessor.h b/src/gpu/ccpr/GrCCCoverageProcessor.h
+index 9687bba..a7068a4 100644
+--- a/src/gpu/ccpr/GrCCCoverageProcessor.h
++++ b/src/gpu/ccpr/GrCCCoverageProcessor.h
+@@ -123,22 +123,28 @@
+     // provides details about shape-specific geometry.
+     class Shader {
+     public:
++        // Returns true if the Impl should not calculate the coverage argument for emitVaryings().
++        // If true, then "coverage" will have a signed magnitude of 1.
++        virtual bool calculatesOwnEdgeCoverage() const { return false; }
++
+         // Called before generating geometry. Subclasses may set up internal member variables during
+         // this time that will be needed during onEmitVaryings (e.g. transformation matrices).
+         //
+         // If the 'outHull4' parameter is provided, and there are not 4 input points, the subclass
+         // is required to fill it with the name of a 4-point hull around which the Impl can generate
+         // its geometry. If it is left unchanged, the Impl will use the regular input points.
+-        virtual void emitSetupCode(GrGLSLVertexGeoBuilder*, const char* pts, const char* wind,
+-                                   const char** outHull4 = nullptr) const {
++        virtual void emitSetupCode(
++                GrGLSLVertexGeoBuilder*, const char* pts, const char** outHull4 = nullptr) const {
+             SkASSERT(!outHull4);
+         }
+ 
+-        void emitVaryings(GrGLSLVaryingHandler* varyingHandler, GrGLSLVarying::Scope scope,
+-                          SkString* code, const char* position, const char* coverage,
+-                          const char* cornerCoverage) {
++        void emitVaryings(
++                GrGLSLVaryingHandler* varyingHandler, GrGLSLVarying::Scope scope, SkString* code,
++                const char* position, const char* coverage, const char* cornerCoverage,
++                const char* wind) {
+             SkASSERT(GrGLSLVarying::Scope::kVertToGeo != scope);
+-            this->onEmitVaryings(varyingHandler, scope, code, position, coverage, cornerCoverage);
++            this->onEmitVaryings(
++                    varyingHandler, scope, code, position, coverage, cornerCoverage, wind);
+         }
+ 
+         void emitFragmentCode(const GrCCCoverageProcessor&, GrGLSLFPFragmentBuilder*,
+@@ -149,13 +155,6 @@
+         static void CalcWind(const GrCCCoverageProcessor&, GrGLSLVertexGeoBuilder*, const char* pts,
+                              const char* outputWind);
+ 
+-        // Defines an equation ("dot(float3(pt, 1), distance_equation)") that is -1 on the outside
+-        // border of a conservative raster edge and 0 on the inside. 'leftPt' and 'rightPt' must be
+-        // ordered clockwise.
+-        static void EmitEdgeDistanceEquation(GrGLSLVertexGeoBuilder*, const char* leftPt,
+-                                             const char* rightPt,
+-                                             const char* outputDistanceEquation);
+-
+         // Calculates an edge's coverage at a conservative raster vertex. The edge is defined by two
+         // clockwise-ordered points, 'leftPt' and 'rightPt'. 'rasterVertexDir' is a pair of +/-1
+         // values that point in the direction of conservative raster bloat, starting from an
+@@ -188,9 +187,9 @@
+         //
+         // NOTE: the coverage values are signed appropriately for wind.
+         //       'coverage' will only be +1 or -1 on curves.
+-        virtual void onEmitVaryings(GrGLSLVaryingHandler*, GrGLSLVarying::Scope, SkString* code,
+-                                    const char* position, const char* coverage,
+-                                    const char* cornerCoverage) = 0;
++        virtual void onEmitVaryings(
++                GrGLSLVaryingHandler*, GrGLSLVarying::Scope, SkString* code, const char* position,
++                const char* coverage, const char* cornerCoverage, const char* wind) = 0;
+ 
+         // Emits the fragment code that calculates a pixel's signed coverage value.
+         virtual void onEmitFragmentCode(GrGLSLFPFragmentBuilder*,
+diff --git a/src/gpu/ccpr/GrCCCubicShader.cpp b/src/gpu/ccpr/GrCCCubicShader.cpp
+index 7336bb0..7480b3e 100644
+--- a/src/gpu/ccpr/GrCCCubicShader.cpp
++++ b/src/gpu/ccpr/GrCCCubicShader.cpp
+@@ -13,8 +13,8 @@
+ 
+ using Shader = GrCCCoverageProcessor::Shader;
+ 
+-void GrCCCubicShader::emitSetupCode(GrGLSLVertexGeoBuilder* s, const char* pts,
+-                                    const char* wind, const char** /*outHull4*/) const {
++void GrCCCubicShader::emitSetupCode(
++        GrGLSLVertexGeoBuilder* s, const char* pts, const char** /*outHull4*/) const {
+     // Find the cubic's power basis coefficients.
+     s->codeAppendf("float2x4 C = float4x4(-1,  3, -3,  1, "
+                                          " 3, -6,  3,  0, "
+@@ -79,28 +79,19 @@
+     s->codeAppendf("%s *= float3x3(orientation[0] * orientation[1], 0, 0, "
+                                   "0, orientation[0], 0, "
+                                   "0, 0, orientation[1]);", fKLMMatrix.c_str());
+-
+-    // Determine the amount of additional coverage to subtract out for the flat edge (P3 -> P0).
+-    s->declareGlobal(fEdgeDistanceEquation);
+-    s->codeAppendf("int edgeidx0 = %s > 0 ? 3 : 0;", wind);
+-    s->codeAppendf("float2 edgept0 = %s[edgeidx0];", pts);
+-    s->codeAppendf("float2 edgept1 = %s[3 - edgeidx0];", pts);
+-    Shader::EmitEdgeDistanceEquation(s, "edgept0", "edgept1", fEdgeDistanceEquation.c_str());
+ }
+ 
+-void GrCCCubicShader::onEmitVaryings(GrGLSLVaryingHandler* varyingHandler,
+-                                     GrGLSLVarying::Scope scope, SkString* code,
+-                                     const char* position, const char* coverage,
+-                                     const char* cornerCoverage) {
++void GrCCCubicShader::onEmitVaryings(
++        GrGLSLVaryingHandler* varyingHandler, GrGLSLVarying::Scope scope, SkString* code,
++        const char* position, const char* coverage, const char* cornerCoverage, const char* wind) {
++    code->appendf("float3 klm = float3(%s, 1) * %s;", position, fKLMMatrix.c_str());
+     fKLM_fEdge.reset(kFloat4_GrSLType, scope);
+     varyingHandler->addVarying("klm_and_edge", &fKLM_fEdge);
+-    code->appendf("float3 klm = float3(%s, 1) * %s;", position, fKLMMatrix.c_str());
+-    // We give L & M both the same sign as wind, in order to pass this value to the fragment shader.
+-    // (Cubics are pre-chopped such that L & M do not change sign within any individual segment.)
+-    code->appendf("%s.xyz = klm * float3(1, %s, %s);",
+-                  OutName(fKLM_fEdge), coverage, coverage); // coverage == wind on curves.
+-    code->appendf("%s.w = dot(float3(%s, 1), %s);", // Flat edge opposite the curve.
+-                  OutName(fKLM_fEdge), position, fEdgeDistanceEquation.c_str());
++    // Give L&M both the same sign as wind, in order to pass this value to the fragment shader.
++    // (Cubics are pre-chopped such that L&M do not change sign within any individual segment.)
++    code->appendf("%s.xyz = klm * float3(1, %s, %s);", OutName(fKLM_fEdge), wind, wind);
++    // Flat edge opposite the curve.
++    code->appendf("%s.w = %s;", OutName(fKLM_fEdge), coverage);
+ 
+     fGradMatrix.reset(kFloat4_GrSLType, scope);
+     varyingHandler->addVarying("grad_matrix", &fGradMatrix);
+@@ -110,6 +101,7 @@
+                     OutName(fGradMatrix), fKLMMatrix.c_str(), fKLMMatrix.c_str());
+ 
+     if (cornerCoverage) {
++        SkASSERT(coverage);
+         code->appendf("half hull_coverage; {");
+         this->calcHullCoverage(code, OutName(fKLM_fEdge), OutName(fGradMatrix), "hull_coverage");
+         code->appendf("}");
+@@ -120,10 +112,10 @@
+     }
+ }
+ 
+-void GrCCCubicShader::onEmitFragmentCode(GrGLSLFPFragmentBuilder* f,
+-                                         const char* outputCoverage) const {
+-    this->calcHullCoverage(&AccessCodeString(f), fKLM_fEdge.fsIn(), fGradMatrix.fsIn(),
+-                           outputCoverage);
++void GrCCCubicShader::onEmitFragmentCode(
++        GrGLSLFPFragmentBuilder* f, const char* outputCoverage) const {
++    this->calcHullCoverage(
++            &AccessCodeString(f), fKLM_fEdge.fsIn(), fGradMatrix.fsIn(), outputCoverage);
+ 
+     // Wind is the sign of both L and/or M. Take the sign of whichever has the larger magnitude.
+     // (In reality, either would be fine because we chop cubics with more than a half pixel of
+diff --git a/src/gpu/ccpr/GrCCCubicShader.h b/src/gpu/ccpr/GrCCCubicShader.h
+index d6c5e26..01c60cb 100644
+--- a/src/gpu/ccpr/GrCCCubicShader.h
++++ b/src/gpu/ccpr/GrCCCubicShader.h
+@@ -23,12 +23,12 @@
+  */
+ class GrCCCubicShader : public GrCCCoverageProcessor::Shader {
+ public:
+-    void emitSetupCode(GrGLSLVertexGeoBuilder*, const char* pts, const char* wind,
+-                       const char** outHull4) const override;
++    void emitSetupCode(
++            GrGLSLVertexGeoBuilder*, const char* pts, const char** outHull4) const override;
+ 
+-    void onEmitVaryings(GrGLSLVaryingHandler*, GrGLSLVarying::Scope, SkString* code,
+-                        const char* position, const char* coverage,
+-                        const char* cornerCoverage) override;
++    void onEmitVaryings(
++            GrGLSLVaryingHandler*, GrGLSLVarying::Scope, SkString* code, const char* position,
++            const char* coverage, const char* cornerCoverage, const char* wind) override;
+ 
+     void onEmitFragmentCode(GrGLSLFPFragmentBuilder*, const char* outputCoverage) const override;
+ 
+@@ -37,7 +37,6 @@
+                           const char* outputCoverage) const;
+ 
+     const GrShaderVar fKLMMatrix{"klm_matrix", kFloat3x3_GrSLType};
+-    const GrShaderVar fEdgeDistanceEquation{"edge_distance_equation", kFloat3_GrSLType};
+     GrGLSLVarying fKLM_fEdge;
+     GrGLSLVarying fGradMatrix;
+     GrGLSLVarying fCornerCoverage;
+diff --git a/src/gpu/ccpr/GrCCQuadraticShader.cpp b/src/gpu/ccpr/GrCCQuadraticShader.cpp
+index 4f248cb..cf9f9ec 100644
+--- a/src/gpu/ccpr/GrCCQuadraticShader.cpp
++++ b/src/gpu/ccpr/GrCCQuadraticShader.cpp
+@@ -10,8 +10,8 @@
+ #include "glsl/GrGLSLFragmentShaderBuilder.h"
+ #include "glsl/GrGLSLVertexGeoBuilder.h"
+ 
+-void GrCCQuadraticShader::emitSetupCode(GrGLSLVertexGeoBuilder* s, const char* pts,
+-                                        const char* wind, const char** outHull4) const {
++void GrCCQuadraticShader::emitSetupCode(
++        GrGLSLVertexGeoBuilder* s, const char* pts, const char** outHull4) const {
+     s->declareGlobal(fQCoordMatrix);
+     s->codeAppendf("%s = float2x2(1, 1, .5, 0) * inverse(float2x2(%s[2] - %s[0], %s[1] - %s[0]));",
+                    fQCoordMatrix.c_str(), pts, pts, pts, pts);
+@@ -19,11 +19,6 @@
+     s->declareGlobal(fQCoord0);
+     s->codeAppendf("%s = %s[0];", fQCoord0.c_str(), pts);
+ 
+-    s->declareGlobal(fEdgeDistanceEquation);
+-    s->codeAppendf("float2 edgept0 = %s[%s > 0 ? 2 : 0];", pts, wind);
+-    s->codeAppendf("float2 edgept1 = %s[%s > 0 ? 0 : 2];", pts, wind);
+-    Shader::EmitEdgeDistanceEquation(s, "edgept0", "edgept1", fEdgeDistanceEquation.c_str());
+-
+     if (outHull4) {
+         // Clip the bezier triangle by the tangent line at maximum height. Quadratics have the nice
+         // property that maximum height always occurs at T=.5. This is a simple application for
+@@ -37,42 +32,40 @@
+     }
+ }
+ 
+-void GrCCQuadraticShader::onEmitVaryings(GrGLSLVaryingHandler* varyingHandler,
+-                                         GrGLSLVarying::Scope scope, SkString* code,
+-                                         const char* position, const char* coverage,
+-                                         const char* cornerCoverage) {
++void GrCCQuadraticShader::onEmitVaryings(
++        GrGLSLVaryingHandler* varyingHandler, GrGLSLVarying::Scope scope, SkString* code,
++        const char* position, const char* coverage, const char* cornerCoverage, const char* wind) {
+     fCoord_fGrad.reset(kFloat4_GrSLType, scope);
+     varyingHandler->addVarying("coord_and_grad", &fCoord_fGrad);
+-    code->appendf("%s.xy = %s * (%s - %s);", // Quadratic coords.
++    code->appendf("%s.xy = %s * (%s - %s);",  // Quadratic coords.
+                   OutName(fCoord_fGrad), fQCoordMatrix.c_str(), position, fQCoord0.c_str());
+-    code->appendf("%s.zw = 2*bloat * float2(2 * %s.x, -1) * %s;", // Gradient.
++    code->appendf("%s.zw = 2*bloat * float2(2 * %s.x, -1) * %s;",  // Gradient.
+                   OutName(fCoord_fGrad), OutName(fCoord_fGrad), fQCoordMatrix.c_str());
+ 
+     // Coverages need full precision since distance to the opposite edge can be large.
+     fEdge_fWind_fCorner.reset(cornerCoverage ? kFloat4_GrSLType : kFloat2_GrSLType, scope);
+     varyingHandler->addVarying("edge_and_wind_and_corner", &fEdge_fWind_fCorner);
+-    code->appendf("float edge = dot(%s, float3(%s, 1));", // Distance to flat opposite edge.
+-                  fEdgeDistanceEquation.c_str(), position);
+-    code->appendf("%s.x = edge;", OutName(fEdge_fWind_fCorner));
+-    code->appendf("%s.y = %s;", OutName(fEdge_fWind_fCorner), coverage); // coverage == wind.
++    code->appendf("%s.x = %s;", OutName(fEdge_fWind_fCorner), coverage);
++    code->appendf("%s.y = %s;", OutName(fEdge_fWind_fCorner), wind);
+ 
+     if (cornerCoverage) {
++        SkASSERT(coverage);
+         code->appendf("half hull_coverage;");
+-        this->calcHullCoverage(code, OutName(fCoord_fGrad), "edge", "hull_coverage");
++        this->calcHullCoverage(code, OutName(fCoord_fGrad), coverage, "hull_coverage");
+         code->appendf("%s.zw = half2(hull_coverage, 1) * %s;",
+                       OutName(fEdge_fWind_fCorner), cornerCoverage);
+     }
+ }
+ 
+-void GrCCQuadraticShader::onEmitFragmentCode(GrGLSLFPFragmentBuilder* f,
+-                                             const char* outputCoverage) const {
++void GrCCQuadraticShader::onEmitFragmentCode(
++        GrGLSLFPFragmentBuilder* f, const char* outputCoverage) const {
+     this->calcHullCoverage(&AccessCodeString(f), fCoord_fGrad.fsIn(),
+                            SkStringPrintf("%s.x", fEdge_fWind_fCorner.fsIn()).c_str(),
+                            outputCoverage);
+-    f->codeAppendf("%s *= half(%s.y);", outputCoverage, fEdge_fWind_fCorner.fsIn()); // Wind.
++    f->codeAppendf("%s *= half(%s.y);", outputCoverage, fEdge_fWind_fCorner.fsIn());  // Wind.
+ 
+     if (kFloat4_GrSLType == fEdge_fWind_fCorner.type()) {
+-        f->codeAppendf("%s = half(%s.z * %s.w) + %s;",// Attenuated corner coverage.
++        f->codeAppendf("%s = half(%s.z * %s.w) + %s;",  // Attenuated corner coverage.
+                        outputCoverage, fEdge_fWind_fCorner.fsIn(), fEdge_fWind_fCorner.fsIn(),
+                        outputCoverage);
+     }
+diff --git a/src/gpu/ccpr/GrCCQuadraticShader.h b/src/gpu/ccpr/GrCCQuadraticShader.h
+index bf29b64..bfe2cb0 100644
+--- a/src/gpu/ccpr/GrCCQuadraticShader.h
++++ b/src/gpu/ccpr/GrCCQuadraticShader.h
+@@ -22,12 +22,12 @@
+  */
+ class GrCCQuadraticShader : public GrCCCoverageProcessor::Shader {
+ public:
+-    void emitSetupCode(GrGLSLVertexGeoBuilder*, const char* pts, const char* wind,
+-                       const char** outHull4) const override;
++    void emitSetupCode(
++            GrGLSLVertexGeoBuilder*, const char* pts, const char** outHull4) const override;
+ 
+-    void onEmitVaryings(GrGLSLVaryingHandler*, GrGLSLVarying::Scope, SkString* code,
+-                        const char* position, const char* coverage,
+-                        const char* cornerCoverage) override;
++    void onEmitVaryings(
++            GrGLSLVaryingHandler*, GrGLSLVarying::Scope, SkString* code, const char* position,
++            const char* coverage, const char* cornerCoverage, const char* wind) override;
+ 
+     void onEmitFragmentCode(GrGLSLFPFragmentBuilder*, const char* outputCoverage) const override;
+ 
+@@ -37,7 +37,6 @@
+ 
+     const GrShaderVar fQCoordMatrix{"qcoord_matrix", kFloat2x2_GrSLType};
+     const GrShaderVar fQCoord0{"qcoord0", kFloat2_GrSLType};
+-    const GrShaderVar fEdgeDistanceEquation{"edge_distance_equation", kFloat3_GrSLType};
+     GrGLSLVarying fCoord_fGrad;
+     GrGLSLVarying fEdge_fWind_fCorner;
+ };
+diff --git a/src/gpu/ccpr/GrGSCoverageProcessor.cpp b/src/gpu/ccpr/GrGSCoverageProcessor.cpp
+index 2a3acc3..6f9b7dd 100644
+--- a/src/gpu/ccpr/GrGSCoverageProcessor.cpp
++++ b/src/gpu/ccpr/GrGSCoverageProcessor.cpp
+@@ -20,7 +20,7 @@
+ protected:
+     Impl(std::unique_ptr<Shader> shader) : fShader(std::move(shader)) {}
+ 
+-    virtual bool hasCoverage() const { return false; }
++    virtual bool hasCoverage(const GrGSCoverageProcessor& proc) const { return false; }
+ 
+     void setData(const GrGLSLProgramDataManager& pdman, const GrPrimitiveProcessor&,
+                  FPCoordTransformIter&& transformIter) final {
+@@ -69,9 +69,9 @@
+         SkSTArray<2, GrShaderVar> emitArgs;
+         const char* corner = emitArgs.emplace_back("corner", kFloat2_GrSLType).c_str();
+         const char* bloatdir = emitArgs.emplace_back("bloatdir", kFloat2_GrSLType).c_str();
+-        const char* coverage = nullptr;
+-        if (this->hasCoverage()) {
+-            coverage = emitArgs.emplace_back("coverage", kHalf_GrSLType).c_str();
++        const char* inputCoverage = nullptr;
++        if (this->hasCoverage(proc)) {
++            inputCoverage = emitArgs.emplace_back("coverage", kHalf_GrSLType).c_str();
+         }
+         const char* cornerCoverage = nullptr;
+         if (Subpass::kCorners == proc.fSubpass) {
+@@ -79,15 +79,26 @@
+         }
+         g->emitFunction(kVoid_GrSLType, "emitVertex", emitArgs.count(), emitArgs.begin(), [&]() {
+             SkString fnBody;
+-            if (coverage) {
+-                fnBody.appendf("%s *= %s;", coverage, wind.c_str());
++            fnBody.appendf("float2 vertexpos = fma(%s, float2(bloat), %s);", bloatdir, corner);
++            const char* coverage = inputCoverage;
++            if (!coverage) {
++                if (!fShader->calculatesOwnEdgeCoverage()) {
++                    // Flat edge opposite the curve. Coverages need full precision since distance
++                    // to the opposite edge can be large.
++                    fnBody.appendf("float coverage = dot(float3(vertexpos, 1), %s);",
++                                   fEdgeDistanceEquation.c_str());
++                } else {
++                    // The "coverage" param should hold only the signed winding value.
++                    fnBody.appendf("float coverage = 1;");
++                }
++                coverage = "coverage";
+             }
++            fnBody.appendf("%s *= %s;", coverage, wind.c_str());
+             if (cornerCoverage) {
+                 fnBody.appendf("%s.x *= %s;", cornerCoverage, wind.c_str());
+             }
+-            fnBody.appendf("float2 vertexpos = fma(%s, float2(bloat), %s);", bloatdir, corner);
+             fShader->emitVaryings(varyingHandler, GrGLSLVarying::Scope::kGeoToFrag, &fnBody,
+-                                  "vertexpos", coverage ? coverage : wind.c_str(), cornerCoverage);
++                                  "vertexpos", coverage, cornerCoverage, wind.c_str());
+             g->emitVertex(&fnBody, "vertexpos", rtAdjust);
+             return fnBody;
+         }().c_str(), &emitVertexFn);
+@@ -100,6 +111,19 @@
+ #endif
+         g->defineConstant("bloat", bloat);
+ 
++        if (!this->hasCoverage(proc) && !fShader->calculatesOwnEdgeCoverage()) {
++            // Determine the amount of coverage to subtract out for the flat edge of the curve.
++            g->declareGlobal(fEdgeDistanceEquation);
++            g->codeAppendf("float2 p0 = pts[0], p1 = pts[%i];", numInputPoints - 1);
++            g->codeAppendf("float2 n = float2(p0.y - p1.y, p1.x - p0.x);");
++            g->codeAppend ("float nwidth = bloat*2 * (abs(n.x) + abs(n.y));");
++            // When nwidth=0, wind must also be 0 (and coverage * wind = 0). So it doesn't matter
++            // what we come up with here as long as it isn't NaN or Inf.
++            g->codeAppend ("n /= (0 != nwidth) ? nwidth : 1;");
++            g->codeAppendf("%s = float3(-n, dot(n, p0) - .5*sign(%s));",
++                           fEdgeDistanceEquation.c_str(), wind.c_str());
++        }
++
+         this->onEmitGeometryShader(proc, g, wind, emitVertexFn.c_str());
+     }
+ 
+@@ -107,6 +131,7 @@
+                                       const GrShaderVar& wind, const char* emitVertexFn) const = 0;
+ 
+     const std::unique_ptr<Shader> fShader;
++    const GrShaderVar fEdgeDistanceEquation{"edge_distance_equation", kFloat3_GrSLType};
+ 
+     typedef GrGLSLGeometryProcessor INHERITED;
+ };
+@@ -125,11 +150,11 @@
+ public:
+     TriangleHullImpl(std::unique_ptr<Shader> shader) : Impl(std::move(shader)) {}
+ 
+-    bool hasCoverage() const override { return true; }
++    bool hasCoverage(const GrGSCoverageProcessor& proc) const override { return true; }
+ 
+     void onEmitGeometryShader(const GrGSCoverageProcessor&, GrGLSLGeometryBuilder* g,
+                               const GrShaderVar& wind, const char* emitVertexFn) const override {
+-        fShader->emitSetupCode(g, "pts", wind.c_str());
++        fShader->emitSetupCode(g, "pts");
+ 
+         // Visualize the input triangle as upright and equilateral, with a flat base. Paying special
+         // attention to wind, we can identify the points as top, bottom-left, and bottom-right.
+@@ -224,7 +249,7 @@
+     void onEmitGeometryShader(const GrGSCoverageProcessor&, GrGLSLGeometryBuilder* g,
+                               const GrShaderVar& wind, const char* emitVertexFn) const override {
+         const char* hullPts = "pts";
+-        fShader->emitSetupCode(g, "pts", wind.c_str(), &hullPts);
++        fShader->emitSetupCode(g, "pts", &hullPts);
+ 
+         // Visualize the input (convex) quadrilateral as a square. Paying special attention to wind,
+         // we can identify the points by their corresponding corner.
+@@ -288,11 +313,13 @@
+ public:
+     CornerImpl(std::unique_ptr<Shader> shader) : Impl(std::move(shader)) {}
+ 
+-    bool hasCoverage() const override { return true; }
++    bool hasCoverage(const GrGSCoverageProcessor& proc) const override {
++        return proc.isTriangles();
++    }
+ 
+     void onEmitGeometryShader(const GrGSCoverageProcessor& proc, GrGLSLGeometryBuilder* g,
+                               const GrShaderVar& wind, const char* emitVertexFn) const override {
+-        fShader->emitSetupCode(g, "pts", wind.c_str());
++        fShader->emitSetupCode(g, "pts");
+ 
+         g->codeAppendf("int corneridx = sk_InvocationID;");
+         if (!proc.isTriangles()) {
+@@ -357,16 +384,20 @@
+                               "half2(1 + right_coverages[1], 1));",
+                            emitVertexFn);
+         } else {
+-            // Curves are simpler. The first coverage value of -1 means "wind = -wind", and causes
+-            // the Shader to erase what it had written previously for the hull. Then, at each vertex
+-            // of the corner box, the Shader will calculate the curve's local coverage value,
+-            // interpolate it alongside our attenuation parameter, and multiply the two together for
+-            // a final coverage value.
+-            g->codeAppendf("%s(corner, -crossbloat, -1, half2(1));", emitVertexFn);
+-            g->codeAppendf("%s(corner, outbloat, -1, half2(0, attenuation));",
++            // Curves are simpler. Setting "wind = -wind" causes the Shader to erase what it had
++            // written in the previous pass hull. Then, at each vertex of the corner box, the Shader
++            // will calculate the curve's local coverage value, interpolate it alongside our
++            // attenuation parameter, and multiply the two together for a final coverage value.
++            g->codeAppendf("%s = -%s;", wind.c_str(), wind.c_str());
++            if (!fShader->calculatesOwnEdgeCoverage()) {
++                g->codeAppendf("%s = -%s;",
++                               fEdgeDistanceEquation.c_str(), fEdgeDistanceEquation.c_str());
++            }
++            g->codeAppendf("%s(corner, -crossbloat, half2(-1, 1));", emitVertexFn);
++            g->codeAppendf("%s(corner, outbloat, half2(0, attenuation));",
+                            emitVertexFn);
+-            g->codeAppendf("%s(corner, -outbloat, -1, half2(1));", emitVertexFn);
+-            g->codeAppendf("%s(corner, crossbloat, -1, half2(1));", emitVertexFn);
++            g->codeAppendf("%s(corner, -outbloat, half2(-1, 1));", emitVertexFn);
++            g->codeAppendf("%s(corner, crossbloat, half2(-1, 1));", emitVertexFn);
+         }
+ 
+         g->configure(InputType::kLines, OutputType::kTriangleStrip, 4, proc.isTriangles() ? 3 : 2);
+diff --git a/src/gpu/ccpr/GrVSCoverageProcessor.cpp b/src/gpu/ccpr/GrVSCoverageProcessor.cpp
+index dc00b96..aa87dd7 100644
+--- a/src/gpu/ccpr/GrVSCoverageProcessor.cpp
++++ b/src/gpu/ccpr/GrVSCoverageProcessor.cpp
+@@ -280,7 +280,7 @@
+     v->defineConstant("bloat", bloat);
+ 
+     const char* hullPts = "pts";
+-    fShader->emitSetupCode(v, "pts", "wind", (4 == fNumSides) ? &hullPts : nullptr);
++    fShader->emitSetupCode(v, "pts", (4 == fNumSides) ? &hullPts : nullptr);
+ 
+     // Reverse all indices if the wind is counter-clockwise: [0, 1, 2] -> [2, 1, 0].
+     v->codeAppendf("int clockwise_indices = wind > 0 ? %s : 0x%x - %s;",
+@@ -360,8 +360,8 @@
+                            // fallthru.
+     v->codeAppend ("}");
+ 
+-    v->codeAppend ("float2 vertex = fma(bloatdir, float2(bloat), corner);");
+-    gpArgs->fPositionVar.set(kFloat2_GrSLType, "vertex");
++    v->codeAppend ("float2 vertexpos = fma(bloatdir, float2(bloat), corner);");
++    gpArgs->fPositionVar.set(kFloat2_GrSLType, "vertexpos");
+ 
+     // Hulls have a coverage of +1 all around.
+     v->codeAppend ("half coverage = +1;");
+@@ -385,6 +385,16 @@
+                        kVertexData_InvertNegativeCoverageBit);
+         v->codeAppend (    "coverage = -1 - coverage;");
+         v->codeAppend ("}");
++    } else if (!fShader->calculatesOwnEdgeCoverage()) {
++        // Determine the amount of coverage to subtract out for the flat edge of the curve.
++        v->codeAppendf("float2 p0 = pts[0], p1 = pts[%i];", numInputPoints - 1);
++        v->codeAppendf("float2 n = float2(p0.y - p1.y, p1.x - p0.x);");
++        v->codeAppend ("float nwidth = bloat*2 * (abs(n.x) + abs(n.y));");
++        // When nwidth=0, wind must also be 0 (and coverage * wind = 0). So it doesn't matter
++        // what we come up with here as long as it isn't NaN or Inf.
++        v->codeAppend ("float d = dot(p0 - vertexpos, n);");
++        v->codeAppend ("d /= (0 != nwidth) ? nwidth : 1;");
++        v->codeAppend ("coverage = half(d) - .5*sign(wind);");
+     }
+ 
+     // Non-corner geometry should have zero effect from corner coverage.
+@@ -392,16 +402,12 @@
+ 
+     v->codeAppendf("if (0 != (%s & %i)) {",  // Are we a corner?
+                    proc.fPerVertexData.name(), kVertexData_IsCornerBit);
+-                       // We use coverage=-1 to erase what the hull geometry wrote.
+-                       //
+-                       // In the context of curves, this effectively means "wind = -wind" and
+-                       // causes the Shader to erase what it had written previously for the hull.
+-                       //
+-                       // For triangles it just erases the "+1" value written by the hull geometry.
+-    v->codeAppend (    "coverage = -1;");
++                       // Erase what the previous geometry wrote.
++    v->codeAppend (    "wind = -wind;");
+     if (3 == fNumSides) {
+-                       // Triangle corners also have to erase what the edge geometry wrote.
+-        v->codeAppend ("coverage -= left_coverage + right_coverage;");
++        v->codeAppend ("coverage = 1 + left_coverage + right_coverage;");
++    } else if (!fShader->calculatesOwnEdgeCoverage()) {
++        v->codeAppend ("coverage = -coverage;");
+     }
+ 
+                        // Corner boxes require attenuated coverage.
+@@ -414,16 +420,16 @@
+                        // Shader will calculate the curve's local coverage value, interpolate it
+                        // alongside our attenuation parameter, and multiply the two together for a
+                        // final coverage value.
+-    v->codeAppend (    "corner_coverage = (0 == bloatidx) ? half2(0, attenuation) : half2(1);");
++    v->codeAppend (    "corner_coverage = (0 == bloatidx) ? half2(0, attenuation) : half2(-1,+1);");
+ 
+     if (3 == fNumSides) {
+                        // For triangles we also provide the actual coverage values at each vertex of
+                        // the corner box.
+         v->codeAppend ("if (1 == bloatidx || 2 == bloatidx) {");
+-        v->codeAppend (    "corner_coverage.x += right_coverage;");
++        v->codeAppend (    "corner_coverage.x -= right_coverage;");
+         v->codeAppend ("}");
+         v->codeAppend ("if (bloatidx >= 2) {");
+-        v->codeAppend (    "corner_coverage.x += left_coverage;");
++        v->codeAppend (    "corner_coverage.x -= left_coverage;");
+         v->codeAppend ("}");
+     }
+     v->codeAppend ("}");
+@@ -432,7 +438,7 @@
+     v->codeAppend ("coverage *= wind;");
+     v->codeAppend ("corner_coverage.x *= wind;");
+     fShader->emitVaryings(varyingHandler, GrGLSLVarying::Scope::kVertToFrag, &AccessCodeString(v),
+-                          gpArgs->fPositionVar.c_str(), "coverage", "corner_coverage");
++                          "vertexpos", "coverage", "corner_coverage", "wind");
+ 
+     varyingHandler->emitAttributes(proc);
+     SkASSERT(!args.fFPCoordTransformHandler->nextCoordTransform());

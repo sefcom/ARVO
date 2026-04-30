@@ -1,0 +1,523 @@
+From 5b8026899b9fbe24ccb3ba94cc5d3738d228ab28 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Wed, 28 Dec 2022 19:59:24 +0100
+Subject: [PATCH] Refactor SigAlgs to use a custom struct that can override
+ ssl->suites
+
+---
+ src/internal.c     | 127 +++++++++++++++++++--------------------------
+ src/tls.c          |  76 ++++++++++++++++++++++-----
+ src/tls13.c        |  25 ++++++---
+ wolfssl/internal.h |  21 +++++++-
+ 4 files changed, 152 insertions(+), 97 deletions(-)
+
+diff --git a/src/internal.c b/src/internal.c
+index d11a7ef44be..edccb60dbe2 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -2782,7 +2782,16 @@ static int GetMacDigestSize(byte macAlgo)
+ }
+ #endif /* USE_ECDSA_KEYSZ_HASH_ALGO */
+ 
+-static WC_INLINE void AddSuiteHashSigAlgo(Suites* suites, byte macAlgo,
++#define ADD_HASH_SIG_ALGO(out, inOutIdx, major, minor)  \
++    do {                                                \
++        if (out != NULL) {                              \
++            out[*inOutIdx    ] = major;                 \
++            out[*inOutIdx + 1] = minor;                 \
++        }                                               \
++        *inOutIdx += 2;                                 \
++    } while(0)
++
++static WC_INLINE void AddSuiteHashSigAlgo(byte* hashSigAlgo, byte macAlgo,
+     byte sigAlgo, int keySz, word16* inOutIdx)
+ {
+     int addSigAlgo = 1;
+@@ -2802,59 +2811,38 @@ static WC_INLINE void AddSuiteHashSigAlgo(Suites* suites, byte macAlgo,
+     if (addSigAlgo) {
+     #ifdef HAVE_ED25519
+         if (sigAlgo == ed25519_sa_algo) {
+-            suites->hashSigAlgo[*inOutIdx] = ED25519_SA_MAJOR;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = ED25519_SA_MINOR;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, ED25519_SA_MAJOR, ED25519_SA_MINOR);
+         }
+         else
+     #endif
+     #ifdef HAVE_ED448
+         if (sigAlgo == ed448_sa_algo) {
+-            suites->hashSigAlgo[*inOutIdx] = ED448_SA_MAJOR;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = ED448_SA_MINOR;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, ED448_SA_MAJOR, ED448_SA_MINOR);
+         }
+         else
+     #endif
+     #ifdef HAVE_PQC
+     #ifdef HAVE_FALCON
+         if (sigAlgo == falcon_level1_sa_algo) {
+-            suites->hashSigAlgo[*inOutIdx] = FALCON_LEVEL1_SA_MAJOR;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = FALCON_LEVEL1_SA_MINOR;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, FALCON_LEVEL1_SA_MAJOR, FALCON_LEVEL1_SA_MINOR);
+         }
+         else
+         if (sigAlgo == falcon_level5_sa_algo) {
+-            suites->hashSigAlgo[*inOutIdx] = FALCON_LEVEL5_SA_MAJOR;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = FALCON_LEVEL5_SA_MINOR;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, FALCON_LEVEL5_SA_MAJOR, FALCON_LEVEL5_SA_MINOR);
+         }
+         else
+     #endif /* HAVE_FALCON */
+     #ifdef HAVE_DILITHIUM
+         if (sigAlgo == dilithium_level2_sa_algo) {
+-            suites->hashSigAlgo[*inOutIdx] = DILITHIUM_LEVEL2_SA_MAJOR;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = DILITHIUM_LEVEL2_SA_MINOR;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, DILITHIUM_LEVEL2_SA_MAJOR, DILITHIUM_LEVEL2_SA_MINOR);
+         }
+         else
+         if (sigAlgo == dilithium_level3_sa_algo) {
+-            suites->hashSigAlgo[*inOutIdx] = DILITHIUM_LEVEL3_SA_MAJOR;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = DILITHIUM_LEVEL3_SA_MINOR;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, DILITHIUM_LEVEL3_SA_MAJOR, DILITHIUM_LEVEL3_SA_MINOR);
+         }
+         else
+         if (sigAlgo == dilithium_level5_sa_algo) {
+-            suites->hashSigAlgo[*inOutIdx] = DILITHIUM_LEVEL5_SA_MAJOR;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = DILITHIUM_LEVEL5_SA_MINOR;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, DILITHIUM_LEVEL5_SA_MAJOR, DILITHIUM_LEVEL5_SA_MINOR);
+         }
+         else
+     #endif /* HAVE_DILITHIUM */
+@@ -2862,82 +2850,70 @@ static WC_INLINE void AddSuiteHashSigAlgo(Suites* suites, byte macAlgo,
+ #ifdef WC_RSA_PSS
+         if (sigAlgo == rsa_pss_sa_algo) {
+             /* RSA PSS is sig then mac */
+-            suites->hashSigAlgo[*inOutIdx] = sigAlgo;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = macAlgo;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, sigAlgo, macAlgo);
+     #ifdef WOLFSSL_TLS13
+             /* Add the certificate algorithm as well */
+-            suites->hashSigAlgo[*inOutIdx] = sigAlgo;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = PSS_RSAE_TO_PSS_PSS(macAlgo);
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, sigAlgo, PSS_RSAE_TO_PSS_PSS(macAlgo));
+     #endif
+         }
+         else
+ #endif
+         {
+-            suites->hashSigAlgo[*inOutIdx] = macAlgo;
+-            *inOutIdx += 1;
+-            suites->hashSigAlgo[*inOutIdx] = sigAlgo;
+-            *inOutIdx += 1;
++            ADD_HASH_SIG_ALGO(hashSigAlgo, inOutIdx, macAlgo, sigAlgo);
+         }
+     }
+ }
+ 
+-void InitSuitesHashSigAlgo(Suites* suites, int haveECDSAsig, int haveRSAsig,
++void InitSuitesHashSigAlgo(byte* hashSigAlgo, int haveECDSAsig, int haveRSAsig,
+                            int haveFalconSig, int haveDilithiumSig,
+-                           int haveAnon, int tls1_2, int keySz)
++                           int haveAnon, int tls1_2, int keySz, word16* len)
+ {
+     word16 idx = 0;
+ 
+     (void)tls1_2;
+     (void)keySz;
+ 
+-    if (suites == NULL)
+-        return;
+-
+ #if defined(HAVE_ECC) || defined(HAVE_ED25519) || defined(HAVE_ED448)
+     if (haveECDSAsig) {
+ #ifdef HAVE_ECC
+     #ifdef WOLFSSL_SHA512
+-        AddSuiteHashSigAlgo(suites, sha512_mac, ecc_dsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha512_mac, ecc_dsa_sa_algo, keySz, &idx);
+     #endif
+     #ifdef WOLFSSL_SHA384
+-        AddSuiteHashSigAlgo(suites, sha384_mac, ecc_dsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha384_mac, ecc_dsa_sa_algo, keySz, &idx);
+     #endif
+     #ifndef NO_SHA256
+-        AddSuiteHashSigAlgo(suites, sha256_mac, ecc_dsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha256_mac, ecc_dsa_sa_algo, keySz, &idx);
+     #endif
+     #if !defined(NO_SHA) && (!defined(NO_OLD_TLS) || \
+                                             defined(WOLFSSL_ALLOW_TLS_SHA1))
+-        AddSuiteHashSigAlgo(suites, sha_mac, ecc_dsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha_mac, ecc_dsa_sa_algo, keySz, &idx);
+     #endif
+ #endif
+     #ifdef HAVE_ED25519
+-        AddSuiteHashSigAlgo(suites, no_mac, ed25519_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, no_mac, ed25519_sa_algo, keySz, &idx);
+     #endif
+     #ifdef HAVE_ED448
+-        AddSuiteHashSigAlgo(suites, no_mac, ed448_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, no_mac, ed448_sa_algo, keySz, &idx);
+     #endif
+     }
+ #endif /* HAVE_ECC || HAVE_ED25519 || HAVE_ED448 */
+     if (haveFalconSig) {
+ #if defined(HAVE_PQC)
+ #ifdef HAVE_FALCON
+-        AddSuiteHashSigAlgo(suites, no_mac, falcon_level1_sa_algo, keySz, &idx);
+-        AddSuiteHashSigAlgo(suites, no_mac, falcon_level5_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, no_mac, falcon_level1_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, no_mac, falcon_level5_sa_algo, keySz, &idx);
+ #endif /* HAVE_FALCON */
+ #endif /* HAVE_PQC */
+     }
+     if (haveDilithiumSig) {
+ #if defined(HAVE_PQC)
+ #ifdef HAVE_DILITHIUM
+-        AddSuiteHashSigAlgo(suites, no_mac, dilithium_level2_sa_algo, keySz,
++        AddSuiteHashSigAlgo(hashSigAlgo, no_mac, dilithium_level2_sa_algo, keySz,
+                             &idx);
+-        AddSuiteHashSigAlgo(suites, no_mac, dilithium_level3_sa_algo, keySz,
++        AddSuiteHashSigAlgo(hashSigAlgo, no_mac, dilithium_level3_sa_algo, keySz,
+                             &idx);
+-        AddSuiteHashSigAlgo(suites, no_mac, dilithium_level5_sa_algo, keySz,
++        AddSuiteHashSigAlgo(hashSigAlgo, no_mac, dilithium_level5_sa_algo, keySz,
+                             &idx);
+ #endif /* HAVE_DILITHIUM */
+ #endif /* HAVE_PQC */
+@@ -2946,46 +2922,46 @@ void InitSuitesHashSigAlgo(Suites* suites, int haveECDSAsig, int haveRSAsig,
+     #ifdef WC_RSA_PSS
+         if (tls1_2) {
+         #ifdef WOLFSSL_SHA512
+-            AddSuiteHashSigAlgo(suites, sha512_mac, rsa_pss_sa_algo, keySz,
++            AddSuiteHashSigAlgo(hashSigAlgo, sha512_mac, rsa_pss_sa_algo, keySz,
+                                                                           &idx);
+         #endif
+         #ifdef WOLFSSL_SHA384
+-            AddSuiteHashSigAlgo(suites, sha384_mac, rsa_pss_sa_algo, keySz,
++            AddSuiteHashSigAlgo(hashSigAlgo, sha384_mac, rsa_pss_sa_algo, keySz,
+                                                                           &idx);
+         #endif
+         #ifndef NO_SHA256
+-            AddSuiteHashSigAlgo(suites, sha256_mac, rsa_pss_sa_algo, keySz,
++            AddSuiteHashSigAlgo(hashSigAlgo, sha256_mac, rsa_pss_sa_algo, keySz,
+                                                                           &idx);
+         #endif
+         }
+     #endif
+     #ifdef WOLFSSL_SHA512
+-        AddSuiteHashSigAlgo(suites, sha512_mac, rsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha512_mac, rsa_sa_algo, keySz, &idx);
+     #endif
+     #ifdef WOLFSSL_SHA384
+-        AddSuiteHashSigAlgo(suites, sha384_mac, rsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha384_mac, rsa_sa_algo, keySz, &idx);
+     #endif
+     #ifndef NO_SHA256
+-        AddSuiteHashSigAlgo(suites, sha256_mac, rsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha256_mac, rsa_sa_algo, keySz, &idx);
+     #endif
+     #ifdef WOLFSSL_SHA224
+-        AddSuiteHashSigAlgo(suites, sha224_mac, rsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha224_mac, rsa_sa_algo, keySz, &idx);
+     #endif
+     #if !defined(NO_SHA) && (!defined(NO_OLD_TLS) || \
+                                             defined(WOLFSSL_ALLOW_TLS_SHA1))
+-        AddSuiteHashSigAlgo(suites, sha_mac, rsa_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha_mac, rsa_sa_algo, keySz, &idx);
+     #endif
+     }
+ 
+ #ifdef HAVE_ANON
+     if (haveAnon) {
+-        AddSuiteHashSigAlgo(suites, sha_mac, anonymous_sa_algo, keySz, &idx);
++        AddSuiteHashSigAlgo(hashSigAlgo, sha_mac, anonymous_sa_algo, keySz, &idx);
+     }
+ #endif
+ 
+     (void)haveAnon;
+     (void)haveECDSAsig;
+-    suites->hashSigAlgoSz = idx;
++    *len = idx;
+ }
+ 
+ int AllocateCtxSuites(WOLFSSL_CTX* ctx)
+@@ -3983,9 +3959,10 @@ void InitSuites(Suites* suites, ProtocolVersion pv, int keySz, word16 haveRSA,
+     suites->suiteSz = idx;
+ 
+     if (suites->hashSigAlgoSz == 0) {
+-        InitSuitesHashSigAlgo(suites, haveECDSAsig | haveECC,
++        InitSuitesHashSigAlgo(suites->hashSigAlgo, haveECDSAsig | haveECC,
+                               haveRSAsig | haveRSA, haveFalconSig,
+-                              haveDilithiumSig, 0, tls1_2, keySz);
++                              haveDilithiumSig, 0, tls1_2, keySz,
++                              &suites->hashSigAlgoSz);
+     }
+ }
+ 
+@@ -24280,6 +24257,7 @@ int SetCipherList(WOLFSSL_CTX* ctx, Suites* suites, const char* list)
+                 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 0, 0, ctx->method->side);
+         return 1; /* wolfSSL default */
++    }
+ 
+     do {
+         const char* current = next;
+@@ -24612,9 +24590,9 @@ int SetCipherList(WOLFSSL_CTX* ctx, Suites* suites, const char* list)
+     #endif
+         {
+             suites->suiteSz   = (word16)idx;
+-            InitSuitesHashSigAlgo(suites, haveECDSAsig, haveRSAsig,
++            InitSuitesHashSigAlgo(suites->hashSigAlgo, haveECDSAsig, haveRSAsig,
+                                   haveFalconSig, haveDilithiumSig, haveAnon,
+-                                  1, keySz);
++                                  1, keySz, &suites->hashSigAlgoSz);
+         }
+         suites->setSuites = 1;
+     }
+@@ -24738,8 +24716,9 @@ int SetCipherListFromBytes(WOLFSSL_CTX* ctx, Suites* suites, const byte* list,
+         keySz = ctx->privateKeySz;
+     #endif
+         suites->suiteSz = (word16)idx;
+-        InitSuitesHashSigAlgo(suites, haveECDSAsig, haveRSAsig, haveFalconSig,
+-                              haveDilithiumSig, haveAnon, 1, keySz);
++        InitSuitesHashSigAlgo(suites->hashSigAlgo, haveECDSAsig, haveRSAsig,
++                              haveFalconSig, haveDilithiumSig, haveAnon, 1,
++                              keySz, &suites->hashSigAlgoSz);
+         suites->setSuites = 1;
+     }
+ 
+@@ -24884,7 +24863,7 @@ int SetSuitesHashSigAlgo(Suites* suites, const char* list)
+                     break;
+                 }
+             }
+-            AddSuiteHashSigAlgo(suites, mac_alg, sig_alg, 0, &idx);
++            AddSuiteHashSigAlgo(suites->hashSigAlgo, mac_alg, sig_alg, 0, &idx);
+             sig_alg = 0;
+             mac_alg = no_mac;
+             s = list + 1;
+diff --git a/src/tls.c b/src/tls.c
+index 23b7d9c149d..4b407ff142b 100644
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -6373,9 +6373,12 @@ int TLSX_Cookie_Use(WOLFSSL* ssl, const byte* data, word16 len, byte* mac,
+ 
+ static word16 TLSX_SignatureAlgorithms_GetSize(void* data)
+ {
+-    WOLFSSL* ssl = (WOLFSSL*)data;
++    SignatureAlgorithms* sa = (SignatureAlgorithms*)data;
+ 
+-    return OPAQUE16_LEN + WOLFSSL_SUITES(ssl)->hashSigAlgoSz;
++    if (sa->hashSigAlgoSz == 0)
++        return OPAQUE16_LEN + WOLFSSL_SUITES(sa->ssl)->hashSigAlgoSz;
++    else
++        return OPAQUE16_LEN + sa->hashSigAlgoSz;
+ }
+ 
+ /* Creates a bit string of supported hash algorithms with RSA PSS.
+@@ -6419,17 +6422,27 @@ static int TLSX_SignatureAlgorithms_MapPss(WOLFSSL *ssl, const byte* input,
+  */
+ static word16 TLSX_SignatureAlgorithms_Write(void* data, byte* output)
+ {
+-    WOLFSSL* ssl = (WOLFSSL*)data;
+-    const Suites* suites = WOLFSSL_SUITES(ssl);
++    SignatureAlgorithms* sa = (SignatureAlgorithms*)data;
++    const Suites* suites = WOLFSSL_SUITES(sa->ssl);
++    word16 hashSigAlgoSz;
+ 
+-    c16toa(suites->hashSigAlgoSz, output);
+-    XMEMCPY(output + OPAQUE16_LEN, suites->hashSigAlgo,
+-            suites->hashSigAlgoSz);
++    if (sa->hashSigAlgoSz == 0) {
++        c16toa(suites->hashSigAlgoSz, output);
++        XMEMCPY(output + OPAQUE16_LEN, suites->hashSigAlgo,
++                suites->hashSigAlgoSz);
++        hashSigAlgoSz = suites->hashSigAlgoSz;
++    }
++    else {
++        c16toa(sa->hashSigAlgoSz, output);
++        XMEMCPY(output + OPAQUE16_LEN, sa->hashSigAlgo,
++                sa->hashSigAlgoSz);
++        hashSigAlgoSz = sa->hashSigAlgoSz;
++    }
+ 
+-    TLSX_SignatureAlgorithms_MapPss(ssl, output + OPAQUE16_LEN,
+-            suites->hashSigAlgoSz);
++    TLSX_SignatureAlgorithms_MapPss(sa->ssl, output + OPAQUE16_LEN,
++            hashSigAlgoSz);
+ 
+-    return OPAQUE16_LEN + suites->hashSigAlgoSz;
++    return OPAQUE16_LEN + hashSigAlgoSz;
+ }
+ 
+ /* Parse the SignatureAlgorithms extension.
+@@ -6480,18 +6493,52 @@ static int TLSX_SignatureAlgorithms_Parse(WOLFSSL *ssl, const byte* input,
+  * heap        The heap used for allocation.
+  * returns 0 on success, otherwise failure.
+  */
+-static int TLSX_SetSignatureAlgorithms(TLSX** extensions, const void* data,
++static int TLSX_SetSignatureAlgorithms(TLSX** extensions, WOLFSSL* ssl,
+                                        void* heap)
+ {
++    SignatureAlgorithms* sa;
++
+     if (extensions == NULL)
+         return BAD_FUNC_ARG;
+ 
+-    return TLSX_Push(extensions, TLSX_SIGNATURE_ALGORITHMS, data, heap);
++    /* Already present */
++    if (TLSX_Find(*extensions, TLSX_SIGNATURE_ALGORITHMS) != NULL)
++        return 0;
++
++    sa = TLSX_SignatureAlgorithms_New(ssl, 0, heap);
++    if (sa == NULL)
++        return MEMORY_ERROR;
++
++    return TLSX_Push(extensions, TLSX_SIGNATURE_ALGORITHMS, sa, heap);
++}
++
++SignatureAlgorithms* TLSX_SignatureAlgorithms_New(WOLFSSL* ssl,
++        word16 hashSigAlgoSz, void* heap)
++{
++    SignatureAlgorithms* sa;
++    (void)heap;
++
++    sa = (SignatureAlgorithms*)XMALLOC(sizeof(*sa) + hashSigAlgoSz, heap,
++                                       DYNAMIC_TYPE_TLSX);
++    if (sa != NULL) {
++        XMEMSET(sa, 0, sizeof(*sa) + hashSigAlgoSz);
++        sa->ssl = ssl;
++        sa->hashSigAlgoSz = hashSigAlgoSz;
++    }
++    return sa;
++}
++
++void TLSX_SignatureAlgorithms_FreeAll(SignatureAlgorithms* sa,
++                                             void* heap)
++{
++    XFREE(sa, heap, DYNAMIC_TYPE_TLSX);
++    (void)heap;
+ }
+ 
+ #define SA_GET_SIZE  TLSX_SignatureAlgorithms_GetSize
+ #define SA_WRITE     TLSX_SignatureAlgorithms_Write
+ #define SA_PARSE     TLSX_SignatureAlgorithms_Parse
++#define SA_FREE_ALL  TLSX_SignatureAlgorithms_FreeAll
+ #endif
+ /******************************************************************************/
+ /* Signature Algorithms Certificate                                           */
+@@ -6571,8 +6618,8 @@ static int TLSX_SignatureAlgorithmsCert_Parse(WOLFSSL *ssl, const byte* input,
+  * heap        The heap used for allocation.
+  * returns 0 on success, otherwise failure.
+  */
+-static int TLSX_SetSignatureAlgorithmsCert(TLSX** extensions, const void* data,
+-                                           void* heap)
++static int TLSX_SetSignatureAlgorithmsCert(TLSX** extensions,
++        const WOLFSSL* data, void* heap)
+ {
+     if (extensions == NULL)
+         return BAD_FUNC_ARG;
+@@ -10280,6 +10327,7 @@ void TLSX_FreeAll(TLSX* list, void* heap)
+                 break;
+ #if !defined(NO_CERTS) && !defined(WOLFSSL_NO_SIGALG)
+             case TLSX_SIGNATURE_ALGORITHMS:
++                SA_FREE_ALL((SignatureAlgorithms*)extension->data, heap);
+                 break;
+ #endif
+ #if defined(HAVE_ENCRYPT_THEN_MAC) && !defined(WOLFSSL_AEAD_ONLY)
+diff --git a/src/tls13.c b/src/tls13.c
+index f80eed322ef..cb091bbd1fc 100644
+--- a/src/tls13.c
++++ b/src/tls13.c
+@@ -6620,21 +6620,30 @@ static int SendTls13CertificateRequest(WOLFSSL* ssl, byte* reqCtx,
+     int    sendSz;
+     word32 i;
+     word16 reqSz;
+-    TLSX*  ext;
++    word16 hashSigAlgoSz = 0;
++    SignatureAlgorithms* sa;
+ 
+     WOLFSSL_START(WC_FUNC_CERTIFICATE_REQUEST_SEND);
+     WOLFSSL_ENTER("SendTls13CertificateRequest");
+ 
+     ssl->options.buildingMsg = 1;
+ 
+-    if (ssl->options.side == WOLFSSL_SERVER_END)
+-        InitSuitesHashSigAlgo(ssl->suites, 1, 1, 1, 1,
+-                              0, 1, ssl->buffers.keySz);
++    if (ssl->options.side != WOLFSSL_SERVER_END)
++        return SIDE_ERROR;
+ 
+-    ext = TLSX_Find(ssl->extensions, TLSX_SIGNATURE_ALGORITHMS);
+-    if (ext == NULL)
+-        return EXT_MISSING;
+-    ext->resp = 0;
++    /* Get the length of the hashSigAlgo buffer */
++    InitSuitesHashSigAlgo(NULL, 1, 1, 1, 1, 0, 1, ssl->buffers.keySz,
++                          &hashSigAlgoSz);
++    sa = TLSX_SignatureAlgorithms_New(ssl, hashSigAlgoSz, ssl->heap);
++    if (sa == NULL)
++        return MEMORY_ERROR;
++    InitSuitesHashSigAlgo(sa->hashSigAlgo, 1, 1, 1, 1, 0, 1, ssl->buffers.keySz,
++                          &sa->hashSigAlgoSz);
++    ret = TLSX_Push(&ssl->extensions, TLSX_SIGNATURE_ALGORITHMS, sa, ssl->heap);
++    if (ret != 0) {
++        TLSX_SignatureAlgorithms_FreeAll(sa, ssl->heap);
++        return ret;
++    }
+ 
+     i = RECORD_HEADER_SZ + HANDSHAKE_HEADER_SZ;
+ #ifdef WOLFSSL_DTLS13
+diff --git a/wolfssl/internal.h b/wolfssl/internal.h
+index 6daebe4685d..92c1be09104 100644
+--- a/wolfssl/internal.h
++++ b/wolfssl/internal.h
+@@ -2120,7 +2120,7 @@ struct Suites {
+     byte   setSuites;               /* user set suites from default */
+ };
+ 
+-WOLFSSL_LOCAL void InitSuitesHashSigAlgo(Suites* suites, int haveECDSAsig,
++WOLFSSL_LOCAL void InitSuitesHashSigAlgo(byte* hashSigAlgo, int haveECDSAsig,
+                                          int haveRSAsig, int haveFalconSig,
+                                          int haveDilithiumSig, int haveAnon,
+                                          int tls1_2, int keySz, word16* len);
+@@ -2777,6 +2777,25 @@ WOLFSSL_API void wolfSSL_CTX_SetProcessPeerCertCb(WOLFSSL_CTX* ctx,
+        CallbackProcessPeerCert cb);
+ #endif /* DecodedCert && HAVE_PK_CALLBACKS */
+ 
++#if !defined(NO_CERTS) && !defined(WOLFSSL_NO_SIGALG)
++typedef struct SignatureAlgorithms {
++    /* Not const since it is modified in TLSX_SignatureAlgorithms_MapPss */
++    WOLFSSL*    ssl;
++    word16      hashSigAlgoSz; /* SigAlgo extension length in bytes */
++    /* Ignore "nonstandard extension used : zero-sized array in struct/union"
++     * MSVC warning */
++    #ifdef _MSC_VER
++    #pragma warning(disable: 4200)
++    #endif
++    byte        hashSigAlgo[]; /* sig/algo to offer */
++} SignatureAlgorithms;
++
++WOLFSSL_LOCAL SignatureAlgorithms* TLSX_SignatureAlgorithms_New(
++        WOLFSSL* ssl, word16 hashSigAlgoSz, void* heap);
++WOLFSSL_LOCAL void TLSX_SignatureAlgorithms_FreeAll(SignatureAlgorithms* sa,
++                                                    void* heap);
++#endif
++
+ /** Supported Elliptic Curves - RFC 4492 (session 4) */
+ #ifdef HAVE_SUPPORTED_CURVES
+ 

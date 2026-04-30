@@ -1,0 +1,113 @@
+From 9a510b8035e6a83fb149cc447a61f847e786140f Mon Sep 17 00:00:00 2001
+From: Arne Welzel <arne.welzel@corelight.com>
+Date: Tue, 23 Jan 2024 15:03:37 +0100
+Subject: [PATCH] SMTP: Add SMTP_IN_BDAT state
+
+Initially this reused SMTP_IN_DATA, but separating into SMTP_IN_BDAT
+to avoid spurious EndData() calls upon a server's reply. The client
+should usually continue to send the full in-flight chunk still.
+---
+ src/analyzer/protocol/smtp/SMTP.cc | 24 ++++++++++++------------
+ src/analyzer/protocol/smtp/SMTP.h  |  3 ++-
+ 2 files changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/src/analyzer/protocol/smtp/SMTP.cc b/src/analyzer/protocol/smtp/SMTP.cc
+index 8fa3dd2c98b..185a3b46bdb 100644
+--- a/src/analyzer/protocol/smtp/SMTP.cc
++++ b/src/analyzer/protocol/smtp/SMTP.cc
+@@ -84,7 +84,7 @@ void SMTP_Analyzer::Undelivered(uint64_t seq, int len, bool is_orig) {
+ 
+     Unexpected(is_orig, "content gap", buf_len, buf);
+ 
+-    if ( state == detail::SMTP_IN_DATA ) {
++    if ( state == detail::SMTP_IN_DATA || state == detail::SMTP_CMD_BDAT ) {
+         // Record the SMTP data gap and terminate the
+         // ongoing mail transaction.
+         if ( mail )
+@@ -202,7 +202,7 @@ void SMTP_Analyzer::ProcessLine(int length, const char* line, bool orig) {
+             expect_recver = true;
+         }
+ 
+-        else if ( state == detail::SMTP_IN_DATA && ! bdat ) {
++        else if ( state == detail::SMTP_IN_DATA ) {
+             // Check "." for end of data for non-BDAT transfers.
+             expect_recver = false; // ?? MAY server respond to mail data?
+ 
+@@ -591,21 +591,21 @@ void SMTP_Analyzer::UpdateState(int cmd_code, int reply_code, bool orig) {
+                         UnexpectedCommand(cmd_code, reply_code);
+ 
+                     assert(bdat);
+-                    state = detail::SMTP_IN_DATA;
++                    state = detail::SMTP_IN_BDAT;
+                     break;
+ 
+                 case 250: break; // server accepted BDAT transfer.
+ 
+-                case 421: state = detail::SMTP_QUIT; break;
+-
++                case 421:
+                 case 500:
+                 case 501:
+                 case 503:
+                 case 451:
+                 case 554:
+-                    // Client may continue sending chunks if pipelined. We don't
+-                    // call EndData() here as it might be interesting what the
+-                    // client does send, even if the server isn't accepting it.
++                    // Client will continue completing the inflight chunk no matter
++                    // what the server replies, so we don't call EndData() here as
++                    // it might be interesting what the client does actually send,
++                    // even if the server isn't accepting it.
+                     break;
+ 
+                 default:
+@@ -618,7 +618,7 @@ void SMTP_Analyzer::UpdateState(int cmd_code, int reply_code, bool orig) {
+         case detail::SMTP_CMD_END_OF_DATA:
+             switch ( reply_code ) {
+                 case 0:
+-                    if ( st != detail::SMTP_IN_DATA )
++                    if ( st != detail::SMTP_IN_DATA && st != detail::SMTP_IN_BDAT )
+                         UnexpectedCommand(cmd_code, reply_code);
+                     EndData();
+                     state = detail::SMTP_AFTER_DATA;
+@@ -875,7 +875,7 @@ bool SMTP_Analyzer::ProcessBdatArg(int arg_len, const char* arg, bool orig) {
+ 
+     if ( ! bdat ) {
+         // This is the first BDAT chunk.
+-        BeginData(orig);
++        BeginData(orig, detail::SMTP_IN_BDAT);
+         bdat = std::make_unique<detail::SMTP_BDAT_Analyzer>(Conn(), mail, zeek::BifConst::SMTP::bdat_max_line_length);
+     }
+ 
+@@ -885,8 +885,8 @@ bool SMTP_Analyzer::ProcessBdatArg(int arg_len, const char* arg, bool orig) {
+     return true;
+ }
+ 
+-void SMTP_Analyzer::BeginData(bool orig) {
+-    state = detail::SMTP_IN_DATA;
++void SMTP_Analyzer::BeginData(bool orig, detail::SMTP_State new_state) {
++    state = new_state;
+     skip_data = false; // reset the flag at the beginning of the mail
+     if ( mail != nullptr ) {
+         Weird("smtp_nested_mail_transaction");
+diff --git a/src/analyzer/protocol/smtp/SMTP.h b/src/analyzer/protocol/smtp/SMTP.h
+index 389a45022d1..1d255bbed38 100644
+--- a/src/analyzer/protocol/smtp/SMTP.h
++++ b/src/analyzer/protocol/smtp/SMTP.h
+@@ -35,6 +35,7 @@ enum SMTP_State {
+     SMTP_QUIT,          // 10: after QUIT
+     SMTP_AFTER_GAP,     // 11: after a gap is detected
+     SMTP_GAP_RECOVERY,  // 12: after the first reply after a gap
++    SMTP_IN_BDAT,       // 13: receiving BDAT chunk via plain delivery
+ };
+ 
+ } // namespace detail
+@@ -63,7 +64,7 @@ class SMTP_Analyzer final : public analyzer::tcp::TCP_ApplicationAnalyzer {
+ 
+     void UpdateState(int cmd_code, int reply_code, bool orig);
+ 
+-    void BeginData(bool orig);
++    void BeginData(bool orig, detail::SMTP_State new_state = detail::SMTP_IN_DATA);
+     void EndData();
+ 
+     int ParseCmd(int cmd_len, const char* cmd);

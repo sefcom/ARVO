@@ -1,0 +1,36 @@
+From 07357cd93355d553dde698933a8176dd48b98344 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sat, 20 Jul 2019 22:41:08 +0200
+Subject: [PATCH] avformat/vividas: Check that value from ffio_read_varlen()
+ does not overflow
+
+Fixes: signed integer overflow: -1241665686 + -1340629419 cannot be represented in type 'int'
+Fixes: 15922/clusterfuzz-testcase-minimized-ffmpeg_DEMUXER_fuzzer-5692826442006528
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavformat/vividas.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/libavformat/vividas.c b/libavformat/vividas.c
+index 1895c75858..c3d3cf548c 100644
+--- a/libavformat/vividas.c
++++ b/libavformat/vividas.c
+@@ -374,8 +374,11 @@ static int track_header(VividasDemuxContext *viv, AVFormatContext *s,  uint8_t *
+             ffio_read_varlen(pb); // len_3
+             num_data = avio_r8(pb);
+             for (j = 0; j < num_data; j++) {
+-                data_len[j] = ffio_read_varlen(pb);
+-                xd_size += data_len[j];
++                uint64_t len = ffio_read_varlen(pb);
++                if (len > INT_MAX/2 - xd_size)
++                    return AVERROR_INVALIDDATA;
++                data_len[j] = len;
++                xd_size += len;
+             }
+ 
+             st->codecpar->extradata_size = 64 + xd_size + xd_size / 255;
+-- 
+2.25.1
+

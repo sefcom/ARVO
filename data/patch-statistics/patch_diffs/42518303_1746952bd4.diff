@@ -1,0 +1,1594 @@
+From 98ff1fd10306d031cfcf8a6becf78b3ac0afe49b Mon Sep 17 00:00:00 2001
+From: DRC <information@libjpeg-turbo.org>
+Date: Mon, 21 Nov 2022 20:57:39 -0600
+Subject: [PATCH] TurboJPEG: Add lossless JPEG detection capability
+
+Add a new TurboJPEG C API function (tjDecompressHeader4()) and Java API
+method (TJDecompressor.getFlags()) that return the bitwise OR of any
+flags that are relevant to the JPEG image being decompressed (currently
+TJFLAG_PROGRESSIVE, TJFLAG_ARITHMETIC, TJFLAG_LOSSLESS, and their Java
+equivalents.)  This allows a calling program to determine whether the
+image being decompressed is a lossless JPEG image, which means that the
+decompression scaling feature will not be available and that a
+full-sized destination buffer should be allocated.
+
+More specifically, this fixes a buffer overrun in TJBench, TJExample,
+and the decompress* fuzz targets that occurred when attempting (in vain)
+to decompress a lossless JPEG image with decompression scaling enabled.
+---
+ CMakeLists.txt                                |  10 +
+ ChangeLog.md                                  |   8 +-
+ doc/html/annotated.html                       |   2 +-
+ doc/html/classes.html                         |   2 +-
+ doc/html/functions.html                       |   2 +-
+ doc/html/functions_vars.html                  |   2 +-
+ doc/html/group___turbo_j_p_e_g.html           |  23 +-
+ doc/html/index.html                           |   2 +-
+ doc/html/modules.html                         |   2 +-
+ doc/html/search/all_6.js                      |   4 +-
+ doc/html/search/functions_0.js                |   2 +-
+ doc/html/structtjregion.html                  |   2 +-
+ doc/html/structtjscalingfactor.html           |   2 +-
+ doc/html/structtjtransform.html               |   2 +-
+ doxygen.config                                |   2 +-
+ fuzz/decompress.cc                            |  10 +-
+ fuzz/decompress_yuv.cc                        |  10 +-
+ java/TJBench.java                             |  17 +-
+ java/TJExample.java                           |   8 +-
+ java/doc/index-all.html                       |   9 +
+ .../turbojpeg/TJDecompressor.html             |  61 ++++-
+ .../libjpegturbo/turbojpeg/TJTransformer.html |   4 +-
+ .../turbojpeg/TJDecompressor.java             |  16 ++
+ tjbench.c                                     |  21 +-
+ tjbenchtest.in                                | 258 ++++++++++--------
+ tjbenchtest.java.in                           | 192 +++++++------
+ tjexample.c                                   |   9 +-
+ turbojpeg-jni.c                               |  12 +-
+ turbojpeg-mapfile                             |   6 +
+ turbojpeg-mapfile.jni                         |   6 +
+ turbojpeg.c                                   |  32 ++-
+ turbojpeg.h                                   |  16 +-
+ 32 files changed, 476 insertions(+), 278 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5c3a63fc9..70b7f9276 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1530,6 +1530,10 @@ if(WITH_TURBOJPEG)
+       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -arithmetic
+       COMMAND echo tjbenchtest -arithmetic -yuv
+       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -arithmetic -yuv
++      COMMAND echo tjbenchtest -lossless
++      COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -lossless
++      COMMAND echo tjbenchtest -lossless -alloc
++      COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -lossless -alloc
+       COMMAND echo tjexampletest
+       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest
+       COMMAND echo tjbenchtest.java
+@@ -1546,6 +1550,8 @@ if(WITH_TURBOJPEG)
+       COMMAND echo tjbenchtest.java -arithmetic -yuv
+       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest.java -arithmetic
+         -yuv
++      COMMAND echo tjbenchtest.java -lossless
++      COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest.java -lossless
+       COMMAND echo tjexampletest.java
+       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest.java
+       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest
+@@ -1566,6 +1572,10 @@ if(WITH_TURBOJPEG)
+       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -progressive
+       COMMAND echo tjbenchtest -progressive -yuv
+       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -progressive -yuv
++      COMMAND echo tjbenchtest -lossless
++      COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -lossless
++      COMMAND echo tjbenchtest -lossless -alloc
++      COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -lossless -alloc
+       COMMAND echo tjexampletest
+       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest
+       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest
+diff --git a/ChangeLog.md b/ChangeLog.md
+index cc5df1e4e..a5597fada 100644
+--- a/ChangeLog.md
++++ b/ChangeLog.md
+@@ -36,7 +36,8 @@ the C API and `TJ.FLAG_LOSSLESS` in the Java API), and cjpeg/TJBench
+ command-line argument (`-lossless`) can be used to create a lossless JPEG
+ image.  (Decompression of lossless JPEG images is handled automatically.)  Note
+ that the TurboJPEG API and TJBench can currently only be used to create and
+-decompress 8-bit lossless JPEG images.
++decompress 8-bit lossless JPEG images.  Refer to [libjpeg.txt](libjpeg.txt),
++[usage.txt](usage.txt), and the TurboJPEG API documentation for more details.
+ 
+ 5. Introduced a new flag in the TurboJPEG C and Java APIs (`TJFLAG_ARITHMETIC`
+ and `TJ.FLAG_ARITHMETIC`, respectively) that causes the library to use
+@@ -46,6 +47,11 @@ API and `TJTransform.OPT_ARITHMETIC` in the Java API) has been introduced,
+ allowing arithmetic entropy coding to be enabled for selected transforms in a
+ multi-transform operation.
+ 
++6. Added a new TurboJPEG C API function (`tjDecompressHeader4()`) and Java API
++method (`TJDecompressor.getFlags()`) that allow calling programs to determine
++whether the JPEG image being decompressed uses progressive and/or arithmetic
++entropy coding or is a lossless JPEG image.
++
+ 
+ 2.1.5
+ =====
+diff --git a/doc/html/annotated.html b/doc/html/annotated.html
+index c735a5a7e..de0462ee3 100644
+--- a/doc/html/annotated.html
++++ b/doc/html/annotated.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doc/html/classes.html b/doc/html/classes.html
+index 42f38f6bc..ac3c535b4 100644
+--- a/doc/html/classes.html
++++ b/doc/html/classes.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doc/html/functions.html b/doc/html/functions.html
+index 5de4c6fba..68fcde3f8 100644
+--- a/doc/html/functions.html
++++ b/doc/html/functions.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doc/html/functions_vars.html b/doc/html/functions_vars.html
+index 2b010f40d..d918435dc 100644
+--- a/doc/html/functions_vars.html
++++ b/doc/html/functions_vars.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doc/html/group___turbo_j_p_e_g.html b/doc/html/group___turbo_j_p_e_g.html
+index ccfa88662..8e2b22291 100644
+--- a/doc/html/group___turbo_j_p_e_g.html
++++ b/doc/html/group___turbo_j_p_e_g.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+@@ -281,9 +281,9 @@
+ <tr class="memitem:ga52300eac3f3d9ef4bab303bc244f62d3"><td class="memItemLeft" align="right" valign="top">DLLEXPORT <a class="el" href="group___turbo_j_p_e_g.html#ga758d2634ecb4949de7815cba621f5763">tjhandle</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="group___turbo_j_p_e_g.html#ga52300eac3f3d9ef4bab303bc244f62d3">tjInitDecompress</a> (void)</td></tr>
+ <tr class="memdesc:ga52300eac3f3d9ef4bab303bc244f62d3"><td class="mdescLeft">&#160;</td><td class="mdescRight">Create a TurboJPEG decompressor instance.  <a href="group___turbo_j_p_e_g.html#ga52300eac3f3d9ef4bab303bc244f62d3">More...</a><br /></td></tr>
+ <tr class="separator:ga52300eac3f3d9ef4bab303bc244f62d3"><td class="memSeparator" colspan="2">&#160;</td></tr>
+-<tr class="memitem:ga0595681096bba7199cc6f3533cb25f77"><td class="memItemLeft" align="right" valign="top">DLLEXPORT int&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="group___turbo_j_p_e_g.html#ga0595681096bba7199cc6f3533cb25f77">tjDecompressHeader3</a> (<a class="el" href="group___turbo_j_p_e_g.html#ga758d2634ecb4949de7815cba621f5763">tjhandle</a> handle, const unsigned char *jpegBuf, unsigned long jpegSize, int *width, int *height, int *jpegSubsamp, int *jpegColorspace)</td></tr>
+-<tr class="memdesc:ga0595681096bba7199cc6f3533cb25f77"><td class="mdescLeft">&#160;</td><td class="mdescRight">Retrieve information about a JPEG image without decompressing it, or prime the decompressor with quantization and Huffman tables.  <a href="group___turbo_j_p_e_g.html#ga0595681096bba7199cc6f3533cb25f77">More...</a><br /></td></tr>
+-<tr class="separator:ga0595681096bba7199cc6f3533cb25f77"><td class="memSeparator" colspan="2">&#160;</td></tr>
++<tr class="memitem:gac104e6e729f57f195009405949d198dc"><td class="memItemLeft" align="right" valign="top">DLLEXPORT int&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="group___turbo_j_p_e_g.html#gac104e6e729f57f195009405949d198dc">tjDecompressHeader4</a> (<a class="el" href="group___turbo_j_p_e_g.html#ga758d2634ecb4949de7815cba621f5763">tjhandle</a> handle, const unsigned char *jpegBuf, unsigned long jpegSize, int *width, int *height, int *jpegSubsamp, int *jpegColorspace, int *jpegFlags)</td></tr>
++<tr class="memdesc:gac104e6e729f57f195009405949d198dc"><td class="mdescLeft">&#160;</td><td class="mdescRight">Retrieve information about a JPEG image without decompressing it, or prime the decompressor with quantization and Huffman tables.  <a href="group___turbo_j_p_e_g.html#gac104e6e729f57f195009405949d198dc">More...</a><br /></td></tr>
++<tr class="separator:gac104e6e729f57f195009405949d198dc"><td class="memSeparator" colspan="2">&#160;</td></tr>
+ <tr class="memitem:gac3854476006b10787bd128f7ede48057"><td class="memItemLeft" align="right" valign="top">DLLEXPORT <a class="el" href="structtjscalingfactor.html">tjscalingfactor</a> *&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="group___turbo_j_p_e_g.html#gac3854476006b10787bd128f7ede48057">tjGetScalingFactors</a> (int *numscalingfactors)</td></tr>
+ <tr class="memdesc:gac3854476006b10787bd128f7ede48057"><td class="mdescLeft">&#160;</td><td class="mdescRight">Returns a list of fractional scaling factors that the JPEG decompressor in this implementation of TurboJPEG supports.  <a href="group___turbo_j_p_e_g.html#gac3854476006b10787bd128f7ede48057">More...</a><br /></td></tr>
+ <tr class="separator:gac3854476006b10787bd128f7ede48057"><td class="memSeparator" colspan="2">&#160;</td></tr>
+@@ -1739,14 +1739,14 @@ <h2 class="memtitle"><span class="permalink"><a href="#gae9eccef8b682a48f43a9117
+ 
+ </div>
+ </div>
+-<a id="ga0595681096bba7199cc6f3533cb25f77"></a>
+-<h2 class="memtitle"><span class="permalink"><a href="#ga0595681096bba7199cc6f3533cb25f77">&#9670;&nbsp;</a></span>tjDecompressHeader3()</h2>
++<a id="gac104e6e729f57f195009405949d198dc"></a>
++<h2 class="memtitle"><span class="permalink"><a href="#gac104e6e729f57f195009405949d198dc">&#9670;&nbsp;</a></span>tjDecompressHeader4()</h2>
+ 
+ <div class="memitem">
+ <div class="memproto">
+       <table class="memname">
+         <tr>
+-          <td class="memname">DLLEXPORT int tjDecompressHeader3 </td>
++          <td class="memname">DLLEXPORT int tjDecompressHeader4 </td>
+           <td>(</td>
+           <td class="paramtype"><a class="el" href="group___turbo_j_p_e_g.html#ga758d2634ecb4949de7815cba621f5763">tjhandle</a>&#160;</td>
+           <td class="paramname"><em>handle</em>, </td>
+@@ -1785,7 +1785,13 @@ <h2 class="memtitle"><span class="permalink"><a href="#ga0595681096bba7199cc6f35
+           <td class="paramkey"></td>
+           <td></td>
+           <td class="paramtype">int *&#160;</td>
+-          <td class="paramname"><em>jpegColorspace</em>&#160;</td>
++          <td class="paramname"><em>jpegColorspace</em>, </td>
++        </tr>
++        <tr>
++          <td class="paramkey"></td>
++          <td></td>
++          <td class="paramtype">int *&#160;</td>
++          <td class="paramname"><em>jpegFlags</em>&#160;</td>
+         </tr>
+         <tr>
+           <td></td>
+@@ -1805,6 +1811,7 @@ <h2 class="memtitle"><span class="permalink"><a href="#ga0595681096bba7199cc6f35
+     <tr><td class="paramname">height</td><td>pointer to an integer variable that will receive the height (in pixels) of the JPEG image. If <code>jpegBuf</code> points to a tables-only datastream, then <code>height</code> is ignored.</td></tr>
+     <tr><td class="paramname">jpegSubsamp</td><td>pointer to an integer variable that will receive the level of chrominance subsampling used when the JPEG image was compressed (see <a class="el" href="group___turbo_j_p_e_g.html#ga1d047060ea80bb9820d540bb928e9074">Chrominance subsampling options</a>.) If <code>jpegBuf</code> points to a tables-only datastream, then <code>jpegSubsamp</code> is ignored.</td></tr>
+     <tr><td class="paramname">jpegColorspace</td><td>pointer to an integer variable that will receive one of the JPEG colorspace constants, indicating the colorspace of the JPEG image (see <a class="el" href="group___turbo_j_p_e_g.html#ga4f83ad3368e0e29d1957be0efa7c3720">JPEG colorspaces</a>.) If <code>jpegBuf</code> points to a tables-only datastream, then <code>jpegColorspace</code> is ignored.</td></tr>
++    <tr><td class="paramname">jpegFlags</td><td>pointer to an integer variable that will receive the bitwise OR of one or more of the <a class="el" href="group___turbo_j_p_e_g.html#gacb233cfd722d66d1ccbf48a7de81f0e0">flags</a>, such as <a class="el" href="group___turbo_j_p_e_g.html#ga43b426750b46190a25d34a67ef76df1b" title="Use progressive entropy coding in JPEG images generated by the compression and transform functions.">TJFLAG_PROGRESSIVE</a> and <a class="el" href="group___turbo_j_p_e_g.html#gaaf0e8b612bb5b981329db9f30e2115bd" title="Generate a lossless JPEG image when compressing.">TJFLAG_LOSSLESS</a>, that describe the JPEG image. If <code>jpegBuf</code> points to a tables-only datastream, then <code>jpegFlags</code> is ignored.</td></tr>
+   </table>
+   </dd>
+ </dl>
+diff --git a/doc/html/index.html b/doc/html/index.html
+index a6f272a39..8d06e0bcd 100644
+--- a/doc/html/index.html
++++ b/doc/html/index.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doc/html/modules.html b/doc/html/modules.html
+index d48980a46..f0d4eb56f 100644
+--- a/doc/html/modules.html
++++ b/doc/html/modules.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doc/html/search/all_6.js b/doc/html/search/all_6.js
+index 2ac83e759..76dc418b1 100644
+--- a/doc/html/search/all_6.js
++++ b/doc/html/search/all_6.js
+@@ -22,7 +22,7 @@ var searchData=
+   ['tjdecodeyuv_27',['tjDecodeYUV',['../group___turbo_j_p_e_g.html#ga70abbf38f77a26fd6da8813bef96f695',1,'turbojpeg.h']]],
+   ['tjdecodeyuvplanes_28',['tjDecodeYUVPlanes',['../group___turbo_j_p_e_g.html#ga10e837c07fa9d25770565b237d3898d9',1,'turbojpeg.h']]],
+   ['tjdecompress2_29',['tjDecompress2',['../group___turbo_j_p_e_g.html#gae9eccef8b682a48f43a9117c231ed013',1,'turbojpeg.h']]],
+-  ['tjdecompressheader3_30',['tjDecompressHeader3',['../group___turbo_j_p_e_g.html#ga0595681096bba7199cc6f3533cb25f77',1,'turbojpeg.h']]],
++  ['tjdecompressheader4_30',['tjDecompressHeader4',['../group___turbo_j_p_e_g.html#gac104e6e729f57f195009405949d198dc',1,'turbojpeg.h']]],
+   ['tjdecompresstoyuv2_31',['tjDecompressToYUV2',['../group___turbo_j_p_e_g.html#ga04d1e839ff9a0860dd1475cff78d3364',1,'turbojpeg.h']]],
+   ['tjdecompresstoyuvplanes_32',['tjDecompressToYUVPlanes',['../group___turbo_j_p_e_g.html#gaa59f901a5258ada5bd0185ad59368540',1,'turbojpeg.h']]],
+   ['tjdestroy_33',['tjDestroy',['../group___turbo_j_p_e_g.html#ga75f355fa27225ba1a4ee392c852394d2',1,'turbojpeg.h']]],
+@@ -84,7 +84,7 @@ var searchData=
+   ['tjsaveimage_89',['tjSaveImage',['../group___turbo_j_p_e_g.html#ga6f445b22d8933ae4815b3370a538d879',1,'turbojpeg.h']]],
+   ['tjscaled_90',['TJSCALED',['../group___turbo_j_p_e_g.html#ga84878bb65404204743aa18cac02781df',1,'turbojpeg.h']]],
+   ['tjscalingfactor_91',['tjscalingfactor',['../structtjscalingfactor.html',1,'']]],
+-  ['tjtransform_92',['tjtransform',['../structtjtransform.html',1,'tjtransform'],['../group___turbo_j_p_e_g.html#ga9cb8abf4cc91881e04a0329b2270be25',1,'tjTransform(tjhandle handle, const unsigned char *jpegBuf, unsigned long jpegSize, int n, unsigned char **dstBufs, unsigned long *dstSizes, tjtransform *transforms, int flags):&#160;turbojpeg.h'],['../group___turbo_j_p_e_g.html#ga504805ec0161f1b505397ca0118bf8fd',1,'tjtransform():&#160;turbojpeg.h']]],
++  ['tjtransform_92',['tjtransform',['../structtjtransform.html',1,'tjtransform'],['../group___turbo_j_p_e_g.html#ga504805ec0161f1b505397ca0118bf8fd',1,'tjtransform():&#160;turbojpeg.h'],['../group___turbo_j_p_e_g.html#ga9cb8abf4cc91881e04a0329b2270be25',1,'tjTransform(tjhandle handle, const unsigned char *jpegBuf, unsigned long jpegSize, int n, unsigned char **dstBufs, unsigned long *dstSizes, tjtransform *transforms, int flags):&#160;turbojpeg.h']]],
+   ['tjxop_93',['TJXOP',['../group___turbo_j_p_e_g.html#ga2de531af4e7e6c4f124908376b354866',1,'turbojpeg.h']]],
+   ['tjxop_5fhflip_94',['TJXOP_HFLIP',['../group___turbo_j_p_e_g.html#gga2de531af4e7e6c4f124908376b354866aa0df69776caa30f0fa28e26332d311ce',1,'turbojpeg.h']]],
+   ['tjxop_5fnone_95',['TJXOP_NONE',['../group___turbo_j_p_e_g.html#gga2de531af4e7e6c4f124908376b354866aad88c0366cd3f7d0eac9d7a3fa1c2c27',1,'turbojpeg.h']]],
+diff --git a/doc/html/search/functions_0.js b/doc/html/search/functions_0.js
+index 440716001..e752acb3e 100644
+--- a/doc/html/search/functions_0.js
++++ b/doc/html/search/functions_0.js
+@@ -9,7 +9,7 @@ var searchData=
+   ['tjdecodeyuv_123',['tjDecodeYUV',['../group___turbo_j_p_e_g.html#ga70abbf38f77a26fd6da8813bef96f695',1,'turbojpeg.h']]],
+   ['tjdecodeyuvplanes_124',['tjDecodeYUVPlanes',['../group___turbo_j_p_e_g.html#ga10e837c07fa9d25770565b237d3898d9',1,'turbojpeg.h']]],
+   ['tjdecompress2_125',['tjDecompress2',['../group___turbo_j_p_e_g.html#gae9eccef8b682a48f43a9117c231ed013',1,'turbojpeg.h']]],
+-  ['tjdecompressheader3_126',['tjDecompressHeader3',['../group___turbo_j_p_e_g.html#ga0595681096bba7199cc6f3533cb25f77',1,'turbojpeg.h']]],
++  ['tjdecompressheader4_126',['tjDecompressHeader4',['../group___turbo_j_p_e_g.html#gac104e6e729f57f195009405949d198dc',1,'turbojpeg.h']]],
+   ['tjdecompresstoyuv2_127',['tjDecompressToYUV2',['../group___turbo_j_p_e_g.html#ga04d1e839ff9a0860dd1475cff78d3364',1,'turbojpeg.h']]],
+   ['tjdecompresstoyuvplanes_128',['tjDecompressToYUVPlanes',['../group___turbo_j_p_e_g.html#gaa59f901a5258ada5bd0185ad59368540',1,'turbojpeg.h']]],
+   ['tjdestroy_129',['tjDestroy',['../group___turbo_j_p_e_g.html#ga75f355fa27225ba1a4ee392c852394d2',1,'turbojpeg.h']]],
+diff --git a/doc/html/structtjregion.html b/doc/html/structtjregion.html
+index 72d49d270..fc3989008 100644
+--- a/doc/html/structtjregion.html
++++ b/doc/html/structtjregion.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doc/html/structtjscalingfactor.html b/doc/html/structtjscalingfactor.html
+index 1606a02cc..6b8b1ffd2 100644
+--- a/doc/html/structtjscalingfactor.html
++++ b/doc/html/structtjscalingfactor.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doc/html/structtjtransform.html b/doc/html/structtjtransform.html
+index ba78980ed..c8f10a52d 100644
+--- a/doc/html/structtjtransform.html
++++ b/doc/html/structtjtransform.html
+@@ -23,7 +23,7 @@
+  <tr style="height: 56px;">
+   <td id="projectalign" style="padding-left: 0.5em;">
+    <div id="projectname">TurboJPEG
+-   &#160;<span id="projectnumber">2.1.4</span>
++   &#160;<span id="projectnumber">2.2</span>
+    </div>
+   </td>
+  </tr>
+diff --git a/doxygen.config b/doxygen.config
+index 16708b03e..b051aa4cf 100644
+--- a/doxygen.config
++++ b/doxygen.config
+@@ -1,5 +1,5 @@
+ PROJECT_NAME = TurboJPEG
+-PROJECT_NUMBER = 2.1.4
++PROJECT_NUMBER = 2.2
+ OUTPUT_DIRECTORY = doc/
+ USE_WINDOWS_ENCODING = NO
+ OPTIMIZE_OUTPUT_FOR_C = YES
+diff --git a/fuzz/decompress.cc b/fuzz/decompress.cc
+index c7fcb5001..b6604224b 100644
+--- a/fuzz/decompress.cc
++++ b/fuzz/decompress.cc
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C)2021 D. R. Commander.  All Rights Reserved.
++ * Copyright (C)2021-2022 D. R. Commander.  All Rights Reserved.
+  *
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions are met:
+@@ -38,7 +38,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+ {
+   tjhandle handle = NULL;
+   unsigned char *dstBuf = NULL;
+-  int width = 0, height = 0, jpegSubsamp, jpegColorspace, pfi;
++  int width = 0, height = 0, jpegSubsamp, jpegColorspace, jpegFlags, pfi;
+   /* TJPF_RGB-TJPF_BGR share the same code paths, as do TJPF_RGBX-TJPF_XRGB and
+      TJPF_RGBA-TJPF_ARGB.  Thus, the pixel formats below should be the minimum
+      necessary to achieve full coverage. */
+@@ -58,8 +58,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+   /* We ignore the return value of tjDecompressHeader3(), because some JPEG
+      images may have unusual subsampling configurations that the TurboJPEG API
+      cannot identify but can still decompress. */
+-  tjDecompressHeader3(handle, data, size, &width, &height, &jpegSubsamp,
+-                      &jpegColorspace);
++  tjDecompressHeader4(handle, data, size, &width, &height, &jpegSubsamp,
++                      &jpegColorspace, &jpegFlags);
+ 
+   /* Ignore 0-pixel images and images larger than 1 Megapixel, as Google's
+      OSS-Fuzz target for libjpeg-turbo did.  Casting width to (uint64_t)
+@@ -75,7 +75,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+     if (pfi == 0)
+       flags |= TJFLAG_BOTTOMUP | TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT;
+     /* Test IDCT scaling on the second iteration. */
+-    else if (pfi == 1) {
++    else if (pfi == 1 && !(jpegFlags & TJFLAG_LOSSLESS)) {
+       w = (width + 1) / 2;
+       h = (height + 1) / 2;
+     }
+diff --git a/fuzz/decompress_yuv.cc b/fuzz/decompress_yuv.cc
+index d603fd819..4b2c89de6 100644
+--- a/fuzz/decompress_yuv.cc
++++ b/fuzz/decompress_yuv.cc
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C)2021 D. R. Commander.  All Rights Reserved.
++ * Copyright (C)2021-2022 D. R. Commander.  All Rights Reserved.
+  *
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions are met:
+@@ -38,7 +38,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+ {
+   tjhandle handle = NULL;
+   unsigned char *dstBuf = NULL, *yuvBuf = NULL;
+-  int width = 0, height = 0, jpegSubsamp, jpegColorspace, pfi;
++  int width = 0, height = 0, jpegSubsamp, jpegColorspace, jpegFlags, pfi;
+   /* TJPF_RGB-TJPF_BGR share the same code paths, as do TJPF_RGBX-TJPF_XRGB and
+      TJPF_RGBA-TJPF_ARGB.  Thus, the pixel formats below should be the minimum
+      necessary to achieve full coverage. */
+@@ -55,8 +55,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+   if ((handle = tjInitDecompress()) == NULL)
+     goto bailout;
+ 
+-  if (tjDecompressHeader3(handle, data, size, &width, &height, &jpegSubsamp,
+-                          &jpegColorspace) < 0)
++  if (tjDecompressHeader4(handle, data, size, &width, &height, &jpegSubsamp,
++                          &jpegColorspace, &jpegFlags) < 0)
+     goto bailout;
+ 
+   /* Ignore 0-pixel images and images larger than 1 Megapixel.  Casting width
+@@ -72,7 +72,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+     if (pfi == 0)
+       flags |= TJFLAG_BOTTOMUP | TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT;
+     /* Test IDCT scaling on the second iteration. */
+-    else if (pfi == 1) {
++    else if (pfi == 1 && !(jpegFlags & TJFLAG_LOSSLESS)) {
+       w = (width + 3) / 4;
+       h = (height + 3) / 4;
+     }
+diff --git a/java/TJBench.java b/java/TJBench.java
+index 4084ea545..0cc0f8865 100644
+--- a/java/TJBench.java
++++ b/java/TJBench.java
+@@ -168,11 +168,16 @@ static void decomp(byte[] srcBuf, byte[][] jpegBuf, int[] jpegSize,
+     TJDecompressor tjd;
+     double elapsed, elapsedDecode;
+     int ps = TJ.getPixelSize(pf), i, iter = 0;
+-    int scaledw = sf.getScaled(w);
+-    int scaledh = sf.getScaled(h);
+-    int pitch = scaledw * ps;
++    int scaledw, scaledh, pitch;
+     YUVImage yuvImage = null;
+ 
++    if ((flags & TJ.FLAG_LOSSLESS) != 0)
++      sf = new TJScalingFactor(1, 1);
++
++    scaledw = sf.getScaled(w);
++    scaledh = sf.getScaled(h);
++    pitch = scaledw * ps;
++
+     if (jpegQual > 0)
+       qualStr = new String("_Q" + jpegQual);
+ 
+@@ -498,7 +503,7 @@ static void decompTest(String fileName) throws Exception {
+     // Original image
+     int w = 0, h = 0, ntilesw = 1, ntilesh = 1, subsamp = -1, cs = -1;
+     // Transformed image
+-    int tw, th, ttilew, ttileh, tntilesw, tntilesh, tsubsamp;
++    int tw, th, ttilew, ttileh, tntilesw, tntilesh, tsubsamp, jpegFlags;
+ 
+     FileInputStream fis = new FileInputStream(fileName);
+     if (fis.getChannel().size() > (long)Integer.MAX_VALUE)
+@@ -521,6 +526,10 @@ static void decompTest(String fileName) throws Exception {
+     h = tjt.getHeight();
+     subsamp = tjt.getSubsamp();
+     cs = tjt.getColorspace();
++    jpegFlags = tjt.getFlags();
++
++    if ((jpegFlags & TJ.FLAG_LOSSLESS) != 0)
++      sf = new TJScalingFactor(1, 1);
+ 
+     if (quiet == 1) {
+       System.out.println("All performance values in Mpixels/sec\n");
+diff --git a/java/TJExample.java b/java/TJExample.java
+index 785988698..9e6edd254 100644
+--- a/java/TJExample.java
++++ b/java/TJExample.java
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C)2011-2012, 2014-2015, 2017-2018 D. R. Commander.
+- *                                              All Rights Reserved.
++ * Copyright (C)2011-2012, 2014-2015, 2017-2018, 2022 D. R. Commander.
++ *                                                    All Rights Reserved.
+  *
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions are met:
+@@ -304,6 +304,10 @@ else if (argv[i].equalsIgnoreCase("-fastupsample")) {
+         height = tjd.getHeight();
+         int inSubsamp = tjd.getSubsamp();
+         int inColorspace = tjd.getColorspace();
++        int inFlags = tjd.getFlags();
++
++        if ((inFlags & TJ.FLAG_LOSSLESS) != 0)
++          scalingFactor = new TJScalingFactor(1, 1);
+ 
+         System.out.println((doTransform ? "Transformed" : "Input") +
+                            " Image (jpg):  " + width + " x " + height +
+diff --git a/java/doc/index-all.html b/java/doc/index-all.html
+index eddddc92b..54f5807f3 100644
+--- a/java/doc/index-all.html
++++ b/java/doc/index-all.html
+@@ -316,6 +316,13 @@ <h2 class="title">G</h2>
+ <div class="block">Returns a code (one of <a href="./org/libjpegturbo/turbojpeg/TJ.html" title="class in org.libjpegturbo.turbojpeg"><code>TJ.ERR_*</code></a>) indicating the severity of the
+  last error.</div>
+ </dd>
++<dt><span class="strong"><a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html#getFlags()">getFlags()</a></span> - Method in class org.libjpegturbo.turbojpeg.<a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html" title="class in org.libjpegturbo.turbojpeg">TJDecompressor</a></dt>
++<dd>
++<div class="block">Returns the bitwise OR of one or more of the
++ <a href="./org/libjpegturbo/turbojpeg/TJ.html#FLAG_BOTTOMUP"><code>flags</code></a>, such as
++ <a href="./org/libjpegturbo/turbojpeg/TJ.html#FLAG_PROGRESSIVE"><code>TJ.FLAG_PROGRESSIVE</code></a> and
++ <a href="./org/libjpegturbo/turbojpeg/TJ.html#FLAG_LOSSLESS"><code>TJ.FLAG_LOSSLESS</code></a>, that describe the JPEG image.</div>
++</dd>
+ <dt><span class="strong"><a href="./org/libjpegturbo/turbojpeg/TJ.html#getGreenOffset(int)">getGreenOffset(int)</a></span> - Static method in class org.libjpegturbo.turbojpeg.<a href="./org/libjpegturbo/turbojpeg/TJ.html" title="class in org.libjpegturbo.turbojpeg">TJ</a></dt>
+ <dd>
+ <div class="block">For the given pixel format, returns the number of bytes that the green
+@@ -462,6 +469,8 @@ <h2 class="title">J</h2>
+ <dd>&nbsp;</dd>
+ <dt><span class="strong"><a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegColorspace">jpegColorspace</a></span> - Variable in class org.libjpegturbo.turbojpeg.<a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html" title="class in org.libjpegturbo.turbojpeg">TJDecompressor</a></dt>
+ <dd>&nbsp;</dd>
++<dt><span class="strong"><a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegFlags">jpegFlags</a></span> - Variable in class org.libjpegturbo.turbojpeg.<a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html" title="class in org.libjpegturbo.turbojpeg">TJDecompressor</a></dt>
++<dd>&nbsp;</dd>
+ <dt><span class="strong"><a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegHeight">jpegHeight</a></span> - Variable in class org.libjpegturbo.turbojpeg.<a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html" title="class in org.libjpegturbo.turbojpeg">TJDecompressor</a></dt>
+ <dd>&nbsp;</dd>
+ <dt><span class="strong"><a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegSubsamp">jpegSubsamp</a></span> - Variable in class org.libjpegturbo.turbojpeg.<a href="./org/libjpegturbo/turbojpeg/TJDecompressor.html" title="class in org.libjpegturbo.turbojpeg">TJDecompressor</a></dt>
+diff --git a/java/doc/org/libjpegturbo/turbojpeg/TJDecompressor.html b/java/doc/org/libjpegturbo/turbojpeg/TJDecompressor.html
+index 0a0d100c4..c27a8abfb 100644
+--- a/java/doc/org/libjpegturbo/turbojpeg/TJDecompressor.html
++++ b/java/doc/org/libjpegturbo/turbojpeg/TJDecompressor.html
+@@ -144,17 +144,21 @@ <h3>Field Summary</h3>
+ </tr>
+ <tr class="altColor">
+ <td class="colFirst"><code>protected int</code></td>
+-<td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegHeight">jpegHeight</a></strong></code>&nbsp;</td>
++<td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegFlags">jpegFlags</a></strong></code>&nbsp;</td>
+ </tr>
+ <tr class="rowColor">
+ <td class="colFirst"><code>protected int</code></td>
+-<td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegSubsamp">jpegSubsamp</a></strong></code>&nbsp;</td>
++<td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegHeight">jpegHeight</a></strong></code>&nbsp;</td>
+ </tr>
+ <tr class="altColor">
+ <td class="colFirst"><code>protected int</code></td>
+-<td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegWidth">jpegWidth</a></strong></code>&nbsp;</td>
++<td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegSubsamp">jpegSubsamp</a></strong></code>&nbsp;</td>
+ </tr>
+ <tr class="rowColor">
++<td class="colFirst"><code>protected int</code></td>
++<td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegWidth">jpegWidth</a></strong></code>&nbsp;</td>
++</tr>
++<tr class="altColor">
+ <td class="colFirst"><code>protected <a href="../../../org/libjpegturbo/turbojpeg/YUVImage.html" title="class in org.libjpegturbo.turbojpeg">YUVImage</a></code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#yuvImage">yuvImage</a></strong></code>&nbsp;</td>
+ </tr>
+@@ -324,25 +328,34 @@ <h3>Method Summary</h3>
+ </tr>
+ <tr class="rowColor">
+ <td class="colFirst"><code>int</code></td>
++<td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getFlags()">getFlags</a></strong>()</code>
++<div class="block">Returns the bitwise OR of one or more of the
++ <a href="../../../org/libjpegturbo/turbojpeg/TJ.html#FLAG_BOTTOMUP"><code>flags</code></a>, such as
++ <a href="../../../org/libjpegturbo/turbojpeg/TJ.html#FLAG_PROGRESSIVE"><code>TJ.FLAG_PROGRESSIVE</code></a> and
++ <a href="../../../org/libjpegturbo/turbojpeg/TJ.html#FLAG_LOSSLESS"><code>TJ.FLAG_LOSSLESS</code></a>, that describe the JPEG image.</div>
++</td>
++</tr>
++<tr class="altColor">
++<td class="colFirst"><code>int</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getHeight()">getHeight</a></strong>()</code>
+ <div class="block">Returns the height of the source image (JPEG or YUV) associated with this
+  decompressor instance.</div>
+ </td>
+ </tr>
+-<tr class="altColor">
++<tr class="rowColor">
+ <td class="colFirst"><code>byte[]</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getJPEGBuf()">getJPEGBuf</a></strong>()</code>
+ <div class="block">Returns the JPEG image buffer associated with this decompressor instance.</div>
+ </td>
+ </tr>
+-<tr class="rowColor">
++<tr class="altColor">
+ <td class="colFirst"><code>int</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getJPEGSize()">getJPEGSize</a></strong>()</code>
+ <div class="block">Returns the size of the JPEG image (in bytes) associated with this
+  decompressor instance.</div>
+ </td>
+ </tr>
+-<tr class="altColor">
++<tr class="rowColor">
+ <td class="colFirst"><code>int</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getScaledHeight(int,%20int)">getScaledHeight</a></strong>(int&nbsp;desiredWidth,
+                int&nbsp;desiredHeight)</code>
+@@ -351,7 +364,7 @@ <h3>Method Summary</h3>
+  height.</div>
+ </td>
+ </tr>
+-<tr class="rowColor">
++<tr class="altColor">
+ <td class="colFirst"><code>int</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getScaledWidth(int,%20int)">getScaledWidth</a></strong>(int&nbsp;desiredWidth,
+               int&nbsp;desiredHeight)</code>
+@@ -360,21 +373,21 @@ <h3>Method Summary</h3>
+  height.</div>
+ </td>
+ </tr>
+-<tr class="altColor">
++<tr class="rowColor">
+ <td class="colFirst"><code>int</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getSubsamp()">getSubsamp</a></strong>()</code>
+ <div class="block">Returns the level of chrominance subsampling used in the source image
+  (JPEG or YUV) associated with this decompressor instance.</div>
+ </td>
+ </tr>
+-<tr class="rowColor">
++<tr class="altColor">
+ <td class="colFirst"><code>int</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getWidth()">getWidth</a></strong>()</code>
+ <div class="block">Returns the width of the source image (JPEG or YUV) associated with this
+  decompressor instance.</div>
+ </td>
+ </tr>
+-<tr class="altColor">
++<tr class="rowColor">
+ <td class="colFirst"><code>void</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#setSourceImage(byte[],%20int)">setSourceImage</a></strong>(byte[]&nbsp;jpegImage,
+               int&nbsp;imageSize)</code>
+@@ -383,7 +396,7 @@ <h3>Method Summary</h3>
+  <code>jpegImage</code> with this decompressor instance.</div>
+ </td>
+ </tr>
+-<tr class="rowColor">
++<tr class="altColor">
+ <td class="colFirst"><code>void</code></td>
+ <td class="colLast"><code><strong><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#setSourceImage(org.libjpegturbo.turbojpeg.YUVImage)">setSourceImage</a></strong>(<a href="../../../org/libjpegturbo/turbojpeg/YUVImage.html" title="class in org.libjpegturbo.turbojpeg">YUVImage</a>&nbsp;srcImage)</code>
+ <div class="block">Associate the specified YUV planar source image with this decompressor
+@@ -478,12 +491,21 @@ <h4>jpegSubsamp</h4>
+ <a name="jpegColorspace">
+ <!--   -->
+ </a>
+-<ul class="blockListLast">
++<ul class="blockList">
+ <li class="blockList">
+ <h4>jpegColorspace</h4>
+ <pre>protected&nbsp;int jpegColorspace</pre>
+ </li>
+ </ul>
++<a name="jpegFlags">
++<!--   -->
++</a>
++<ul class="blockListLast">
++<li class="blockList">
++<h4>jpegFlags</h4>
++<pre>protected&nbsp;int jpegFlags</pre>
++</li>
++</ul>
+ </li>
+ </ul>
+ <!-- ========= CONSTRUCTOR DETAIL ======== -->
+@@ -657,6 +679,21 @@ <h4>getColorspace</h4>
+  with this decompressor instance.</dd></dl>
+ </li>
+ </ul>
++<a name="getFlags()">
++<!--   -->
++</a>
++<ul class="blockList">
++<li class="blockList">
++<h4>getFlags</h4>
++<pre>public&nbsp;int&nbsp;getFlags()</pre>
++<div class="block">Returns the bitwise OR of one or more of the
++ <a href="../../../org/libjpegturbo/turbojpeg/TJ.html#FLAG_BOTTOMUP"><code>flags</code></a>, such as
++ <a href="../../../org/libjpegturbo/turbojpeg/TJ.html#FLAG_PROGRESSIVE"><code>TJ.FLAG_PROGRESSIVE</code></a> and
++ <a href="../../../org/libjpegturbo/turbojpeg/TJ.html#FLAG_LOSSLESS"><code>TJ.FLAG_LOSSLESS</code></a>, that describe the JPEG image.</div>
++<dl><dt><span class="strong">Returns:</span></dt><dd>the bitwise OR of one or more of the
++ <a href="../../../org/libjpegturbo/turbojpeg/TJ.html#FLAG_BOTTOMUP"><code>flags</code></a> that describe the JPEG image.</dd></dl>
++</li>
++</ul>
+ <a name="getJPEGBuf()">
+ <!--   -->
+ </a>
+diff --git a/java/doc/org/libjpegturbo/turbojpeg/TJTransformer.html b/java/doc/org/libjpegturbo/turbojpeg/TJTransformer.html
+index 8bad93f58..69923f333 100644
+--- a/java/doc/org/libjpegturbo/turbojpeg/TJTransformer.html
++++ b/java/doc/org/libjpegturbo/turbojpeg/TJTransformer.html
+@@ -125,7 +125,7 @@ <h3>Field Summary</h3>
+ <!--   -->
+ </a>
+ <h3>Fields inherited from class&nbsp;org.libjpegturbo.turbojpeg.<a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html" title="class in org.libjpegturbo.turbojpeg">TJDecompressor</a></h3>
+-<code><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#handle">handle</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegBuf">jpegBuf</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegBufSize">jpegBufSize</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegColorspace">jpegColorspace</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegHeight">jpegHeight</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegSubsamp">jpegSubsamp</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegWidth">jpegWidth</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#yuvImage">yuvImage</a></code></li>
++<code><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#handle">handle</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegBuf">jpegBuf</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegBufSize">jpegBufSize</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegColorspace">jpegColorspace</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegFlags">jpegFlags</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegHeight">jpegHeight</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegSubsamp">jpegSubsamp</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#jpegWidth">jpegWidth</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#yuvImage">yuvImage</a></code></li>
+ </ul>
+ </li>
+ </ul>
+@@ -206,7 +206,7 @@ <h3>Method Summary</h3>
+ <!--   -->
+ </a>
+ <h3>Methods inherited from class&nbsp;org.libjpegturbo.turbojpeg.<a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html" title="class in org.libjpegturbo.turbojpeg">TJDecompressor</a></h3>
+-<code><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#close()">close</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(java.awt.image.BufferedImage,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(byte[],%20int,%20int,%20int,%20int,%20int,%20int,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(int[],%20int,%20int,%20int,%20int,%20int,%20int,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(int,%20int,%20int,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(int,%20int,%20int,%20int,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompressToYUV(int,%20int[],%20int,%20int)">decompressToYUV</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompressToYUV(int,%20int,%20int,%20int)">decompressToYUV</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompressToYUV(org.libjpegturbo.turbojpeg.YUVImage,%20int)">decompressToYUV</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#finalize()">finalize</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getColorspace()">getColorspace</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getHeight()">getHeight</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getJPEGBuf()">getJPEGBuf</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getJPEGSize()">getJPEGSize</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getScaledHeight(int,%20int)">getScaledHeight</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getScaledWidth(int,%20int)">getScaledWidth</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getSubsamp()">getSubsamp</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getWidth()">getWidth</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#setSourceImage(byte[],%20int)">setSourceImage</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#setSourceImage(org.libjpegturbo.turbojpeg.YUVImage)">setSourceImage</a></code></li>
++<code><a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#close()">close</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(java.awt.image.BufferedImage,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(byte[],%20int,%20int,%20int,%20int,%20int,%20int,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(int[],%20int,%20int,%20int,%20int,%20int,%20int,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(int,%20int,%20int,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompress(int,%20int,%20int,%20int,%20int)">decompress</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompressToYUV(int,%20int[],%20int,%20int)">decompressToYUV</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompressToYUV(int,%20int,%20int,%20int)">decompressToYUV</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#decompressToYUV(org.libjpegturbo.turbojpeg.YUVImage,%20int)">decompressToYUV</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#finalize()">finalize</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getColorspace()">getColorspace</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getFlags()">getFlags</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getHeight()">getHeight</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getJPEGBuf()">getJPEGBuf</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getJPEGSize()">getJPEGSize</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getScaledHeight(int,%20int)">getScaledHeight</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getScaledWidth(int,%20int)">getScaledWidth</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getSubsamp()">getSubsamp</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#getWidth()">getWidth</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#setSourceImage(byte[],%20int)">setSourceImage</a>, <a href="../../../org/libjpegturbo/turbojpeg/TJDecompressor.html#setSourceImage(org.libjpegturbo.turbojpeg.YUVImage)">setSourceImage</a></code></li>
+ </ul>
+ <ul class="blockList">
+ <li class="blockList"><a name="methods_inherited_from_class_java.lang.Object">
+diff --git a/java/org/libjpegturbo/turbojpeg/TJDecompressor.java b/java/org/libjpegturbo/turbojpeg/TJDecompressor.java
+index afeb051b6..c115d47e5 100644
+--- a/java/org/libjpegturbo/turbojpeg/TJDecompressor.java
++++ b/java/org/libjpegturbo/turbojpeg/TJDecompressor.java
+@@ -199,6 +199,21 @@ public int getColorspace() {
+     return jpegColorspace;
+   }
+ 
++  /**
++   * Returns the bitwise OR of one or more of the
++   * {@link TJ#FLAG_BOTTOMUP flags}, such as
++   * {@link TJ#FLAG_PROGRESSIVE TJ.FLAG_PROGRESSIVE} and
++   * {@link TJ#FLAG_LOSSLESS TJ.FLAG_LOSSLESS}, that describe the JPEG image.
++   *
++   * @return the bitwise OR of one or more of the
++   * {@link TJ#FLAG_BOTTOMUP flags} that describe the JPEG image.
++   */
++  public int getFlags() {
++    if (jpegFlags < 0)
++      throw new IllegalStateException(NO_ASSOC_ERROR);
++    return jpegFlags;
++  }
++
+   /**
+    * Returns the JPEG image buffer associated with this decompressor instance.
+    *
+@@ -873,5 +888,6 @@ private native void decodeYUV(byte[][] srcPlanes, int[] srcOffsets,
+   protected int jpegHeight = 0;
+   protected int jpegSubsamp = -1;
+   protected int jpegColorspace = -1;
++  protected int jpegFlags = -1;
+   private ByteOrder byteOrder = null;
+ }
+diff --git a/tjbench.c b/tjbench.c
+index b26c8f2fb..cfda0dc05 100644
+--- a/tjbench.c
++++ b/tjbench.c
+@@ -153,12 +153,17 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
+   int row, col, iter = 0, dstBufAlloc = 0, retval = 0;
+   double elapsed, elapsedDecode;
+   int ps = tjPixelSize[pf];
+-  int scaledw = TJSCALED(w, sf);
+-  int scaledh = TJSCALED(h, sf);
+-  int pitch = scaledw * ps;
++  int scaledw, scaledh, pitch;
+   int ntilesw = (w + tilew - 1) / tilew, ntilesh = (h + tileh - 1) / tileh;
+   unsigned char *dstPtr, *dstPtr2, *yuvBuf = NULL;
+ 
++  if (flags & TJFLAG_LOSSLESS)
++    sf.num = sf.denom = 1;
++
++  scaledw = TJSCALED(w, sf);
++  scaledh = TJSCALED(h, sf);
++  pitch = scaledw * ps;
++
+   if (jpegQual > 0) {
+     SNPRINTF(qualStr, 13, "_Q%d", jpegQual);
+     qualStr[12] = 0;
+@@ -537,7 +542,7 @@ static int decompTest(char *fileName)
+   int w = 0, h = 0, tilew, tileh, ntilesw = 1, ntilesh = 1, subsamp = -1,
+     cs = -1;
+   /* Transformed image */
+-  int tw, th, ttilew, ttileh, tntilesw, tntilesh, tsubsamp;
++  int tw, th, ttilew, ttileh, tntilesw, tntilesh, tsubsamp, jpegFlags;
+ 
+   if ((file = fopen(fileName, "rb")) == NULL)
+     THROW_UNIX("opening file");
+@@ -557,14 +562,16 @@ static int decompTest(char *fileName)
+ 
+   if ((handle = tjInitTransform()) == NULL)
+     THROW_TJ("executing tjInitTransform()");
+-  if (tjDecompressHeader3(handle, srcBuf, srcSize, &w, &h, &subsamp,
+-                          &cs) == -1)
+-    THROW_TJ("executing tjDecompressHeader3()");
++  if (tjDecompressHeader4(handle, srcBuf, srcSize, &w, &h, &subsamp, &cs,
++                          &jpegFlags) == -1)
++    THROW_TJ("executing tjDecompressHeader4()");
+   if (w < 1 || h < 1)
+     THROW("reading JPEG header", "Invalid image dimensions");
+   if (cs == TJCS_YCCK || cs == TJCS_CMYK) {
+     pf = TJPF_CMYK;  ps = tjPixelSize[pf];
+   }
++  if (jpegFlags & TJFLAG_LOSSLESS)
++    sf.num = sf.denom = 1;
+ 
+   if (quiet == 1) {
+     printf("All performance values in Mpixels/sec\n\n");
+diff --git a/tjbenchtest.in b/tjbenchtest.in
+index d8aa208aa..9b847cd00 100755
+--- a/tjbenchtest.in
++++ b/tjbenchtest.in
+@@ -31,6 +31,12 @@ ALLOC=0
+ ALLOCARG=
+ PROGARG=
+ ARIARG=
++LOSSLSARG=
++LOSSLSPSV=
++TJQUAL=95
++h1SUBSAMP="GRAY 444"
++h2SUBSAMP="420 422"
++ALLSUBSAMP="GRAY 420 422 444"
+ if [ "$EXT" = "bmp" ]; then BMPARG=-bmp; fi
+ 
+ if [ -d $OUTDIR ]; then
+@@ -72,31 +78,39 @@ while [ $# -gt 0 ]; do
+ 	-arithmetic)
+ 		ARIARG=-arithmetic
+ 		;;
++	-lossless)
++		LOSSLSARG="-lossless"
++		LOSSLSPSV=4
++		TJQUAL=40
++		h1SUBSAMP=444
++		h2SUBSAMP=444
++		ALLSUBSAMP=444
++		;;
+ 	esac
+ 	shift
+ done
+ 
+-exec >$EXEDIR/tjbenchtest$YUVARG$ALLOCARG$PROGARG$ARIARG.log
++exec >$EXEDIR/tjbenchtest$YUVARG$ALLOCARG$PROGARG$ARIARG$LOSSLSARG.log
+ 
+ # Standard tests
+ for image in $IMAGES; do
+ 
+ 	cp $IMGDIR/$image $OUTDIR
+ 	basename=`basename $image .${EXT}`
+-	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG -grayscale -outfile $OUTDIR/${basename}_GRAY_fast_cjpeg.jpg $IMGDIR/${basename}.${EXT}
+-	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG -sample 2x2 -outfile $OUTDIR/${basename}_420_fast_cjpeg.jpg $IMGDIR/${basename}.${EXT}
+-	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG -sample 2x1 -outfile $OUTDIR/${basename}_422_fast_cjpeg.jpg $IMGDIR/${basename}.${EXT}
+-	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG -sample 1x1 -outfile $OUTDIR/${basename}_444_fast_cjpeg.jpg $IMGDIR/${basename}.${EXT}
+-	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG -grayscale -outfile $OUTDIR/${basename}_GRAY_accurate_cjpeg.jpg $IMGDIR/${basename}.${EXT}
+-	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG -sample 2x2 -outfile $OUTDIR/${basename}_420_accurate_cjpeg.jpg $IMGDIR/${basename}.${EXT}
+-	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG -sample 2x1 -outfile $OUTDIR/${basename}_422_accurate_cjpeg.jpg $IMGDIR/${basename}.${EXT}
+-	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG -sample 1x1 -outfile $OUTDIR/${basename}_444_accurate_cjpeg.jpg $IMGDIR/${basename}.${EXT}
+-	for samp in GRAY 420 422 444; do
++	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -grayscale -outfile $OUTDIR/${basename}_GRAY_fast_cjpeg.jpg $IMGDIR/${basename}.${EXT}
++	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 2x2 -outfile $OUTDIR/${basename}_420_fast_cjpeg.jpg $IMGDIR/${basename}.${EXT}
++	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 2x1 -outfile $OUTDIR/${basename}_422_fast_cjpeg.jpg $IMGDIR/${basename}.${EXT}
++	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 1x1 -outfile $OUTDIR/${basename}_444_fast_cjpeg.jpg $IMGDIR/${basename}.${EXT}
++	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -grayscale -outfile $OUTDIR/${basename}_GRAY_accurate_cjpeg.jpg $IMGDIR/${basename}.${EXT}
++	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 2x2 -outfile $OUTDIR/${basename}_420_accurate_cjpeg.jpg $IMGDIR/${basename}.${EXT}
++	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 2x1 -outfile $OUTDIR/${basename}_422_accurate_cjpeg.jpg $IMGDIR/${basename}.${EXT}
++	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 1x1 -outfile $OUTDIR/${basename}_444_accurate_cjpeg.jpg $IMGDIR/${basename}.${EXT}
++	for samp in $ALLSUBSAMP; do
+ 		runme $EXEDIR/djpeg -rgb $NSARG $BMPARG -outfile $OUTDIR/${basename}_${samp}_default_djpeg.${EXT} $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+ 		runme $EXEDIR/djpeg -dct fast -rgb $NSARG $BMPARG -outfile $OUTDIR/${basename}_${samp}_fast_djpeg.${EXT} $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+ 		runme $EXEDIR/djpeg -dct int -rgb $NSARG $BMPARG -outfile $OUTDIR/${basename}_${samp}_accurate_djpeg.${EXT} $OUTDIR/${basename}_${samp}_accurate_cjpeg.jpg
+ 	done
+-	for samp in 420 422; do
++	for samp in $h2SUBSAMP; do
+ 		runme $EXEDIR/djpeg -nosmooth $BMPARG -outfile $OUTDIR/${basename}_${samp}_default_nosmooth_djpeg.${EXT} $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+ 		runme $EXEDIR/djpeg -dct fast -nosmooth $BMPARG -outfile $OUTDIR/${basename}_${samp}_fast_nosmooth_djpeg.${EXT} $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+ 		runme $EXEDIR/djpeg -dct int -nosmooth $BMPARG -outfile $OUTDIR/${basename}_${samp}_accurate_nosmooth_djpeg.${EXT} $OUTDIR/${basename}_${samp}_accurate_cjpeg.jpg
+@@ -104,9 +118,9 @@ for image in $IMAGES; do
+ 
+ 	# Compression
+ 	for dct in accurate fast; do
+-		runme $EXEDIR/tjbench $OUTDIR/$image 95 -rgb -quiet -benchtime 0.01 -warmup 0 -${dct}dct $YUVARG $ALLOCARG $PROGARG $ARIARG
+-		for samp in GRAY 420 422 444; do
+-			runme cmp $OUTDIR/${basename}_${samp}_Q95.jpg $OUTDIR/${basename}_${samp}_${dct}_cjpeg.jpg
++		runme $EXEDIR/tjbench $OUTDIR/$image $TJQUAL -rgb -quiet -benchtime 0.01 -warmup 0 -${dct}dct $YUVARG $ALLOCARG $PROGARG $ARIARG $LOSSLSARG
++		for samp in $ALLSUBSAMP; do
++			runme cmp $OUTDIR/${basename}_${samp}_Q${TJQUAL}.jpg $OUTDIR/${basename}_${samp}_${dct}_cjpeg.jpg
+ 		done
+ 	done
+ 
+@@ -117,27 +131,27 @@ for image in $IMAGES; do
+ 		fi
+ 
+ 		# Tiled compression & decompression
+-		runme $EXEDIR/tjbench $OUTDIR/$image 95 -rgb -tile -quiet -benchtime 0.01 -warmup 0 ${dctarg} $YUVARG $ALLOCARG $PROGARG $ARIARG
+-		for samp in GRAY 444; do
++		runme $EXEDIR/tjbench $OUTDIR/$image $TJQUAL -rgb -tile -quiet -benchtime 0.01 -warmup 0 ${dctarg} $YUVARG $ALLOCARG $PROGARG $ARIARG $LOSSLSARG
++		for samp in $h1SUBSAMP; do
+ 			if [ $ALLOC = 1 ]; then
+-				runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${dct}_djpeg.${EXT}
+-				rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
++				runme cmp $OUTDIR/${basename}_${samp}_Q${TJQUAL}_full.${EXT} $OUTDIR/${basename}_${samp}_${dct}_djpeg.${EXT}
++				rm $OUTDIR/${basename}_${samp}_Q${TJQUAL}_full.${EXT}
+ 			else
+-				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
+-					$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
++				for i in $OUTDIR/${basename}_${samp}_Q${TJQUAL}_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
++					$OUTDIR/${basename}_${samp}_Q${TJQUAL}_full.${EXT}; do
+ 					runme cmp $i $OUTDIR/${basename}_${samp}_${dct}_djpeg.${EXT}
+ 					rm $i
+ 				done
+ 			fi
+ 		done
+-		runme $EXEDIR/tjbench $OUTDIR/$image 95 -rgb -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample ${dctarg} $YUVARG $ALLOCARG $PROGARG $ARIARG
+-		for samp in 420 422; do
++		runme $EXEDIR/tjbench $OUTDIR/$image $TJQUAL -rgb -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample ${dctarg} $YUVARG $ALLOCARG $PROGARG $ARIARG $LOSSLSARG
++		for samp in $h2SUBSAMP; do
+ 			if [ $ALLOC = 1 ]; then
+-				runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.${EXT}
+-				rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
++				runme cmp $OUTDIR/${basename}_${samp}_Q${TJQUAL}_full.${EXT} $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.${EXT}
++				rm $OUTDIR/${basename}_${samp}_Q${TJQUAL}_full.${EXT}
+ 			else
+-				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
+-					$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
++				for i in $OUTDIR/${basename}_${samp}_Q${TJQUAL}_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
++					$OUTDIR/${basename}_${samp}_Q${TJQUAL}_full.${EXT}; do
+ 					runme cmp $i $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.${EXT}
+ 					rm $i
+ 				done
+@@ -145,115 +159,123 @@ for image in $IMAGES; do
+ 		done
+ 
+ 		# Tiled decompression
+-		for samp in GRAY 444; do
+-			runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -tile -quiet -benchtime 0.01 -warmup 0 ${dctarg} $YUVARG $ALLOCARG $PROGARG $ARIARG
+-			if [ $ALLOC = 1 ]; then
+-				runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${dct}_djpeg.${EXT}
+-				rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
+-			else
+-				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
+-					$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
+-					runme cmp $i $OUTDIR/${basename}_${samp}_${dct}_djpeg.${EXT}
+-					rm $i
+-				done
+-			fi
+-		done
+-		for samp in 420 422; do
+-			runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample ${dctarg} $YUVARG $ALLOCARG $PROGARG $ARIARG
+-			if [ $ALLOC = 1 ]; then
+-				runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.${EXT}
+-				rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
+-			else
+-				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
+-					$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
+-					runme cmp $i $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.${EXT}
+-					rm $i
+-				done
+-			fi
+-		done
++		if [ "$LOSSLSARG" != "-lossless" ]; then
++			for samp in GRAY 444; do
++				runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -tile -quiet -benchtime 0.01 -warmup 0 ${dctarg} $YUVARG $ALLOCARG $PROGARG $ARIARG
++				if [ $ALLOC = 1 ]; then
++					runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${dct}_djpeg.${EXT}
++					rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
++				else
++					for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
++						$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
++						runme cmp $i $OUTDIR/${basename}_${samp}_${dct}_djpeg.${EXT}
++						rm $i
++					done
++				fi
++			done
++			for samp in 420 422; do
++				runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample ${dctarg} $YUVARG $ALLOCARG $PROGARG $ARIARG
++				if [ $ALLOC = 1 ]; then
++					runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.${EXT}
++					rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
++				else
++					for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
++						$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
++						runme cmp $i $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.${EXT}
++						rm $i
++					done
++				fi
++			done
++		fi
+ 	done
+ 
+ 	# Scaled decompression
+ 	for scale in 2_1 15_8 7_4 13_8 3_2 11_8 5_4 9_8 7_8 3_4 5_8 1_2 3_8 1_4 1_8; do
+ 		scalearg=`echo $scale | sed 's/\_/\//g'`
+-		for samp in GRAY 420 422 444; do
++		SCALE=$scale
++		if [ "$LOSSLSARG" = "-lossless" ]; then
++			SCALE=full
++		fi
++		for samp in $ALLSUBSAMP; do
+ 			runme $EXEDIR/djpeg -rgb -scale ${scalearg} $NSARG $BMPARG -outfile $OUTDIR/${basename}_${samp}_${scale}_djpeg.${EXT} $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+-			runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -scale ${scalearg} -quiet -benchtime 0.01 -warmup 0 $YUVARG $ALLOCARG $PROGARG $ARIARG
+-			runme cmp $OUTDIR/${basename}_${samp}_Q95_${scale}.${EXT} $OUTDIR/${basename}_${samp}_${scale}_djpeg.${EXT}
+-			rm $OUTDIR/${basename}_${samp}_Q95_${scale}.${EXT}
++			runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q${TJQUAL}.jpg $BMPARG -scale ${scalearg} -quiet -benchtime 0.01 -warmup 0 $YUVARG $ALLOCARG $PROGARG $ARIARG $LOSSLSARG
++			runme cmp $OUTDIR/${basename}_${samp}_Q${TJQUAL}_${SCALE}.${EXT} $OUTDIR/${basename}_${samp}_${scale}_djpeg.${EXT}
++			rm $OUTDIR/${basename}_${samp}_Q${TJQUAL}_${SCALE}.${EXT}
+ 		done
+ 	done
+ 
+ 	# Transforms
+-	for samp in GRAY 420 422 444; do
+-		runme $EXEDIR/jpegtran -flip horizontal -trim -outfile $OUTDIR/${basename}_${samp}_hflip_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -flip vertical -trim -outfile $OUTDIR/${basename}_${samp}_vflip_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -transpose -trim -outfile $OUTDIR/${basename}_${samp}_transpose_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -transverse -trim -outfile $OUTDIR/${basename}_${samp}_transverse_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -rotate 90 -trim -outfile $OUTDIR/${basename}_${samp}_rot90_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -rotate 180 -trim -outfile $OUTDIR/${basename}_${samp}_rot180_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -rotate 270 -trim -outfile $OUTDIR/${basename}_${samp}_rot270_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-	done
+-	for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
+-		for samp in GRAY 444; do
+-			runme $EXEDIR/djpeg -rgb $BMPARG -outfile $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
+-			runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -$xform -tile -quiet -benchtime 0.01 -warmup 0 $YUVARG $ALLOCARG $PROGARG $ARIARG
+-			if [ $ALLOC = 1 ]; then
+-				runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT}
+-				rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
+-			else
+-				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
+-					$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
+-					runme cmp $i $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT}
+-					rm $i
+-				done
+-			fi
++	if [ "$LOSSLSARG" != "-lossless" ]; then
++		for samp in GRAY 420 422 444; do
++			runme $EXEDIR/jpegtran -flip horizontal -trim -outfile $OUTDIR/${basename}_${samp}_hflip_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -flip vertical -trim -outfile $OUTDIR/${basename}_${samp}_vflip_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -transpose -trim -outfile $OUTDIR/${basename}_${samp}_transpose_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -transverse -trim -outfile $OUTDIR/${basename}_${samp}_transverse_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -rotate 90 -trim -outfile $OUTDIR/${basename}_${samp}_rot90_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -rotate 180 -trim -outfile $OUTDIR/${basename}_${samp}_rot180_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -rotate 270 -trim -outfile $OUTDIR/${basename}_${samp}_rot270_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+ 		done
+-		for samp in 420 422; do
+-			runme $EXEDIR/djpeg -nosmooth -rgb $BMPARG -outfile $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
+-			runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -$xform -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample $YUVARG $ALLOCARG $PROGARG $ARIARG
+-			if [ $ALLOC = 1 ]; then
+-				runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT}
+-				rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
+-			else
+-				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
+-					$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
+-					runme cmp $i $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT}
+-					rm $i
+-				done
+-			fi
++		for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
++			for samp in GRAY 444; do
++				runme $EXEDIR/djpeg -rgb $BMPARG -outfile $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
++				runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -$xform -tile -quiet -benchtime 0.01 -warmup 0 $YUVARG $ALLOCARG $PROGARG $ARIARG
++				if [ $ALLOC = 1 ]; then
++					runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT}
++					rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
++				else
++					for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
++						$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
++						runme cmp $i $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT}
++						rm $i
++					done
++				fi
++			done
++			for samp in 420 422; do
++				runme $EXEDIR/djpeg -nosmooth -rgb $BMPARG -outfile $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
++				runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -$xform -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample $YUVARG $ALLOCARG $PROGARG $ARIARG
++				if [ $ALLOC = 1 ]; then
++					runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT}
++					rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
++				else
++					for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
++						$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
++						runme cmp $i $OUTDIR/${basename}_${samp}_${xform}_jpegtran.${EXT}
++						rm $i
++					done
++				fi
++			done
+ 		done
+-	done
+ 
+-	# Grayscale transform
+-	for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
+-		for samp in GRAY 444 422 420; do
+-			runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -$xform -tile -quiet -benchtime 0.01 -warmup 0 -grayscale $YUVARG $ALLOCARG $PROGARG $ARIARG
+-			if [ $ALLOC = 1 ]; then
+-				runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_GRAY_${xform}_jpegtran.${EXT}
+-				rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
+-			else
+-				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
+-					$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
+-					runme cmp $i $OUTDIR/${basename}_GRAY_${xform}_jpegtran.${EXT}
+-					rm $i
+-				done
+-			fi
++		# Grayscale transform
++		for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
++			for samp in GRAY 444 422 420; do
++				runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -$xform -tile -quiet -benchtime 0.01 -warmup 0 -grayscale $YUVARG $ALLOCARG $PROGARG $ARIARG
++				if [ $ALLOC = 1 ]; then
++					runme cmp $OUTDIR/${basename}_${samp}_Q95_full.${EXT} $OUTDIR/${basename}_GRAY_${xform}_jpegtran.${EXT}
++					rm $OUTDIR/${basename}_${samp}_Q95_full.${EXT}
++				else
++					for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].${EXT} \
++						$OUTDIR/${basename}_${samp}_Q95_full.${EXT}; do
++						runme cmp $i $OUTDIR/${basename}_GRAY_${xform}_jpegtran.${EXT}
++						rm $i
++					done
++				fi
++			done
+ 		done
+-	done
+ 
+-	# Transforms with scaling
+-	for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
+-		for samp in GRAY 444 422 420; do
+-			for scale in 2_1 15_8 7_4 13_8 3_2 11_8 5_4 9_8 7_8 3_4 5_8 1_2 3_8 1_4 1_8; do
+-				scalearg=`echo $scale | sed 's/\_/\//g'`
+-				runme $EXEDIR/djpeg -rgb -scale ${scalearg} $NSARG $BMPARG -outfile $OUTDIR/${basename}_${samp}_${xform}_${scale}_jpegtran.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
+-				runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -$xform -scale ${scalearg} -quiet -benchtime 0.01 -warmup 0 $YUVARG $ALLOCARG $PROGARG $ARIARG
+-				runme cmp $OUTDIR/${basename}_${samp}_Q95_${scale}.${EXT} $OUTDIR/${basename}_${samp}_${xform}_${scale}_jpegtran.${EXT}
+-				rm $OUTDIR/${basename}_${samp}_Q95_${scale}.${EXT}
++		# Transforms with scaling
++		for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
++			for samp in GRAY 444 422 420; do
++				for scale in 2_1 15_8 7_4 13_8 3_2 11_8 5_4 9_8 7_8 3_4 5_8 1_2 3_8 1_4 1_8; do
++					scalearg=`echo $scale | sed 's/\_/\//g'`
++					runme $EXEDIR/djpeg -rgb -scale ${scalearg} $NSARG $BMPARG -outfile $OUTDIR/${basename}_${samp}_${xform}_${scale}_jpegtran.${EXT} $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
++					runme $EXEDIR/tjbench $OUTDIR/${basename}_${samp}_Q95.jpg $BMPARG -$xform -scale ${scalearg} -quiet -benchtime 0.01 -warmup 0 $YUVARG $ALLOCARG $PROGARG $ARIARG
++					runme cmp $OUTDIR/${basename}_${samp}_Q95_${scale}.${EXT} $OUTDIR/${basename}_${samp}_${xform}_${scale}_jpegtran.${EXT}
++					rm $OUTDIR/${basename}_${samp}_Q95_${scale}.${EXT}
++				done
+ 			done
+ 		done
+-	done
++	fi
+ 
+ done
+ 
+diff --git a/tjbenchtest.java.in b/tjbenchtest.java.in
+index a392b373f..f99c5ce73 100755
+--- a/tjbenchtest.java.in
++++ b/tjbenchtest.java.in
+@@ -30,6 +30,12 @@ NSARG=
+ YUVARG=
+ PROGARG=
+ ARIARG=
++LOSSLSARG=
++LOSSLSPSV=
++TJQUAL=95
++h1SUBSAMP="GRAY 444"
++h2SUBSAMP="420 422"
++ALLSUBSAMP="GRAY 420 422 444"
+ 
+ if [ -d $OUTDIR ]; then
+ 	rm -rf $OUTDIR
+@@ -66,31 +72,39 @@ while [ $# -gt 0 ]; do
+ 	-arithmetic)
+ 		ARIARG=-arithmetic
+ 		;;
++	-lossless)
++		LOSSLSARG="-lossless"
++		LOSSLSPSV=4
++		TJQUAL=40
++		h1SUBSAMP=444
++		h2SUBSAMP=444
++		ALLSUBSAMP=444
++		;;
+ 	esac
+ 	shift
+ done
+ 
+-exec >$EXEDIR/tjbenchtest-java$YUVARG$PROGARG$ARIARG.log
++exec >$EXEDIR/tjbenchtest-java$YUVARG$PROGARG$ARIARG$LOSSLSARG.log
+ 
+ # Standard tests
+ for image in $IMAGES; do
+ 
+ 	cp $IMGDIR/$image $OUTDIR
+ 	basename=`basename $image .bmp`
+-	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG -grayscale -outfile $OUTDIR/${basename}_GRAY_fast_cjpeg.jpg $IMGDIR/${basename}.bmp
+-	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG -sample 2x2 -outfile $OUTDIR/${basename}_420_fast_cjpeg.jpg $IMGDIR/${basename}.bmp
+-	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG -sample 2x1 -outfile $OUTDIR/${basename}_422_fast_cjpeg.jpg $IMGDIR/${basename}.bmp
+-	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG -sample 1x1 -outfile $OUTDIR/${basename}_444_fast_cjpeg.jpg $IMGDIR/${basename}.bmp
+-	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG -grayscale -outfile $OUTDIR/${basename}_GRAY_accurate_cjpeg.jpg $IMGDIR/${basename}.bmp
+-	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG -sample 2x2 -outfile $OUTDIR/${basename}_420_accurate_cjpeg.jpg $IMGDIR/${basename}.bmp
+-	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG -sample 2x1 -outfile $OUTDIR/${basename}_422_accurate_cjpeg.jpg $IMGDIR/${basename}.bmp
+-	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG -sample 1x1 -outfile $OUTDIR/${basename}_444_accurate_cjpeg.jpg $IMGDIR/${basename}.bmp
+-	for samp in GRAY 420 422 444; do
++	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -grayscale -outfile $OUTDIR/${basename}_GRAY_fast_cjpeg.jpg $IMGDIR/${basename}.bmp
++	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 2x2 -outfile $OUTDIR/${basename}_420_fast_cjpeg.jpg $IMGDIR/${basename}.bmp
++	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 2x1 -outfile $OUTDIR/${basename}_422_fast_cjpeg.jpg $IMGDIR/${basename}.bmp
++	runme $EXEDIR/cjpeg -quality 95 -dct fast $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 1x1 -outfile $OUTDIR/${basename}_444_fast_cjpeg.jpg $IMGDIR/${basename}.bmp
++	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -grayscale -outfile $OUTDIR/${basename}_GRAY_accurate_cjpeg.jpg $IMGDIR/${basename}.bmp
++	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 2x2 -outfile $OUTDIR/${basename}_420_accurate_cjpeg.jpg $IMGDIR/${basename}.bmp
++	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 2x1 -outfile $OUTDIR/${basename}_422_accurate_cjpeg.jpg $IMGDIR/${basename}.bmp
++	runme $EXEDIR/cjpeg -quality 95 -dct int $PROGARG $ARIARG $LOSSLSARG $LOSSLSPSV -sample 1x1 -outfile $OUTDIR/${basename}_444_accurate_cjpeg.jpg $IMGDIR/${basename}.bmp
++	for samp in $ALLSUBSAMP; do
+ 		runme $EXEDIR/djpeg -rgb -bmp -outfile $OUTDIR/${basename}_${samp}_default_djpeg.bmp $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+ 		runme $EXEDIR/djpeg -dct fast -rgb -bmp -outfile $OUTDIR/${basename}_${samp}_fast_djpeg.bmp $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+ 		runme $EXEDIR/djpeg -dct int -rgb -bmp -outfile $OUTDIR/${basename}_${samp}_accurate_djpeg.bmp $OUTDIR/${basename}_${samp}_accurate_cjpeg.jpg
+ 	done
+-	for samp in 420 422; do
++	for samp in $h2SUBSAMP; do
+ 		runme $EXEDIR/djpeg -nosmooth -bmp -outfile $OUTDIR/${basename}_${samp}_default_nosmooth_djpeg.bmp $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+ 		runme $EXEDIR/djpeg -dct fast -nosmooth -bmp -outfile $OUTDIR/${basename}_${samp}_fast_nosmooth_djpeg.bmp $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+ 		runme $EXEDIR/djpeg -dct int -nosmooth -bmp -outfile $OUTDIR/${basename}_${samp}_accurate_nosmooth_djpeg.bmp $OUTDIR/${basename}_${samp}_accurate_cjpeg.jpg
+@@ -98,9 +112,9 @@ for image in $IMAGES; do
+ 
+ 	# Compression
+ 	for dct in accurate fast; do
+-		runme "$JAVA" $JAVAARGS TJBench $OUTDIR/$image 95 -rgb -quiet -benchtime 0.01 -warmup 0 -${dct}dct $YUVARG $PROGARG $ARIARG
+-		for samp in GRAY 420 422 444; do
+-			runme cmp $OUTDIR/${basename}_${samp}_Q95.jpg $OUTDIR/${basename}_${samp}_${dct}_cjpeg.jpg
++		runme "$JAVA" $JAVAARGS TJBench $OUTDIR/$image $TJQUAL -rgb -quiet -benchtime 0.01 -warmup 0 -${dct}dct $YUVARG $PROGARG $ARIARG $LOSSLSARG
++		for samp in $ALLSUBSAMP; do
++			runme cmp $OUTDIR/${basename}_${samp}_Q${TJQUAL}.jpg $OUTDIR/${basename}_${samp}_${dct}_cjpeg.jpg
+ 		done
+ 	done
+ 
+@@ -111,108 +125,116 @@ for image in $IMAGES; do
+ 		fi
+ 
+ 		# Tiled compression & decompression
+-		runme "$JAVA" $JAVAARGS TJBench $OUTDIR/$image 95 -rgb -tile -quiet -benchtime 0.01 -warmup 0 ${dctarg} $YUVARG $PROGARG $ARIARG
+-		for samp in GRAY 444; do
+-			for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
+-				$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
++		runme "$JAVA" $JAVAARGS TJBench $OUTDIR/$image $TJQUAL -rgb -tile -quiet -benchtime 0.01 -warmup 0 ${dctarg} $YUVARG $PROGARG $ARIARG $LOSSLSARG
++		for samp in $h1SUBSAMP; do
++			for i in $OUTDIR/${basename}_${samp}_Q${TJQUAL}_[0-9]*[0-9]x[0-9]*[0-9].bmp \
++				$OUTDIR/${basename}_${samp}_Q${TJQUAL}_full.bmp; do
+ 				runme cmp -i 54:54 $i $OUTDIR/${basename}_${samp}_${dct}_djpeg.bmp
+ 				rm $i
+ 			done
+ 		done
+-		runme "$JAVA" $JAVAARGS TJBench $OUTDIR/$image 95 -rgb -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample ${dctarg} $YUVARG $PROGARG $ARIARG
+-		for samp in 420 422; do
+-			for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
+-				$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
++		runme "$JAVA" $JAVAARGS TJBench $OUTDIR/$image $TJQUAL -rgb -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample ${dctarg} $YUVARG $PROGARG $ARIARG $LOSSLSARG
++		for samp in $h2SUBSAMP; do
++			for i in $OUTDIR/${basename}_${samp}_Q${TJQUAL}_[0-9]*[0-9]x[0-9]*[0-9].bmp \
++				$OUTDIR/${basename}_${samp}_Q${TJQUAL}_full.bmp; do
+ 				runme cmp -i 54:54 $i $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.bmp
+ 				rm $i
+ 			done
+ 		done
+ 
+ 		# Tiled decompression
+-		for samp in GRAY 444; do
+-			runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -tile -quiet -benchtime 0.01 -warmup 0 ${dctarg} $YUVARG $PROGARG $ARIARG
+-			for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
+-				$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
+-				runme cmp -i 54:54 $i $OUTDIR/${basename}_${samp}_${dct}_djpeg.bmp
+-				rm $i
++		if [ "$LOSSLSARG" != "-lossless" ]; then
++			for samp in GRAY 444; do
++				runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -tile -quiet -benchtime 0.01 -warmup 0 ${dctarg} $YUVARG $PROGARG $ARIARG
++				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
++					$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
++					runme cmp -i 54:54 $i $OUTDIR/${basename}_${samp}_${dct}_djpeg.bmp
++					rm $i
++				done
+ 			done
+-		done
+-		for samp in 420 422; do
+-			runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample ${dctarg} $YUVARG $PROGARG $ARIARG
+-			for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
+-				$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
+-				runme cmp $i -i 54:54 $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.bmp
+-				rm $i
++			for samp in 420 422; do
++				runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample ${dctarg} $YUVARG $PROGARG $ARIARG
++				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
++					$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
++					runme cmp $i -i 54:54 $OUTDIR/${basename}_${samp}_${dct}_nosmooth_djpeg.bmp
++					rm $i
++				done
+ 			done
+-		done
++		fi
+ 	done
+ 
+ 	# Scaled decompression
+ 	for scale in 2_1 15_8 7_4 13_8 3_2 11_8 5_4 9_8 7_8 3_4 5_8 1_2 3_8 1_4 1_8; do
+ 		scalearg=`echo $scale | sed 's/\_/\//g'`
+-		for samp in GRAY 420 422 444; do
++		SCALE=$scale
++		if [ "$LOSSLSARG" = "-lossless" ]; then
++			SCALE=full
++		fi
++		for samp in $ALLSUBSAMP; do
+ 			runme $EXEDIR/djpeg -rgb -scale ${scalearg} $NSARG -bmp -outfile $OUTDIR/${basename}_${samp}_${scale}_djpeg.bmp $OUTDIR/${basename}_${samp}_fast_cjpeg.jpg
+-			runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -scale ${scalearg} -quiet -benchtime 0.01 -warmup 0 $YUVARG $PROGARG $ARIARG
+-			runme cmp -i 54:54 $OUTDIR/${basename}_${samp}_Q95_${scale}.bmp $OUTDIR/${basename}_${samp}_${scale}_djpeg.bmp
+-			rm $OUTDIR/${basename}_${samp}_Q95_${scale}.bmp
++			runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q${TJQUAL}.jpg -scale ${scalearg} -quiet -benchtime 0.01 -warmup 0 $YUVARG $PROGARG $ARIARG $LOSSLSARG
++			runme cmp -i 54:54 $OUTDIR/${basename}_${samp}_Q${TJQUAL}_${SCALE}.bmp $OUTDIR/${basename}_${samp}_${scale}_djpeg.bmp
++			rm $OUTDIR/${basename}_${samp}_Q${TJQUAL}_${SCALE}.bmp
+ 		done
+ 	done
+ 
+ 	# Transforms
+-	for samp in GRAY 420 422 444; do
+-		runme $EXEDIR/jpegtran -flip horizontal -trim -outfile $OUTDIR/${basename}_${samp}_hflip_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -flip vertical -trim -outfile $OUTDIR/${basename}_${samp}_vflip_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -transpose -trim -outfile $OUTDIR/${basename}_${samp}_transpose_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -transverse -trim -outfile $OUTDIR/${basename}_${samp}_transverse_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -rotate 90 -trim -outfile $OUTDIR/${basename}_${samp}_rot90_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -rotate 180 -trim -outfile $OUTDIR/${basename}_${samp}_rot180_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-		runme $EXEDIR/jpegtran -rotate 270 -trim -outfile $OUTDIR/${basename}_${samp}_rot270_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+-	done
+-	for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
+-		for samp in GRAY 444; do
+-			runme $EXEDIR/djpeg -rgb -bmp -outfile $OUTDIR/${basename}_${samp}_${xform}_jpegtran.bmp $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
+-			runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -$xform -tile -quiet -benchtime 0.01 -warmup 0 $YUVARG $PROGARG $ARIARG
+-			for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
+-				$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
+-				runme cmp -i 54:54 $i $OUTDIR/${basename}_${samp}_${xform}_jpegtran.bmp
+-				rm $i
+-			done
++	if [ "$LOSSLSARG" != "-lossless" ]; then
++		for samp in GRAY 420 422 444; do
++			runme $EXEDIR/jpegtran -flip horizontal -trim -outfile $OUTDIR/${basename}_${samp}_hflip_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -flip vertical -trim -outfile $OUTDIR/${basename}_${samp}_vflip_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -transpose -trim -outfile $OUTDIR/${basename}_${samp}_transpose_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -transverse -trim -outfile $OUTDIR/${basename}_${samp}_transverse_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -rotate 90 -trim -outfile $OUTDIR/${basename}_${samp}_rot90_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -rotate 180 -trim -outfile $OUTDIR/${basename}_${samp}_rot180_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
++			runme $EXEDIR/jpegtran -rotate 270 -trim -outfile $OUTDIR/${basename}_${samp}_rot270_jpegtran.jpg $OUTDIR/${basename}_${samp}_Q95.jpg
+ 		done
+-		for samp in 420 422; do
+-			runme $EXEDIR/djpeg -nosmooth -rgb -bmp -outfile $OUTDIR/${basename}_${samp}_${xform}_jpegtran.bmp $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
+-			runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -$xform -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample $YUVARG $PROGARG $ARIARG
+-			for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
+-				$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
+-				runme cmp -i 54:54 $i $OUTDIR/${basename}_${samp}_${xform}_jpegtran.bmp
+-				rm $i
++		for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
++			for samp in GRAY 444; do
++				runme $EXEDIR/djpeg -rgb -bmp -outfile $OUTDIR/${basename}_${samp}_${xform}_jpegtran.bmp $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
++				runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -$xform -tile -quiet -benchtime 0.01 -warmup 0 $YUVARG $PROGARG $ARIARG
++				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
++					$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
++					runme cmp -i 54:54 $i $OUTDIR/${basename}_${samp}_${xform}_jpegtran.bmp
++					rm $i
++				done
++			done
++			for samp in 420 422; do
++				runme $EXEDIR/djpeg -nosmooth -rgb -bmp -outfile $OUTDIR/${basename}_${samp}_${xform}_jpegtran.bmp $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
++				runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -$xform -tile -quiet -benchtime 0.01 -warmup 0 -fastupsample $YUVARG $PROGARG $ARIARG
++				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
++					$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
++					runme cmp -i 54:54 $i $OUTDIR/${basename}_${samp}_${xform}_jpegtran.bmp
++					rm $i
++				done
+ 			done
+ 		done
+-	done
+ 
+-	# Grayscale transform
+-	for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
+-		for samp in GRAY 444 422 420; do
+-			runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -$xform -tile -quiet -benchtime 0.01 -warmup 0 -grayscale $YUVARG $PROGARG $ARIARG
+-			for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
+-				$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
+-				runme cmp -i 54:54 $i $OUTDIR/${basename}_GRAY_${xform}_jpegtran.bmp
+-				rm $i
++		# Grayscale transform
++		for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
++			for samp in GRAY 444 422 420; do
++				runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -$xform -tile -quiet -benchtime 0.01 -warmup 0 -grayscale $YUVARG $PROGARG $ARIARG
++				for i in $OUTDIR/${basename}_${samp}_Q95_[0-9]*[0-9]x[0-9]*[0-9].bmp \
++					$OUTDIR/${basename}_${samp}_Q95_full.bmp; do
++					runme cmp -i 54:54 $i $OUTDIR/${basename}_GRAY_${xform}_jpegtran.bmp
++					rm $i
++				done
+ 			done
+ 		done
+-	done
+ 
+-	# Transforms with scaling
+-	for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
+-		for samp in GRAY 444 422 420; do
+-			for scale in 2_1 15_8 7_4 13_8 3_2 11_8 5_4 9_8 7_8 3_4 5_8 1_2 3_8 1_4 1_8; do
+-				scalearg=`echo $scale | sed 's/\_/\//g'`
+-				runme $EXEDIR/djpeg -rgb -scale ${scalearg} $NSARG -bmp -outfile $OUTDIR/${basename}_${samp}_${xform}_${scale}_jpegtran.bmp $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
+-				runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -$xform -scale ${scalearg} -quiet -benchtime 0.01 -warmup 0 $YUVARG $PROGARG $ARIARG
+-				runme cmp -i 54:54 $OUTDIR/${basename}_${samp}_Q95_${scale}.bmp $OUTDIR/${basename}_${samp}_${xform}_${scale}_jpegtran.bmp
+-				rm $OUTDIR/${basename}_${samp}_Q95_${scale}.bmp
++		# Transforms with scaling
++		for xform in hflip vflip transpose transverse rot90 rot180 rot270; do
++			for samp in GRAY 444 422 420; do
++				for scale in 2_1 15_8 7_4 13_8 3_2 11_8 5_4 9_8 7_8 3_4 5_8 1_2 3_8 1_4 1_8; do
++					scalearg=`echo $scale | sed 's/\_/\//g'`
++					runme $EXEDIR/djpeg -rgb -scale ${scalearg} $NSARG -bmp -outfile $OUTDIR/${basename}_${samp}_${xform}_${scale}_jpegtran.bmp $OUTDIR/${basename}_${samp}_${xform}_jpegtran.jpg
++					runme "$JAVA" $JAVAARGS TJBench $OUTDIR/${basename}_${samp}_Q95.jpg -$xform -scale ${scalearg} -quiet -benchtime 0.01 -warmup 0 $YUVARG $PROGARG $ARIARG
++					runme cmp -i 54:54 $OUTDIR/${basename}_${samp}_Q95_${scale}.bmp $OUTDIR/${basename}_${samp}_${xform}_${scale}_jpegtran.bmp
++					rm $OUTDIR/${basename}_${samp}_Q95_${scale}.bmp
++				done
+ 			done
+ 		done
+-	done
++	fi
+ 
+ done
+ 
+diff --git a/tjexample.c b/tjexample.c
+index 505c9dd4a..2142024ef 100644
+--- a/tjexample.c
++++ b/tjexample.c
+@@ -263,7 +263,7 @@ int main(int argc, char **argv)
+   if (!strcasecmp(inFormat, "jpg")) {
+     /* Input image is a JPEG image.  Decompress and/or transform it. */
+     long size;
+-    int inSubsamp, inColorspace;
++    int inSubsamp, inColorspace, inFlags;
+     int doTransform = (xform.op != TJXOP_NONE || xform.options != 0 ||
+                        xform.customFilter != NULL);
+     unsigned long jpegSize;
+@@ -304,10 +304,13 @@ int main(int argc, char **argv)
+         THROW_TJ("initializing decompressor");
+     }
+ 
+-    if (tjDecompressHeader3(tjInstance, jpegBuf, jpegSize, &width, &height,
+-                            &inSubsamp, &inColorspace) < 0)
++    if (tjDecompressHeader4(tjInstance, jpegBuf, jpegSize, &width, &height,
++                            &inSubsamp, &inColorspace, &inFlags) < 0)
+       THROW_TJ("reading JPEG header");
+ 
++    if (inFlags & TJFLAG_LOSSLESS)
++      scalingFactor.num = scalingFactor.denom = 1;
++
+     printf("%s Image:  %d x %d pixels, %s subsampling, %s colorspace\n",
+            (doTransform ? "Transformed" : "Input"), width, height,
+            subsampName[inSubsamp], colorspaceName[inColorspace]);
+diff --git a/turbojpeg-jni.c b/turbojpeg-jni.c
+index 660a5baa0..ec59bb809 100644
+--- a/turbojpeg-jni.c
++++ b/turbojpeg-jni.c
+@@ -555,7 +555,8 @@ JNIEXPORT void JNICALL Java_org_libjpegturbo_turbojpeg_TJDecompressor_decompress
+ {
+   tjhandle handle = 0;
+   unsigned char *jpegBuf = NULL;
+-  int width = 0, height = 0, jpegSubsamp = -1, jpegColorspace = -1;
++  int width = 0, height = 0, jpegSubsamp = -1, jpegColorspace = -1,
++    jpegFlags = -1;
+ 
+   GET_HANDLE();
+ 
+@@ -564,8 +565,9 @@ JNIEXPORT void JNICALL Java_org_libjpegturbo_turbojpeg_TJDecompressor_decompress
+ 
+   BAILIF0NOEC(jpegBuf = (*env)->GetPrimitiveArrayCritical(env, src, 0));
+ 
+-  if (tjDecompressHeader3(handle, jpegBuf, (unsigned long)jpegSize, &width,
+-                          &height, &jpegSubsamp, &jpegColorspace) == -1) {
++  if (tjDecompressHeader4(handle, jpegBuf, (unsigned long)jpegSize, &width,
++                          &height, &jpegSubsamp, &jpegColorspace,
++                          &jpegFlags) == -1) {
+     SAFE_RELEASE(src, jpegBuf);
+     THROW_TJ();
+   }
+@@ -578,6 +580,10 @@ JNIEXPORT void JNICALL Java_org_libjpegturbo_turbojpeg_TJDecompressor_decompress
+     (*env)->ExceptionClear(env);
+   else
+     (*env)->SetIntField(env, obj, _fid, jpegColorspace);
++  if ((_fid = (*env)->GetFieldID(env, _cls, "jpegFlags", "I")) == 0)
++    (*env)->ExceptionClear(env);
++  else
++    (*env)->SetIntField(env, obj, _fid, jpegFlags);
+   BAILIF0(_fid = (*env)->GetFieldID(env, _cls, "jpegWidth", "I"));
+   (*env)->SetIntField(env, obj, _fid, width);
+   BAILIF0(_fid = (*env)->GetFieldID(env, _cls, "jpegHeight", "I"));
+diff --git a/turbojpeg-mapfile b/turbojpeg-mapfile
+index 5477fed2c..34995b123 100644
+--- a/turbojpeg-mapfile
++++ b/turbojpeg-mapfile
+@@ -63,3 +63,9 @@ TURBOJPEG_2.0
+     tjLoadImage;
+     tjSaveImage;
+ } TURBOJPEG_1.4;
++
++TURBOJPEG_2.2
++{
++  global:
++    tjDecompressHeader4;
++} TURBOJPEG_2.0;
+diff --git a/turbojpeg-mapfile.jni b/turbojpeg-mapfile.jni
+index 44327912b..f86209d17 100644
+--- a/turbojpeg-mapfile.jni
++++ b/turbojpeg-mapfile.jni
+@@ -99,3 +99,9 @@ TURBOJPEG_2.0
+     tjLoadImage;
+     tjSaveImage;
+ } TURBOJPEG_1.4;
++
++TURBOJPEG_2.2
++{
++  global:
++    tjDecompressHeader4;
++} TURBOJPEG_2.0;
+diff --git a/turbojpeg.c b/turbojpeg.c
+index cb8abe1ab..355ad6583 100644
+--- a/turbojpeg.c
++++ b/turbojpeg.c
+@@ -1223,21 +1223,21 @@ DLLEXPORT tjhandle tjInitDecompress(void)
+ }
+ 
+ 
+-DLLEXPORT int tjDecompressHeader3(tjhandle handle,
++DLLEXPORT int tjDecompressHeader4(tjhandle handle,
+                                   const unsigned char *jpegBuf,
+                                   unsigned long jpegSize, int *width,
+                                   int *height, int *jpegSubsamp,
+-                                  int *jpegColorspace)
++                                  int *jpegColorspace, int *jpegFlags)
+ {
+   int retval = 0;
+ 
+   GET_DINSTANCE(handle);
+   if ((this->init & DECOMPRESS) == 0)
+-    THROW("tjDecompressHeader3(): Instance has not been initialized for decompression");
++    THROW("tjDecompressHeader4(): Instance has not been initialized for decompression");
+ 
+   if (jpegBuf == NULL || jpegSize <= 0 || width == NULL || height == NULL ||
+-      jpegSubsamp == NULL || jpegColorspace == NULL)
+-    THROW("tjDecompressHeader3(): Invalid argument");
++      jpegSubsamp == NULL || jpegColorspace == NULL || jpegFlags == NULL)
++    THROW("tjDecompressHeader4(): Invalid argument");
+ 
+   if (setjmp(this->jerr.setjmp_buffer)) {
+     /* If we get here, the JPEG code has signaled an error. */
+@@ -1264,21 +1264,37 @@ DLLEXPORT int tjDecompressHeader3(tjhandle handle,
+   case JCS_YCCK:       *jpegColorspace = TJCS_YCCK;  break;
+   default:             *jpegColorspace = -1;  break;
+   }
++  *jpegFlags = 0;
++  if (dinfo->progressive_mode) *jpegFlags |= TJFLAG_PROGRESSIVE;
++  if (dinfo->arith_code) *jpegFlags |= TJFLAG_ARITHMETIC;
++  if (dinfo->master->lossless) *jpegFlags |= TJFLAG_LOSSLESS;
+ 
+   jpeg_abort_decompress(dinfo);
+ 
+   if (*jpegSubsamp < 0)
+-    THROW("tjDecompressHeader3(): Could not determine subsampling type for JPEG image");
++    THROW("tjDecompressHeader4(): Could not determine subsampling type for JPEG image");
+   if (*jpegColorspace < 0)
+-    THROW("tjDecompressHeader3(): Could not determine colorspace of JPEG image");
++    THROW("tjDecompressHeader4(): Could not determine colorspace of JPEG image");
+   if (*width < 1 || *height < 1)
+-    THROW("tjDecompressHeader3(): Invalid data returned in header");
++    THROW("tjDecompressHeader4(): Invalid data returned in header");
+ 
+ bailout:
+   if (this->jerr.warning) retval = -1;
+   return retval;
+ }
+ 
++DLLEXPORT int tjDecompressHeader3(tjhandle handle,
++                                  const unsigned char *jpegBuf,
++                                  unsigned long jpegSize, int *width,
++                                  int *height, int *jpegSubsamp,
++                                  int *jpegColorspace)
++{
++  int flags;
++
++  return tjDecompressHeader4(handle, jpegBuf, jpegSize, width, height,
++                             jpegSubsamp, jpegColorspace, &flags);
++}
++
+ DLLEXPORT int tjDecompressHeader2(tjhandle handle, unsigned char *jpegBuf,
+                                   unsigned long jpegSize, int *width,
+                                   int *height, int *jpegSubsamp)
+diff --git a/turbojpeg.h b/turbojpeg.h
+index 77a90b5f2..adac92c68 100644
+--- a/turbojpeg.h
++++ b/turbojpeg.h
+@@ -1201,14 +1201,20 @@ DLLEXPORT tjhandle tjInitDecompress(void);
+  * image (see @ref TJCS "JPEG colorspaces".)  If <tt>jpegBuf</tt>
+  * points to a tables-only datastream, then <tt>jpegColorspace</tt> is ignored.
+  *
++ * @param jpegFlags pointer to an integer variable that will receive the
++ * bitwise OR of one or more of the @ref TJFLAG_ACCURATEDCT "flags", such as
++ * #TJFLAG_PROGRESSIVE and #TJFLAG_LOSSLESS, that describe the JPEG image.  If
++ * <tt>jpegBuf</tt> points to a tables-only datastream, then <tt>jpegFlags</tt>
++ * is ignored.
++ *
+  * @return 0 if successful, or -1 if an error occurred (see #tjGetErrorStr2()
+  * and #tjGetErrorCode().)
+ */
+-DLLEXPORT int tjDecompressHeader3(tjhandle handle,
++DLLEXPORT int tjDecompressHeader4(tjhandle handle,
+                                   const unsigned char *jpegBuf,
+                                   unsigned long jpegSize, int *width,
+                                   int *height, int *jpegSubsamp,
+-                                  int *jpegColorspace);
++                                  int *jpegColorspace, int *jpegFlags);
+ 
+ 
+ /**
+@@ -1783,6 +1789,12 @@ DLLEXPORT int tjDecompressHeader2(tjhandle handle, unsigned char *jpegBuf,
+                                   unsigned long jpegSize, int *width,
+                                   int *height, int *jpegSubsamp);
+ 
++DLLEXPORT int tjDecompressHeader3(tjhandle handle,
++                                  const unsigned char *jpegBuf,
++                                  unsigned long jpegSize, int *width,
++                                  int *height, int *jpegSubsamp,
++                                  int *jpegColorspace);
++
+ DLLEXPORT int tjDecompress(tjhandle handle, unsigned char *jpegBuf,
+                            unsigned long jpegSize, unsigned char *dstBuf,
+                            int width, int pitch, int height, int pixelSize,

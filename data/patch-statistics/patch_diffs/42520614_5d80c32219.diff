@@ -1,0 +1,159 @@
+From 02fd447dbbcc68d6e3cf819ccc0f8fb6c9bb07aa Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michal=20Josef=20=C5=A0pa=C4=8Dek?=
+ <michal.josef.spacek@gmail.com>
+Date: Thu, 14 Dec 2023 20:12:11 +0100
+Subject: [PATCH] Remove zero_5 from header
+
+---
+ include/dwg.h    |  1 -
+ src/decode.c     | 19 +++++--------------
+ src/decode_r11.c |  2 +-
+ src/encode.c     |  2 +-
+ src/header.spec  | 10 +---------
+ src/in_json.c    |  9 ---------
+ 6 files changed, 8 insertions(+), 35 deletions(-)
+
+diff --git a/include/dwg.h b/include/dwg.h
+index 2adcc31ad7..b20ae1baa8 100644
+--- a/include/dwg.h
++++ b/include/dwg.h
+@@ -9356,7 +9356,6 @@ typedef struct _dwg_header
+ {
+   Dwg_Version_Type version;      /* calculated from the header magic */
+   Dwg_Version_Type from_version; /* option. set by --as (convert from) */
+-  BITCODE_RC zero_5[5];
+   BITCODE_RC is_maint;
+   BITCODE_RC zero_one_or_three;
+   BITCODE_RS numentity_sections; /* < R13, always 3 */
+diff --git a/src/decode.c b/src/decode.c
+index fe9701fe11..b3e3b02262 100644
+--- a/src/decode.c
++++ b/src/decode.c
+@@ -125,7 +125,7 @@ static int objfreespace_private (Bit_Chain *restrict dat,
+ EXPORT int
+ dwg_decode (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+ {
+-  char magic[8];
++  char magic[11];
+ 
+   dwg->num_object_refs = 0;
+   // dwg->num_layers = 0; // see now dwg->layer_control->num_entries
+@@ -186,14 +186,8 @@ dwg_decode (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+       LOG_ERROR ("dwg too small: %" PRIuSIZE " bytes", dat->size);
+       return DWG_ERR_INVALIDDWG;
+     }
+-  strncpy (magic, (const char *)dat->chain, 6);
+-  if (memcmp (dat->chain, "AC103-4", 7) == 0)
+-    {
+-      magic[6] = '4';
+-      magic[7] = '\0';
+-    }
+-  else
+-    magic[6] = '\0';
++  strncpy (magic, (const char *)dat->chain, 11);
++  magic[10] = '\0';
+ 
+   dwg->header.from_version = dwg_version_hdr_type (magic);
+   if (!dwg->header.from_version)
+@@ -216,6 +210,7 @@ dwg_decode (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+   LOG_INFO ("This file's version code is: %s (%s)\n", magic,
+             dwg_version_type (dat->from_version))
+ 
++  dat->byte = 0xb; // After magic string.
+   PRE (R_13b1)
+   {
+     Dwg_Object *ctrl;
+@@ -319,7 +314,7 @@ decode_R13_R2000 (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+     Dwg_Header *_obj = &dwg->header;
+     Bit_Chain *hdl_dat = dat;
+     BITCODE_BL vcount;
+-    dat->byte = 0x06;
++
+     // clang-format off
+     #include "header.spec"
+     // clang-format on
+@@ -3369,9 +3364,6 @@ decode_R2004 (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+     int i;
+     BITCODE_BL vcount;
+ 
+-    dat->byte = 0x06;
+-    if (dat->from_version >= R_2022b)
+-      dat->byte = 0x07;
+     // clang-format off
+     #include "header.spec"
+     // clang-format on
+@@ -3479,7 +3471,6 @@ decode_R2007 (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+     Dwg_Object *obj = NULL;
+     BITCODE_BL vcount;
+ 
+-    dat->byte = 0x06;
+     // clang-format off
+     #include "header.spec"
+     // clang-format on
+diff --git a/src/decode_r11.c b/src/decode_r11.c
+index bcc95d7b2d..de775e4226 100644
+--- a/src/decode_r11.c
++++ b/src/decode_r11.c
+@@ -636,7 +636,7 @@ decode_preR13 (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+     Dwg_Header *_obj = (Dwg_Header *)&dwg->header;
+     // Bit_Chain *hdl_dat = dat;
+     BITCODE_BL vcount;
+-    dat->byte = 0x06;
++
+     // clang-format off
+     #include "header.spec"
+     // clang-format on
+diff --git a/src/encode.c b/src/encode.c
+index 641c19ab1a..88e8f2af18 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -2624,7 +2624,7 @@ dwg_encode (Dwg_Data *restrict dwg, Bit_Chain *restrict dat)
+    */
+   strcpy ((char *)dat->chain,
+           dwg_version_codes (dwg->header.version)); // Chain version
+-  dat->byte += 6;
++  dat->byte += 11;
+ 
+   {
+     BITCODE_BL vcount;
+diff --git a/src/header.spec b/src/header.spec
+index 4c60eec4a1..3f05e4d945 100644
+--- a/src/header.spec
++++ b/src/header.spec
+@@ -18,15 +18,7 @@
+ 
+ #include "spec.h"
+ 
+-// char version[6] handled separately. older releases just had a version[12]
+-#ifdef IS_JSON
+-  KEY (zero_5);
+-  fprintf (dat->fh, "[ %d, %d, %d, %d, %d ]",
+-          _obj->zero_5[0], _obj->zero_5[1], _obj->zero_5[2], _obj->zero_5[3],
+-          _obj->zero_5[4]);
+-#else
+-  FIELD_VECTOR_INL (zero_5, RC, 5, 0)
+-#endif
++  // char version[11] handled separately
+   FIELD_RC (is_maint, 0);
+ 
+   VERSIONS (R_2_0b, R_13b1) {
+diff --git a/src/in_json.c b/src/in_json.c
+index 530feb249d..8ea1d6778f 100644
+--- a/src/in_json.c
++++ b/src/in_json.c
+@@ -1078,15 +1078,6 @@ json_FILEHEADER (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
+               return DWG_ERR_INVALIDDWG;
+             }
+         }
+-      // FIELD_VECTOR_INL (zero_5, RL, 5, 0)
+-      else if (strEQc (key, "zero_5") && t->type == JSMN_ARRAY)
+-        {
+-          tokens->index++;
+-          for (int j = 0; j < MIN (5, t->size); j++)
+-            {
+-              _obj->zero_5[j] = json_long (dat, tokens);
+-            }
+-        }
+       // clang-format off
+       FIELD_RC (is_maint, 0)
+       FIELD_RC (zero_one_or_three, 0)

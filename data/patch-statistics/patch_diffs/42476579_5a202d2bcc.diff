@@ -1,0 +1,69 @@
+From ba54b896969930491645aa3ec4125b76480add9c Mon Sep 17 00:00:00 2001
+From: Peter Wu <peter@lekensteyn.nl>
+Date: Thu, 18 Jul 2019 00:13:33 +0100
+Subject: [PATCH] QUIC: fix out-of-bounds write due to missing CID length check
+
+The length was previously increased to max 255, but v1 limits it. Be
+sure to check the bounds before doing anything.
+
+Bug: 15919
+Change-Id: I2ed8469d882d5ac2dc4c21e3f5486534e4bf32e6
+Fixes: v3.1.0rc0-1289-g3967f60e45 ("QUIC: update for new Connection ID Lengths (draft -22)")
+Link: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=15936
+Reviewed-on: https://code.wireshark.org/review/34000
+Petri-Dish: Peter Wu <peter@lekensteyn.nl>
+Tested-by: Petri Dish Buildbot
+Reviewed-by: Peter Wu <peter@lekensteyn.nl>
+---
+ epan/dissectors/packet-quic.c | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/epan/dissectors/packet-quic.c b/epan/dissectors/packet-quic.c
+index dfa9d636be5..cab7fba0ac8 100644
+--- a/epan/dissectors/packet-quic.c
++++ b/epan/dissectors/packet-quic.c
+@@ -1792,8 +1792,10 @@ dissect_quic_long_header_common(tvbuff_t *tvb, packet_info *pinfo, proto_tree *q
+     if (dcil) {
+         proto_tree_add_item(quic_tree, hf_quic_dcid, tvb, offset, dcil, ENC_NA);
+         // TODO expert info on CID mismatch with connection
+-        tvb_memcpy(tvb, dcid->cid, offset, dcil);
+-        dcid->len = dcil;
++        if (dcil <= QUIC_MAX_CID_LENGTH) {
++            tvb_memcpy(tvb, dcid->cid, offset, dcil);
++            dcid->len = dcil;
++        }
+         offset += dcil;
+     }
+ 
+@@ -1802,8 +1804,10 @@ dissect_quic_long_header_common(tvbuff_t *tvb, packet_info *pinfo, proto_tree *q
+     if (scil) {
+         proto_tree_add_item(quic_tree, hf_quic_scid, tvb, offset, scil, ENC_NA);
+         // TODO expert info on CID mismatch with connection
+-        tvb_memcpy(tvb, scid->cid, offset, scil);
+-        scid->len = scil;
++        if (scil <= QUIC_MAX_CID_LENGTH) {
++            tvb_memcpy(tvb, scid->cid, offset, scil);
++            scid->len = scil;
++        }
+         offset += scil;
+     }
+ 
+@@ -2164,15 +2168,15 @@ quic_extract_header(tvbuff_t *tvb, guint8 *long_packet_type, guint32 *version,
+         guint8 dcil = tvb_get_guint8(tvb, offset);
+         offset++;
+ 
+-        if (dcil) {
++        if (dcil && dcil <= QUIC_MAX_CID_LENGTH) {
+             tvb_memcpy(tvb, dcid->cid, offset, dcil);
+             dcid->len = dcil;
+-            offset += dcil;
+         }
++        offset += dcil;
+ 
+         guint8 scil = tvb_get_guint8(tvb, offset);
+         offset++;
+-        if (scil) {
++        if (scil && scil <= QUIC_MAX_CID_LENGTH) {
+             tvb_memcpy(tvb, scid->cid, offset, scil);
+             scid->len = scil;
+         }

@@ -1,0 +1,77 @@
+From ee11d47e3d907b66eeff99e0ba1e1c71e05164b7 Mon Sep 17 00:00:00 2001
+From: Patrick Steinhardt <ps@pks.im>
+Date: Fri, 19 Oct 2018 09:47:50 +0200
+Subject: [PATCH] tag: fix out of bounds read when searching for tag message
+
+When parsing tags, we skip all unknown fields that appear before the tag
+message. This skipping is done by using a plain `strstr(buffer, "\n\n")`
+to search for the two newlines that separate tag fields from tag
+message. As it is not possible to supply a buffer length to `strstr`,
+this call may skip over the buffer's end and thus result in an out of
+bounds read. As `strstr` may return a pointer that is out of bounds, the
+following computation of `buffer_end - buffer` will overflow and result
+in an allocation of an invalid length.
+
+Fix the issue by using `git__memmem` instead. Add a test that verifies
+parsing the tag fails not due to the allocation failure but due to the
+tag having no message.
+---
+ src/tag.c                | 10 +++++-----
+ tests/object/tag/parse.c | 18 ++++++++++++++++++
+ 2 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/src/tag.c b/src/tag.c
+index 663c7dabde2..c45335151b8 100644
+--- a/src/tag.c
++++ b/src/tag.c
+@@ -70,10 +70,9 @@ static int tag_parse(git_tag *tag, const char *buffer, const char *buffer_end)
+ 	static const char *tag_types[] = {
+ 		NULL, "commit\n", "tree\n", "blob\n", "tag\n"
+ 	};
+-
+-	unsigned int i;
+ 	size_t text_len, alloc_len;
+-	char *search;
++	const char *search;
++	unsigned int i;
+ 
+ 	if (git_oid__parse(&tag->target, &buffer, buffer_end, "object ") < 0)
+ 		return tag_error("object field invalid");
+@@ -138,8 +137,9 @@ static int tag_parse(git_tag *tag, const char *buffer, const char *buffer_end)
+ 	tag->message = NULL;
+ 	if (buffer < buffer_end) {
+ 		/* If we're not at the end of the header, search for it */
+-		if( *buffer != '\n' ) {
+-			search = strstr(buffer, "\n\n");
++		if(*buffer != '\n') {
++			search = git__memmem(buffer, buffer_end - buffer,
++					     "\n\n", 2);
+ 			if (search)
+ 				buffer = search + 1;
+ 			else
+diff --git a/tests/object/tag/parse.c b/tests/object/tag/parse.c
+index 7e58ed12bb3..f701f6b8946 100644
+--- a/tests/object/tag/parse.c
++++ b/tests/object/tag/parse.c
+@@ -198,3 +198,21 @@ void test_object_tag_parse__missing_message_fails(void)
+ 		"tagger taggy@taggart.com>\n";
+ 	assert_tag_fails(tag, 0);
+ }
++
++void test_object_tag_parse__no_oob_read_when_searching_message(void)
++{
++	const char *tag =
++		"object a8d447f68076d1520f69649bb52629941be7031f\n"
++		"type tag\n"
++		"tag \n"
++		"tagger <>\n"
++		" \n\n"
++		"Message";
++	/*
++	 * The OOB read previously resulted in an OOM error. We
++	 * thus want to make sure that the resulting error is the
++	 * expected one.
++	 */
++	assert_tag_fails(tag, strlen(tag) - strlen("\n\nMessage"));
++	cl_assert(strstr(giterr_last()->message, "tag contains no message"));
++}

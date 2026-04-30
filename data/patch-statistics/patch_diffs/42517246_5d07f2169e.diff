@@ -1,0 +1,174 @@
+From 938105b572433e0772c507d434a8e7985e6cdf5d Mon Sep 17 00:00:00 2001
+From: Nick Wellnhofer <wellnhofer@aevum.de>
+Date: Fri, 21 Oct 2022 15:56:12 +0200
+Subject: [PATCH] Revert "xinclude: Fix regression with nested includes"
+
+This reverts commit 7f04e297318b1b908cec20711f74f75625afed7f which
+caused memory errors.
+
+See #424.
+---
+ result/XInclude/issue424.xml     |  6 -----
+ result/XInclude/issue424.xml.rdr | 17 ------------
+ test/XInclude/docs/issue424.xml  |  5 ----
+ xinclude.c                       | 46 +++++---------------------------
+ 4 files changed, 7 insertions(+), 67 deletions(-)
+ delete mode 100644 result/XInclude/issue424.xml
+ delete mode 100644 result/XInclude/issue424.xml.rdr
+ delete mode 100644 test/XInclude/docs/issue424.xml
+
+diff --git a/result/XInclude/issue424.xml b/result/XInclude/issue424.xml
+deleted file mode 100644
+index dc497fa94..000000000
+--- a/result/XInclude/issue424.xml
++++ /dev/null
+@@ -1,6 +0,0 @@
+-<?xml version="1.0"?>
+-<x xmlns:xinclude="http://www.w3.org/2001/XInclude">
+-   <p>Something</p>
+-   <d xmlns:xinclude="http://www.w3.org/2001/XInclude"><p>Something</p></d>
+-   <d xmlns:xinclude="http://www.w3.org/2001/XInclude"><p>Something</p></d>
+-</x>
+diff --git a/result/XInclude/issue424.xml.rdr b/result/XInclude/issue424.xml.rdr
+deleted file mode 100644
+index 39c3b82a0..000000000
+--- a/result/XInclude/issue424.xml.rdr
++++ /dev/null
+@@ -1,17 +0,0 @@
+-0 1 x 0 0
+-1 14 #text 0 1 
+-   
+-1 1 p 0 0
+-2 3 #text 0 1 Something
+-1 15 p 0 0
+-1 14 #text 0 1 
+-   
+-1 1 d 0 0
+-2 1 xinclude:include 1 0
+-1 15 d 0 0
+-1 14 #text 0 1 
+-   
+-1 1 xinclude:include 1 0
+-1 14 #text 0 1 
+-
+-0 15 x 0 0
+diff --git a/test/XInclude/docs/issue424.xml b/test/XInclude/docs/issue424.xml
+deleted file mode 100644
+index fc1cd6f37..000000000
+--- a/test/XInclude/docs/issue424.xml
++++ /dev/null
+@@ -1,5 +0,0 @@
+-<x xmlns:xinclude="http://www.w3.org/2001/XInclude">
+-   <p>Something</p>
+-   <d xmlns:xinclude="http://www.w3.org/2001/XInclude"><xinclude:include xpointer="xpointer(//p)"/></d>
+-   <xinclude:include xpointer="xpointer(//d)"/>
+-</x>
+diff --git a/xinclude.c b/xinclude.c
+index e14176c62..93d7e5257 100644
+--- a/xinclude.c
++++ b/xinclude.c
+@@ -60,7 +60,6 @@ struct _xmlXIncludeRef {
+     xmlNodePtr            inc; /* the included copy */
+     int                   xml; /* xml or txt */
+     int                 count; /* how many refs use that specific doc */
+-    xmlXPathObjectPtr    xptr; /* the xpointer if needed */
+     int	             fallback; /* fallback was loaded */
+     int		      emptyFb; /* flag to show fallback empty */
+ };
+@@ -212,8 +211,6 @@ xmlXIncludeFreeRef(xmlXIncludeRefPtr ref) {
+ 	xmlFree(ref->URI);
+     if (ref->fragment != NULL)
+ 	xmlFree(ref->fragment);
+-    if (ref->xptr != NULL)
+-	xmlXPathFreeObject(ref->xptr);
+     xmlFree(ref);
+ }
+ 
+@@ -1471,7 +1468,7 @@ xmlXIncludeLoadDoc(xmlXIncludeCtxtPtr ctxt, const xmlChar *url, int nr) {
+      */
+     if ((URL[0] == 0) || (URL[0] == '#') ||
+ 	((ctxt->doc != NULL) && (xmlStrEqual(URL, ctxt->doc->URL)))) {
+-	doc = NULL;
++	doc = ctxt->doc;
+         goto loaded;
+     }
+ 
+@@ -1563,15 +1560,8 @@ loaded:
+ 	/*
+ 	 * Add the top children list as the replacement copy.
+ 	 */
+-	if (doc == NULL)
+-	{
+-	    /* Hopefully a DTD declaration won't be copied from
+-	     * the same document */
+-	    ctxt->incTab[nr]->inc = xmlCopyNodeList(ctxt->doc->children);
+-	} else {
+-	    ctxt->incTab[nr]->inc = xmlXIncludeCopyNodeList(ctxt, ctxt->doc,
+-		                                       doc, doc->children);
+-	}
++	ctxt->incTab[nr]->inc = xmlXIncludeCopyNodeList(ctxt, ctxt->doc,
++		                                        doc, doc->children);
+     }
+ #ifdef LIBXML_XPTR_ENABLED
+     else {
+@@ -1583,12 +1573,7 @@ loaded:
+ 	xmlXPathContextPtr xptrctxt;
+ 	xmlNodeSetPtr set;
+ 
+-	if (doc == NULL) {
+-	    xptrctxt = xmlXPtrNewContext(ctxt->doc, ctxt->incTab[nr]->ref,
+-		                         NULL);
+-	} else {
+-	    xptrctxt = xmlXPtrNewContext(doc, NULL, NULL);
+-	}
++	xptrctxt = xmlXPtrNewContext(doc, NULL, NULL);
+ 	if (xptrctxt == NULL) {
+ 	    xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref,
+ 	                   XML_XINCLUDE_XPTR_FAILED,
+@@ -1693,14 +1678,9 @@ loaded:
+ 		}
+ 	    }
+ 	}
+-	if (doc == NULL) {
+-	    ctxt->incTab[nr]->xptr = xptr;
+-	    ctxt->incTab[nr]->inc = NULL;
+-	} else {
+-	    ctxt->incTab[nr]->inc =
+-		xmlXIncludeCopyXPointer(ctxt, ctxt->doc, doc, xptr);
+-	    xmlXPathFreeObject(xptr);
+-	}
++        ctxt->incTab[nr]->inc =
++            xmlXIncludeCopyXPointer(ctxt, ctxt->doc, doc, xptr);
++        xmlXPathFreeObject(xptr);
+ 	xmlXPathFreeContext(xptrctxt);
+ 	xmlFree(fragment);
+     }
+@@ -2222,17 +2202,6 @@ xmlXIncludeIncludeNode(xmlXIncludeCtxtPtr ctxt, int nr) {
+     if ((cur == NULL) || (cur->type == XML_NAMESPACE_DECL))
+ 	return(-1);
+ 
+-    /*
+-     * If we stored an XPointer a late computation may be needed
+-     */
+-    if ((ctxt->incTab[nr]->inc == NULL) &&
+-	(ctxt->incTab[nr]->xptr != NULL)) {
+-	ctxt->incTab[nr]->inc =
+-	    xmlXIncludeCopyXPointer(ctxt, ctxt->doc, ctxt->doc,
+-		                    ctxt->incTab[nr]->xptr);
+-	xmlXPathFreeObject(ctxt->incTab[nr]->xptr);
+-	ctxt->incTab[nr]->xptr = NULL;
+-    }
+     list = ctxt->incTab[nr]->inc;
+     ctxt->incTab[nr]->inc = NULL;
+     ctxt->incTab[nr]->emptyFb = 0;
+@@ -2501,7 +2470,6 @@ xmlXIncludeDoProcess(xmlXIncludeCtxtPtr ctxt, xmlDocPtr doc, xmlNodePtr tree,
+      */
+     for (i = ctxt->incBase;i < ctxt->incNr; i++) {
+ 	if ((ctxt->incTab[i]->inc != NULL) ||
+-            (ctxt->incTab[i]->xptr != NULL) ||
+ 	    (ctxt->incTab[i]->emptyFb != 0))	/* (empty fallback) */
+ 	    xmlXIncludeIncludeNode(ctxt, i);
+     }
+-- 
+GitLab
+

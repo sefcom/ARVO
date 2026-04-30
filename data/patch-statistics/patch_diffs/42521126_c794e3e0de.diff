@@ -1,0 +1,54 @@
+From 8fdad62ddb46f8798643e9b1a564a2af8b12411d Mon Sep 17 00:00:00 2001
+From: Sebastian Rasmussen <sebras@gmail.com>
+Date: Wed, 24 Jan 2018 00:59:35 +0100
+Subject: [PATCH] Bug 698904: Drop pixmap only once upon error when painting
+ shades.
+
+If fz_new_pixmap_with_bbox() threw conv would be NULL and temp would
+be pointing to a pixmap that would be dropped 2 times.
+
+If fz_clone_pixmap_area_with_different_seps() threw temp and conv
+would be pointing to the same pixmap that would be dropped 3 times.
+---
+ source/fitz/draw-mesh.c | 14 +++++---------
+ 1 file changed, 5 insertions(+), 9 deletions(-)
+
+diff --git a/source/fitz/draw-mesh.c b/source/fitz/draw-mesh.c
+index 90838709e8..b8bf68d2bd 100644
+--- a/source/fitz/draw-mesh.c
++++ b/source/fitz/draw-mesh.c
+@@ -293,6 +293,7 @@ fz_paint_shade(fz_context *ctx, fz_shade *shade, fz_colorspace *colorspace, cons
+ 				}
+ 				fz_drop_pixmap(ctx, temp);
+ 				temp = conv;
++				conv = NULL;
+ 
+ 				/* Now Change from our device_n colorspace into the target colorspace/spots. */
+ 				conv = fz_clone_pixmap_area_with_different_seps(ctx, temp, NULL, dest->colorspace, dest->seps, color_params, NULL);
+@@ -343,22 +344,17 @@ fz_paint_shade(fz_context *ctx, fz_shade *shade, fz_colorspace *colorspace, cons
+ 				}
+ 			}
+ 			fz_paint_pixmap_with_overprint(dest, conv, op);
+-			fz_drop_pixmap(ctx, conv);
+ 		}
+ 	}
+ 	fz_always(ctx)
+-	{
+-		if (temp != dest)
+-			fz_drop_pixmap(ctx, temp);
+-		fz_fin_cached_color_converter(ctx, &ptd.cc);
+-	}
+-	fz_catch(ctx)
+ 	{
+ 		if (shade->use_function)
+ 		{
+-			fz_drop_pixmap(ctx, conv);
+ 			fz_drop_pixmap(ctx, temp);
++			fz_drop_pixmap(ctx, conv);
+ 		}
+-		fz_rethrow(ctx);
++		fz_fin_cached_color_converter(ctx, &ptd.cc);
+ 	}
++	fz_catch(ctx)
++		fz_rethrow(ctx);
+ }

@@ -1,0 +1,137 @@
+From 5dd3629bc93449840c36dd635ea6cce606b8c366 Mon Sep 17 00:00:00 2001
+From: Andrew Selivanov <andrew.selivanov@gmail.com>
+Date: Thu, 20 Jun 2019 05:04:25 +0300
+Subject: [PATCH] fix segfault when parsing wrong type of record (#262)
+
+Fixes segfault when trying to ares_parse_aaaa with AF_INET and vise versa.
+
+Fix By: Andrew Selivanov (@ki11roy)
+---
+ ares_parse_a_reply.c    | 36 ++++++++++++++++++++++++------------
+ ares_parse_aaaa_reply.c | 36 ++++++++++++++++++++++++------------
+ 2 files changed, 48 insertions(+), 24 deletions(-)
+
+diff --git a/ares_parse_a_reply.c b/ares_parse_a_reply.c
+index 8c8da835eb..850c39c0bf 100644
+--- a/ares_parse_a_reply.c
++++ b/ares_parse_a_reply.c
+@@ -125,6 +125,11 @@ int ares_parse_a_reply(const unsigned char *abuf, int alen,
+       goto enomem;
+     }
+ 
++  for (i = 0; i < naddrs + 1; ++i)
++    {
++      hostent->h_addr_list[i] = NULL;
++    }
++
+   if (ai.cnames)
+     {
+       hostent->h_name = strdup(ai.cnames->name);
+@@ -147,26 +152,33 @@ int ares_parse_a_reply(const unsigned char *abuf, int alen,
+           goto enomem;
+         }
+ 
++      i = 0;
+       next = ai.nodes;
+-      for (i = 0; i < naddrs; i++)
++      while (next)
+         {
+-          hostent->h_addr_list[i] = (char*)&addrs[i];
+-          memcpy(hostent->h_addr_list[i], &(((struct sockaddr_in *)next->ai_addr)->sin_addr), sizeof(struct in_addr));
+-          if (naddrttls)
++          if (next->ai_family == AF_INET)
+             {
+-                if(next->ai_ttl > cname_ttl)
+-                  addrttls[i].ttl = cname_ttl;
+-                else
+-                  addrttls[i].ttl = next->ai_ttl;
+-
+-                memcpy(&addrttls[i].ipaddr, &(((struct sockaddr_in *)next->ai_addr)->sin_addr), sizeof(struct in_addr));
++              hostent->h_addr_list[i] = (char *)&addrs[i];
++              memcpy(hostent->h_addr_list[i],
++                     &(((struct sockaddr_in *)next->ai_addr)->sin_addr),
++                     sizeof(struct in_addr));
++              if (naddrttls)
++                {
++                  if (next->ai_ttl > cname_ttl)
++                    addrttls[i].ttl = cname_ttl;
++                  else
++                    addrttls[i].ttl = next->ai_ttl;
++
++                  memcpy(&addrttls[i].ipaddr,
++                         &(((struct sockaddr_in *)next->ai_addr)->sin_addr),
++                         sizeof(struct in_addr));
++                }
++              ++i;
+             }
+           next = next->ai_next;
+         }
+     }
+ 
+-  hostent->h_addr_list[naddrs] = NULL;
+-
+   if (host)
+     {
+       *host = hostent;
+diff --git a/ares_parse_aaaa_reply.c b/ares_parse_aaaa_reply.c
+index b296a98a0e..c56279fa05 100644
+--- a/ares_parse_aaaa_reply.c
++++ b/ares_parse_aaaa_reply.c
+@@ -127,6 +127,11 @@ int ares_parse_aaaa_reply(const unsigned char *abuf, int alen,
+       goto enomem;
+     }
+ 
++  for (i = 0; i < naddrs + 1; ++i)
++    {
++      hostent->h_addr_list[i] = NULL;
++    }
++
+   if (ai.cnames)
+     {
+       hostent->h_name = strdup(ai.cnames->name);
+@@ -149,26 +154,33 @@ int ares_parse_aaaa_reply(const unsigned char *abuf, int alen,
+           goto enomem;
+         }
+ 
++      i = 0;
+       next = ai.nodes;
+-      for (i = 0; i < naddrs; i++)
++      while (next)
+         {
+-          hostent->h_addr_list[i] = (char*)&addrs[i];
+-          memcpy(hostent->h_addr_list[i], &(((struct sockaddr_in6 *)next->ai_addr)->sin6_addr), sizeof(struct ares_in6_addr));
+-          if (naddrttls)
++          if(next->ai_family == AF_INET6)
+             {
+-                if(next->ai_ttl > cname_ttl)
+-                  addrttls[i].ttl = cname_ttl;
+-                else
+-                  addrttls[i].ttl = next->ai_ttl;
+-
+-                memcpy(&addrttls[i].ip6addr, &(((struct sockaddr_in6 *)next->ai_addr)->sin6_addr), sizeof(struct ares_in6_addr));
++              hostent->h_addr_list[i] = (char*)&addrs[i];
++              memcpy(hostent->h_addr_list[i],
++                     &(((struct sockaddr_in6 *)next->ai_addr)->sin6_addr),
++                     sizeof(struct ares_in6_addr));
++              if (naddrttls)
++                {
++                    if(next->ai_ttl > cname_ttl)
++                      addrttls[i].ttl = cname_ttl;
++                    else
++                      addrttls[i].ttl = next->ai_ttl;
++
++                    memcpy(&addrttls[i].ip6addr,
++                           &(((struct sockaddr_in6 *)next->ai_addr)->sin6_addr),
++                           sizeof(struct ares_in6_addr));
++                }
++              ++i;
+             }
+           next = next->ai_next;
+         }
+     }
+ 
+-  hostent->h_addr_list[naddrs] = NULL;
+-
+   if (host)
+     {
+       *host = hostent;

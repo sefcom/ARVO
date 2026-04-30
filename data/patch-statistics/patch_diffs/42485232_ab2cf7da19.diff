@@ -1,0 +1,99 @@
+From f126e71e362dad0f7f1841cbc56b5d85e16e8cc4 Mon Sep 17 00:00:00 2001
+From: Qian Matteo Chen <chqmatteo@fb.com>
+Date: Thu, 9 Jul 2020 02:18:26 -0700
+Subject: [PATCH] Fix out of bound read on invalid code points
+
+Summary:
+Fix a heap out of bounds read from curCharPtr_ in JSLexer::consumeBracedCodePoint.
+
+An invalid code point can trigger a call to forceEOF in JSLexer::error and set the curCharPtr_ pointer to the end of the buffer, and JSLexer::consumeBracedCodePoint continues to use curCharPtr_ past the end of the buffer.
+
+JSLexer::error calls forceEOF and returns false when the error limit is reached.
+This commit adds checks in JSLexer::consumeBracedCodePoint to return llvh::None when JSLexer::error returns false.
+
+Reviewed By: tmikov
+
+Differential Revision: D22256409
+
+fbshipit-source-id: ca90a8cf3729b0c5239cd17a420f344eea14c4a5
+---
+ lib/Parser/JSLexer.cpp           | 21 ++++++++++++++-------
+ unittests/Parser/JSLexerTest.cpp | 19 +++++++++++++++++++
+ 2 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/lib/Parser/JSLexer.cpp b/lib/Parser/JSLexer.cpp
+index c31c2cf6d33..5caa1509ec6 100644
+--- a/lib/Parser/JSLexer.cpp
++++ b/lib/Parser/JSLexer.cpp
+@@ -975,9 +975,11 @@ llvh::Optional<uint32_t> JSLexer::consumeBracedCodePoint(bool errorOnFail) {
+       }
+       // Invalid character, set the failed flag and continue.
+       if (!failed && errorOnFail) {
+-        error(
+-            SMLoc::getFromPointer(curCharPtr_),
+-            "invalid character in unicode codepoint escape");
++        if (!error(
++                SMLoc::getFromPointer(curCharPtr_),
++                "invalid character in unicode codepoint escape")) {
++          return llvh::None;
++        }
+       }
+       failed = true;
+       continue;
+@@ -986,9 +988,11 @@ llvh::Optional<uint32_t> JSLexer::consumeBracedCodePoint(bool errorOnFail) {
+     if (cp > UNICODE_MAX_VALUE) {
+       // Number grew too big, set the failed flag and continue.
+       if (!failed && errorOnFail) {
+-        error(
+-            SMLoc::getFromPointer(start),
+-            "unicode codepoint escape is too large");
++        if (!error(
++                SMLoc::getFromPointer(start),
++                "unicode codepoint escape is too large")) {
++          return llvh::None;
++        }
+       }
+       failed = true;
+     }
+@@ -999,7 +1003,10 @@ llvh::Optional<uint32_t> JSLexer::consumeBracedCodePoint(bool errorOnFail) {
+   // An empty escape sequence is invalid.
+   if (curCharPtr_ == start) {
+     if (!failed && errorOnFail) {
+-      error(SMLoc::getFromPointer(start), "empty unicode codepoint escape");
++      if (!error(
++              SMLoc::getFromPointer(start), "empty unicode codepoint escape")) {
++        return llvh::None;
++      }
+     }
+     failed = true;
+   }
+diff --git a/unittests/Parser/JSLexerTest.cpp b/unittests/Parser/JSLexerTest.cpp
+index 40fb8657afc..33b53a8badb 100644
+--- a/unittests/Parser/JSLexerTest.cpp
++++ b/unittests/Parser/JSLexerTest.cpp
+@@ -957,6 +957,25 @@ TEST(JSLexerTest, RegressConsumeBadHexTest) {
+   ASSERT_EQ(0, diag.getErrCountClear());
+ }
+ 
++TEST(JSLexerTest, ConsumeBadBracedCodePoint) {
++  JSLexer::Allocator alloc;
++  SourceErrorManager sm;
++  DiagContext diag(sm);
++
++  // Test an invalid curly brace escape without a terminating curly brace
++  // This catches an out of bounds read where we hit the error limit and
++  // curCharPtr_ was set to eof, but JSLexer::consumeBracedCodePoint continued
++  // to operate on curCharPtr_
++  // We configure a low error limit to reach the interesting code path faster
++  // then we use invalid characters in a non terminated curly brace code point
++  // to trigger JSLexer:error
++  sm.setErrorLimit(1);
++  JSLexer lex("'\\u{12XXXXXXXXXXX'", sm, alloc);
++
++  ASSERT_EQ(TokenKind::string_literal, lex.advance()->getKind());
++  ASSERT_EQ(TokenKind::eof, lex.advance()->getKind());
++}
++
+ TEST(JSLexerTest, JSXTest) {
+   JSLexer::Allocator alloc;
+   SourceErrorManager sm;

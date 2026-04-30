@@ -1,0 +1,281 @@
+From 936848eefe067bdd3832e1d5e0faa3c523c9dc43 Mon Sep 17 00:00:00 2001
+From: Djordje Baljozovic <121813753+djb-rwth@users.noreply.github.com>
+Date: Thu, 27 Jun 2024 19:40:45 +0200
+Subject: [PATCH] Version 1.07-RC4
+
+---
+ INCHI-1-SRC/INCHI_BASE/src/bcf_s.h    |  1 +
+ INCHI-1-SRC/INCHI_BASE/src/ichican2.c | 14 ++++++++----
+ INCHI-1-SRC/INCHI_BASE/src/ichimak2.c |  9 ++++++++
+ INCHI-1-SRC/INCHI_BASE/src/ichimake.c |  8 +++++++
+ INCHI-1-SRC/INCHI_BASE/src/ichiread.c | 15 ++++++++++---
+ INCHI-1-SRC/INCHI_BASE/src/ichirvr4.c |  7 +++++-
+ INCHI-1-SRC/INCHI_BASE/src/runichi3.c | 31 +++++++++++++++------------
+ 7 files changed, 63 insertions(+), 22 deletions(-)
+
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/bcf_s.h b/INCHI-1-SRC/INCHI_BASE/src/bcf_s.h
+index 21a4c683..2faa3a99 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/bcf_s.h
++++ b/INCHI-1-SRC/INCHI_BASE/src/bcf_s.h
+@@ -77,5 +77,6 @@ int memcpy_custom(char** dst, char* src, unsigned long long len);
+ extern int at_size_check1; /* djb-rwth: required for fixing oss-fuzz issue #68329 */
+ extern int sminor_size; /* djb-rwth: required for fixing oss-fuzz issue #66746 */
+ extern int na_global; /* djb-rwth: required for fixing oss-fuzz issue #69315 */
++extern int sp_at_size; /* djb-rwth: required for fixing oss-fuzz issue #69656 */
+ 
+ #endif
+\ No newline at end of file
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichican2.c b/INCHI-1-SRC/INCHI_BASE/src/ichican2.c
+index c0e85683..645849cd 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichican2.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichican2.c
+@@ -1860,7 +1860,7 @@ void CtPartFill( Graph *G,
+     int     startCtbl;
+     int     startAtOrd;
+     AT_RANK r, rj, nn, j, rj_prev; /* djb-rwth: ignoring LLVM warning as the variable is used */
+-    int     i, m;
++    int     i, m, an_sao;
+ 
+ #ifdef INCHI_CANON_USE_HASH
+     CtHash  hash = 0;
+@@ -1871,7 +1871,7 @@ void CtPartFill( Graph *G,
+     INCHI_HEAPCHK
+ 
+     k--;
+-    if (k)
++    if (Ct && k) /* djb-rwth: fixing oss-fuzz issue #69612 */
+     {
+         startCtbl = Ct->nextCtblPos[k - 1];
+         startAtOrd = Ct->nextAtRank[k - 1] - 1;  /* here  p->Rank[p->AtNumber[r-1]] = r */
+@@ -1883,7 +1883,13 @@ void CtPartFill( Graph *G,
+     }
+ 
+     /******* Well-defined (by fixed ranks) part of the connection table ************/
+-    r = ( rank_mask_bit & p->Rank[(int) p->AtNumber[startAtOrd]] );
++    /* djb-rwth: fixing oss-fuzz issue #69612 */
++    if ((startAtOrd < 0) || (startAtOrd >= na_global))
++    {
++        return;
++    }
++    an_sao = (int)p->AtNumber[startAtOrd];
++    r = ( rank_mask_bit & p->Rank[an_sao] );
+ 
+     for (i = startAtOrd; i < n_tg && r == ( rank_mask_bit&p->Rank[m = (int) p->AtNumber[i]] ); i++, r++)
+     {
+@@ -5293,7 +5299,7 @@ int GetBaseCanonRanking( INCHI_CLOCK *ic,
+     nRank = (AT_RANK *) inchi_calloc( num_max, sizeof( nRank[0] ) );
+     nAtomNumber = (AT_NUMB *) inchi_calloc( num_max, sizeof( nAtomNumber[0] ) );
+     nTempRank = (AT_RANK *) inchi_calloc( num_max, sizeof( nTempRank[0] ) );
+-    na_global = num_max; /* djb-rwth: fixing oss-fuzz issue #69315 */
++    na_global = num_max; /* djb-rwth: required for fixing oss-fuzz issue #69315 */
+ 
+     if (!pAtomInvariant ||
+          !nSymmRankNoH || !nCanonRankNoH || !nAtomNumberCanonNoH ||
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichimak2.c b/INCHI-1-SRC/INCHI_BASE/src/ichimak2.c
+index 396b1e0b..07d14a8d 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichimak2.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichimak2.c
+@@ -1059,6 +1059,15 @@ int FillOutINChI( INChI *pINChI,
+     }
+ 
+     /*  Total charge */
++    /* djb-rwth: required for fixing oss-fuzz issue #69656 */
++    if (num_atoms + num_removed_H > sp_at_size)
++    {
++        nErrorCode = 0;
++        ret = CT_OVERFLOW;
++        pINChI->nErrorCode = pINChI_Aux->nErrorCode = CT_OVERFLOW;
++        goto exit_function;
++    }
++
+     for (i = 0, n = 0; i < num_atoms + num_removed_H; i++)
+     {
+         n += at[i].charge;
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichimake.c b/INCHI-1-SRC/INCHI_BASE/src/ichimake.c
+index f9f293f4..030264cd 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichimake.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichimake.c
+@@ -52,6 +52,7 @@
+ #include "ichi_bns.h"
+ 
+ #include "bcf_s.h"
++int sp_at_size; /* djb-rwth: required for fixing oss-fuzz issue #69656 */
+ 
+ /*
+     Local functions
+@@ -3742,6 +3743,8 @@ int  Create_INChI( CANON_GLOBALS *pCG,
+     int bMayHaveStereo = 0;
+     int num_taut_at = 0;
+ 
++    sp_at_size = 0; /* djb-rwth: required for fixing oss-fuzz issue #69656 */
++
+     inp_ATOM *out_at = NULL;     /*, *norm_at_fixed_bonds[TAUT_NUM]; */ /*  = {out_norm_nontaut_at, out_norm_taut_at} ; */
+     INChI     *pINChI = NULL;      /* added initialization 2006-03 */
+     INChI_Aux *pINChI_Aux = NULL;  /* added initialization 2006-03 */
+@@ -3833,12 +3836,17 @@ int  Create_INChI( CANON_GLOBALS *pCG,
+             {
+                 ret = -1;
+             }
++            else
++            {
++                sp_at_size = num_inp_at; /* djb-rwth: required for fixing oss-fuzz issue #69656 */\
++            }
+         }
+         else
+         {
+             at[i] = NULL;
+         }
+     }
++    
+     if ((!out_norm_data[TAUT_NON]->at && !out_norm_data[TAUT_YES]->at)
+          || !inp_at || ret) /* djb-rwth: addressing LLVM warning */
+     {
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichiread.c b/INCHI-1-SRC/INCHI_BASE/src/ichiread.c
+index 0e3f4aca..986f2b07 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichiread.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichiread.c
+@@ -80,7 +80,8 @@
+ /* */
+ 
+ #include "bcf_s.h"
+-static int pi_nnc; /* djb-rwth: required for fixing oss-fuzz issue #69489 */
++static int pi_nnc1; /* djb-rwth: required for fixing oss-fuzz issue #69489 */
++static int pi_nnc2; /* djb-rwth: required for fixing oss-fuzz issue #69699 */
+ 
+ #define SEGM_LINE_ADD 128
+ 
+@@ -8240,6 +8241,7 @@ int ParseSegmentMobileH( const char *str,
+             }
+             pInChI[i].nNum_H = pi_nnh2;
+             /* pi_nnh2_init = true; */
++            pi_nnc2 = len;
+         }
+         /* copy immobile H from Mobile-H layer to Fixed-H layer */
+         if (bMobileH == TAUT_NON && i < pnNumComponents[nAltMobileH])
+@@ -8368,7 +8370,7 @@ int ParseSegmentMobileH( const char *str,
+             t = NULL; /* found no tautomeric group for this component */
+         }
+         /* djb-rwth: fixing oss-fuzz issue #69489 */
+-        for (i = 0; (i < mpy_component) && (iComponent + i < pi_nnc); i++)
++        for (i = 0; (i < mpy_component) && (iComponent + i < pi_nnc1); i++)
+         {
+             if (bMobileH == TAUT_NON)
+             {
+@@ -8964,12 +8966,19 @@ int ParseSegmentMobileH( const char *str,
+                 ret = RI_ERR_SYNTAX; /* syntax error */
+                 goto exit_function;
+             }
++
+             if ((pInChI[iComponent + i].nNumberOfAtoms <= 0) || (pInChI[iComponent + i].nNumberOfAtoms>MAX_ATOMS))
+             {
+                 ret = RI_ERR_SYNTAX; /* syntax error */
+                 goto exit_function;
+             }
+ #endif
++            /* djb-rwth: fixing oss-fuzz issue #69699 */
++            if ((iComponent + i < 0) || (iComponent + i >= pi_nnc2))
++            {
++                ret = RI_ERR_SYNTAX; /* syntax error */
++                goto exit_function;
++            }
+             memcpy(nNum_H(iComponent + i), nNum_H(iComponent), pInChI[iComponent + i].nNumberOfAtoms * sizeof(nNum_H(0)[0]));
+             /*
+             memcpy( pInChI[iComponent+i].nNum_H, pInChI[iComponent].nNum_H,
+@@ -9870,7 +9879,7 @@ int ParseSegmentFormula( const char *str,
+                 {
+                     /* allocate InChI */
+                     pInChI = (INChI*)inchi_calloc(nNumComponents, sizeof(INChI));
+-                    pi_nnc = nNumComponents;
++                    pi_nnc1 = nNumComponents;
+                     if (!(pInChI))
+                     {
+                         return RI_ERR_ALLOC; /* alloc failure */
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichirvr4.c b/INCHI-1-SRC/INCHI_BASE/src/ichirvr4.c
+index ad3ddea4..9b5fa461 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichirvr4.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichirvr4.c
+@@ -3219,6 +3219,7 @@ int RestoreAtomMakeBNS( INCHI_CLOCK *ic, CANON_GLOBALS *pCG,
+     ALL_TC_GROUPS   TCGroups;
+     ALL_TC_GROUPS *pTCGroups = &TCGroups;
+     int            nAddEdges2eachAtom = 2, nAddVertices = 0;
++    T_GROUP_INFO* tgi_tmp_oti = &(pStruct->One_ti); /* djb-rwth: required for fixing oss-fuzz issue #69602 */
+ 
+     BFS_Q bfsq;
+ 
+@@ -3266,7 +3267,11 @@ int RestoreAtomMakeBNS( INCHI_CLOCK *ic, CANON_GLOBALS *pCG,
+                 pStruct->pOne_norm_data[i] = NULL;
+             }
+         }
+-        free_t_group_info( &pStruct->One_ti );
++        /* djb-rwth: fixing oss-fuzz issue #69602 */
++        if (tgi_tmp_oti)
++        {
++            free_t_group_info(tgi_tmp_oti);
++        }
+         inchi_free( at3 );
+ 
+         return ret;
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/runichi3.c b/INCHI-1-SRC/INCHI_BASE/src/runichi3.c
+index 8e6ea2ad..6a85d8e1 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/runichi3.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/runichi3.c
+@@ -2566,18 +2566,21 @@ int  OrigAtData_RemoveBond( int      this_atom,
+                             int      *num_inp_bonds )
+ {
+     int del = 0;
+-
+-    del = OrigAtData_RemoveHalfBond( this_atom, other_atom, at, bond_type, bond_stereo );
+-    del += OrigAtData_RemoveHalfBond( other_atom, this_atom, at, bond_type, bond_stereo );
+-
+-    if (del == 2)
++    
++    if (at) /* djb-rwth: fixing oss-fuzz issue #68329, #68286 */
+     {
+-        ( *num_inp_bonds )--;
+-        at[this_atom].valence--;
+-        at[this_atom].chem_bonds_valence -= *bond_type;
+-        at[other_atom].valence--;
+-        at[other_atom].chem_bonds_valence -= *bond_type;
+-        return 1;
++        del = OrigAtData_RemoveHalfBond(this_atom, other_atom, at, bond_type, bond_stereo);
++        del += OrigAtData_RemoveHalfBond(other_atom, this_atom, at, bond_type, bond_stereo);
++
++        if (del == 2)
++        {
++            (*num_inp_bonds)--;
++            at[this_atom].valence--;
++            at[this_atom].chem_bonds_valence -= *bond_type;
++            at[other_atom].valence--;
++            at[other_atom].chem_bonds_valence -= *bond_type;
++            return 1;
++        }
+     }
+ 
+     return 0;
+@@ -3328,7 +3331,7 @@ void OAD_Polymer_SetAtProps( OAD_Polymer *pd,
+     int err2_len = sizeof(erank_rule2) / sizeof(erank_rule2[0]);
+     int err4_len = sizeof(erank_rule4) / sizeof(erank_rule4[0]);
+ 
+-    if (NULL == aprops)
++    if ((NULL == aprops) && !at) /* djb-rwth: fixing oss-fuzz issue #68329, #68286 */
+     {
+         return;
+     }
+@@ -3868,7 +3871,7 @@ void OAD_Polymer_SmartReopenCyclizedUnits( OAD_Polymer *p,
+         return;
+     }
+     /* djb-rwth: fixing oss-fuzz issue #68329 */
+-    if ((nat <= 0) || (nat > at_size_check1)) 
++    if ((nat <= 0) || (nat >= at_size_check1)) 
+     {
+         return;
+     }
+@@ -3880,7 +3883,7 @@ void OAD_Polymer_SmartReopenCyclizedUnits( OAD_Polymer *p,
+     aprops = (OAD_AtProps *) inchi_calloc( (long long)nat + 1, sizeof( OAD_AtProps ) ); /* djb-rwth: cast operator added */
+                                         /* nat + 1: add extra element for possibe 1-based indexing */
+     nat_global = nat + 1; /* djb-rwth: fixing oss-fuzz issue #68277 */
+-    if (!aprops)
++    if (!aprops || !at) /* djb-rwth: fixing oss-fuzz issue #68329, #68286 */
+     {
+         return;
+     }

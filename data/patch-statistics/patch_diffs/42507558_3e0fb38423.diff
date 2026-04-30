@@ -1,0 +1,61 @@
+From 9dcc4a2334fa10d7d0a3c019ee35dfde4c06e044 Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Thu, 27 Jan 2022 10:59:35 +0100
+Subject: [PATCH] Kerberos, TLS, example: fix some memory errors (#1419)
+
+Detected by oss-fuzz:
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=43823
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=43921
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=43925
+---
+ example/reader_util.c        | 5 +++++
+ src/lib/protocols/kerberos.c | 2 +-
+ src/lib/protocols/tls.c      | 3 ++-
+ 3 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/example/reader_util.c b/example/reader_util.c
+index 136bef91437..d47b5a5ec6f 100644
+--- a/example/reader_util.c
++++ b/example/reader_util.c
+@@ -2037,9 +2037,14 @@ struct ndpi_proto ndpi_workflow_process_packet(struct ndpi_workflow * workflow,
+ 	    if(iph->version == 6) {
+ 	      iph6 = (struct ndpi_ipv6hdr *)&packet[ip_offset];
+ 	      iph = NULL;
++              if(header->caplen < ip_offset + sizeof(struct ndpi_ipv6hdr))
++	        return(nproto);
+ 	    } else if(iph->version != IPVERSION) {
+ 	      // printf("WARNING: not good (packet_id=%u)!\n", (unsigned int)workflow->stats.raw_packet_count);
+ 	      goto v4_warning;
++	    } else {
++              if(header->caplen < ip_offset + sizeof(struct ndpi_iphdr))
++	        return(nproto);
+ 	    }
+ 	  }
+ 	}
+diff --git a/src/lib/protocols/kerberos.c b/src/lib/protocols/kerberos.c
+index 98d91939163..65b35838f58 100644
+--- a/src/lib/protocols/kerberos.c
++++ b/src/lib/protocols/kerberos.c
+@@ -230,7 +230,7 @@ void ndpi_search_kerberos(struct ndpi_detection_module_struct *ndpi_struct,
+ 		    name_offset++;
+ 		  }
+ 
+-		  if(name_offset < packet->payload_packet_len - 1 &&
++		  if(name_offset < packet->payload_packet_len - 3 &&
+ 		     packet->payload[name_offset+1] == 0x1b)
+ 		  {
+ 		    name_offset += 2;
+diff --git a/src/lib/protocols/tls.c b/src/lib/protocols/tls.c
+index 96ee3e6a285..1eefe2d0f02 100644
+--- a/src/lib/protocols/tls.c
++++ b/src/lib/protocols/tls.c
+@@ -2052,7 +2052,8 @@ int processClientServerHello(struct ndpi_detection_module_struct *ndpi_struct,
+ 		for(i=0; ja3.client.alpn[i] != '\0'; i++)
+ 		  if(ja3.client.alpn[i] == ',') ja3.client.alpn[i] = '-';
+ 
+-	      } else if(extension_id == 43 /* supported versions */) {
++	      } else if(extension_id == 43 /* supported versions */ &&
++	                offset+extension_offset < total_len) {
+ 		u_int16_t s_offset = offset+extension_offset;
+ 		u_int8_t version_len = packet->payload[s_offset];
+ 		char version_str[256];

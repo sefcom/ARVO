@@ -1,0 +1,100 @@
+From a7874ebcf88499106deec0f87ebc18672fd55ea8 Mon Sep 17 00:00:00 2001
+From: Srujan Vandrangi <srujan.vandrangi@ittiam.com>
+Date: Thu, 1 Jun 2023 17:48:43 +0000
+Subject: [PATCH] encoder: hevc encoder expects allocation returns zeroed
+ memory
+
+earlier, hevc encoder memory allocation wrappers were not clearing the memory.it requires explicit calling of memset functions wherever required for memory management.
+
+this has been resolved since the memory reset happens with in the function call and returns the zeroed memory whenever it is called and does memory management efficiently.
+
+Bug: 275059745
+Bug: 275060007
+Bug: 275802472
+Bug: oss-fuzz:57397, oss-fuzz:57398, oss-fuzz:57401
+Test: hevc_enc_fuzzer
+(cherry picked from https://partner-android-review.googlesource.com/q/commit:545fd7bfd22d2894057caac2baa835a082f515fd)
+(cherry picked from https://googleplex-android-review.googlesource.com/q/commit:a0b217f1c0b58547e6732e77cff6306e9b8c7e81)
+Merged-In: I76fa9371aac6ef5fca3923435e0010cf2f13db6f
+Change-Id: I76fa9371aac6ef5fca3923435e0010cf2f13db6f
+---
+ encoder/ihevce_memory_init.c |  2 --
+ encoder/ihevce_plugin.c      | 17 ++++++++++++++---
+ 2 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/encoder/ihevce_memory_init.c b/encoder/ihevce_memory_init.c
+index 479ab3b..b6f3b87 100644
+--- a/encoder/ihevce_memory_init.c
++++ b/encoder/ihevce_memory_init.c
+@@ -1515,8 +1515,6 @@ void ihevce_mem_manager_init(enc_ctxt_t *ps_enc_ctxt, ihevce_hle_ctxt_t *ps_intr
+             ps_intrf_ctxt->i4_error_code = IHEVCE_CANNOT_ALLOCATE_MEMORY;
+             return;
+         }
+-
+-        memset(pu1_mem, 0, ps_memtab[ctr].i4_mem_size);
+     }
+ 
+     /* --------------------------------------------------------------------- */
+diff --git a/encoder/ihevce_plugin.c b/encoder/ihevce_plugin.c
+index 00637fa..26f3ba4 100644
+--- a/encoder/ihevce_plugin.c
++++ b/encoder/ihevce_plugin.c
+@@ -112,6 +112,8 @@
+ *
+ * \brief
+ *    Memory manager specific alloc function
++*    it expects to reset the allocated memory and provide the zero initialised
++*    memory whenever this function getting called
+ *
+ * \param[in] pv_handle : handle to memory manager
+ *                        (currently not required can be set to null)
+@@ -158,6 +160,10 @@ void mem_mngr_alloc(void *pv_handle, ihevce_sys_api_t *ps_sys_api, iv_mem_rec_t
+             ps_sys_api->pv_cb_handle, "IHEVCE ERROR: Unable to allocate memory\n");
+         ASSERT(0);
+     }
++    else
++    {
++        memset(ps_memtab->pv_base, 0, ps_memtab->i4_mem_size);
++    }
+     return;
+ }
+ 
+@@ -167,6 +173,8 @@ void mem_mngr_alloc(void *pv_handle, ihevce_sys_api_t *ps_sys_api, iv_mem_rec_t
+ *
+ * \brief
+ *    common memory allocate function should be used across all threads
++*    it expects to reset the allocated memory and return the zero initialised
++*    memory pointer whenever this function getting called
+ *
+ * \param[in] pv_handle : handle to memory manager
+ *                        (currently not required can be set to null)
+@@ -183,7 +191,12 @@ void mem_mngr_alloc(void *pv_handle, ihevce_sys_api_t *ps_sys_api, iv_mem_rec_t
+ void *memory_alloc(void *pv_handle, UWORD32 u4_size)
+ {
+     (void)pv_handle;
+-    return (malloc(u4_size));
++    void *pv_buf = malloc(u4_size);
++    if(pv_buf)
++    {
++        memset(pv_buf, 0, u4_size);
++    }
++    return (pv_buf);
+ }
+ 
+ /*!
+@@ -629,7 +642,6 @@ IHEVCE_PLUGIN_STATUS_T ihevce_init(ihevce_static_cfg_params_t *ps_params, void *
+             ps_sys_api->pv_cb_handle, "IHEVCE ERROR: Error in Plugin initialization\n");
+         return (IHEVCE_EFAIL);
+     }
+-    memset(ps_ctxt, 0, sizeof(plugin_ctxt_t));
+ 
+     /* initialise memory call backs */
+     ps_ctxt->ihevce_mem_alloc = memory_alloc;
+@@ -754,7 +766,6 @@ IHEVCE_PLUGIN_STATUS_T ihevce_init(ihevce_static_cfg_params_t *ps_params, void *
+                 "IHEVCE ERROR: Error in Plugin HLE memory initialization\n");
+             return (IHEVCE_EFAIL);
+         }
+-        memset(ps_interface_ctxt, 0, sizeof(ihevce_hle_ctxt_t));
+         ps_interface_ctxt->i4_size = sizeof(ihevce_hle_ctxt_t);
+ 
+         ps_ctxt->pv_hle_interface_ctxt = ps_interface_ctxt;

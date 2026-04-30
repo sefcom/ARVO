@@ -1,0 +1,52 @@
+From f76d7352e05526fde7c607b9a9db536a5760af29 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sat, 22 Jun 2019 19:21:50 +0200
+Subject: [PATCH] avcodec/iff: Check ham vs bpp
+
+This checks the ham value much stricter and avoids hitting cases which cannot be reached
+with data from the libavformat demuxer.
+
+Fixes: out of array access
+Fixes: 15320/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_IFF_ILBM_fuzzer-5080476840099840
+Fixes: 15423/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_IFF_ILBM_fuzzer-5630765833912320
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/iff.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/libavcodec/iff.c b/libavcodec/iff.c
+index 4099d118e4..c6e2359b00 100644
+--- a/libavcodec/iff.c
++++ b/libavcodec/iff.c
+@@ -280,6 +280,16 @@ static int extract_header(AVCodecContext *const avctx,
+         for (i = 0; i < 16; i++)
+             s->tvdc[i] = bytestream_get_be16(&buf);
+ 
++        if (s->ham) {
++            if (s->bpp > 8) {
++                av_log(avctx, AV_LOG_ERROR, "Invalid number of hold bits for HAM: %u\n", s->ham);
++                return AVERROR_INVALIDDATA;
++            } if (s->ham != (s->bpp > 6 ? 6 : 4)) {
++                av_log(avctx, AV_LOG_ERROR, "Invalid number of hold bits for HAM: %u, BPP: %u\n", s->ham, s->bpp);
++                return AVERROR_INVALIDDATA;
++            }
++        }
++
+         if (s->masking == MASK_HAS_MASK) {
+             if (s->bpp >= 8 && !s->ham) {
+                 avctx->pix_fmt = AV_PIX_FMT_RGB32;
+@@ -307,9 +317,6 @@ static int extract_header(AVCodecContext *const avctx,
+         if (!s->bpp || s->bpp > 32) {
+             av_log(avctx, AV_LOG_ERROR, "Invalid number of bitplanes: %u\n", s->bpp);
+             return AVERROR_INVALIDDATA;
+-        } else if (s->ham >= 8) {
+-            av_log(avctx, AV_LOG_ERROR, "Invalid number of hold bits for HAM: %u\n", s->ham);
+-            return AVERROR_INVALIDDATA;
+         }
+ 
+         av_freep(&s->ham_buf);
+-- 
+2.25.1
+

@@ -1,0 +1,172 @@
+From f07b44cec577a117ad0028c35896804dc8efd548 Mon Sep 17 00:00:00 2001
+From: Nickolay Olshevsky <o.nickolay@gmail.com>
+Date: Sat, 1 Aug 2020 14:54:54 +0300
+Subject: [PATCH] Correctly handle case with too long gpg s2k card serial
+ number.
+
+---
+ src/librepgp/stream-dump.cpp                  |  14 ++---
+ src/librepgp/stream-packet.cpp                |   6 ++-
+ .../alice-s2k-101-2-card-len.pgp              | Bin 0 -> 942 bytes
+ src/tests/ffi.cpp                             |  50 ++++++++++++++++++
+ src/tests/rnp_tests.h                         |   2 +
+ 5 files changed, 65 insertions(+), 7 deletions(-)
+ create mode 100644 src/tests/data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp
+
+diff --git a/src/librepgp/stream-dump.cpp b/src/librepgp/stream-dump.cpp
+index 18178bcfa..33c650829 100644
+--- a/src/librepgp/stream-dump.cpp
++++ b/src/librepgp/stream-dump.cpp
+@@ -437,8 +437,9 @@ dst_print_s2k(pgp_dest_t *dst, pgp_s2k_t *s2k)
+     if ((s2k->specifier == PGP_S2KS_EXPERIMENTAL) && s2k->gpg_ext_num) {
+         dst_printf(dst, "GPG extension num: %d\n", (int) s2k->gpg_ext_num);
+         if (s2k->gpg_ext_num == PGP_S2K_GPG_SMARTCARD) {
+-            dst_print_hex(
+-              dst, "card serial number", s2k->gpg_serial, s2k->gpg_serial_len, true);
++            static_assert(sizeof(s2k->gpg_serial) == 16, "invalid s2k->gpg_serial size");
++            size_t slen = s2k->gpg_serial_len > 16 ? 16 : s2k->gpg_serial_len;
++            dst_print_hex(dst, "card serial number", s2k->gpg_serial, slen, true);
+         }
+         return;
+     }
+@@ -1420,10 +1421,11 @@ obj_add_s2k_json(json_object *obj, pgp_s2k_t *s2k)
+               s2k_obj, "gpg extension", json_object_new_int(s2k->gpg_ext_num))) {
+             return false;
+         }
+-        if ((s2k->gpg_ext_num == PGP_S2K_GPG_SMARTCARD) &&
+-            !obj_add_hex_json(
+-              s2k_obj, "card serial number", s2k->gpg_serial, s2k->gpg_serial_len)) {
+-            return false;
++        if (s2k->gpg_ext_num == PGP_S2K_GPG_SMARTCARD) {
++            size_t slen = s2k->gpg_serial_len > 16 ? 16 : s2k->gpg_serial_len;
++            if (!obj_add_hex_json(s2k_obj, "card serial number", s2k->gpg_serial, slen)) {
++                return false;
++            }
+         }
+     }
+     if (!obj_add_intstr_json(s2k_obj, "hash algorithm", s2k->hash_alg, hash_alg_map)) {
+diff --git a/src/librepgp/stream-packet.cpp b/src/librepgp/stream-packet.cpp
+index 02141038d..2879f5715 100644
+--- a/src/librepgp/stream-packet.cpp
++++ b/src/librepgp/stream-packet.cpp
+@@ -619,7 +619,11 @@ get_packet_body_s2k(pgp_packet_body_t *body, pgp_s2k_t *s2k)
+             RNP_LOG("Failed to get GPG serial len");
+             return false;
+         }
+-        size_t len = s2k->gpg_serial_len > 16 ? 16 : s2k->gpg_serial_len;
++        size_t len = s2k->gpg_serial_len;
++        if (s2k->gpg_serial_len > 16) {
++            RNP_LOG("Warning: gpg_serial_len is %d", (int) len);
++            len = 16;
++        }
+         if (!get_packet_body_buf(body, s2k->gpg_serial, len)) {
+             RNP_LOG("Failed to get GPG serial");
+             return false;
+diff --git a/src/tests/data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp b/src/tests/data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp
+new file mode 100644
+index 0000000000000000000000000000000000000000..93e7b09061413a12335d2481a715f14b6a094db5
+GIT binary patch
+literal 942
+zcmbQ@!xG1`Utf$<n~jl$@s>M3BO|+m`iFGhlXEN-ng4Cwemds7tm>~R3?6TCYu#7&
+zx3QmSvj5MJ%HZx7%A~-+$i&RT%Er#Y$;HjX%g4V(&@m@7IaR?X5kxr@<rUa<Okfcf
+z<6y85Q)DTAduF2K`V)_C?>+mJCD377=Kp&(tV|&5nWULnxj8x5nb<_RI61hPSj3o^
+z8JXl5nZz3yxHtu1idE(^{P&AmuV>}w_++cD-N*D}3zw{&=^%H1ZKLe&t1Jr|MavBs
+z8TMWJzwTYert`_i^IBGRe3SHGm%1&n>dc@1n7wcHQVqH0EMke9+3YCHs@=%Kzy<U`
+z@R1MQ3CTB9SGa_k-9Gi>=GS>T$GaBK$rH?rUUTX}_#4NQw-;Xj&-o=;bNlwV!j;|g
+z?Kba8PQCRqX})K<S(IPmKXzs&Rl~_1*Cd`PzcmVu{~&Vc_geb}fnDt^2bD#q%?&7C
+zzA58&c7}WP2`jf_9$yl@Py6P5+ohJc@dd-3B}*-?Bu@2uE);!mw!$2NM`y1+juqR{
+z@t#Ej7-|Z*Lk;KyCTS*yMnve8DX>Tib1=vP^_+jYL1f<(+qo*A-&-hsUL=0tiREcv
+zNCWkNf)ggPgNu>jL_EuHRh^R77H#i0>rQ>ys%IavtM@xwgQTPCs<%5{yk}%+__yQ#
+z;vlEP8Ln5Jb<VBb6f)0s`*P1ei3=xLnS97#RZ!(%_$$B2(qr%1535@8SEbjL-i-~v
+z%kXRV)Op*l8&~aq{`vbfhX2LO8N;^!diS=m`_|JiJD%4TN<!>$2Yfb*ize}h?9S(%
+zvx+5-jqjikr?v_+GZP0e6#^qB#^1#5xoFdx_rd%kt`$D@civ?lzR2CrU+7);IM%OV
+zsWbn!<<W-CAt?-E3%+l5WM*{Z<8sY@zRuV_^3V2NhR2y1IoLswW6)&Hx$E-fptr65
+z%eL&<Y=3#Kru$b19+!?4r?s5jcwe(GkN7F8u=AHub?Fb@ukr5+?U!3H2AwnGesAKy
+zZFpDX@!ZU~>zbV>cTL;p&ba1xM+KqC0s4eVng==QE?mIKu;uUd)AOhG?~Yk@L4DiW
+zh;xpAGG9CkxXYlT&$;HH<7H=te@62ry=3jwjrHb_ef=U}nKPHPuHE&8cXM=(Stv29
+HI4}bMJ`joy
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/tests/ffi.cpp b/src/tests/ffi.cpp
+index a3d884231..baecdb46a 100644
+--- a/src/tests/ffi.cpp
++++ b/src/tests/ffi.cpp
+@@ -5307,6 +5307,39 @@ TEST_F(rnp_tests, test_ffi_key_dump)
+     rnp_ffi_destroy(ffi);
+ }
+ 
++TEST_F(rnp_tests, test_ffi_key_dump_edge_cases)
++{
++    rnp_ffi_t ffi = NULL;
++    assert_rnp_success(rnp_ffi_create(&ffi, "GPG", "GPG"));
++
++    /* secret key, stored on gpg card, with too large card serial len */
++    rnp_input_t input = NULL;
++    assert_rnp_success(
++      rnp_input_from_path(&input, "data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp"));
++    rnp_output_t output = NULL;
++    assert_rnp_success(rnp_output_to_memory(&output, 0));
++    assert_rnp_success(rnp_dump_packets_to_output(input, output, 0));
++    rnp_input_destroy(input);
++    uint8_t *buf = NULL;
++    size_t   len = 0;
++    assert_rnp_success(rnp_output_memory_get_buf(output, &buf, &len, false));
++    buf[len - 1] = '\0';
++    assert_non_null(strstr(
++      (char *) buf, "card serial number: 0x000102030405060708090a0b0c0d0e0f (16 bytes)"));
++    rnp_output_destroy(output);
++
++    assert_rnp_success(
++      rnp_input_from_path(&input, "data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp"));
++    char *json = NULL;
++    assert_rnp_success(rnp_dump_packets_to_json(input, 0, &json));
++    rnp_input_destroy(input);
++    assert_non_null(
++      strstr(json, "\"card serial number\":\"000102030405060708090a0b0c0d0e0f\""));
++    rnp_buffer_destroy(json);
++
++    rnp_ffi_destroy(ffi);
++}
++
+ TEST_F(rnp_tests, test_ffi_key_userid_dump_has_no_special_chars)
+ {
+     rnp_ffi_t    ffi = NULL;
+@@ -9511,6 +9544,23 @@ TEST_F(rnp_tests, test_ffi_key_import_gpg_s2k)
+     assert_int_equal(count, 2);
+     rnp_key_handle_destroy(key);
+ 
++    /* load key with too large gpg_serial_len */
++    assert_rnp_success(rnp_unload_keys(ffi, RNP_KEY_UNLOAD_PUBLIC | RNP_KEY_UNLOAD_SECRET));
++    assert_rnp_success(
++      rnp_input_from_path(&input, "data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp"));
++    assert_rnp_success(rnp_import_keys(
++      ffi, input, RNP_LOAD_SAVE_PUBLIC_KEYS | RNP_LOAD_SAVE_SECRET_KEYS, NULL));
++    rnp_input_destroy(input);
++    assert_rnp_success(rnp_locate_key(ffi, "keyid", "0451409669FFDE3C", &key));
++    secret = false;
++    assert_rnp_success(rnp_key_have_secret(key, &secret));
++    assert_true(secret);
++    locked = false;
++    assert_rnp_success(rnp_key_is_locked(key, &locked));
++    assert_true(locked);
++    assert_rnp_failure(rnp_key_unlock(key, "password"));
++    rnp_key_handle_destroy(key);
++
+     rnp_ffi_destroy(ffi);
+ }
+ 
+diff --git a/src/tests/rnp_tests.h b/src/tests/rnp_tests.h
+index 37614af3e..9e3e7b91a 100644
+--- a/src/tests/rnp_tests.h
++++ b/src/tests/rnp_tests.h
+@@ -235,6 +235,8 @@ void test_ffi_key_export_customized_enarmor(void **state);
+ 
+ void test_ffi_key_dump(void **state);
+ 
++void test_ffi_key_dump_edge_cases(void **state);
++
+ void test_ffi_key_userid_dump_has_no_special_chars(void **state);
+ 
+ void test_ffi_pkt_dump(void **state);

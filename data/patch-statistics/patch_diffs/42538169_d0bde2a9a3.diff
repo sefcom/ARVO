@@ -1,0 +1,62 @@
+From 17d46bb3b296e019da52a73ea40c7a38622c81e7 Mon Sep 17 00:00:00 2001
+From: Arnaud Le Blanc <arnaud.lb@gmail.com>
+Date: Tue, 17 Sep 2024 16:06:51 +0200
+Subject: [PATCH] Fix oss-fuzz #71382 (#15854)
+
+The return value of zho_build_properties_ex() is passed to ZVAL_ARR(), which sets the IS_TYPE_REFCOUNTED flag. Returning &zend_emtpy_array will crash later when trying to dtor the zval.
+
+I'm fixing this by returning zend_new_array(0) instead of &zend_empty_array.
+
+An alternative was to make ZVAL_ARR() aware of immutable arrays, like ZVAL_STR() is with interned strings, but I found no other problematic cases.
+---
+ Zend/tests/lazy_objects/oss_fuzz_71382.phpt | 27 +++++++++++++++++++++
+ Zend/zend_property_hooks.c                  |  2 +-
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+ create mode 100644 Zend/tests/lazy_objects/oss_fuzz_71382.phpt
+
+diff --git a/Zend/tests/lazy_objects/oss_fuzz_71382.phpt b/Zend/tests/lazy_objects/oss_fuzz_71382.phpt
+new file mode 100644
+index 0000000000000..2f63b05902b06
+--- /dev/null
++++ b/Zend/tests/lazy_objects/oss_fuzz_71382.phpt
+@@ -0,0 +1,27 @@
++--TEST--
++oss-fuzz #71382
++--FILE--
++<?php
++
++class C {
++    public $a;
++    public $b {
++        get {
++        }
++    }
++}
++
++$reflector = new ReflectionClass(C::class);
++$obj = $reflector->newLazyGhost(function() {
++    throw new \Exception('initializer');
++});
++
++try {
++    foreach($obj as $a) {
++    }
++} catch (Exception $e) {
++    printf("%s: %s\n", $e::class, $e->getMessage());
++}
++
++--EXPECT--
++Exception: initializer
+diff --git a/Zend/zend_property_hooks.c b/Zend/zend_property_hooks.c
+index 9cfa15ecafa4d..523584de943df 100644
+--- a/Zend/zend_property_hooks.c
++++ b/Zend/zend_property_hooks.c
+@@ -54,7 +54,7 @@ static zend_array *zho_build_properties_ex(zend_object *zobj, bool check_access,
+ 	if (UNEXPECTED(zend_lazy_object_must_init(zobj))) {
+ 		zobj = zend_lazy_object_init(zobj);
+ 		if (UNEXPECTED(!zobj)) {
+-			return (zend_array*) &zend_empty_array;
++			return zend_new_array(0);
+ 		}
+ 	}
+ 

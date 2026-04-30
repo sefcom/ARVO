@@ -1,0 +1,112 @@
+From b4c01782212931014c603d337d762174a742c5b6 Mon Sep 17 00:00:00 2001
+From: Alex Deymo <deymo@google.com>
+Date: Fri, 23 Jul 2021 16:21:33 +0200
+Subject: [PATCH] Fuzz: Fix Rect rounding error decoding extra channels.
+
+When using an upsampling factor > 1 for extra channels with an odd size
+(or not a multiple of the upsampling factor) we need to round up the
+Rect copied in ModularImageToDecodedRect().
+
+This fixes an msan bug where some pixels near the right or bottom edge
+can be uninitialized.
+
+Added more msan checks to the extra channels to fail faster on this type
+of errors.
+---
+ lib/jxl/dec_modular.cc     | 11 +++++++++--
+ lib/jxl/dec_reconstruct.cc |  3 +++
+ lib/jxl/dec_upsample.cc    |  5 +++++
+ 3 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/lib/jxl/dec_modular.cc b/lib/jxl/dec_modular.cc
+index 4abc3d68673..a8378c17b7c 100644
+--- a/lib/jxl/dec_modular.cc
++++ b/lib/jxl/dec_modular.cc
+@@ -563,9 +563,15 @@ Status ModularFrameDecoder::ModularImageToDecodedRect(
+     const size_t ec_xsize = DivCeil(frame_dim.xsize_upsampled, ecups);
+     const size_t ec_ysize = DivCeil(frame_dim.ysize_upsampled, ecups);
+     Channel& ch_in = gi.channel[c];
++    // For x0, y0 there's no need to do a DivCeil().
++    JXL_DASSERT(rect.x0() % (1ul << ch_in.hshift) == 0);
++    JXL_DASSERT(rect.y0() % (1ul << ch_in.vshift) == 0);
+     Rect r(rect.x0() >> ch_in.hshift, rect.y0() >> ch_in.vshift,
+-           rect.xsize() >> ch_in.hshift, rect.ysize() >> ch_in.vshift, ec_xsize,
+-           ec_ysize);
++           DivCeil(rect.xsize(), 1lu << ch_in.hshift),
++           DivCeil(rect.ysize(), 1lu << ch_in.vshift), ec_xsize, ec_ysize);
++
++    JXL_DASSERT(r.IsInside(dec_state->extra_channels[ec]));
++    JXL_DASSERT(r.IsInside(ch_in.plane));
+     for (size_t y = 0; y < r.ysize(); ++y) {
+       float* const JXL_RESTRICT row_out =
+           r.Row(&dec_state->extra_channels[ec], y);
+@@ -578,6 +584,7 @@ Status ModularFrameDecoder::ModularImageToDecodedRect(
+         }
+       }
+     }
++    JXL_CHECK_IMAGE_INITIALIZED(dec_state->extra_channels[ec], r);
+   }
+   return true;
+ }
+diff --git a/lib/jxl/dec_reconstruct.cc b/lib/jxl/dec_reconstruct.cc
+index b295728ba49..817060a5b78 100644
+--- a/lib/jxl/dec_reconstruct.cc
++++ b/lib/jxl/dec_reconstruct.cc
+@@ -430,6 +430,7 @@ Rect ScaleRectForEC(Rect in, const FrameHeader& frame_header, size_t ec) {
+     return DivCeil(x * frame_header.upsampling,
+                    frame_header.extra_channel_upsampling[ec]);
+   };
++  // For x0 and y0 the DivCeil is actually an exact division.
+   return Rect(s(in.x0()), s(in.y0()), s(in.xsize()), s(in.ysize()));
+ }
+ 
+@@ -1149,10 +1150,12 @@ Status FinalizeFrameDecoding(ImageBundle* decoded,
+           // Poison the temp image on this thread to prevent leaking initialized
+           // data from a previous run in this thread in msan builds.
+           msan::PoisonImage(*eti);
++          JXL_CHECK_IMAGE_INITIALIZED(dec_state->extra_channels[i], r);
+           CopyImageToWithPadding(r, dec_state->extra_channels[i],
+                                  /*padding=*/2, ec_input_rect, eti);
+           ec_rects.emplace_back(eti, ec_input_rect);
+         } else {
++          JXL_CHECK_IMAGE_INITIALIZED(decoded->extra_channels()[i], r);
+           ec_rects.emplace_back(&decoded->extra_channels()[i], r);
+         }
+       }
+diff --git a/lib/jxl/dec_upsample.cc b/lib/jxl/dec_upsample.cc
+index 9c7a5e5a922..bdc2119d221 100644
+--- a/lib/jxl/dec_upsample.cc
++++ b/lib/jxl/dec_upsample.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "lib/jxl/base/profiler.h"
+ #include "lib/jxl/image_ops.h"
++#include "lib/jxl/sanitizers.h"
+ 
+ HWY_BEFORE_NAMESPACE();
+ namespace jxl {
+@@ -355,9 +356,11 @@ void Upsampler::UpsampleRect(const ImageF& src, const Rect& src_rect,
+                              ssize_t image_y_offset, size_t image_ysize,
+                              float* arena) const {
+   JXL_CHECK(arena);
++  JXL_CHECK_IMAGE_INITIALIZED(src, src_rect);
+   HWY_DYNAMIC_DISPATCH(UpsampleRect)
+   (upsampling_, reinterpret_cast<float*>(kernel_storage_.get()), src, src_rect,
+    dst, dst_rect, image_y_offset, image_ysize, arena, x_repeat_);
++  JXL_CHECK_IMAGE_INITIALIZED(*dst, dst_rect);
+ }
+ 
+ void Upsampler::UpsampleRect(const Image3F& src, const Rect& src_rect,
+@@ -365,10 +368,12 @@ void Upsampler::UpsampleRect(const Image3F& src, const Rect& src_rect,
+                              ssize_t image_y_offset, size_t image_ysize,
+                              float* arena) const {
+   PROFILER_FUNC;
++  JXL_CHECK_IMAGE_INITIALIZED(src, src_rect);
+   for (size_t c = 0; c < 3; c++) {
+     UpsampleRect(src.Plane(c), src_rect, &dst->Plane(c), dst_rect,
+                  image_y_offset, image_ysize, arena);
+   }
++  JXL_CHECK_IMAGE_INITIALIZED(*dst, dst_rect);
+ }
+ 
+ }  // namespace jxl

@@ -1,0 +1,60 @@
+From dbf98db6f073cc646b20b5dcfabfadeec61b4ea3 Mon Sep 17 00:00:00 2001
+From: Jeff Law <jeffreyalaw@gmail.com>
+Date: Sat, 20 Nov 2021 13:06:15 -0500
+Subject: [PATCH]     Fix intermittent failures on the H8, particularly H8/SX
+ tests.
+
+    The upstream GCC tester has  showed spurious execution failures on the
+    H8 target for the H8/SX multilibs. I suspected memory corruption or an
+    uninitialized variable early as the same binary would sometimes work and
+    sometimes it got the wrong result. Worse yet, the point where the test
+    determined it was getting the wrong result would change.
+
+    Because it only happened on the H8/SX variant I was able to zero in on
+    the "mova" support and the "short form" of those instructions in particular.
+
+    As the code stands it checks if code->op3.type == 0 to try and identify cases
+    where op3 wasn't filled in and thus we've got the short form of the mova
+    instruction.
+
+    But for the short-form of those instructions we never set any of the "op3"
+    data structure. We get whatever was lying around -- it's usually zero and
+     thus things usually work, but if the stale data was nonzero, then we'd
+    fail to recognize the instruction as a short-form and fail to set up the
+    various fields appropriately.
+
+    I initially initialized the op3.type field to zero, but didn't like that
+     because it was inconsistent with how other operands were initialized.
+    Bringing consistency meant using -1 as the initializer value and adjusting
+    the check for short form mova appropriately.
+
+    I've had this in the upstream GCC tester for perhaps a year at this point
+    and haven't seen any of the intermittent failures again.
+---
+ sim/h8300/compile.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/sim/h8300/compile.c b/sim/h8300/compile.c
+index e729c520e4e..9be7dd565a9 100644
+--- a/sim/h8300/compile.c
++++ b/sim/h8300/compile.c
+@@ -492,6 +492,7 @@ decode (SIM_DESC sd, int addr, unsigned char *data, decoded_inst *dst)
+ 
+   dst->dst.type = -1;
+   dst->src.type = -1;
++  dst->op3.type = -1;
+ 
+   /* Find the exact opcode/arg combo.  */
+   for (q = h8_opcodes; q->name; q++)
+@@ -1853,7 +1854,7 @@ step_once (SIM_DESC sd, SIM_CPU *cpu)
+ 		of the same register.
+ 	  */
+ 
+-	  if (code->op3.type == 0)
++	  if (code->op3.type == -1)
+ 	    {
+ 	      /* Short form: src == INDEXB/INDEXW, dst == op3 == 0.
+ 		 We get to compose dst and op3 as follows:
+-- 
+GitLab
+

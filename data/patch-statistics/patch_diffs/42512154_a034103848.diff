@@ -1,0 +1,2410 @@
+From b48ed70c79c6482e1f39b77d16e62043ff5042a5 Mon Sep 17 00:00:00 2001
+From: Yu Watanabe <watanabe.yu+github@gmail.com>
+Date: Tue, 14 Jun 2022 15:06:27 +0900
+Subject: [PATCH] Revert NFTSet feature
+
+This reverts PR #22587 and its follow-up commit. More specifically,
+2299b1cae32c1fb8911da0ce26efced68032f4f8 (partially),
+e176f855278d5098d3fecc5aa24ba702147d42e0,
+ceb46a31a01b3d3d1d6095d857e29ea214a2776b, and
+51bb9076ab8c050bebb64db5035852385accda35.
+
+The PR was merged without final approval, and has several issues:
+- OSS fuzz reported issues in the conf parser,
+- It calls synchrnous netlink call, it should not be especially in PID1,
+- The importance of NFTSet for CGroup and DynamicUser may be
+  questionable, at least, there was no justification PID1 should support
+  it.
+- For networkd, it should be implemented with Request object,
+- There is no test for the feature.
+
+Fixes #23711.
+Fixes #23717.
+Fixes #23719.
+Fixes #23720.
+Fixes #23721.
+Fixes #23759.
+---
+ man/org.freedesktop.systemd1.xml            |  60 ----
+ man/systemd.exec.xml                        |  34 ---
+ man/systemd.network.xml                     |  64 -----
+ man/systemd.resource-control.xml            |  29 --
+ src/basic/parse-util.c                      |  35 ---
+ src/basic/parse-util.h                      |   2 -
+ src/core/cgroup.c                           |  52 ----
+ src/core/cgroup.h                           |   4 -
+ src/core/dbus-cgroup.c                      |  85 ------
+ src/core/dbus-execute.c                     |  85 ------
+ src/core/execute.c                          |  46 ---
+ src/core/execute.h                          |   6 -
+ src/core/load-fragment-gperf.gperf.in       |   2 -
+ src/core/load-fragment.c                    | 104 -------
+ src/core/load-fragment.h                    |   2 -
+ src/core/service.c                          |   3 -
+ src/network/networkd-address.c              | 159 -----------
+ src/network/networkd-address.h              |   6 -
+ src/network/networkd-network-gperf.gperf    |   6 -
+ src/network/networkd-network.c              |  88 ------
+ src/network/networkd-network.h              |  13 -
+ src/shared/bus-unit-util.c                  |  92 ------
+ src/shared/firewall-util-nft.c              | 297 +-------------------
+ src/shared/firewall-util.h                  |  40 ---
+ src/test/meson.build                        |   3 -
+ src/test/test-nft-set.c                     |  69 -----
+ test/fuzz/fuzz-network-parser/directives    |   6 -
+ test/fuzz/fuzz-unit-file/directives.mount   |   2 -
+ test/fuzz/fuzz-unit-file/directives.scope   |   1 -
+ test/fuzz/fuzz-unit-file/directives.service |   2 -
+ test/fuzz/fuzz-unit-file/directives.slice   |   1 -
+ test/fuzz/fuzz-unit-file/directives.socket  |   2 -
+ test/fuzz/fuzz-unit-file/directives.swap    |   2 -
+ 33 files changed, 7 insertions(+), 1395 deletions(-)
+ delete mode 100644 src/test/test-nft-set.c
+
+diff --git a/man/org.freedesktop.systemd1.xml b/man/org.freedesktop.systemd1.xml
+index b9b5768bf0892..79748335547df 100644
+--- a/man/org.freedesktop.systemd1.xml
++++ b/man/org.freedesktop.systemd1.xml
+@@ -2599,8 +2599,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+       readonly (bas) RestrictNetworkInterfaces = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) ControlGroupNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly as Environment = ['...', ...];
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly a(sb) EnvironmentFiles = [...];
+@@ -2785,8 +2783,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly b DynamicUser = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) DynamicUserNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly b RemoveIPC = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly a(say) SetCredential = [...];
+@@ -3174,8 +3170,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
+ 
+     <!--property RestrictNetworkInterfaces is not documented!-->
+ 
+-    <!--property ControlGroupNFTSet is not documented!-->
+-
+     <!--property EnvironmentFiles is not documented!-->
+ 
+     <!--property PassEnvironment is not documented!-->
+@@ -3334,8 +3328,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
+ 
+     <!--property DynamicUser is not documented!-->
+ 
+-    <!--property DynamicUserNFTSet is not documented!-->
+-
+     <!--property RemoveIPC is not documented!-->
+ 
+     <!--property SetCredential is not documented!-->
+@@ -3758,8 +3750,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="ControlGroupNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="Environment"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="EnvironmentFiles"/>
+@@ -3944,8 +3934,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="DynamicUser"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="DynamicUserNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="RemoveIPC"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="SetCredential"/>
+@@ -4499,8 +4487,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+       readonly (bas) RestrictNetworkInterfaces = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) ControlGroupNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly as Environment = ['...', ...];
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly a(sb) EnvironmentFiles = [...];
+@@ -4685,8 +4671,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly b DynamicUser = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) DynamicUserNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly b RemoveIPC = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly a(say) SetCredential = [...];
+@@ -5098,8 +5082,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
+ 
+     <!--property RestrictNetworkInterfaces is not documented!-->
+ 
+-    <!--property ControlGroupNFTSet is not documented!-->
+-
+     <!--property EnvironmentFiles is not documented!-->
+ 
+     <!--property PassEnvironment is not documented!-->
+@@ -5258,8 +5240,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
+ 
+     <!--property DynamicUser is not documented!-->
+ 
+-    <!--property DynamicUserNFTSet is not documented!-->
+-
+     <!--property RemoveIPC is not documented!-->
+ 
+     <!--property SetCredential is not documented!-->
+@@ -5676,8 +5656,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="ControlGroupNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="Environment"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="EnvironmentFiles"/>
+@@ -5862,8 +5840,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="DynamicUser"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="DynamicUserNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="RemoveIPC"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="SetCredential"/>
+@@ -6306,8 +6282,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+       readonly (bas) RestrictNetworkInterfaces = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) ControlGroupNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly as Environment = ['...', ...];
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly a(sb) EnvironmentFiles = [...];
+@@ -6492,8 +6466,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly b DynamicUser = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) DynamicUserNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly b RemoveIPC = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly a(say) SetCredential = [...];
+@@ -6833,8 +6805,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
+ 
+     <!--property RestrictNetworkInterfaces is not documented!-->
+ 
+-    <!--property ControlGroupNFTSet is not documented!-->
+-
+     <!--property EnvironmentFiles is not documented!-->
+ 
+     <!--property PassEnvironment is not documented!-->
+@@ -6993,8 +6963,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
+ 
+     <!--property DynamicUser is not documented!-->
+ 
+-    <!--property DynamicUserNFTSet is not documented!-->
+-
+     <!--property RemoveIPC is not documented!-->
+ 
+     <!--property SetCredential is not documented!-->
+@@ -7329,8 +7297,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="ControlGroupNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="Environment"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="EnvironmentFiles"/>
+@@ -7515,8 +7481,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="DynamicUser"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="DynamicUserNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="RemoveIPC"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="SetCredential"/>
+@@ -8086,8 +8050,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+       readonly (bas) RestrictNetworkInterfaces = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) ControlGroupNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly as Environment = ['...', ...];
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly a(sb) EnvironmentFiles = [...];
+@@ -8272,8 +8234,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly b DynamicUser = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) DynamicUserNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly b RemoveIPC = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly a(say) SetCredential = [...];
+@@ -8599,8 +8559,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
+ 
+     <!--property RestrictNetworkInterfaces is not documented!-->
+ 
+-    <!--property ControlGroupNFTSet is not documented!-->
+-
+     <!--property EnvironmentFiles is not documented!-->
+ 
+     <!--property PassEnvironment is not documented!-->
+@@ -8759,8 +8717,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
+ 
+     <!--property DynamicUser is not documented!-->
+ 
+-    <!--property DynamicUserNFTSet is not documented!-->
+-
+     <!--property RemoveIPC is not documented!-->
+ 
+     <!--property SetCredential is not documented!-->
+@@ -9081,8 +9037,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="ControlGroupNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="Environment"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="EnvironmentFiles"/>
+@@ -9267,8 +9221,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="DynamicUser"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="DynamicUserNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="RemoveIPC"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="SetCredential"/>
+@@ -9696,8 +9648,6 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
+       readonly a(iiqq) SocketBindDeny = [...];
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+       readonly (bas) RestrictNetworkInterfaces = ...;
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) ControlGroupNFTSet = [...];
+   };
+   interface org.freedesktop.DBus.Peer { ... };
+   interface org.freedesktop.DBus.Introspectable { ... };
+@@ -9850,8 +9800,6 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
+ 
+     <!--property RestrictNetworkInterfaces is not documented!-->
+ 
+-    <!--property ControlGroupNFTSet is not documented!-->
+-
+     <!--Autogenerated cross-references for systemd.directives, do not edit-->
+ 
+     <variablelist class="dbus-interface" generated="True" extra-ref="org.freedesktop.systemd1.Unit"/>
+@@ -10010,8 +9958,6 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="ControlGroupNFTSet"/>
+-
+     <!--End of Autogenerated section-->
+ 
+     <refsect2>
+@@ -10192,8 +10138,6 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+       readonly (bas) RestrictNetworkInterfaces = ...;
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+-      readonly a(iss) ControlGroupNFTSet = [...];
+-      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly s KillMode = '...';
+       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+       readonly i KillSignal = ...;
+@@ -10363,8 +10307,6 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
+ 
+     <!--property RestrictNetworkInterfaces is not documented!-->
+ 
+-    <!--property ControlGroupNFTSet is not documented!-->
+-
+     <!--property KillMode is not documented!-->
+ 
+     <!--property KillSignal is not documented!-->
+@@ -10551,8 +10493,6 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
+ 
+-    <variablelist class="dbus-property" generated="True" extra-ref="ControlGroupNFTSet"/>
+-
+     <variablelist class="dbus-property" generated="True" extra-ref="KillMode"/>
+ 
+     <variablelist class="dbus-property" generated="True" extra-ref="KillSignal"/>
+diff --git a/man/systemd.exec.xml b/man/systemd.exec.xml
+index c2c36d55e4581..e92f615994f3b 100644
+--- a/man/systemd.exec.xml
++++ b/man/systemd.exec.xml
+@@ -3163,40 +3163,6 @@ StandardInputData=V2XigLJyZSBubyBzdHJhbmdlcnMgdG8gbG92ZQpZb3Uga25vdyB0aGUgcnVsZX
+     </variablelist>
+   </refsect1>
+ 
+-  <refsect1>
+-    <title>Firewall Integration</title>
+-    <variablelist class='unit-directives'>
+-
+-      <varlistentry>
+-        <term><varname>DynamicUserNFTSet=</varname><replaceable>family</replaceable>:<replaceable>table</replaceable>:<replaceable>set</replaceable></term>
+-        <listitem><para>This setting provides a method for integrating <varname>DynamicUser=</varname>
+-        configuration into firewall rules with NFT sets. This option expects a whitespace separated list of
+-        NFT set definitions. Each definition consists of a colon-separated tuple of NFT address family (one
+-        of <literal>arp</literal>, <literal>bridge</literal>, <literal>inet</literal>, <literal>ip</literal>,
+-        <literal>ip6</literal>, or <literal>netdev</literal>), table name and set name. The names of tables
+-        and sets must conform to lexical restrictions of NFT table names. When the unit starts, the user ID
+-        will be appended to the NFT sets and it will be removed when the unit is stopped. Failures to manage
+-        the sets will be ignored.</para>
+-
+-          <para>Example:
+-          <programlisting>[Service]
+-DynamicUserNFTSet=inet:filter:u</programlisting>
+-          Corresponding NFT rules:
+-          <programlisting>table inet filter {
+-        set u {
+-                typeof meta skuid
+-        }
+-        chain service_output {
+-                meta skuid != @u drop
+-                accept
+-        }
+-}</programlisting>
+-          </para>
+-        </listitem>
+-      </varlistentry>
+-    </variablelist>
+-  </refsect1>
+-
+   <refsect1>
+     <title>System V Compatibility</title>
+     <variablelist class='unit-directives'>
+diff --git a/man/systemd.network.xml b/man/systemd.network.xml
+index d69e63e6b87bd..da19d98c46284 100644
+--- a/man/systemd.network.xml
++++ b/man/systemd.network.xml
+@@ -1141,39 +1141,6 @@ NetLabel=system_u:object_r:localnet_peer_t:s0</programlisting>
+           and the reverse operation when the IPv4 address is deconfigured.</para>
+         </listitem>
+       </varlistentry>
+-
+-      <varlistentry>
+-        <term><varname>IPv4NFTSet=</varname><replaceable>family</replaceable>:<replaceable>table</replaceable>:<replaceable>set</replaceable></term>
+-        <term><varname>IPv6NFTSet=</varname><replaceable>family</replaceable>:<replaceable>table</replaceable>:<replaceable>set</replaceable></term>
+-        <listitem>
+-          <para>These settings provide a method for integrating dynamic network configuration into firewall
+-          rules with NFT sets. These options expect a whitespace separated list of NFT set definitions. Each
+-          definition consists of a colon-separated tuple of NFT address family (one of
+-          <literal>arp</literal>, <literal>bridge</literal>, <literal>inet</literal>, <literal>ip</literal>,
+-          <literal>ip6</literal>, or <literal>netdev</literal>), table name and set name. The names of tables
+-          and sets must conform to lexical restrictions of NFT table names. When an interface is configured
+-          with IP addresses, the addresses and subnetwork masks will be appended to the NFT sets. They will
+-          be removed when the interface is deconfigured. Failures to manage the sets will be ignored.</para>
+-
+-          <para>Example:
+-          <programlisting>[Address]
+-IPv4NFTSet=netdev:filter:eth_ipv4_address
+-IPv6NFTSet=netdev:filter:eth_ipv6_address</programlisting>
+-          Corresponding NFT rules:
+-          <programlisting>table netdev filter {
+-        set eth_ipv4_address {
+-                type ipv4_addr
+-                flags interval
+-        }
+-        chain eth_ingress {
+-                type filter hook ingress device "eth0" priority filter; policy drop;
+-                ip daddr != @eth_ipv4_address drop
+-                accept
+-        }
+-}</programlisting>
+-          </para>
+-        </listitem>
+-      </varlistentry>
+     </variablelist>
+   </refsect1>
+ 
+@@ -2122,14 +2089,6 @@ IPv6NFTSet=netdev:filter:eth_ipv6_address</programlisting>
+           <para>As in [Address] section.</para>
+         </listitem>
+       </varlistentry>
+-
+-      <varlistentry>
+-        <term><varname>NFTSet=</varname></term>
+-        <listitem>
+-          <para>As in [Address] section. The type in NFT set definition must be
+-          <literal>ipv4_addr</literal>.</para>
+-        </listitem>
+-      </varlistentry>
+     </variablelist>
+   </refsect1>
+ 
+@@ -2249,14 +2208,6 @@ IPv6NFTSet=netdev:filter:eth_ipv6_address</programlisting>
+         </listitem>
+       </varlistentry>
+ 
+-      <varlistentry>
+-        <term><varname>NFTSet=</varname></term>
+-        <listitem>
+-          <para>As in [DHCPv4] section. The type in NFT set definition must be
+-          <literal>ipv6_addr</literal>.</para>
+-        </listitem>
+-      </varlistentry>
+-
+       <!-- How to communicate with the server -->
+ 
+       <varlistentry>
+@@ -2360,14 +2311,6 @@ IPv6NFTSet=netdev:filter:eth_ipv6_address</programlisting>
+           <para>As in [Address] section.</para>
+         </listitem>
+       </varlistentry>
+-
+-      <varlistentry>
+-        <term><varname>NFTSet=</varname></term>
+-        <listitem>
+-          <para>As in [DHCPv6] section. The type in NFT set definition must be
+-          <literal>ipv6_addr</literal>.</para>
+-        </listitem>
+-      </varlistentry>
+     </variablelist>
+   </refsect1>
+ 
+@@ -2632,13 +2575,6 @@ Token=prefixstable:2002:da8:1::</programlisting></para>
+           <para>As in [Address] section.</para>
+         </listitem>
+       </varlistentry>
+-      <varlistentry>
+-        <term><varname>NFTSet=</varname></term>
+-        <listitem>
+-          <para>As in [DHCPv6] section. The type in NFT set definition must be
+-          <literal>ipv6_addr</literal>.</para>
+-        </listitem>
+-      </varlistentry>
+     </variablelist>
+   </refsect1>
+ 
+diff --git a/man/systemd.resource-control.xml b/man/systemd.resource-control.xml
+index 23b2d0f39087e..1397b886c5c20 100644
+--- a/man/systemd.resource-control.xml
++++ b/man/systemd.resource-control.xml
+@@ -1173,35 +1173,6 @@ DeviceAllow=/dev/loop-control
+           </para>
+         </listitem>
+       </varlistentry>
+-      <varlistentry>
+-        <term><varname>ControlGroupNFTSet=</varname><replaceable>family</replaceable>:<replaceable>table</replaceable>:<replaceable>set</replaceable></term>
+-        <listitem>
+-          <para>This setting provides a method for integrating dynamic cgroup IDs into firewall rules with
+-          NFT sets. This option expects a whitespace separated list of NFT set definitions. Each definition
+-          consists of a colon-separated tuple of NFT address family (one of <literal>arp</literal>,
+-          <literal>bridge</literal>, <literal>inet</literal>, <literal>ip</literal>, <literal>ip6</literal>,
+-          or <literal>netdev</literal>), table name and set name. The names of tables and sets must conform
+-          to lexical restrictions of NFT table names. When a control group for a unit is realized, the cgroup
+-          ID will be appended to the NFT sets and it will be be removed when the control group is
+-          removed. Failures to manage the sets will be ignored.</para>
+-
+-          <para>Example:
+-          <programlisting>[Unit]
+-ControlGroupNFTSet=inet:filter:my_service
+-</programlisting>
+-          Corresponding NFT rules:
+-          <programlisting>table inet filter {
+-        set my_service {
+-                type cgroupsv2
+-        }
+-        chain x {
+-                socket cgroupv2 level 2 @my_service accept
+-                drop
+-        }
+-}</programlisting>
+-          </para>
+-        </listitem>
+-      </varlistentry>
+     </variablelist>
+   </refsect1>
+ 
+diff --git a/src/basic/parse-util.c b/src/basic/parse-util.c
+index 0c7c562d17e8e..35fbb5ec6adc7 100644
+--- a/src/basic/parse-util.c
++++ b/src/basic/parse-util.c
+@@ -750,38 +750,3 @@ int parse_loadavg_fixed_point(const char *s, loadavg_t *ret) {
+ 
+         return store_loadavg_fixed_point(i, f, ret);
+ }
+-
+-static bool nft_first_char_bad(const char c) {
+-        if ((c >= 'a' && c <= 'z') ||
+-            (c >= 'A' && c <= 'Z'))
+-                return false;
+-        return true;
+-}
+-
+-static bool nft_next_char_bad(const char c) {
+-        if ((c >= 'a' && c <= 'z') ||
+-            (c >= 'A' && c <= 'Z') ||
+-            (c >= '0' && c <= '9') ||
+-            c == '/' || c == '\\' || c == '_' || c == '.')
+-                return false;
+-        return true;
+-}
+-
+-/* Limitations are described in https://www.netfilter.org/projects/nftables/manpage.html and
+- * https://bugzilla.netfilter.org/show_bug.cgi?id=1175 */
+-bool nft_identifier_bad(const char *id) {
+-        assert(id);
+-
+-        size_t len;
+-        len = strlen(id);
+-        if (len == 0 || len > 31)
+-                return true;
+-
+-        if (nft_first_char_bad(id[0]))
+-                return true;
+-
+-        for (size_t i = 1; i < len; i++)
+-                if (nft_next_char_bad(id[i]))
+-                        return true;
+-        return false;
+-}
+diff --git a/src/basic/parse-util.h b/src/basic/parse-util.h
+index 8530ad1c49766..f2222dcffb09d 100644
+--- a/src/basic/parse-util.h
++++ b/src/basic/parse-util.h
+@@ -146,5 +146,3 @@ int parse_oom_score_adjust(const char *s, int *ret);
+  * to a loadavg_t. */
+ int store_loadavg_fixed_point(unsigned long i, unsigned long f, loadavg_t *ret);
+ int parse_loadavg_fixed_point(const char *s, loadavg_t *ret);
+-
+-bool nft_identifier_bad(const char *id);
+diff --git a/src/core/cgroup.c b/src/core/cgroup.c
+index a3fb44fcb8a57..25707fce64250 100644
+--- a/src/core/cgroup.c
++++ b/src/core/cgroup.c
+@@ -19,7 +19,6 @@
+ #include "devnum-util.h"
+ #include "fd-util.h"
+ #include "fileio.h"
+-#include "firewall-util.h"
+ #include "in-addr-prefix-util.h"
+ #include "inotify-util.h"
+ #include "io-util.h"
+@@ -280,8 +279,6 @@ void cgroup_context_done(CGroupContext *c) {
+         cpu_set_reset(&c->startup_cpuset_cpus);
+         cpu_set_reset(&c->cpuset_mems);
+         cpu_set_reset(&c->startup_cpuset_mems);
+-
+-        c->nft_set_context = nft_set_context_free_many(c->nft_set_context, &c->n_nft_set_contexts);
+ }
+ 
+ static int unit_get_kernel_memory_limit(Unit *u, const char *file, uint64_t *ret) {
+@@ -612,11 +609,6 @@ void cgroup_context_dump(Unit *u, FILE* f, const char *prefix) {
+                 SET_FOREACH(iface, c->restrict_network_interfaces)
+                         fprintf(f, "%sRestrictNetworkInterfaces: %s\n", prefix, iface);
+         }
+-
+-        for (size_t i = 0; i < c->n_nft_set_contexts; i++)
+-                fprintf(f, "%sControlGroupNFTSet: %s:%s:%s\n", prefix,
+-                        nfproto_to_string(c->nft_set_context[i].nfproto),
+-                        c->nft_set_context[i].table, c->nft_set_context[i].set);
+ }
+ 
+ void cgroup_context_dump_socket_bind_item(const CGroupSocketBindItem *item, FILE *f) {
+@@ -1226,46 +1218,6 @@ static void cgroup_apply_firewall(Unit *u) {
+         (void) bpf_firewall_install(u);
+ }
+ 
+-static void cgroup_apply_nft_set(Unit *u) {
+-        int r;
+-        CGroupContext *c;
+-
+-        assert(u);
+-
+-        assert_se(c = unit_get_cgroup_context(u));
+-
+-        for (size_t i = 0; i < c->n_nft_set_contexts; i++) {
+-                NFTSetContext *s = &c->nft_set_context[i];
+-                r = nft_set_element_add_uint64(s, u->cgroup_id);
+-                if (r < 0)
+-                        log_warning_errno(r, "Adding NFT family %s table %s set %s cgroup %" PRIu64 " failed, ignoring: %m",
+-                                 nfproto_to_string(s->nfproto),
+-                                 s->table,
+-                                 s->set,
+-                                 u->cgroup_id);
+-        }
+-}
+-
+-static void cgroup_delete_nft_set(Unit *u) {
+-        int r;
+-        CGroupContext *c;
+-
+-        assert(u);
+-
+-        assert_se(c = unit_get_cgroup_context(u));
+-
+-        for (size_t i = 0; i < c->n_nft_set_contexts; i++) {
+-                NFTSetContext *s = &c->nft_set_context[i];
+-                r = nft_set_element_del_uint64(s, u->cgroup_id);
+-                if (r < 0)
+-                        log_warning_errno(r, "Deleting NFT family %s table %s set %s cgroup %" PRIu64 " failed, ignoring: %m",
+-                                 nfproto_to_string(s->nfproto),
+-                                 s->table,
+-                                 s->set,
+-                                 u->cgroup_id);
+-        }
+-}
+-
+ static void cgroup_apply_socket_bind(Unit *u) {
+         assert(u);
+ 
+@@ -1698,8 +1650,6 @@ static void cgroup_context_apply(
+ 
+         if (apply_mask & CGROUP_MASK_BPF_RESTRICT_NETWORK_INTERFACES)
+                 cgroup_apply_restrict_network_interfaces(u);
+-
+-        cgroup_apply_nft_set(u);
+ }
+ 
+ static bool unit_get_needs_bpf_firewall(Unit *u) {
+@@ -2849,8 +2799,6 @@ void unit_prune_cgroup(Unit *u) {
+         (void) lsm_bpf_cleanup(u); /* Remove cgroup from the global LSM BPF map */
+ #endif
+ 
+-        cgroup_delete_nft_set(u);
+-
+         is_root_slice = unit_has_name(u, SPECIAL_ROOT_SLICE);
+ 
+         r = cg_trim_everywhere(u->manager->cgroup_supported, u->cgroup_path, !is_root_slice);
+diff --git a/src/core/cgroup.h b/src/core/cgroup.h
+index 6ac28d7ca7114..4413eeaaa0afe 100644
+--- a/src/core/cgroup.h
++++ b/src/core/cgroup.h
+@@ -6,7 +6,6 @@
+ #include "bpf-lsm.h"
+ #include "cgroup-util.h"
+ #include "cpu-set-util.h"
+-#include "firewall-util.h"
+ #include "list.h"
+ #include "time-util.h"
+ 
+@@ -195,9 +194,6 @@ struct CGroupContext {
+         ManagedOOMMode moom_mem_pressure;
+         uint32_t moom_mem_pressure_limit; /* Normalized to 2^32-1 == 100% */
+         ManagedOOMPreference moom_preference;
+-
+-        NFTSetContext *nft_set_context;
+-        size_t n_nft_set_contexts;
+ };
+ 
+ /* Used when querying IP accounting data */
+diff --git a/src/core/dbus-cgroup.c b/src/core/dbus-cgroup.c
+index 82072da9e43f7..607370d7bfe7a 100644
+--- a/src/core/dbus-cgroup.c
++++ b/src/core/dbus-cgroup.c
+@@ -15,7 +15,6 @@
+ #include "errno-util.h"
+ #include "fd-util.h"
+ #include "fileio.h"
+-#include "firewall-util.h"
+ #include "in-addr-prefix-util.h"
+ #include "ip-protocol-list.h"
+ #include "limits-util.h"
+@@ -444,36 +443,6 @@ static int property_get_restrict_network_interfaces(
+         return sd_bus_message_close_container(reply);
+ }
+ 
+-static int property_get_cgroup_nft_set(
+-                sd_bus *bus,
+-                const char *path,
+-                const char *interface,
+-                const char *property,
+-                sd_bus_message *reply,
+-                void *userdata,
+-                sd_bus_error *error) {
+-        int r;
+-        CGroupContext *c = userdata;
+-
+-        assert(bus);
+-        assert(reply);
+-        assert(c);
+-
+-        r = sd_bus_message_open_container(reply, 'a', "(iss)");
+-        if (r < 0)
+-                return r;
+-
+-        for (size_t i = 0; i < c->n_nft_set_contexts; i++) {
+-                NFTSetContext *s = &c->nft_set_context[i];
+-
+-                r = sd_bus_message_append(reply, "(iss)", s->nfproto, s->table, s->set);
+-                if (r < 0)
+-                        return r;
+-        }
+-
+-        return sd_bus_message_close_container(reply);
+-}
+-
+ const sd_bus_vtable bus_cgroup_vtable[] = {
+         SD_BUS_VTABLE_START(0),
+         SD_BUS_PROPERTY("Delegate", "b", bus_property_get_bool, offsetof(CGroupContext, delegate), 0),
+@@ -531,7 +500,6 @@ const sd_bus_vtable bus_cgroup_vtable[] = {
+         SD_BUS_PROPERTY("SocketBindAllow", "a(iiqq)", property_get_socket_bind, offsetof(CGroupContext, socket_bind_allow), 0),
+         SD_BUS_PROPERTY("SocketBindDeny", "a(iiqq)", property_get_socket_bind, offsetof(CGroupContext, socket_bind_deny), 0),
+         SD_BUS_PROPERTY("RestrictNetworkInterfaces", "(bas)", property_get_restrict_network_interfaces, 0, 0),
+-        SD_BUS_PROPERTY("ControlGroupNFTSet", "a(iss)", property_get_cgroup_nft_set, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+         SD_BUS_VTABLE_END
+ };
+ 
+@@ -2085,58 +2053,5 @@ int bus_cgroup_set_property(
+         if (streq(name, "DisableControllers") || (u->transient && u->load_state == UNIT_STUB))
+                 return bus_cgroup_set_transient_property(u, c, name, message, flags, error);
+ 
+-        if (streq(name, "ControlGroupNFTSet")) {
+-                int nfproto;
+-                const char *table, *set;
+-                bool empty = true;
+-
+-                r = sd_bus_message_enter_container(message, 'a', "(iss)");
+-                if (r < 0)
+-                        return r;
+-
+-                while ((r = sd_bus_message_read(message, "(iss)", &nfproto, &table, &set)) > 0) {
+-                        const char *nfproto_name;
+-
+-                        nfproto_name = nfproto_to_string(nfproto);
+-                        if (!nfproto_name)
+-                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid protocol %d.", nfproto);
+-
+-                        if (nft_identifier_bad(table))
+-                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid NFT table name %s.", table);
+-
+-                        if (nft_identifier_bad(set))
+-                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid NFT set name %s.", set);
+-
+-                        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+-                                r = nft_set_context_add(&c->nft_set_context, &c->n_nft_set_contexts, nfproto, table, set);
+-                                if (r < 0)
+-                                        return r;
+-
+-                                unit_write_settingf(
+-                                                u, flags|UNIT_ESCAPE_SPECIFIERS, name,
+-                                                "%s=%s:%s:%s",
+-                                                name,
+-                                                nfproto_name,
+-                                                table,
+-                                                set);
+-                        }
+-
+-                        empty = false;
+-                }
+-                if (r < 0)
+-                        return r;
+-
+-                r = sd_bus_message_exit_container(message);
+-                if (r < 0)
+-                        return r;
+-
+-                if (empty) {
+-                        c->nft_set_context = nft_set_context_free_many(c->nft_set_context, &c->n_nft_set_contexts);
+-                        unit_write_settingf(u, flags, name, "%s=", name);
+-                }
+-
+-                return 1;
+-        }
+-
+         return 0;
+ }
+diff --git a/src/core/dbus-execute.c b/src/core/dbus-execute.c
+index 0b28d4f603284..1a9e5da6350c9 100644
+--- a/src/core/dbus-execute.c
++++ b/src/core/dbus-execute.c
+@@ -22,7 +22,6 @@
+ #include "execute.h"
+ #include "fd-util.h"
+ #include "fileio.h"
+-#include "firewall-util.h"
+ #include "hexdecoct.h"
+ #include "io-util.h"
+ #include "ioprio-util.h"
+@@ -1143,37 +1142,6 @@ static int bus_property_get_exec_dir_symlink(
+         return sd_bus_message_close_container(reply);
+ }
+ 
+-static int property_get_dynamic_user_nft_set(
+-                sd_bus *bus,
+-                const char *path,
+-                const char *interface,
+-                const char *property,
+-                sd_bus_message *reply,
+-                void *userdata,
+-                sd_bus_error *error) {
+-
+-        ExecContext *c = userdata;
+-        int r;
+-
+-        assert(bus);
+-        assert(reply);
+-        assert(c);
+-
+-        r = sd_bus_message_open_container(reply, 'a', "(iss)");
+-        if (r < 0)
+-                return r;
+-
+-        for (size_t i = 0; i < c->n_dynamic_user_nft_set_contexts; i++) {
+-                NFTSetContext *s = &c->dynamic_user_nft_set_context[i];
+-
+-                r = sd_bus_message_append(reply, "(iss)", s->nfproto, s->table, s->set);
+-                if (r < 0)
+-                        return r;
+-        }
+-
+-        return sd_bus_message_close_container(reply);
+-}
+-
+ const sd_bus_vtable bus_exec_vtable[] = {
+         SD_BUS_VTABLE_START(0),
+         SD_BUS_PROPERTY("Environment", "as", NULL, offsetof(ExecContext, environment), SD_BUS_VTABLE_PROPERTY_CONST),
+@@ -1268,7 +1236,6 @@ const sd_bus_vtable bus_exec_vtable[] = {
+         SD_BUS_PROPERTY("User", "s", NULL, offsetof(ExecContext, user), SD_BUS_VTABLE_PROPERTY_CONST),
+         SD_BUS_PROPERTY("Group", "s", NULL, offsetof(ExecContext, group), SD_BUS_VTABLE_PROPERTY_CONST),
+         SD_BUS_PROPERTY("DynamicUser", "b", bus_property_get_bool, offsetof(ExecContext, dynamic_user), SD_BUS_VTABLE_PROPERTY_CONST),
+-        SD_BUS_PROPERTY("DynamicUserNFTSet", "a(iss)", property_get_dynamic_user_nft_set, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+         SD_BUS_PROPERTY("RemoveIPC", "b", bus_property_get_bool, offsetof(ExecContext, remove_ipc), SD_BUS_VTABLE_PROPERTY_CONST),
+         SD_BUS_PROPERTY("SetCredential", "a(say)", property_get_set_credential, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+         SD_BUS_PROPERTY("SetCredentialEncrypted", "a(say)", property_get_set_credential, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+@@ -3540,58 +3507,6 @@ int bus_exec_context_set_transient_property(
+ 
+                 return 1;
+ 
+-        } else if (streq(name, "DynamicUserNFTSet")) {
+-                int nfproto;
+-                const char *table, *set;
+-                bool empty = true;
+-
+-                r = sd_bus_message_enter_container(message, 'a', "(iss)");
+-                if (r < 0)
+-                        return r;
+-
+-                while ((r = sd_bus_message_read(message, "(iss)", &nfproto, &table, &set)) > 0) {
+-                        const char *nfproto_name;
+-
+-                        nfproto_name = nfproto_to_string(nfproto);
+-                        if (!nfproto_name)
+-                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid protocol %d.", nfproto);
+-
+-                        if (nft_identifier_bad(table))
+-                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid NFT table name %s.", table);
+-
+-                        if (nft_identifier_bad(set))
+-                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid NFT set name %s.", set);
+-
+-                        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+-                                r = nft_set_context_add(&c->dynamic_user_nft_set_context, &c->n_dynamic_user_nft_set_contexts, nfproto, table, set);
+-                                if (r < 0)
+-                                        return r;
+-
+-                                unit_write_settingf(
+-                                                u, flags|UNIT_ESCAPE_SPECIFIERS, name,
+-                                                "%s=%s:%s:%s",
+-                                                name,
+-                                                nfproto_name,
+-                                                table,
+-                                                set);
+-                        }
+-
+-                        empty = false;
+-                }
+-                if (r < 0)
+-                        return r;
+-
+-                r = sd_bus_message_exit_container(message);
+-                if (r < 0)
+-                        return r;
+-
+-                if (empty) {
+-                        c->dynamic_user_nft_set_context = nft_set_context_free_many(c->dynamic_user_nft_set_context, &c->n_dynamic_user_nft_set_contexts);
+-                        unit_write_settingf(u, flags, name, "%s=", name);
+-                }
+-
+-                return 1;
+-
+         } else if ((suffix = startswith(name, "Limit"))) {
+                 const char *soft = NULL;
+                 int ri;
+diff --git a/src/core/execute.c b/src/core/execute.c
+index f128a45f546f9..05fc00ca1ce56 100644
+--- a/src/core/execute.c
++++ b/src/core/execute.c
+@@ -4083,43 +4083,6 @@ static int add_shifted_fd(int *fds, size_t fds_size, size_t *n_fds, int fd, int
+         return 1;
+ }
+ 
+-static void exec_op_dynamic_user_nft_set(bool add, const ExecContext *c, uid_t uid) {
+-        int r;
+-
+-        assert(c);
+-
+-        for (size_t i = 0; i < c->n_dynamic_user_nft_set_contexts; i++) {
+-                NFTSetContext *s = &c->dynamic_user_nft_set_context[i];
+-                if (add)
+-                        r = nft_set_element_add_uint32(s, uid);
+-                else
+-                        r = nft_set_element_del_uint32(s, uid);
+-                if (r < 0)
+-                        log_warning_errno(r, "%s NFT family %s table %s set %s UID " UID_FMT " failed, ignoring: %m",
+-                                          add? "Adding" : "Deleting", nfproto_to_string(s->nfproto), s->table, s->set, uid);
+-        }
+-}
+-
+-static void exec_add_dynamic_user_nft_set(const ExecContext *c, uid_t uid) {
+-        exec_op_dynamic_user_nft_set(true, c, uid);
+-}
+-
+-void exec_delete_dynamic_user_nft_set(const ExecContext *c, DynamicUser *d) {
+-        int r;
+-        uid_t uid;
+-
+-        if (!d)
+-                return;
+-
+-        r = dynamic_user_current(d, &uid);
+-        if (r < 0) {
+-                log_warning_errno(r, "Can't get current dynamic user, ignoring: %m");
+-                return;
+-        }
+-
+-        exec_op_dynamic_user_nft_set(false, c, uid);
+-}
+-
+ static int exec_child(
+                 Unit *unit,
+                 const ExecCommand *command,
+@@ -4321,8 +4284,6 @@ static int exec_child(
+                 if (dcreds->user)
+                         username = dcreds->user->name;
+ 
+-                exec_add_dynamic_user_nft_set(context, uid);
+-
+         } else {
+                 r = get_fixed_user(context, &username, &uid, &gid, &home, &shell);
+                 if (r < 0) {
+@@ -5385,8 +5346,6 @@ void exec_context_done(ExecContext *c) {
+         c->user = mfree(c->user);
+         c->group = mfree(c->group);
+ 
+-        c->dynamic_user_nft_set_context = nft_set_context_free_many(c->dynamic_user_nft_set_context, &c->n_dynamic_user_nft_set_contexts);
+-
+         c->supplementary_groups = strv_free(c->supplementary_groups);
+ 
+         c->pam_name = mfree(c->pam_name);
+@@ -6061,11 +6020,6 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
+                 fprintf(f, "%sGroup: %s\n", prefix, c->group);
+ 
+         fprintf(f, "%sDynamicUser: %s\n", prefix, yes_no(c->dynamic_user));
+-        for (size_t i = 0; i < c->n_dynamic_user_nft_set_contexts; i++)
+-                fprintf(f, "%sDynamicUserNFTSet: %s:%s:%s\n", prefix,
+-                        nfproto_to_string(c->dynamic_user_nft_set_context[i].nfproto),
+-                        c->dynamic_user_nft_set_context[i].table,
+-                        c->dynamic_user_nft_set_context[i].set);
+ 
+         strv_dump(f, prefix, "SupplementaryGroups", c->supplementary_groups);
+ 
+diff --git a/src/core/execute.h b/src/core/execute.h
+index b3516c29fc025..904e7943f32e2 100644
+--- a/src/core/execute.h
++++ b/src/core/execute.h
+@@ -18,7 +18,6 @@ typedef struct Manager Manager;
+ #include "cpu-set-util.h"
+ #include "exec-util.h"
+ #include "fdset.h"
+-#include "firewall-util.h"
+ #include "list.h"
+ #include "missing_resource.h"
+ #include "namespace.h"
+@@ -314,9 +313,6 @@ struct ExecContext {
+         bool mount_apivfs;
+ 
+         bool dynamic_user;
+-        size_t n_dynamic_user_nft_set_contexts;
+-        NFTSetContext *dynamic_user_nft_set_context;
+-
+         bool remove_ipc;
+ 
+         bool memory_deny_write_execute;
+@@ -526,5 +522,3 @@ const char* exec_resource_type_to_string(ExecDirectoryType i) _const_;
+ ExecDirectoryType exec_resource_type_from_string(const char *s) _pure_;
+ 
+ bool exec_needs_mount_namespace(const ExecContext *context, const ExecParameters *params, const ExecRuntime *runtime);
+-
+-void exec_delete_dynamic_user_nft_set(const ExecContext *c, DynamicUser *d);
+diff --git a/src/core/load-fragment-gperf.gperf.in b/src/core/load-fragment-gperf.gperf.in
+index facda69d0dd86..7817c20c0ba9d 100644
+--- a/src/core/load-fragment-gperf.gperf.in
++++ b/src/core/load-fragment-gperf.gperf.in
+@@ -32,7 +32,6 @@
+ {{type}}.PassEnvironment,                  config_parse_pass_environ,                   0,                                  offsetof({{type}}, exec_context.pass_environment)
+ {{type}}.UnsetEnvironment,                 config_parse_unset_environ,                  0,                                  offsetof({{type}}, exec_context.unset_environment)
+ {{type}}.DynamicUser,                      config_parse_bool,                           true,                               offsetof({{type}}, exec_context.dynamic_user)
+-{{type}}.DynamicUserNFTSet,                config_parse_dynamic_user_nft_set,           0,                                  offsetof({{type}}, exec_context)
+ {{type}}.RemoveIPC,                        config_parse_bool,                           0,                                  offsetof({{type}}, exec_context.remove_ipc)
+ {{type}}.StandardInput,                    config_parse_exec_input,                     0,                                  offsetof({{type}}, exec_context)
+ {{type}}.StandardOutput,                   config_parse_exec_output,                    0,                                  offsetof({{type}}, exec_context)
+@@ -242,7 +241,6 @@
+ {{type}}.SocketBindAllow,                  config_parse_cgroup_socket_bind,             0,                                  offsetof({{type}}, cgroup_context.socket_bind_allow)
+ {{type}}.SocketBindDeny,                   config_parse_cgroup_socket_bind,             0,                                  offsetof({{type}}, cgroup_context.socket_bind_deny)
+ {{type}}.RestrictNetworkInterfaces,        config_parse_restrict_network_interfaces,    0,                                  offsetof({{type}}, cgroup_context)
+-{{type}}.ControlGroupNFTSet,               config_parse_cgroup_nft_set,                 0,                                  offsetof({{type}}, cgroup_context)
+ {%- endmacro -%}
+ 
+ %{
+diff --git a/src/core/load-fragment.c b/src/core/load-fragment.c
+index 8c136b140271a..3ff6eae8fcead 100644
+--- a/src/core/load-fragment.c
++++ b/src/core/load-fragment.c
+@@ -35,10 +35,8 @@
+ #include "env-util.h"
+ #include "errno-list.h"
+ #include "escape.h"
+-#include "execute.h"
+ #include "fd-util.h"
+ #include "fileio.h"
+-#include "firewall-util.h"
+ #include "fs-util.h"
+ #include "hexdecoct.h"
+ #include "io-util.h"
+@@ -6522,105 +6520,3 @@ int config_parse_tty_size(
+ 
+         return config_parse_unsigned(unit, filename, line, section, section_line, lvalue, ltype, rvalue, data, userdata);
+ }
+-
+-static int config_parse_nft_set(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                NFTSetContext **c,
+-                size_t *n,
+-                Unit *u) {
+-        _cleanup_free_ char *family_str = NULL, *table = NULL, *set = NULL, *table_resolved = NULL, *set_resolved = NULL;
+-        int nfproto, r;
+-        assert(filename);
+-        assert(lvalue);
+-        assert(rvalue);
+-        assert(u);
+-
+-        if (isempty(rvalue)) {
+-                /* Empty assignment resets the list */
+-                *c = nft_set_context_free_many(*c, n);
+-                return 0;
+-        }
+-
+-        for (const char *p = rvalue;;) {
+-                r = extract_many_words(&p, ":", EXTRACT_CUNESCAPE, &family_str, &table, &set, NULL);
+-                if (r == -ENOMEM)
+-                        return log_oom();
+-                if (r == 0)
+-                        break;
+-                if (r != 3) {
+-                        log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse NFT set, ignoring: %s", p);
+-                        return 0;
+-                }
+-
+-                nfproto = nfproto_from_string(family_str);
+-                if (nfproto < 0) {
+-                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Unknown NFT protocol family, ignoring: %s", family_str);
+-                        return 0;
+-                }
+-
+-                r = unit_path_printf(u, table, &table_resolved);
+-                if (r < 0) {
+-                        log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to resolve unit specifiers in '%s', ignoring: %m", table);
+-                        return 0;
+-                }
+-
+-                if (nft_identifier_bad(table_resolved))
+-                        return log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid table name %s, ignoring", table);
+-
+-                r = unit_path_printf(u, set, &set_resolved);
+-                if (r < 0) {
+-                        log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to resolve unit specifiers in '%s', ignoring: %m", set);
+-                        return 0;
+-                }
+-
+-                if (nft_identifier_bad(set_resolved))
+-                        return log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid set name %s, ignoring", set);
+-
+-                r = nft_set_context_add(c, n, nfproto, table_resolved, set_resolved);
+-                if (r < 0)
+-                        return log_oom();
+-        }
+-
+-        return 0;
+-}
+-
+-int config_parse_cgroup_nft_set(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                void *data,
+-                void *userdata) {
+-        CGroupContext *c = data;
+-        Unit *u = userdata;
+-
+-        return config_parse_nft_set(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &c->nft_set_context, &c->n_nft_set_contexts, u);
+-}
+-
+-int config_parse_dynamic_user_nft_set(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                void *data,
+-                void *userdata) {
+-        ExecContext *c = data;
+-        Unit *u = userdata;
+-
+-        return config_parse_nft_set(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &c->dynamic_user_nft_set_context, &c->n_dynamic_user_nft_set_contexts, u);
+-}
+diff --git a/src/core/load-fragment.h b/src/core/load-fragment.h
+index c250e4684616c..26b8de28f7a09 100644
+--- a/src/core/load-fragment.h
++++ b/src/core/load-fragment.h
+@@ -150,8 +150,6 @@ CONFIG_PARSER_PROTOTYPE(config_parse_cgroup_socket_bind);
+ CONFIG_PARSER_PROTOTYPE(config_parse_restrict_network_interfaces);
+ CONFIG_PARSER_PROTOTYPE(config_parse_watchdog_sec);
+ CONFIG_PARSER_PROTOTYPE(config_parse_tty_size);
+-CONFIG_PARSER_PROTOTYPE(config_parse_cgroup_nft_set);
+-CONFIG_PARSER_PROTOTYPE(config_parse_dynamic_user_nft_set);
+ 
+ /* gperf prototypes */
+ const struct ConfigPerfItem* load_fragment_gperf_lookup(const char *key, GPERF_LEN_TYPE length);
+diff --git a/src/core/service.c b/src/core/service.c
+index f8d751e32fcbd..5f1a218bb5beb 100644
+--- a/src/core/service.c
++++ b/src/core/service.c
+@@ -1877,9 +1877,6 @@ static void service_enter_dead(Service *s, ServiceResult f, bool allow_restart)
+         /* Get rid of the IPC bits of the user */
+         unit_unref_uid_gid(UNIT(s), true);
+ 
+-        /* Delete DynamicUserNFTSet= */
+-        exec_delete_dynamic_user_nft_set(&s->exec_context, s->dynamic_creds.user);
+-
+         /* Release the user, and destroy it if we are the only remaining owner */
+         dynamic_creds_destroy(&s->dynamic_creds);
+ 
+diff --git a/src/network/networkd-address.c b/src/network/networkd-address.c
+index fb9273934ed7b..2bedbe4275e58 100644
+--- a/src/network/networkd-address.c
++++ b/src/network/networkd-address.c
+@@ -139,8 +139,6 @@ Address *address_free(Address *address) {
+         config_section_free(address->section);
+         free(address->label);
+         set_free(address->netlabels);
+-        nft_set_context_free_many(address->ipv4_nft_set_context, &address->n_ipv4_nft_set_contexts);
+-        nft_set_context_free_many(address->ipv6_nft_set_context, &address->n_ipv6_nft_set_contexts);
+         return mfree(address);
+ }
+ 
+@@ -452,91 +450,6 @@ static int address_set_masquerade(Address *address, bool add) {
+         return 0;
+ }
+ 
+-static void address_add_nft_set_context(const Address *address, const NFTSetContext *nft_set_context, size_t n_nft_set_contexts) {
+-        int r;
+-
+-        assert(address);
+-
+-        for (size_t i = 0; i < n_nft_set_contexts; i++) {
+-                r = nft_set_element_add_in_addr(&nft_set_context[i], address->family,
+-                                                &address->in_addr, address->prefixlen);
+-                if (r < 0)
+-                        log_warning_errno(r, "Adding NFT family %s table %s set %s for IP address %s failed, ignoring",
+-                                          nfproto_to_string(nft_set_context[i].nfproto),
+-                                          nft_set_context[i].table,
+-                                          nft_set_context[i].set,
+-                                          IN_ADDR_PREFIX_TO_STRING(address->family, &address->in_addr, address->prefixlen));
+-        }
+-}
+-
+-static void address_del_nft_set_context(const Address *address, const NFTSetContext *nft_set_context, size_t n_nft_set_contexts) {
+-        int r;
+-
+-        assert(address);
+-
+-        for (size_t i = 0; i < n_nft_set_contexts; i++) {
+-                r = nft_set_element_del_in_addr(&nft_set_context[i], address->family,
+-                                                &address->in_addr, address->prefixlen);
+-                if (r < 0)
+-                        log_warning_errno(r, "Deleting NFT family %s table %s set %s for IP address %s failed, ignoring",
+-                                          nfproto_to_string(nft_set_context[i].nfproto),
+-                                          nft_set_context[i].table,
+-                                          nft_set_context[i].set,
+-                                          IN_ADDR_PREFIX_TO_STRING(address->family, &address->in_addr, address->prefixlen));               }
+-}
+-
+-static void address_add_nft_set(const Address *address) {
+-        assert(address);
+-        assert(address->link);
+-
+-        if (!address->link->network || !IN_SET(address->family, AF_INET, AF_INET6))
+-                return;
+-
+-        switch (address->source) {
+-        case NETWORK_CONFIG_SOURCE_DHCP4:
+-                return address_add_nft_set_context(address, address->link->network->dhcp_nft_set_context, address->link->network->n_dhcp_nft_set_contexts);
+-        case NETWORK_CONFIG_SOURCE_DHCP6:
+-                return address_add_nft_set_context(address, address->link->network->dhcp6_nft_set_context, address->link->network->n_dhcp6_nft_set_contexts);
+-        case NETWORK_CONFIG_SOURCE_DHCP_PD:
+-                return address_add_nft_set_context(address, address->link->network->dhcp_pd_nft_set_context, address->link->network->n_dhcp_pd_nft_set_contexts);
+-        case NETWORK_CONFIG_SOURCE_NDISC:
+-                return address_add_nft_set_context(address, address->link->network->ndisc_nft_set_context, address->link->network->n_ndisc_nft_set_contexts);
+-        case NETWORK_CONFIG_SOURCE_STATIC:
+-                if (address->family == AF_INET)
+-                        return address_add_nft_set_context(address, address->ipv4_nft_set_context, address->n_ipv4_nft_set_contexts);
+-                else
+-                        return address_add_nft_set_context(address, address->ipv6_nft_set_context, address->n_ipv6_nft_set_contexts);
+-        default:
+-                return;
+-        }
+-}
+-
+-static void address_del_nft_set(const Address *address) {
+-        assert(address);
+-        assert(address->link);
+-
+-        if (!address->link->network || !IN_SET(address->family, AF_INET, AF_INET6))
+-                return;
+-
+-        switch (address->source) {
+-        case NETWORK_CONFIG_SOURCE_DHCP4:
+-                return address_del_nft_set_context(address, address->link->network->dhcp_nft_set_context, address->link->network->n_dhcp_nft_set_contexts);
+-        case NETWORK_CONFIG_SOURCE_DHCP6:
+-                return address_del_nft_set_context(address, address->link->network->dhcp6_nft_set_context, address->link->network->n_dhcp6_nft_set_contexts);
+-        case NETWORK_CONFIG_SOURCE_DHCP_PD:
+-                return address_del_nft_set_context(address, address->link->network->dhcp_pd_nft_set_context, address->link->network->n_dhcp_pd_nft_set_contexts);
+-        case NETWORK_CONFIG_SOURCE_NDISC:
+-                return address_del_nft_set_context(address, address->link->network->ndisc_nft_set_context, address->link->network->n_ndisc_nft_set_contexts);
+-        case NETWORK_CONFIG_SOURCE_STATIC:
+-                if (address->family == AF_INET)
+-                        return address_del_nft_set_context(address, address->ipv4_nft_set_context, address->n_ipv4_nft_set_contexts);
+-                else
+-                        return address_del_nft_set_context(address, address->ipv6_nft_set_context, address->n_ipv6_nft_set_contexts);
+-        default:
+-                return;
+-        }
+-}
+-
+ static int address_add(Link *link, Address *address) {
+         int r;
+ 
+@@ -583,8 +496,6 @@ static int address_update(Address *address) {
+ 
+         address_add_netlabel(address);
+ 
+-        address_add_nft_set(address);
+-
+         if (address_is_ready(address) && address->callback) {
+                 r = address->callback(address);
+                 if (r < 0)
+@@ -611,8 +522,6 @@ static int address_drop(Address *address) {
+         if (r < 0)
+                 log_link_warning_errno(link, r, "Failed to disable IP masquerading, ignoring: %m");
+ 
+-        address_del_nft_set(address);
+-
+         address_del_netlabel(address);
+ 
+         if (address->state == 0)
+@@ -2172,71 +2081,3 @@ int network_drop_invalid_addresses(Network *network) {
+ 
+         return 0;
+ }
+-
+-int config_parse_address_ipv4_nft_set_context(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                void *data,
+-                void *userdata) {
+-        Network *network = userdata;
+-        _cleanup_(address_free_or_set_invalidp) Address *n = NULL;
+-        int r;
+-
+-        assert(filename);
+-        assert(section);
+-        assert(lvalue);
+-        assert(rvalue);
+-        assert(data);
+-        assert(network);
+-
+-        r = address_new_static(network, filename, section_line, &n);
+-        if (r == -ENOMEM)
+-                return log_oom();
+-        if (r < 0) {
+-                log_syntax(unit, LOG_WARNING, filename, line, r,
+-                           "Failed to allocate new address, ignoring assignment: %m");
+-                return 0;
+-        }
+-
+-        return config_parse_nft_set_context(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &n->ipv4_nft_set_context, &n->n_ipv4_nft_set_contexts);
+-}
+-
+-int config_parse_address_ipv6_nft_set_context(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                void *data,
+-                void *userdata) {
+-        Network *network = userdata;
+-        _cleanup_(address_free_or_set_invalidp) Address *n = NULL;
+-        int r;
+-
+-        assert(filename);
+-        assert(section);
+-        assert(lvalue);
+-        assert(rvalue);
+-        assert(data);
+-        assert(network);
+-
+-        r = address_new_static(network, filename, section_line, &n);
+-        if (r == -ENOMEM)
+-                return log_oom();
+-        if (r < 0) {
+-                log_syntax(unit, LOG_WARNING, filename, line, r,
+-                           "Failed to allocate new address, ignoring assignment: %m");
+-                return 0;
+-        }
+-
+-        return config_parse_nft_set_context(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &n->ipv6_nft_set_context, &n->n_ipv6_nft_set_contexts);
+-}
+diff --git a/src/network/networkd-address.h b/src/network/networkd-address.h
+index c7746f931c569..e5770155fa37f 100644
+--- a/src/network/networkd-address.h
++++ b/src/network/networkd-address.h
+@@ -8,7 +8,6 @@
+ #include "sd-ipv4acd.h"
+ 
+ #include "conf-parser.h"
+-#include "firewall-util.h"
+ #include "in-addr-util.h"
+ #include "networkd-link.h"
+ #include "networkd-util.h"
+@@ -65,9 +64,6 @@ struct Address {
+ 
+         /* NetLabel */
+         Set *netlabels;
+-
+-        NFTSetContext *ipv4_nft_set_context, *ipv6_nft_set_context;
+-        size_t n_ipv4_nft_set_contexts, n_ipv6_nft_set_contexts;
+ };
+ 
+ const char* format_lifetime(char *buf, size_t l, usec_t lifetime_usec) _warn_unused_result_;
+@@ -143,5 +139,3 @@ CONFIG_PARSER_PROTOTYPE(config_parse_address_scope);
+ CONFIG_PARSER_PROTOTYPE(config_parse_address_route_metric);
+ CONFIG_PARSER_PROTOTYPE(config_parse_duplicate_address_detection);
+ CONFIG_PARSER_PROTOTYPE(config_parse_address_netlabel);
+-CONFIG_PARSER_PROTOTYPE(config_parse_address_ipv4_nft_set_context);
+-CONFIG_PARSER_PROTOTYPE(config_parse_address_ipv6_nft_set_context);
+diff --git a/src/network/networkd-network-gperf.gperf b/src/network/networkd-network-gperf.gperf
+index faa9aa61b47ba..ef5cec1b52d26 100644
+--- a/src/network/networkd-network-gperf.gperf
++++ b/src/network/networkd-network-gperf.gperf
+@@ -158,8 +158,6 @@ Address.DuplicateAddressDetection,           config_parse_duplicate_address_dete
+ Address.Scope,                               config_parse_address_scope,                               0,                             0
+ Address.RouteMetric,                         config_parse_address_route_metric,                        0,                             0
+ Address.NetLabel,                            config_parse_address_netlabel,                            0,                             0
+-Address.IPv4NFTSet,                          config_parse_address_ipv4_nft_set_context,                0,                             0
+-Address.IPv6NFTSet,                          config_parse_address_ipv6_nft_set_context,                0,                             0
+ IPv6AddressLabel.Prefix,                     config_parse_address_label_prefix,                        0,                             0
+ IPv6AddressLabel.Label,                      config_parse_address_label,                               0,                             0
+ Neighbor.Address,                            config_parse_neighbor_address,                            0,                             0
+@@ -248,7 +246,6 @@ DHCPv4.RouteMTUBytes,                        config_parse_mtu,
+ DHCPv4.FallbackLeaseLifetimeSec,             config_parse_dhcp_fallback_lease_lifetime,                0,                             0
+ DHCPv4.Use6RD,                               config_parse_bool,                                        0,                             offsetof(Network, dhcp_use_6rd)
+ DHCPv4.NetLabel,                             config_parse_netlabel,                                    0,                             offsetof(Network, dhcp_netlabels)
+-DHCPv4.NFTSet,                               config_parse_dhcp_nft_set_context,                        0,                             0
+ DHCPv6.UseAddress,                           config_parse_bool,                                        0,                             offsetof(Network, dhcp6_use_address)
+ DHCPv6.UseDelegatedPrefix,                   config_parse_bool,                                        0,                             offsetof(Network, dhcp6_use_pd_prefix)
+ DHCPv6.UseDNS,                               config_parse_dhcp_use_dns,                                AF_INET6,                      0
+@@ -267,7 +264,6 @@ DHCPv6.IAID,                                 config_parse_iaid,
+ DHCPv6.DUIDType,                             config_parse_duid_type,                                   0,                             offsetof(Network, dhcp6_duid)
+ DHCPv6.DUIDRawData,                          config_parse_duid_rawdata,                                0,                             offsetof(Network, dhcp6_duid)
+ DHCPv6.NetLabel,                             config_parse_netlabel,                                    0,                             offsetof(Network, dhcp6_netlabels)
+-DHCPv6.NFTSet,                               config_parse_dhcp6_nft_set_context,                       0,                             0
+ IPv6AcceptRA.UseGateway,                     config_parse_bool,                                        0,                             offsetof(Network, ipv6_accept_ra_use_gateway)
+ IPv6AcceptRA.UseRoutePrefix,                 config_parse_bool,                                        0,                             offsetof(Network, ipv6_accept_ra_use_route_prefix)
+ IPv6AcceptRA.UseAutonomousPrefix,            config_parse_bool,                                        0,                             offsetof(Network, ipv6_accept_ra_use_autonomous_prefix)
+@@ -286,7 +282,6 @@ IPv6AcceptRA.RouteAllowList,                 config_parse_in_addr_prefixes,
+ IPv6AcceptRA.RouteDenyList,                  config_parse_in_addr_prefixes,                            AF_INET6,                      offsetof(Network, ndisc_deny_listed_route_prefix)
+ IPv6AcceptRA.Token,                          config_parse_address_generation_type,                     0,                             offsetof(Network, ndisc_tokens)
+ IPv6AcceptRA.NetLabel,                       config_parse_netlabel,                                    0,                             offsetof(Network, ndisc_netlabels)
+-IPv6AcceptRA.NFTSet,                         config_parse_ndisc_nft_set_context,                       0,                             0
+ DHCPServer.ServerAddress,                    config_parse_dhcp_server_address,                         0,                             0
+ DHCPServer.UplinkInterface,                  config_parse_uplink,                                      0,                             0
+ DHCPServer.RelayTarget,                      config_parse_in_addr_non_null,                            AF_INET,                       offsetof(Network, dhcp_server_relay_target)
+@@ -354,7 +349,6 @@ DHCPPrefixDelegation.ManageTemporaryAddress, config_parse_bool,
+ DHCPPrefixDelegation.Token,                  config_parse_address_generation_type,                     0,                             offsetof(Network, dhcp_pd_tokens)
+ DHCPPrefixDelegation.RouteMetric,            config_parse_uint32,                                      0,                             offsetof(Network, dhcp_pd_route_metric)
+ DHCPPrefixDelegation.NetLabel,               config_parse_netlabel,                                    0,                             offsetof(Network, dhcp_pd_netlabels)
+-DHCPPrefixDelegation.NFTSet,                 config_parse_dhcp_pd_nft_set_context,                     0,                             0
+ IPv6SendRA.RouterLifetimeSec,                config_parse_router_lifetime,                             0,                             offsetof(Network, router_lifetime_usec)
+ IPv6SendRA.Managed,                          config_parse_bool,                                        0,                             offsetof(Network, router_managed)
+ IPv6SendRA.OtherInformation,                 config_parse_bool,                                        0,                             offsetof(Network, router_other_information)
+diff --git a/src/network/networkd-network.c b/src/network/networkd-network.c
+index 494e87e126535..a6660d72b94e4 100644
+--- a/src/network/networkd-network.c
++++ b/src/network/networkd-network.c
+@@ -690,8 +690,6 @@ static Network *network_free(Network *network) {
+         strv_free(network->dhcp6_vendor_class);
+         set_free(network->dhcp_netlabels);
+         set_free(network->dhcp6_netlabels);
+-        nft_set_context_free_many(network->dhcp_nft_set_context, &network->n_dhcp_nft_set_contexts);
+-        nft_set_context_free_many(network->dhcp6_nft_set_context, &network->n_dhcp6_nft_set_contexts);
+ 
+         strv_free(network->ntp);
+         for (unsigned i = 0; i < network->n_dns; i++)
+@@ -760,8 +758,6 @@ static Network *network_free(Network *network) {
+         set_free(network->ndisc_tokens);
+         set_free(network->dhcp_pd_netlabels);
+         set_free(network->ndisc_netlabels);
+-        nft_set_context_free_many(network->dhcp_pd_nft_set_context, &network->n_dhcp_pd_nft_set_contexts);
+-        nft_set_context_free_many(network->ndisc_nft_set_context, &network->n_ndisc_nft_set_contexts);
+ 
+         return mfree(network);
+ }
+@@ -1306,90 +1302,6 @@ int config_parse_ignore_carrier_loss(
+         return 0;
+ }
+ 
+-int config_parse_dhcp_nft_set_context(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                void *data,
+-                void *userdata) {
+-        Network *network = userdata;
+-
+-        assert(filename);
+-        assert(lvalue);
+-        assert(rvalue);
+-        assert(network);
+-
+-        return config_parse_nft_set_context(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &network->dhcp_nft_set_context, &network->n_dhcp_nft_set_contexts);
+-}
+-
+-int config_parse_dhcp6_nft_set_context(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                void *data,
+-                void *userdata) {
+-        Network *network = userdata;
+-
+-        assert(filename);
+-        assert(lvalue);
+-        assert(rvalue);
+-        assert(network);
+-
+-        return config_parse_nft_set_context(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &network->dhcp6_nft_set_context, &network->n_dhcp6_nft_set_contexts);
+-}
+-
+-int config_parse_dhcp_pd_nft_set_context(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                void *data,
+-                void *userdata) {
+-        Network *network = userdata;
+-
+-        assert(filename);
+-        assert(lvalue);
+-        assert(rvalue);
+-        assert(network);
+-
+-        return config_parse_nft_set_context(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &network->dhcp_pd_nft_set_context, &network->n_dhcp_pd_nft_set_contexts);
+-}
+-
+-int config_parse_ndisc_nft_set_context(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                void *data,
+-                void *userdata) {
+-        Network *network = userdata;
+-
+-        assert(filename);
+-        assert(lvalue);
+-        assert(rvalue);
+-        assert(network);
+-
+-        return config_parse_nft_set_context(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &network->ndisc_nft_set_context, &network->n_ndisc_nft_set_contexts);
+-}
+-
+ DEFINE_CONFIG_PARSE_ENUM(config_parse_required_family_for_online, link_required_address_family, AddressFamily,
+                          "Failed to parse RequiredFamilyForOnline= setting");
+ 
+diff --git a/src/network/networkd-network.h b/src/network/networkd-network.h
+index 6d0748aedcfdb..96cd316e0198a 100644
+--- a/src/network/networkd-network.h
++++ b/src/network/networkd-network.h
+@@ -10,7 +10,6 @@
+ #include "bridge.h"
+ #include "condition.h"
+ #include "conf-parser.h"
+-#include "firewall-util.h"
+ #include "hashmap.h"
+ #include "ipoib.h"
+ #include "net-condition.h"
+@@ -157,8 +156,6 @@ struct Network {
+         OrderedHashmap *dhcp_client_send_options;
+         OrderedHashmap *dhcp_client_send_vendor_options;
+         Set *dhcp_netlabels;
+-        NFTSetContext *dhcp_nft_set_context;
+-        size_t n_dhcp_nft_set_contexts;
+ 
+         /* DHCPv6 Client support */
+         bool dhcp6_use_address;
+@@ -184,8 +181,6 @@ struct Network {
+         OrderedHashmap *dhcp6_client_send_vendor_options;
+         Set *dhcp6_request_options;
+         Set *dhcp6_netlabels;
+-        NFTSetContext *dhcp6_nft_set_context;
+-        size_t n_dhcp6_nft_set_contexts;
+ 
+         /* DHCP Server Support */
+         bool dhcp_server;
+@@ -243,8 +238,6 @@ struct Network {
+         int dhcp_pd_uplink_index;
+         char *dhcp_pd_uplink_name;
+         Set *dhcp_pd_netlabels;
+-        NFTSetContext *dhcp_pd_nft_set_context;
+-        size_t n_dhcp_pd_nft_set_contexts;
+ 
+         /* Bridge Support */
+         int use_bpdu;
+@@ -330,8 +323,6 @@ struct Network {
+         Set *ndisc_allow_listed_route_prefix;
+         Set *ndisc_tokens;
+         Set *ndisc_netlabels;
+-        NFTSetContext *ndisc_nft_set_context;
+-        size_t n_ndisc_nft_set_contexts;
+ 
+         /* LLDP support */
+         LLDPMode lldp_mode; /* LLDP reception */
+@@ -397,10 +388,6 @@ CONFIG_PARSER_PROTOTYPE(config_parse_keep_configuration);
+ CONFIG_PARSER_PROTOTYPE(config_parse_activation_policy);
+ CONFIG_PARSER_PROTOTYPE(config_parse_link_group);
+ CONFIG_PARSER_PROTOTYPE(config_parse_ignore_carrier_loss);
+-CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_nft_set_context);
+-CONFIG_PARSER_PROTOTYPE(config_parse_dhcp6_nft_set_context);
+-CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_pd_nft_set_context);
+-CONFIG_PARSER_PROTOTYPE(config_parse_ndisc_nft_set_context);
+ 
+ const struct ConfigPerfItem* network_network_gperf_lookup(const char *key, GPERF_LEN_TYPE length);
+ 
+diff --git a/src/shared/bus-unit-util.c b/src/shared/bus-unit-util.c
+index 1ffdcf384fce6..a326ca30a9a49 100644
+--- a/src/shared/bus-unit-util.c
++++ b/src/shared/bus-unit-util.c
+@@ -16,7 +16,6 @@
+ #include "exec-util.h"
+ #include "exit-status.h"
+ #include "fileio.h"
+-#include "firewall-util.h"
+ #include "hexdecoct.h"
+ #include "hostname-util.h"
+ #include "in-addr-util.h"
+@@ -435,91 +434,6 @@ static int bus_append_ip_address_access(sd_bus_message *m, int family, const uni
+         return sd_bus_message_close_container(m);
+ }
+ 
+-static int bus_append_nft_set(sd_bus_message *m, const char *field, const char *eq) {
+-        int r;
+-
+-        assert(m);
+-
+-        if (isempty(eq)) {
+-                r = sd_bus_message_append(m, "(sv)", field, "a(iss)", 0);
+-                if (r < 0)
+-                        return bus_log_create_error(r);
+-
+-                return 1;
+-        }
+-
+-        r = sd_bus_message_open_container(m, SD_BUS_TYPE_STRUCT, "sv");
+-        if (r < 0)
+-                return bus_log_create_error(r);
+-
+-        r = sd_bus_message_append_basic(m, SD_BUS_TYPE_STRING, field);
+-        if (r < 0)
+-                return bus_log_create_error(r);
+-
+-        r = sd_bus_message_open_container(m, 'v', "a(iss)");
+-        if (r < 0)
+-                return bus_log_create_error(r);
+-
+-        r = sd_bus_message_open_container(m, 'a', "(iss)");
+-        if (r < 0)
+-                return bus_log_create_error(r);
+-
+-        for (;;) {
+-                _cleanup_free_ char *word = NULL;
+-                int family;
+-
+-                r = extract_first_word(&eq, &word, ":", 0);
+-                if (r == -ENOMEM)
+-                        return log_oom();
+-                if (r < 0)
+-                        return log_error_errno(r, "Failed to parse %s: %m", field);
+-                if (isempty(word)) {
+-                        log_error("Failed to parse %s", field);
+-                        return 0;
+-                }
+-
+-                family = nfproto_from_string(word);
+-                if (family < 0)
+-                        return log_error_errno(family, "Failed to parse %s: %m", field);
+-
+-                r = extract_first_word(&eq, &word, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS);
+-                if (r == -ENOMEM)
+-                        return log_oom();
+-                if (r < 0)
+-                        return log_error_errno(r, "Failed to parse %s: %m", field);
+-                if (isempty(word) || isempty(eq)) {
+-                        log_error("Failed to parse %s", field);
+-                        return 0;
+-                }
+-
+-                _cleanup_free_ char *unescaped = NULL;
+-                ssize_t l;
+-
+-                l = cunescape(eq, 0, &unescaped);
+-                if (l < 0)
+-                        return log_error_errno(l, "Failed to unescape %s= value: %s", field, eq);
+-
+-                r = sd_bus_message_append(m, "(iss)", family, word, eq);
+-
+-                r = sd_bus_message_close_container(m);
+-                if (r < 0)
+-                        return bus_log_create_error(r);
+-        }
+-        r = sd_bus_message_close_container(m);
+-        if (r < 0)
+-                return bus_log_create_error(r);
+-
+-        r = sd_bus_message_close_container(m);
+-        if (r < 0)
+-                return bus_log_create_error(r);
+-
+-        r = sd_bus_message_close_container(m);
+-        if (r < 0)
+-                return bus_log_create_error(r);
+-
+-        return 1;
+-}
+-
+ static int bus_append_cgroup_property(sd_bus_message *m, const char *field, const char *eq) {
+         int r;
+ 
+@@ -977,9 +891,6 @@ static int bus_append_cgroup_property(sd_bus_message *m, const char *field, cons
+                 return 1;
+         }
+ 
+-        if (streq(field, "ControlGroupNFTSet"))
+-                return bus_append_nft_set(m, field, eq);
+-
+         return 0;
+ }
+ 
+@@ -2137,9 +2048,6 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
+                 return 1;
+         }
+ 
+-        if (STR_IN_SET(field, "DynamicUserNFTSet"))
+-                return bus_append_nft_set(m, field, eq);
+-
+         return 0;
+ }
+ 
+diff --git a/src/shared/firewall-util-nft.c b/src/shared/firewall-util-nft.c
+index 331aaf3f0b48f..2f98e791c21cd 100644
+--- a/src/shared/firewall-util-nft.c
++++ b/src/shared/firewall-util-nft.c
+@@ -14,13 +14,11 @@
+ #include "sd-netlink.h"
+ 
+ #include "alloc-util.h"
+-#include "extract-word.h"
+ #include "firewall-util.h"
+ #include "firewall-util-private.h"
+ #include "in-addr-util.h"
+ #include "macro.h"
+ #include "socket-util.h"
+-#include "string-table.h"
+ #include "time-util.h"
+ 
+ #define NFT_SYSTEMD_DNAT_MAP_NAME "map_port_ipport"
+@@ -850,12 +848,9 @@ static int nft_message_add_setelem_ip6range(
+ 
+ #define NFT_MASQ_MSGS   3
+ 
+-static int nft_set_element_op_in_addr(
+-                sd_netlink *nfnl,
+-                const char *table,
+-                const char *set,
++static int fw_nftables_add_masquerade_internal(
++                FirewallContext *ctx,
+                 bool add,
+-                int nfproto,
+                 int af,
+                 const union in_addr_union *source,
+                 unsigned int source_prefixlen) {
+@@ -870,14 +865,14 @@ static int nft_set_element_op_in_addr(
+         if (af == AF_INET6 && source_prefixlen < 8)
+                 return -EINVAL;
+ 
+-        r = sd_nfnl_message_batch_begin(nfnl, &transaction[0]);
++        r = sd_nfnl_message_batch_begin(ctx->nfnl, &transaction[0]);
+         if (r < 0)
+                 return r;
+         tsize = 1;
+         if (add)
+-                r = sd_nfnl_nft_message_new_setelems_begin(nfnl, &transaction[tsize], nfproto, table, set);
++                r = sd_nfnl_nft_message_new_setelems_begin(ctx->nfnl, &transaction[tsize], af, NFT_SYSTEMD_TABLE_NAME, NFT_SYSTEMD_MASQ_SET_NAME);
+         else
+-                r = sd_nfnl_nft_message_del_setelems_begin(nfnl, &transaction[tsize], nfproto, table, set);
++                r = sd_nfnl_nft_message_del_setelems_begin(ctx->nfnl, &transaction[tsize], af, NFT_SYSTEMD_TABLE_NAME, NFT_SYSTEMD_MASQ_SET_NAME);
+         if (r < 0)
+                 goto out_unref;
+ 
+@@ -890,12 +885,12 @@ static int nft_set_element_op_in_addr(
+ 
+         ++tsize;
+         assert(tsize < NFT_MASQ_MSGS);
+-        r = sd_nfnl_message_batch_end(nfnl, &transaction[tsize]);
++        r = sd_nfnl_message_batch_end(ctx->nfnl, &transaction[tsize]);
+         if (r < 0)
+                 return r;
+ 
+         ++tsize;
+-        r = nfnl_netlink_sendv(nfnl, transaction, tsize);
++        r = nfnl_netlink_sendv(ctx->nfnl, transaction, tsize);
+ 
+ out_unref:
+         while (tsize > 0)
+@@ -903,65 +898,6 @@ static int nft_set_element_op_in_addr(
+         return r < 0 ? r : 0;
+ }
+ 
+-static int nft_set_element_op_in_addr_open(
+-                bool add,
+-                const NFTSetContext *nft_set_context,
+-                int af,
+-                const union in_addr_union *address,
+-                unsigned int prefixlen) {
+-
+-        _cleanup_(sd_netlink_unrefp) sd_netlink *nfnl = NULL;
+-        const char *table, *set;
+-        int r, nfproto;
+-
+-        assert(nft_set_context);
+-        nfproto = nft_set_context->nfproto;
+-        table = nft_set_context->table;
+-        assert(table);
+-        set = nft_set_context->set;
+-        assert(set);
+-
+-        r = sd_nfnl_socket_open(&nfnl);
+-        if (r < 0)
+-                return r;
+-
+-        r = nft_set_element_op_in_addr(nfnl, table, set,
+-                                       add, nfproto, af, address, prefixlen);
+-
+-        log_debug("%s NFT family %s table %s set %s IP address %s",
+-                  add ? "Added" : "Deleted",
+-                  nfproto_to_string(nfproto), table, set,
+-                  IN_ADDR_PREFIX_TO_STRING(af, address, prefixlen));
+-
+-        return r;
+-}
+-
+-int nft_set_element_add_in_addr(
+-                const NFTSetContext *nft_set_context,
+-                int af,
+-                const union in_addr_union *address,
+-                unsigned int prefixlen) {
+-        return nft_set_element_op_in_addr_open(true, nft_set_context, af, address, prefixlen);
+-}
+-
+-int nft_set_element_del_in_addr(
+-                const NFTSetContext *nft_set_context,
+-                int af,
+-                const union in_addr_union *address,
+-                unsigned int prefixlen) {
+-        return nft_set_element_op_in_addr_open(false, nft_set_context, af, address, prefixlen);
+-}
+-
+-static int fw_nftables_add_masquerade_internal(
+-                FirewallContext *ctx,
+-                bool add,
+-                int af,
+-                const union in_addr_union *source,
+-                unsigned int source_prefixlen) {
+-        return nft_set_element_op_in_addr(ctx->nfnl, NFT_SYSTEMD_TABLE_NAME, NFT_SYSTEMD_MASQ_SET_NAME,
+-                                          add, af, af, source, source_prefixlen);
+-}
+-
+ int fw_nftables_add_masquerade(
+                 FirewallContext *ctx,
+                 bool add,
+@@ -1135,222 +1071,3 @@ int fw_nftables_add_local_dnat(
+         /* table created anew; previous address already gone */
+         return fw_nftables_add_local_dnat_internal(ctx, add, af, protocol, local_port, remote, remote_port, NULL);
+ }
+-
+-static const char *const nfproto_table[] = {
+-        [NFPROTO_ARP] = "arp",
+-        [NFPROTO_BRIDGE] = "bridge",
+-        [NFPROTO_INET] = "inet",
+-        [NFPROTO_IPV4] = "ip",
+-        [NFPROTO_IPV6] = "ip6",
+-        [NFPROTO_NETDEV] = "netdev",
+-};
+-
+-DEFINE_STRING_TABLE_LOOKUP(nfproto, int);
+-
+-#define NFT_SET_MSGS 3
+-
+-static int nft_set_element_op(bool add, const NFTSetContext *nft_set_context, void *element, size_t element_size) {
+-        _cleanup_(sd_netlink_unrefp) sd_netlink *nfnl = NULL;
+-        sd_netlink_message *transaction[NFT_SET_MSGS] = {};
+-        _cleanup_free_ uint32_t *serial = NULL;
+-        size_t tsize;
+-        int r, nfproto;
+-        const char *table, *set;
+-
+-        assert(nft_set_context);
+-        nfproto = nft_set_context->nfproto;
+-        table = nft_set_context->table;
+-        assert(table);
+-        set = nft_set_context->set;
+-        assert(set);
+-        assert(element);
+-
+-        r = sd_nfnl_socket_open(&nfnl);
+-        if (r < 0)
+-                return r;
+-
+-        r = sd_nfnl_message_batch_begin(nfnl, &transaction[0]);
+-        if (r < 0)
+-                return r;
+-        tsize = 1;
+-
+-        if (add)
+-                r = sd_nfnl_nft_message_new_setelems_begin(nfnl, &transaction[tsize], nfproto, table, set);
+-        else
+-                r = sd_nfnl_nft_message_del_setelems_begin(nfnl, &transaction[tsize], nfproto, table, set);
+-        if (r < 0)
+-                goto out_unref;
+-
+-        r = sd_nfnl_nft_message_add_setelem(transaction[tsize], 0, element, element_size, NULL, 0);
+-        if (r < 0)
+-                return r;
+-
+-        r = sd_nfnl_nft_message_add_setelem_end(transaction[tsize]);
+-        if (r < 0)
+-                return r;
+-        ++tsize;
+-        assert(tsize < ELEMENTSOF(transaction));
+-        r = sd_nfnl_message_batch_end(nfnl, &transaction[tsize]);
+-        if (r < 0)
+-                return r;
+-
+-        ++tsize;
+-        r = sd_netlink_sendv(nfnl, transaction, tsize, &serial);
+-
+-out_unref:
+-        while (tsize > 0)
+-                sd_netlink_message_unref(transaction[--tsize]);
+-        return r < 0 ? r : 0;
+-}
+-
+-int nft_set_element_add_uint32(const NFTSetContext *nft_set_context, uint32_t element) {
+-        int r;
+-
+-        assert(nft_set_context);
+-        r = nft_set_element_op(true, nft_set_context, &element, sizeof(element));
+-        if (r == 0)
+-                log_debug("Added NFT family %s table %s set %s element %d",
+-                          nfproto_to_string(nft_set_context->nfproto), nft_set_context->table, nft_set_context->set, element);
+-        return r;
+-}
+-
+-int nft_set_element_del_uint32(const NFTSetContext *nft_set_context, uint32_t element) {
+-        int r;
+-
+-        assert(nft_set_context);
+-        r = nft_set_element_op(false, nft_set_context, &element, sizeof(element));
+-        if (r == 0)
+-                log_debug("Deleted NFT family %s table %s set %s element %d",
+-                          nfproto_to_string(nft_set_context->nfproto), nft_set_context->table, nft_set_context->set, element);
+-        return r;
+-}
+-
+-int nft_set_element_add_uint64(const NFTSetContext *nft_set_context, uint64_t element) {
+-        int r;
+-
+-        assert(nft_set_context);
+-        r = nft_set_element_op(true, nft_set_context, &element, sizeof(element));
+-        if (r == 0)
+-                log_debug("Added NFT family %s table %s set %s element %"PRIu64,
+-                          nfproto_to_string(nft_set_context->nfproto), nft_set_context->table, nft_set_context->set, element);
+-        return r;
+-}
+-
+-int nft_set_element_del_uint64(const NFTSetContext *nft_set_context, uint64_t element) {
+-        int r;
+-
+-        assert(nft_set_context);
+-        r = nft_set_element_op(false, nft_set_context, &element, sizeof(element));
+-        if (r == 0)
+-                log_debug("Deleted NFT family %s table %s set %s element %"PRIu64,
+-                          nfproto_to_string(nft_set_context->nfproto), nft_set_context->table, nft_set_context->set, element);
+-        return r;
+-}
+-
+-NFTSetContext* nft_set_context_free_many(NFTSetContext *s, size_t *n) {
+-        assert(n);
+-        assert(s || *n == 0);
+-
+-        for (size_t i = 0; i < *n; i++) {
+-                free(s[i].table);
+-                free(s[i].set);
+-        }
+-
+-        free(s);
+-        *n = 0;
+-        return NULL;
+-}
+-
+-int nft_set_context_add(NFTSetContext **s, size_t *n, int nfproto, const char *table, const char *set) {
+-        _cleanup_free_ char *table_dup = NULL, *set_dup = NULL;
+-        assert(s);
+-        assert(n);
+-
+-        table_dup = strdup(table);
+-        if (!table_dup)
+-                return -ENOMEM;
+-
+-        set_dup = strdup(set);
+-        if (!set_dup)
+-                return -ENOMEM;
+-
+-        NFTSetContext *c;
+-        c = reallocarray(*s, *n + 1, sizeof(NFTSetContext));
+-        if (!c)
+-                return -ENOMEM;
+-
+-        *s = c;
+-
+-        c[(*n) ++] = (NFTSetContext) {
+-                .nfproto = nfproto,
+-                .table = TAKE_PTR(table_dup),
+-                .set = TAKE_PTR(set_dup),
+-        };
+-
+-        return 0;
+-}
+-
+-int config_parse_nft_set_context(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                NFTSetContext **nft_set_context,
+-                size_t *n) {
+-        _cleanup_free_ char *family_str = NULL, *table = NULL, *set = NULL;
+-        int nfproto, r;
+-
+-        assert(filename);
+-        assert(lvalue);
+-        assert(rvalue);
+-        assert(nft_set_context);
+-
+-        if (isempty(rvalue)) {
+-                nft_set_context_free_many(*nft_set_context, n);
+-
+-                return 0;
+-        }
+-
+-        for (const char *p = rvalue;;) {
+-                r = extract_many_words(&p, ":" WHITESPACE, EXTRACT_CUNESCAPE, &family_str, &table, &set, NULL);
+-                if (r == -ENOMEM)
+-                        return log_oom();
+-                if (r == 0)
+-                        return 0;
+-                if (r != 3) {
+-                        log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse IPvxNFT set, ignoring: %s", rvalue);
+-                        return 0;
+-                }
+-
+-                nfproto = nfproto_from_string(family_str);
+-                if (nfproto < 0) {
+-                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Unknown NFT protocol family, ignoring: %s", family_str);
+-                        return 0;
+-                }
+-
+-                if (nft_identifier_bad(table))
+-                        return log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid table name %s, ignoring", table);
+-
+-                if (nft_identifier_bad(set))
+-                        return log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid set name %s, ignoring", set);
+-
+-                NFTSetContext *c;
+-                c = reallocarray(*nft_set_context, *n + 1, sizeof(NFTSetContext));
+-                if (!c)
+-                        return -ENOMEM;
+-
+-                *nft_set_context = c;
+-
+-                c[(*n) ++] = (NFTSetContext) {
+-                        .nfproto = nfproto,
+-                        .table = TAKE_PTR(table),
+-                        .set = TAKE_PTR(set),
+-                };
+-        }
+-
+-        return 0;
+-}
+diff --git a/src/shared/firewall-util.h b/src/shared/firewall-util.h
+index 3cea144ab947b..7725a5e58dfd3 100644
+--- a/src/shared/firewall-util.h
++++ b/src/shared/firewall-util.h
+@@ -29,43 +29,3 @@ int fw_add_local_dnat(
+                 const union in_addr_union *remote,
+                 uint16_t remote_port,
+                 const union in_addr_union *previous_remote);
+-
+-struct NFTSetContext {
+-        int nfproto;
+-        char *table;
+-        char *set;
+-};
+-typedef struct NFTSetContext NFTSetContext;
+-
+-int nft_set_context_add(NFTSetContext **s, size_t *n, int nfproto, const char *table, const char *set);
+-NFTSetContext* nft_set_context_free_many(NFTSetContext *s, size_t *n);
+-int config_parse_nft_set_context(
+-                const char *unit,
+-                const char *filename,
+-                unsigned line,
+-                const char *section,
+-                unsigned section_line,
+-                const char *lvalue,
+-                int ltype,
+-                const char *rvalue,
+-                NFTSetContext **nft_set_context,
+-                size_t *n);
+-
+-const char *nfproto_to_string(int i) _const_;
+-int nfproto_from_string(const char *s) _pure_;
+-
+-int nft_set_element_add_in_addr(
+-                const NFTSetContext *nft_set_context,
+-                int af,
+-                const union in_addr_union *address,
+-                unsigned int prefixlen);
+-int nft_set_element_del_in_addr(
+-                const NFTSetContext *nft_set_context,
+-                int af,
+-                const union in_addr_union *address,
+-                unsigned int prefixlen);
+-
+-int nft_set_element_add_uint32(const NFTSetContext *nft_set_context, uint32_t element);
+-int nft_set_element_del_uint32(const NFTSetContext *nft_set_context, uint32_t element);
+-int nft_set_element_add_uint64(const NFTSetContext *nft_set_context, uint64_t element);
+-int nft_set_element_del_uint64(const NFTSetContext *nft_set_context, uint64_t element);
+diff --git a/src/test/meson.build b/src/test/meson.build
+index 081d79feeed59..cc590f4f3d915 100644
+--- a/src/test/meson.build
++++ b/src/test/meson.build
+@@ -672,9 +672,6 @@ tests += [
+         [files('test-hmac.c')],
+ 
+         [files('test-sha256.c')],
+-
+-        [files('test-nft-set.c'),
+-         [], [], [], '', 'manual'],
+ ]
+ 
+ ############################################################
+diff --git a/src/test/test-nft-set.c b/src/test/test-nft-set.c
+deleted file mode 100644
+index df5322b4b2114..0000000000000
+--- a/src/test/test-nft-set.c
++++ /dev/null
+@@ -1,69 +0,0 @@
+-/* SPDX-License-Identifier: LGPL-2.1-or-later */
+-
+-#include <assert.h>
+-#include <unistd.h>
+-
+-#include "firewall-util.h"
+-#include "in-addr-util.h"
+-#include "log.h"
+-#include "parse-util.h"
+-#include "string-util.h"
+-#include "tests.h"
+-
+-int main(int argc, char **argv) {
+-        int r;
+-
+-        assert_se(argc == 7);
+-
+-        test_setup_logging(LOG_DEBUG);
+-
+-        if (getuid() != 0)
+-                return log_tests_skipped("not root");
+-
+-        int nfproto;
+-        nfproto = nfproto_from_string(argv[2]);
+-        assert_se(nfproto > 0);
+-
+-        const NFTSetContext nft_set_context = {
+-                .nfproto = nfproto,
+-                .table = argv[3],
+-                .set = argv[4],
+-        };
+-
+-        if (streq(argv[5], "uint32")) {
+-                uint32_t element;
+-                r = safe_atou32(argv[6], &element);
+-                assert_se(r == 0);
+-
+-                if (streq(argv[1], "add"))
+-                        r = nft_set_element_add_uint32(&nft_set_context, element);
+-                else
+-                        r = nft_set_element_del_uint32(&nft_set_context, element);
+-                assert_se(r == 0);
+-        } else if (streq(argv[5], "uint64")) {
+-                uint64_t element;
+-                r = safe_atou64(argv[6], &element);
+-                assert_se(r == 0);
+-
+-                if (streq(argv[1], "add"))
+-                        r = nft_set_element_add_uint64(&nft_set_context, element);
+-                else
+-                        r = nft_set_element_del_uint64(&nft_set_context, element);
+-                assert_se(r == 0);
+-        } else {
+-                union in_addr_union addr;
+-                int af;
+-                unsigned char prefixlen;
+-
+-                r = in_addr_prefix_from_string_auto(argv[6], &af, &addr, &prefixlen);
+-                assert_se(r == 0);
+-
+-                if (streq(argv[1], "add"))
+-                        r = nft_set_element_add_in_addr(&nft_set_context, af, &addr, prefixlen);
+-                else
+-                        r = nft_set_element_del_in_addr(&nft_set_context, af, &addr, prefixlen);
+-                assert_se(r == 0);
+-        }
+-
+-        return 0;
+-}
+diff --git a/test/fuzz/fuzz-network-parser/directives b/test/fuzz/fuzz-network-parser/directives
+index 803f0d19695e5..0b850cdfcf0d7 100644
+--- a/test/fuzz/fuzz-network-parser/directives
++++ b/test/fuzz/fuzz-network-parser/directives
+@@ -132,7 +132,6 @@ RouteMTUBytes=
+ FallbackLeaseLifetimeSec=
+ Use6RD=
+ NetLabel=
+-NFTSet=
+ [DHCPv6]
+ UseAddress=
+ UseDelegatedPrefix=
+@@ -155,7 +154,6 @@ IAID=
+ DUIDType=
+ DUIDRawData=
+ NetLabel=
+-NFTSet=
+ [DHCPv6PrefixDelegation]
+ SubnetId=
+ Announce=
+@@ -173,7 +171,6 @@ ManageTemporaryAddress=
+ Token=
+ RouteMetric=
+ NetLabel=
+-NFTSet=
+ [Route]
+ Destination=
+ Protocol=
+@@ -260,8 +257,6 @@ DHCPv6PrefixDelegation=
+ DHCPPrefixDelegation=
+ BatmanAdvanced=
+ IPoIB=
+-IPv4NFTSet=
+-IPv6NFTSet=
+ [IPv6Prefix]
+ Prefix=
+ OnLink=
+@@ -353,7 +348,6 @@ Managed=
+ OtherInformation=
+ UplinkInterface=
+ NetLabel=
+-NFTSet=
+ [IPv6PrefixDelegation]
+ RouterPreference=
+ DNSLifetimeSec=
+diff --git a/test/fuzz/fuzz-unit-file/directives.mount b/test/fuzz/fuzz-unit-file/directives.mount
+index 16d2138a04cf1..0a44328e5c687 100644
+--- a/test/fuzz/fuzz-unit-file/directives.mount
++++ b/test/fuzz/fuzz-unit-file/directives.mount
+@@ -28,7 +28,6 @@ Capabilities=
+ CapabilityBoundingSet=
+ ConfigurationDirectory=
+ ConfigurationDirectoryMode=
+-ControlGroupNFTSet=
+ CoredumpFilter=
+ DefaultMemoryLow=
+ DefaultMemoryMin=
+@@ -38,7 +37,6 @@ DevicePolicy=
+ DirectoryMode=
+ DisableControllers=
+ DynamicUser=
+-DynamicUserNFTSet=
+ Environment=
+ EnvironmentFile=
+ ExecPaths=
+diff --git a/test/fuzz/fuzz-unit-file/directives.scope b/test/fuzz/fuzz-unit-file/directives.scope
+index c4d579065a6cf..4552d0b403dec 100644
+--- a/test/fuzz/fuzz-unit-file/directives.scope
++++ b/test/fuzz/fuzz-unit-file/directives.scope
+@@ -8,7 +8,6 @@ BlockIODeviceWeight=
+ BlockIOReadBandwidth=
+ BlockIOWeight=
+ BlockIOWriteBandwidth=
+-ControlGroupNFTSet=
+ CPUAccounting=
+ CPUQuota=
+ CPUQuotaPeriodSec=
+diff --git a/test/fuzz/fuzz-unit-file/directives.service b/test/fuzz/fuzz-unit-file/directives.service
+index 511c2f6b4fbcb..3c33d947fe2bb 100644
+--- a/test/fuzz/fuzz-unit-file/directives.service
++++ b/test/fuzz/fuzz-unit-file/directives.service
+@@ -72,7 +72,6 @@ ConditionSecurity=
+ ConditionUser=
+ ConditionVirtualization=
+ Conflicts=
+-ControlGroupNFTSet=
+ DefaultDependencies=
+ Description=
+ Documentation=
+@@ -160,7 +159,6 @@ DeviceAllow=
+ DevicePolicy=
+ DisableControllers=
+ DynamicUser=
+-DynamicUserNFTSet=
+ Environment=
+ EnvironmentFile=
+ ExecCondition=
+diff --git a/test/fuzz/fuzz-unit-file/directives.slice b/test/fuzz/fuzz-unit-file/directives.slice
+index 749f1795e3de7..ab77070c5ea1e 100644
+--- a/test/fuzz/fuzz-unit-file/directives.slice
++++ b/test/fuzz/fuzz-unit-file/directives.slice
+@@ -8,7 +8,6 @@ BlockIODeviceWeight=
+ BlockIOReadBandwidth=
+ BlockIOWeight=
+ BlockIOWriteBandwidth=
+-ControlGroupNFTSet=
+ CPUAccounting=
+ CPUQuota=
+ CPUQuotaPeriodSec=
+diff --git a/test/fuzz/fuzz-unit-file/directives.socket b/test/fuzz/fuzz-unit-file/directives.socket
+index b9ad5e5f84ec8..90358fc11aa84 100644
+--- a/test/fuzz/fuzz-unit-file/directives.socket
++++ b/test/fuzz/fuzz-unit-file/directives.socket
+@@ -33,7 +33,6 @@ Capabilities=
+ CapabilityBoundingSet=
+ ConfigurationDirectory=
+ ConfigurationDirectoryMode=
+-ControlGroupNFTSet=
+ CoredumpFilter=
+ DefaultMemoryLow=
+ DefaultMemoryMin=
+@@ -44,7 +43,6 @@ DevicePolicy=
+ DirectoryMode=
+ DisableControllers=
+ DynamicUser=
+-DynamicUserNFTSet=
+ Environment=
+ EnvironmentFile=
+ ExecPaths=
+diff --git a/test/fuzz/fuzz-unit-file/directives.swap b/test/fuzz/fuzz-unit-file/directives.swap
+index 4721edce4be4d..5d057fa63060c 100644
+--- a/test/fuzz/fuzz-unit-file/directives.swap
++++ b/test/fuzz/fuzz-unit-file/directives.swap
+@@ -28,7 +28,6 @@ Capabilities=
+ CapabilityBoundingSet=
+ ConfigurationDirectory=
+ ConfigurationDirectoryMode=
+-ControlGroupNFTSet=
+ CoredumpFilter=
+ DefaultMemoryLow=
+ DefaultMemoryMin=
+@@ -37,7 +36,6 @@ DeviceAllow=
+ DevicePolicy=
+ DisableControllers=
+ DynamicUser=
+-DynamicUserNFTSet=
+ Environment=
+ EnvironmentFile=
+ ExecPaths=

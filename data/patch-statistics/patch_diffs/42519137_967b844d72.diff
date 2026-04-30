@@ -1,0 +1,245 @@
+From c799eddb3512a4ce2b5c11bd91f888f30241faf6 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Tue, 13 Dec 2022 10:05:17 +1030
+Subject: [PATCH] asan: mips_hi16_list segfault in bfd_get_section_limit_octets
+
+static variables like mips_hi16_list are nasty for applications using
+bfd.  It is possible when opening and closing bfds with mis-matched
+hi/lo relocs to leave a stale section pointer on the list.  That can
+cause a segfault if multiple bfds are being processed.
+
+Tidying the list when closing is sufficient to stop this happening
+(and fixes small memory leaks).  This patch goes further and moves
+mips_hi16_list to where it belongs in the bfd tdata.
+
+	* elf32-mips.c (bfd_elf32_close_and_cleanup(: Define.
+	* elf64-mips.c (bfd_elf64_close_and_cleanup): Define.
+	* elfn32-mips.c (bfd_elf32_close_and_cleanup(: Define.
+	* elfxx-mips.c (struct mips_hi16): Move earlier.
+	(mips_hi16_list): Move to..
+	(struct mips_elf_obj_tdata): ..here.
+	(_bfd_mips_elf_close_and_cleanup): New function.
+	(_bfd_mips_elf_hi16_reloc, _bfd_mips_elf_lo16_reloc),
+	(_bfd_elf_mips_get_relocated_section_contents): Adjust uses of
+	mips_hi16_list.
+	* elfxx-mips.h (_bfd_mips_elf_close_and_cleanup): Declare.
+---
+ bfd/elf32-mips.c  |  1 +
+ bfd/elf64-mips.c  |  1 +
+ bfd/elfn32-mips.c |  1 +
+ bfd/elfxx-mips.c  | 69 ++++++++++++++++++++++++++++++-----------------
+ bfd/elfxx-mips.h  |  2 ++
+ 5 files changed, 50 insertions(+), 24 deletions(-)
+
+diff --git a/bfd/elf32-mips.c b/bfd/elf32-mips.c
+index be28d1a3b1c..0ffa9017d7b 100644
+--- a/bfd/elf32-mips.c
++++ b/bfd/elf32-mips.c
+@@ -2599,6 +2599,7 @@ static const struct ecoff_debug_swap mips_elf32_ecoff_debug_swap = {
+ 					_bfd_mips_elf_print_private_bfd_data
+ #define bfd_elf32_bfd_relax_section	_bfd_mips_elf_relax_section
+ #define bfd_elf32_mkobject		_bfd_mips_elf_mkobject
++#define bfd_elf32_close_and_cleanup	_bfd_mips_elf_close_and_cleanup
+ 
+ /* Support for SGI-ish mips targets.  */
+ #define TARGET_LITTLE_SYM		mips_elf32_le_vec
+diff --git a/bfd/elf64-mips.c b/bfd/elf64-mips.c
+index 419d9bc6dbd..9b0120b8167 100644
+--- a/bfd/elf64-mips.c
++++ b/bfd/elf64-mips.c
+@@ -4815,6 +4815,7 @@ const struct elf_size_info mips_elf64_size_info =
+ 
+ #define bfd_elf64_get_dynamic_reloc_upper_bound mips_elf64_get_dynamic_reloc_upper_bound
+ #define bfd_elf64_mkobject		_bfd_mips_elf_mkobject
++#define bfd_elf64_close_and_cleanup	_bfd_mips_elf_close_and_cleanup
+ 
+ /* The SGI style (n)64 NewABI.  */
+ #define TARGET_LITTLE_SYM		mips_elf64_le_vec
+diff --git a/bfd/elfn32-mips.c b/bfd/elfn32-mips.c
+index d222d1a5d15..452a2a7b74b 100644
+--- a/bfd/elfn32-mips.c
++++ b/bfd/elfn32-mips.c
+@@ -4197,6 +4197,7 @@ static const struct ecoff_debug_swap mips_elf32_ecoff_debug_swap = {
+ #define bfd_elf32_bfd_print_private_bfd_data \
+ 					_bfd_mips_elf_print_private_bfd_data
+ #define bfd_elf32_mkobject		mips_elf_n32_mkobject
++#define bfd_elf32_close_and_cleanup	_bfd_mips_elf_close_and_cleanup
+ 
+ /* Support for SGI-ish mips targets using n32 ABI.  */
+ 
+diff --git a/bfd/elfxx-mips.c b/bfd/elfxx-mips.c
+index 618fb43540c..f77ccde8409 100644
+--- a/bfd/elfxx-mips.c
++++ b/bfd/elfxx-mips.c
+@@ -549,6 +549,19 @@ struct mips_htab_traverse_info
+   bool error;
+ };
+ 
++/* Used to store a REL high-part relocation such as R_MIPS_HI16 or
++   R_MIPS_GOT16.  REL is the relocation, INPUT_SECTION is the section
++   that contains the relocation field and DATA points to the start of
++   INPUT_SECTION.  */
++
++struct mips_hi16
++{
++  struct mips_hi16 *next;
++  bfd_byte *data;
++  asection *input_section;
++  arelent rel;
++};
++
+ /* MIPS ELF private object data.  */
+ 
+ struct mips_elf_obj_tdata
+@@ -584,6 +597,8 @@ struct mips_elf_obj_tdata
+   asymbol *elf_text_symbol;
+   asection *elf_data_section;
+   asection *elf_text_section;
++
++  struct mips_hi16 *mips_hi16_list;
+ };
+ 
+ /* Get MIPS ELF private object data from BFD's tdata.  */
+@@ -1365,6 +1380,23 @@ _bfd_mips_elf_mkobject (bfd *abfd)
+ 				  MIPS_ELF_DATA);
+ }
+ 
++bool
++_bfd_mips_elf_close_and_cleanup (bfd *abfd)
++{
++  struct mips_elf_obj_tdata *tdata = mips_elf_tdata (abfd);
++  if (tdata != NULL && bfd_get_format (abfd) == bfd_object)
++    {
++      BFD_ASSERT (tdata->root.object_id == MIPS_ELF_DATA);
++      while (tdata->mips_hi16_list != NULL)
++	{
++	  struct mips_hi16 *hi = tdata->mips_hi16_list;
++	  tdata->mips_hi16_list = hi->next;
++	  free (hi);
++	}
++    }
++  return _bfd_elf_close_and_cleanup (abfd);
++}
++
+ bool
+ _bfd_mips_elf_new_section_hook (bfd *abfd, asection *sec)
+ {
+@@ -2481,23 +2513,6 @@ _bfd_mips_elf_gprel16_with_gp (bfd *abfd, asymbol *symbol,
+   return bfd_reloc_ok;
+ }
+ 
+-/* Used to store a REL high-part relocation such as R_MIPS_HI16 or
+-   R_MIPS_GOT16.  REL is the relocation, INPUT_SECTION is the section
+-   that contains the relocation field and DATA points to the start of
+-   INPUT_SECTION.  */
+-
+-struct mips_hi16
+-{
+-  struct mips_hi16 *next;
+-  bfd_byte *data;
+-  asection *input_section;
+-  arelent rel;
+-};
+-
+-/* FIXME: This should not be a static variable.  */
+-
+-static struct mips_hi16 *mips_hi16_list;
+-
+ /* A howto special_function for REL *HI16 relocations.  We can only
+    calculate the correct value once we've seen the partnering
+    *LO16 relocation, so just save the information for later.
+@@ -2508,12 +2523,13 @@ static struct mips_hi16 *mips_hi16_list;
+    simplies the relocation handling in gcc.  */
+ 
+ bfd_reloc_status_type
+-_bfd_mips_elf_hi16_reloc (bfd *abfd ATTRIBUTE_UNUSED, arelent *reloc_entry,
++_bfd_mips_elf_hi16_reloc (bfd *abfd, arelent *reloc_entry,
+ 			  asymbol *symbol ATTRIBUTE_UNUSED, void *data,
+ 			  asection *input_section, bfd *output_bfd,
+ 			  char **error_message ATTRIBUTE_UNUSED)
+ {
+   struct mips_hi16 *n;
++  struct mips_elf_obj_tdata *tdata;
+ 
+   if (reloc_entry->address > bfd_get_section_limit (abfd, input_section))
+     return bfd_reloc_outofrange;
+@@ -2522,11 +2538,12 @@ _bfd_mips_elf_hi16_reloc (bfd *abfd ATTRIBUTE_UNUSED, arelent *reloc_entry,
+   if (n == NULL)
+     return bfd_reloc_outofrange;
+ 
+-  n->next = mips_hi16_list;
++  tdata = mips_elf_tdata (abfd);
++  n->next = tdata->mips_hi16_list;
+   n->data = data;
+   n->input_section = input_section;
+   n->rel = *reloc_entry;
+-  mips_hi16_list = n;
++  tdata->mips_hi16_list = n;
+ 
+   if (output_bfd != NULL)
+     reloc_entry->address += input_section->output_offset;
+@@ -2566,6 +2583,7 @@ _bfd_mips_elf_lo16_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+ {
+   bfd_vma vallo;
+   bfd_byte *location = (bfd_byte *) data + reloc_entry->address;
++  struct mips_elf_obj_tdata *tdata;
+ 
+   if (!bfd_reloc_offset_in_range (reloc_entry->howto, abfd, input_section,
+ 				  reloc_entry->address))
+@@ -2577,12 +2595,13 @@ _bfd_mips_elf_lo16_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+   _bfd_mips_elf_reloc_shuffle (abfd, reloc_entry->howto->type, false,
+ 			       location);
+ 
+-  while (mips_hi16_list != NULL)
++  tdata = mips_elf_tdata (abfd);
++  while (tdata->mips_hi16_list != NULL)
+     {
+       bfd_reloc_status_type ret;
+       struct mips_hi16 *hi;
+ 
+-      hi = mips_hi16_list;
++      hi = tdata->mips_hi16_list;
+ 
+       /* R_MIPS*_GOT16 relocations are something of a special case.  We
+ 	 want to install the addend in the same way as for a R_MIPS*_HI16
+@@ -2606,7 +2625,7 @@ _bfd_mips_elf_lo16_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+       if (ret != bfd_reloc_ok)
+ 	return ret;
+ 
+-      mips_hi16_list = hi->next;
++      tdata->mips_hi16_list = hi->next;
+       free (hi);
+     }
+ 
+@@ -13294,12 +13313,14 @@ _bfd_elf_mips_get_relocated_section_contents
+   reloc_vector = (arelent **) bfd_malloc (reloc_size);
+   if (reloc_vector == NULL)
+     {
++      struct mips_elf_obj_tdata *tdata;
+       struct mips_hi16 **hip, *hi;
+     error_return:
+       /* If we are going to return an error, remove entries on
+ 	 mips_hi16_list that point into this section's data.  Data
+ 	 will typically be freed on return from this function.  */
+-      hip = &mips_hi16_list;
++      tdata = mips_elf_tdata (abfd);
++      hip = &tdata->mips_hi16_list;
+       while ((hi = *hip) != NULL)
+ 	{
+ 	  if (hi->input_section == input_section)
+diff --git a/bfd/elfxx-mips.h b/bfd/elfxx-mips.h
+index 6b22fdab3ae..7d40808496d 100644
+--- a/bfd/elfxx-mips.h
++++ b/bfd/elfxx-mips.h
+@@ -31,6 +31,8 @@ enum reloc_check
+ 
+ extern bool _bfd_mips_elf_mkobject
+   (bfd *);
++extern bool _bfd_mips_elf_close_and_cleanup
++  (bfd *);
+ extern bool _bfd_mips_elf_new_section_hook
+   (bfd *, asection *);
+ extern void _bfd_mips_elf_symbol_processing
+-- 
+GitLab
+

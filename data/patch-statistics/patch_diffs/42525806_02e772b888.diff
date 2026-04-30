@@ -1,0 +1,81 @@
+From 31a301389bc94b6cac513e315cca0c621f7e1684 Mon Sep 17 00:00:00 2001
+From: DRC <information@libjpeg-turbo.org>
+Date: Fri, 30 Jun 2023 17:58:45 -0400
+Subject: [PATCH] jchuff.c: Test for out-of-range coefficients
+
+Restore two coefficient range checks from libjpeg to the C baseline
+Huffman encoder.  This fixes an issue
+(https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=60253) whereby
+the encoder could read from uninitialized memory when attempting to
+transform a specially-crafted malformed arithmetic-coded JPEG source
+image into a baseline Huffman-coded JPEG destination image with default
+Huffman tables.  More specifically, the out-of-range coefficients caused
+r to equal 256, which overflowed the actbl->ehufsi[] array.  Because the
+overflow was contained within the huff_entropy_encoder structure, this
+issue was not exploitable (nor was it observable at all on x86 or Arm
+CPUs unless JSIMD_NOHUFFENC=1 or JSIMD_FORCENONE=1 was set in the
+environment or unless libjpeg-turbo was built with WITH_SIMD=0.)
+
+The fix is performance-neutral (+/- 1-2%) for x86-64 code and causes a
+0-4% (avg. 1-2%, +/- 1-2%) compression regression for i386 code on Intel
+CPUs when the C baseline Huffman encoder is used (JSIMD_NOHUFFENC=1).
+The fix is performance-neutral (+/- 1-2%) on Intel CPUs when all of the
+libjpeg-turbo SIMD extensions are disabled (JSIMD_FORCENONE=1).  The fix
+causes a 0-2% (avg. <1%, +/- 1%) compression regression for PowerPC
+code.
+---
+ ChangeLog.md |  5 +++++
+ jchuff.c     | 10 +++++++++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/ChangeLog.md b/ChangeLog.md
+index 1a917cbad..92d82cce4 100644
+--- a/ChangeLog.md
++++ b/ChangeLog.md
+@@ -33,6 +33,11 @@ cannot reliably transform JPEG source images that contain a large amount of
+ metadata unless automatic JPEG destination buffer (re)allocation is used or
+ `TJXOPT_COPYNONE` is set.
+ 
++4. Fixed an issue that caused the C Huffman encoder (which is not used by
++default on x86 and Arm CPUs) to read from uninitialized memory when attempting
++to transform a specially-crafted malformed arithmetic-coded JPEG source image
++into a baseline Huffman-coded JPEG destination image.
++
+ 
+ 2.1.5.1
+ =======
+diff --git a/jchuff.c b/jchuff.c
+index 5d0276ad2..063f5b24e 100644
+--- a/jchuff.c
++++ b/jchuff.c
+@@ -4,7 +4,7 @@
+  * This file was part of the Independent JPEG Group's software:
+  * Copyright (C) 1991-1997, Thomas G. Lane.
+  * libjpeg-turbo Modifications:
+- * Copyright (C) 2009-2011, 2014-2016, 2018-2022, D. R. Commander.
++ * Copyright (C) 2009-2011, 2014-2016, 2018-2023, D. R. Commander.
+  * Copyright (C) 2015, Matthieu Darbois.
+  * Copyright (C) 2018, Matthias Räncker.
+  * Copyright (C) 2020, Arm Limited.
+@@ -588,6 +588,11 @@ encode_one_block(working_state *state, JCOEFPTR block, int last_dc_val,
+ 
+   /* Find the number of bits needed for the magnitude of the coefficient */
+   nbits = JPEG_NBITS(nbits);
++  /* Check for out-of-range coefficient values.
++   * Since we're encoding a difference, the range limit is twice as much.
++   */
++  if (nbits > MAX_COEF_BITS + 1)
++    ERREXIT(state->cinfo, JERR_BAD_DCT_COEF);
+ 
+   /* Emit the Huffman-coded symbol for the number of bits.
+    * Emit that number of bits of the value, if positive,
+@@ -613,6 +618,9 @@ encode_one_block(working_state *state, JCOEFPTR block, int last_dc_val,
+     temp += nbits; \
+     nbits ^= temp; \
+     nbits = JPEG_NBITS_NONZERO(nbits); \
++    /* Check for out-of-range coefficient values */ \
++    if (nbits > MAX_COEF_BITS) \
++      ERREXIT(state->cinfo, JERR_BAD_DCT_COEF); \
+     /* if run length > 15, must emit special run-length-16 codes (0xF0) */ \
+     while (r >= 16 * 16) { \
+       r -= 16 * 16; \

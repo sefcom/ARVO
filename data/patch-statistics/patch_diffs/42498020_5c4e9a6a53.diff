@@ -1,0 +1,471 @@
+From 371ab925eaef2b872efc2c68442a02588ccaee04 Mon Sep 17 00:00:00 2001
+From: Alex Deymo <deymo@google.com>
+Date: Fri, 9 Jul 2021 17:16:53 +0200
+Subject: [PATCH] Relax x0 % kPaddingXRound requirement in FilterPipeline
+ (#303)
+
+The FilterPipeline required that the x0 in all three input, output and
+image rects be a multiple of kPaddingXRound. This has the issue that it
+is 4 in ARM but 8 in x86, however Sigma is always an 8x8 downsampled
+image.
+
+This patch relaxes the requirement so that input, output and image rect
+all have the same alignment % kPaddingXRound but it doesn't need to be
+0, removing the logic that extends the filters ranges from
+dec_reconstruct.
+
+The EPF functions were receiving a image_x_mod_8 value as
+image_rect.x0() % 8, which was always 0 in x86, but may be 4 in ARM.
+This value now can be anything between 0 and 7 in both architectures
+since it depends on the value of x0.
+
+This patch overall reduces a tiny bit the total range of [x0, x1) where
+we run intermediate filters since the FilterPipeline now handles the
+values of image_rect.x0() that are not a multiple of kPaddingXRound.
+
+This removes the rect parameter from ApplyFiltersRow() since it is
+already passed on initialization and it must be the same every time.
+---
+ lib/jxl/dec_reconstruct.cc | 28 +++--------------
+ lib/jxl/epf.cc             | 64 +++++++++++++++++++++++++-------------
+ lib/jxl/epf.h              | 22 +++++++++++--
+ lib/jxl/filters.cc         | 37 +++++++++++++++-------
+ lib/jxl/filters.h          | 56 ++++++++++++++++++++++++---------
+ 5 files changed, 132 insertions(+), 75 deletions(-)
+
+diff --git a/lib/jxl/dec_reconstruct.cc b/lib/jxl/dec_reconstruct.cc
+index c2db7cb9f8b..266c2496ea9 100644
+--- a/lib/jxl/dec_reconstruct.cc
++++ b/lib/jxl/dec_reconstruct.cc
+@@ -689,13 +689,8 @@ Status FinalizeImageRect(
+   FilterPipeline* fp = nullptr;
+   ssize_t ensure_padding_filter_y0 = 0;
+   ssize_t ensure_padding_filter_y1 = 0;
+-  Rect image_padded_rect;
+   if (lf.epf_iters != 0 || lf.gab) {
+     fp = &dec_state->filter_pipelines[thread];
+-    size_t xextra =
+-        rect_for_if_input.x0() % GroupBorderAssigner::kPaddingXRound;
+-    image_padded_rect = Rect(rect_for_if.x0() - xextra, rect_for_if.y0(),
+-                             rect_for_if.xsize() + xextra, rect_for_if.ysize());
+   }
+ 
+   // +----------------------------- STEP 2 ------------------------------+
+@@ -838,27 +833,14 @@ Status FinalizeImageRect(
+   // | Set up the filter pipeline.                                       |
+   // +-------------------------------------------------------------------+
+   if (fp) {
+-    // If `rect_for_if_input` does not start at a multiple of
+-    // GroupBorderAssigner::kPaddingXRound, we extend the rect we run EPF on by
+-    // one full padding length to ensure sigma is handled correctly. We also
+-    // extend the output and image rects accordingly. To do this, we need 2x the
+-    // border.
+-    size_t xextra =
+-        rect_for_if_input.x0() % GroupBorderAssigner::kPaddingXRound;
+-    Rect filter_input_padded_rect(
+-        rect_for_if_input.x0() - xextra, rect_for_if_input.y0(),
+-        rect_for_if_input.xsize() + xextra, rect_for_if_input.ysize());
+     ensure_padding_filter.Init(
+         input, rect_for_if_input, rect_for_if, frame_dim.xsize_padded,
+         frame_dim.ysize_padded, lf.Padding(), lf.Padding(),
+         &ensure_padding_filter_y0, &ensure_padding_filter_y1);
+-    Rect filter_output_padded_rect(
+-        rect_for_if_storage.x0() - xextra, rect_for_if_storage.y0(),
+-        rect_for_if_storage.xsize() + xextra, rect_for_if_storage.ysize());
+-    fp = PrepareFilterPipeline(dec_state, image_padded_rect, *input,
+-                               filter_input_padded_rect, frame_dim.ysize_padded,
+-                               thread, storage_for_if,
+-                               filter_output_padded_rect);
++
++    fp = PrepareFilterPipeline(dec_state, rect_for_if, *input,
++                               rect_for_if_input, frame_dim.ysize_padded,
++                               thread, storage_for_if, rect_for_if_storage);
+   }
+ 
+   // +----------------------------- STEP 5 ------------------------------+
+@@ -887,7 +869,7 @@ Status FinalizeImageRect(
+       if (y >= first_ensure_padding_y && y < ensure_padding_filter_y1) {
+         ensure_padding_filter.Process3(y);
+       }
+-      fp->ApplyFiltersRow(lf, dec_state->filter_weights, image_padded_rect, y);
++      fp->ApplyFiltersRow(lf, dec_state->filter_weights, y);
+     } else if (output_pixel_data_storage != input) {
+       for (size_t c = 0; c < 3; c++) {
+         memcpy(rect_for_if_storage.PlaneRow(storage_for_if, c, y),
+diff --git a/lib/jxl/epf.cc b/lib/jxl/epf.cc
+index 43de31f7ad9..1701203d8d5 100644
+--- a/lib/jxl/epf.cc
++++ b/lib/jxl/epf.cc
+@@ -141,7 +141,7 @@ void GaborishVector(const D df, const float* JXL_RESTRICT row_t,
+ 
+ void GaborishRow(const FilterRows& rows, const LoopFilter& /* lf */,
+                  const FilterWeights& filter_weights, size_t x0, size_t x1,
+-                 size_t /*image_x_mod_8*/, size_t /* image_y_mod_8 */) {
++                 size_t /*sigma_x_offset*/, size_t /* image_y_mod_8 */) {
+   JXL_DASSERT(x0 % Lanes(df) == 0);
+ 
+   const float* JXL_RESTRICT gab_weights = filter_weights.gab_weights;
+@@ -192,7 +192,7 @@ void GaborishRow(const FilterRows& rows, const LoopFilter& /* lf */,
+ // plus-shaped). So this makes this filter a 7x7 filter.
+ void Epf0Row(const FilterRows& rows, const LoopFilter& lf,
+              const FilterWeights& filter_weights, size_t x0, size_t x1,
+-             size_t image_x_mod_8, size_t image_y_mod_8) {
++             size_t sigma_x_offset, size_t image_y_mod_8) {
+   JXL_DASSERT(x0 % Lanes(df) == 0);
+   const float* JXL_RESTRICT row_sigma = rows.GetSigmaRow();
+ 
+@@ -208,8 +208,8 @@ void Epf0Row(const FilterRows& rows, const LoopFilter& lf,
+   }
+ 
+   for (size_t x = x0; x < x1; x += Lanes(df)) {
+-    size_t bx = (x + image_x_mod_8) / kBlockDim;
+-    size_t ix = (x + image_x_mod_8) % kBlockDim;
++    size_t bx = (x + sigma_x_offset) / kBlockDim;
++    size_t ix = (x + sigma_x_offset) % kBlockDim;
+     if (row_sigma[bx] < kMinSigma) {
+       for (size_t c = 0; c < 3; c++) {
+         auto px = Load(df, rows.GetInputRow(0, c) + x);
+@@ -277,7 +277,7 @@ void Epf0Row(const FilterRows& rows, const LoopFilter& lf,
+ // plus-shaped). So this makes this filter a 5x5 filter.
+ void Epf1Row(const FilterRows& rows, const LoopFilter& lf,
+              const FilterWeights& filter_weights, size_t x0, size_t x1,
+-             size_t image_x_mod_8, size_t image_y_mod_8) {
++             size_t sigma_x_offset, size_t image_y_mod_8) {
+   JXL_DASSERT(x0 % Lanes(df) == 0);
+   const float* JXL_RESTRICT row_sigma = rows.GetSigmaRow();
+ 
+@@ -293,8 +293,8 @@ void Epf1Row(const FilterRows& rows, const LoopFilter& lf,
+   }
+ 
+   for (size_t x = x0; x < x1; x += Lanes(df)) {
+-    size_t bx = (x + image_x_mod_8) / kBlockDim;
+-    size_t ix = (x + image_x_mod_8) % kBlockDim;
++    size_t bx = (x + sigma_x_offset) / kBlockDim;
++    size_t ix = (x + sigma_x_offset) % kBlockDim;
+     if (row_sigma[bx] < kMinSigma) {
+       for (size_t c = 0; c < 3; c++) {
+         auto px = Load(df, rows.GetInputRow(0, c) + x);
+@@ -404,7 +404,7 @@ void Epf1Row(const FilterRows& rows, const LoopFilter& lf,
+ // the output of the previous step.
+ void Epf2Row(const FilterRows& rows, const LoopFilter& lf,
+              const FilterWeights& filter_weights, size_t x0, size_t x1,
+-             size_t image_x_mod_8, size_t image_y_mod_8) {
++             size_t sigma_x_offset, size_t image_y_mod_8) {
+   JXL_DASSERT(x0 % Lanes(df) == 0);
+   const float* JXL_RESTRICT row_sigma = rows.GetSigmaRow();
+ 
+@@ -420,8 +420,8 @@ void Epf2Row(const FilterRows& rows, const LoopFilter& lf,
+   }
+ 
+   for (size_t x = x0; x < x1; x += Lanes(df)) {
+-    size_t bx = (x + image_x_mod_8) / kBlockDim;
+-    size_t ix = (x + image_x_mod_8) % kBlockDim;
++    size_t bx = (x + sigma_x_offset) / kBlockDim;
++    size_t ix = (x + sigma_x_offset) % kBlockDim;
+ 
+     if (row_sigma[bx] < kMinSigma) {
+       for (size_t c = 0; c < 3; c++) {
+@@ -508,14 +508,23 @@ void FilterPipelineInit(FilterPipeline* fp, const LoopFilter& lf,
+   // Walk the list of filters backwards to compute how many rows are needed.
+   size_t col_border = 0;
+   for (int i = fp->num_filters - 1; i >= 0; i--) {
+-    // The extra border needed for future filtering should be a multiple of
+-    // Lanes(df). Rounding up in each step but not storing the rounded up
+-    // value in col_border means that in a 3-step filter the first two filters
+-    // may have the same output_col_border value but the second one would use
+-    // uninitialized values from the previous one. It is fine to have this
+-    // situation for pixels outside the col_border but inside the rounded up
+-    // col_border.
+-    fp->filters[i].output_col_border = RoundUpTo(col_border, Lanes(df));
++    // Compute the region where we need to apply this filter. Depending on the
++    // step we might need to compute a larger portion than the original rect
++    // because of the border needed by other stages. This is the range of valid
++    // output values we produce, however we run the filter over a larger region
++    // to make those values multiple of Lanes(df).
++    const size_t x0 =
++        FilterPipeline::FilterStep::MaxLeftPadding(image_rect.x0()) -
++        col_border;
++    const size_t x1 =
++        FilterPipeline::FilterStep::MaxLeftPadding(image_rect.x0()) +
++        image_rect.xsize() + col_border;
++
++    fp->filters[i].filter_x0 = x0 - x0 % Lanes(df);
++    fp->filters[i].filter_x1 = RoundUpTo(x1, Lanes(df));
++
++    // The extra border needed for future filtering.
++    fp->filters[i].output_col_border = col_border;
+     col_border += fp->filters[i].filter_def.border;
+   }
+   fp->total_border = col_border;
+@@ -648,13 +657,24 @@ FilterPipeline* PrepareFilterPipeline(
+     const Rect& input_rect, size_t image_ysize, size_t thread,
+     Image3F* JXL_RESTRICT out, const Rect& output_rect) {
+   const LoopFilter& lf = dec_state->shared->frame_header.loop_filter;
+-  JXL_DASSERT(image_rect.x0() % GroupBorderAssigner::kPaddingXRound == 0);
+-  JXL_DASSERT(input_rect.x0() % GroupBorderAssigner::kPaddingXRound == 0);
+-  JXL_DASSERT(output_rect.x0() % GroupBorderAssigner::kPaddingXRound == 0);
+-  JXL_DASSERT(input_rect.x0() >= lf.Padding());
++  // image_rect, input and output must all have the same kPaddingXRound
++  // alignment for SIMD, but it doesn't need to be 0.
++  JXL_DASSERT(image_rect.x0() % GroupBorderAssigner::kPaddingXRound ==
++              input_rect.x0() % GroupBorderAssigner::kPaddingXRound);
++  JXL_DASSERT(image_rect.x0() % GroupBorderAssigner::kPaddingXRound ==
++              output_rect.x0() % GroupBorderAssigner::kPaddingXRound);
++
++  // We need enough pixels to access the padding and the rounding to
++  // GroupBorderAssigner::kPaddingXRound to the left of the image.
++  JXL_DASSERT(input_rect.x0() >=
++              input_rect.x0() % GroupBorderAssigner::kPaddingXRound +
++                  lf.Padding());
++
+   JXL_DASSERT(image_rect.xsize() == input_rect.xsize());
+   JXL_DASSERT(image_rect.xsize() == output_rect.xsize());
+   FilterPipeline* fp = &(dec_state->filter_pipelines[thread]);
++  fp->image_rect = image_rect;
++
+   HWY_DYNAMIC_DISPATCH(FilterPipelineInit)
+   (fp, lf, input, input_rect, image_rect, image_ysize, out, output_rect);
+   return fp;
+diff --git a/lib/jxl/epf.h b/lib/jxl/epf.h
+index 6a2a8f72c8d..a2fd9d16f4a 100644
+--- a/lib/jxl/epf.h
++++ b/lib/jxl/epf.h
+@@ -26,9 +26,25 @@ static constexpr float kInvSigmaNum = -1.1715728752538099024f;
+ // and epf_sharpness fields in the corresponding positions.
+ void ComputeSigma(const Rect& block_rect, PassesDecoderState* state);
+ 
+-// Same as ApplyFilters, but only prepares the pipeline (which is returned and
+-// must be run by the caller on -lf.Padding() to image_rect.ysize() +
+-// lf.Padding()).
++// Applies Gaborish + EPF to the given `image_rect` part of the image (used to
++// select the sigma values). Input pixels are taken from `input:input_rect`, and
++// the filtering result is written to `out:output_rect`. `dec_state->sigma` must
++// be padded with `kMaxFilterPadding/kBlockDim` values along the x axis.
++// All rects must have the same alignment module
++// GroupBorderAssigner::kPaddingXRound pixels.
++// `input_rect`, `output_rect` and `image_rect` must all have the same size.
++// At least `lf.Padding()` pixels must be accessible and contain valid values
++// outside of `image_rect` in `input`. Also, depending on the implementation,
++// more pixels in the input up to a vector size boundary should be accessible
++// but may contain uninitialized data.
++//
++// This function only prepares and returns the pipeline, to perform the
++// filtering process it must be called on all row from -lf.Padding() to
++// image_rect.ysize() + lf.Padding() .
++//
++// Note: if the output_rect x0 or x1 are not a multiple of kPaddingXRound more
++// pixels with potentially uninitialized data will be written to the output left
++// and right of the requested rect up to a multiple of kPaddingXRound pixels.
+ FilterPipeline* PrepareFilterPipeline(
+     PassesDecoderState* dec_state, const Rect& image_rect, const Image3F& input,
+     const Rect& input_rect, size_t image_ysize, size_t thread,
+diff --git a/lib/jxl/filters.cc b/lib/jxl/filters.cc
+index 195df1ce966..064670d7e90 100644
+--- a/lib/jxl/filters.cc
++++ b/lib/jxl/filters.cc
+@@ -43,16 +43,30 @@ void FilterWeights::GaborishWeights(const LoopFilter& lf) {
+ 
+ void FilterPipeline::ApplyFiltersRow(const LoopFilter& lf,
+                                      const FilterWeights& filter_weights,
+-                                     const Rect& rect, ssize_t y) {
++                                     ssize_t y) {
+   PROFILER_ZONE("Gaborish+EPF");
+   JXL_DASSERT(num_filters != 0);  // Must be initialized.
+ 
+-  JXL_ASSERT(y < static_cast<ssize_t>(rect.ysize() + lf.Padding()));
++  JXL_ASSERT(y < static_cast<ssize_t>(image_rect.ysize() + lf.Padding()));
+ 
+   // The minimum value of the center row "y" needed to process the current
+   // filter.
+   ssize_t rows_needed = -static_cast<ssize_t>(lf.Padding());
+ 
++  // We pass `image_rect.x0() - image_rect.x0() % kBlockDim` as the x0 for
++  // the row_sigma, so to go from an `x` value in the filter to the
++  // corresponding value in row_sigma we use the fact that we mapped
++  // image_rect.x0() in the original image to MaxLeftPadding(image_rect.x0()) in
++  // the input/output rows seen by the filters:
++  // x_in_sigma_row =
++  //    ((x - (image_rect.x0() % kPaddingXRound) + image_rect.x0()) -
++  //     (image_rect.x0() - image_rect.x0() % kBlockDim))) / kBlockDim
++  // x_in_sigma_row =
++  //   x - image_rect.x0() % kPaddingXRound + image_rect.x0() % kBlockDim
++  const size_t sigma_x_offset =
++      image_rect.x0() % kBlockDim -
++      image_rect.x0() % GroupBorderAssigner::kPaddingXRound;
++
+   for (size_t i = 0; i < num_filters; i++) {
+     const FilterStep& filter = filters[i];
+ 
+@@ -62,12 +76,6 @@ void FilterPipeline::ApplyFiltersRow(const LoopFilter& lf,
+     y -= filter.filter_def.border;
+     if (y < rows_needed) return;
+ 
+-    // Compute the region where we need to apply this filter. Depending on the
+-    // step we might need to compute a larger portion than the original rect.
+-    const size_t filter_x0 = kMaxFilterPadding - filter.output_col_border;
+-    const size_t filter_x1 =
+-        filter_x0 + rect.xsize() + 2 * filter.output_col_border;
+-
+     // Apply filter to the given region.
+     FilterRows rows(filter.filter_def.border);
+     filter.set_input_rows(filter, &rows, y);
+@@ -76,14 +84,19 @@ void FilterPipeline::ApplyFiltersRow(const LoopFilter& lf,
+     // The "y" coordinate used for the sigma image in EPF1. Sigma is padded
+     // with kMaxFilterPadding (or kMaxFilterPadding/kBlockDim rows in sigma)
+     // above and below.
+-    const size_t sigma_y = kMaxFilterPadding + rect.y0() + y;
++    const size_t sigma_y = kMaxFilterPadding + image_rect.y0() + y;
++    // The offset to subtract to a "x" value in the filter to obtain the
++    // corresponding x in the sigma row.
+     if (compute_sigma) {
+-      rows.SetSigma(filter_weights.sigma, sigma_y, rect.x0());
++      rows.SetSigma(filter_weights.sigma, sigma_y,
++                    image_rect.x0() - image_rect.x0() % kBlockDim);
+     }
+ 
+-    filter.filter_def.apply(rows, lf, filter_weights, filter_x0, filter_x1,
+-                            rect.x0() % kBlockDim, sigma_y % kBlockDim);
++    filter.filter_def.apply(rows, lf, filter_weights, filter.filter_x0,
++                            filter.filter_x1, sigma_x_offset,
++                            sigma_y % kBlockDim);
+   }
++
+   JXL_DASSERT(rows_needed == 0);
+ }
+ 
+diff --git a/lib/jxl/filters.h b/lib/jxl/filters.h
+index f0223ef44d3..4b3745c71ac 100644
+--- a/lib/jxl/filters.h
++++ b/lib/jxl/filters.h
+@@ -107,7 +107,7 @@ struct FilterRows {
+   // blocks (pixels in sigma) on each one of the four sides. The (x0, y0) values
+   // should include this padding.
+   void SetSigma(const ImageF& sigma, size_t y0, size_t x0) {
+-    JXL_DASSERT(x0 % GroupBorderAssigner::kPaddingXRound == 0);
++    JXL_DASSERT(x0 % kBlockDim == 0);
+     row_sigma_ = sigma.ConstRow(y0 / kBlockDim) + x0 / kBlockDim;
+   }
+ 
+@@ -132,14 +132,14 @@ struct FilterRows {
+ // filter and its row and column padding requirements.
+ struct FilterDefinition {
+   // Function to apply the filter to a given row. The filter constant parameters
+-  // are passed in LoopFilter lf and filter_weights. `xoff` is needed to offset
+-  // the `x0` value so that it will cause correct accesses to
++  // are passed in LoopFilter lf and filter_weights. `sigma_x_offset` is needed
++  // to offset the `x0` value so that it will cause correct accesses to
+   // rows.GetSigmaRow(): there is just one sigma value per 8 pixels, and if the
+   // image rectangle is not aligned to multiples of 8 pixels, we need to
+   // compensate for the difference between x0 and the image position modulo 8.
+   void (*apply)(const FilterRows& rows, const LoopFilter& lf,
+                 const FilterWeights& filter_weights, size_t x0, size_t x1,
+-                size_t image_y_mod_8, size_t image_x_mod_8);
++                size_t sigma_x_offset, size_t image_y_mod_8);
+ 
+   // Number of source image rows and cols before and after an input pixel needed
+   // to compute the output of the filter. For a 3x3 convolution this border will
+@@ -153,7 +153,9 @@ class FilterPipeline {
+  public:
+   FilterPipeline() : FilterPipeline(kApplyImageFeaturesTileDim) {}
+   explicit FilterPipeline(size_t max_rect_xsize)
+-      : storage{max_rect_xsize + 2 * kMaxFilterPadding, kTotalStorageRows} {
++      : storage{max_rect_xsize + 2 * kMaxFilterPadding +
++                    GroupBorderAssigner::kPaddingXRound,
++                kTotalStorageRows} {
+ #if MEMORY_SANITIZER
+     // The padding of the storage may be used uninitialized since we process
+     // multiple SIMD lanes at a time, aligned to a multiple of lanes.
+@@ -181,13 +183,21 @@ class FilterPipeline {
+   FilterPipeline(FilterPipeline&&) = default;
+ 
+   // Apply the filter chain to a given row. To apply the filter chain to a whole
+-  // image this must be called for `rect.ysize() + 2 * total_border`
++  // image this must be called for `image_rect.ysize() + 2 * total_border`
+   // values of `y`, in increasing order, starting from `y = -total_border`.
++  // `image_rect` is the value passed to FilterPipelineInit().
+   void ApplyFiltersRow(const LoopFilter& lf,
+-                       const FilterWeights& filter_weights, const Rect& rect,
+-                       ssize_t y);
++                       const FilterWeights& filter_weights, ssize_t y);
+ 
+   struct FilterStep {
++    // We don't map self.input_rect.x0() directly to kMaxFilterPadding in
++    // input/output row since they might have a different alignment, instead we
++    // keep the alignment modulo kPaddingXRound.
++    static size_t MaxLeftPadding(size_t image_rect_x0) {
++      return kMaxFilterPadding +
++             image_rect_x0 % GroupBorderAssigner::kPaddingXRound;
++    }
++
+     // Sets the input of the filter step as an image region.
+     void SetInput(const Image3F* im_input, const Rect& input_rect,
+                   const Rect& image_rect, size_t image_ysize) {
+@@ -205,12 +215,17 @@ class FilterPipeline {
+                                      self.input_rect.y0() + y0,
+                                      self.input_rect.x0() - kMaxFilterPadding,
+                                      full_image_y_offset, self.image_ysize);
++        rows->SetInput<RowMapMirror>(
++            *(self.input), 0, self.input_rect.y0() + y0,
++            self.input_rect.x0() - MaxLeftPadding(self.input_rect.x0()),
++            full_image_y_offset, self.image_ysize);
+       };
+     }
+ 
+     // Sets the input of the filter step as the temporary cyclic storage with
+-    // num_rows rows. The value rect.x0() during application will be mapped to
+-    // kMaxFilterPadding regardless of the rect being processed.
++    // num_rows rows. The value image_rect.x0() during application will be
++    // mapped to "kMaxFilterPadding + alignment" regardless of the rect being
++    // processed.
+     template <size_t num_rows>
+     void SetInputCyclicStorage(const Image3F* storage, size_t offset_rows) {
+       input = storage;
+@@ -223,8 +238,9 @@ class FilterPipeline {
+     }
+ 
+     // Sets the output of the filter step as the temporary cyclic storage with
+-    // num_rows rows. The value rect.x0() during application will be mapped to
+-    // kMaxFilterPadding regardless of the rect being processed.
++    // num_rows rows. The value image_rect.x0() during application will be
++    // mapped to "kMaxFilterPadding + alignment" regardless of the rect being
++    // processed.
+     template <size_t num_rows>
+     void SetOutputCyclicStorage(Image3F* storage, size_t offset_rows) {
+       output = storage;
+@@ -243,9 +259,9 @@ class FilterPipeline {
+       this->output_rect = output_rect;
+       set_output_rows = [](const FilterStep& self, FilterRows* rows,
+                            ssize_t y0) {
+-        rows->SetOutput<RowMapId>(
+-            self.output, 0, self.output_rect.y0() + y0,
+-            static_cast<ssize_t>(self.output_rect.x0()) - kMaxFilterPadding);
++        rows->SetOutput<RowMapId>(self.output, 0, self.output_rect.y0() + y0,
++                                  static_cast<ssize_t>(self.output_rect.x0()) -
++                                      MaxLeftPadding(self.output_rect.x0()));
+       };
+     }
+ 
+@@ -273,6 +289,12 @@ class FilterPipeline {
+     // Actual filter descriptor.
+     FilterDefinition filter_def;
+ 
++    // Range of output pixels of the step. The filter [x0, x1) range is always
++    // a multiple of Lanes(df) and is large enough to contain the input and
++    // border needed by the next stages, but values outside that range may be
++    // undefined values. Coordinates are relative to the FilterRows pointers.
++    size_t filter_x0, filter_x1;
++
+     // Number of extra horizontal pixels needed on each side of the output of
+     // this filter to produce the requested rect at the end of the chain. This
+     // value is always 0 for the last filter of the chain but it depends on the
+@@ -312,6 +334,10 @@ class FilterPipeline {
+   // Whether we need to compute the sigma_row_ during application.
+   bool compute_sigma = false;
+ 
++  // Rect to be processed in the image coordinates. This doesn't include any
++  // padding needed to produce the output.
++  Rect image_rect;
++
+   // The total border needed to process this pipeline.
+   size_t total_border = 0;
+ };

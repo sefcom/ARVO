@@ -1,0 +1,2835 @@
+From d7cdfdc8d7b8e74a6be74f4f3535ef6eac976dc1 Mon Sep 17 00:00:00 2001
+From: Fabrice Bellard <fabrice@bellard.org>
+Date: Fri, 16 May 2025 17:43:03 +0200
+Subject: [PATCH] regexp: added v flag support - fixed corner cases of case
+ insensitive matching
+
+---
+ libregexp.c           | 828 ++++++++++++++++++++++++++++++++++++------
+ libregexp.h           |   1 +
+ libunicode-table.h    | 420 ++++++++++++++++++++-
+ libunicode.c          | 215 ++++++++++-
+ libunicode.h          |  14 +-
+ quickjs-atom.h        |   6 +
+ quickjs.c             |  93 +++--
+ test262.conf          |  30 +-
+ test262_errors.txt    |   4 -
+ tests/test_builtin.js |  28 ++
+ unicode_download.sh   |  12 +-
+ unicode_gen.c         | 541 ++++++++++++++++++++++++++-
+ unicode_gen_def.h     |  15 +
+ 13 files changed, 2003 insertions(+), 204 deletions(-)
+
+diff --git a/libregexp.c b/libregexp.c
+index 8c4738985..cca21977f 100644
+--- a/libregexp.c
++++ b/libregexp.c
+@@ -71,6 +71,7 @@ typedef struct {
+     const uint8_t *buf_start;
+     int re_flags;
+     BOOL is_unicode;
++    BOOL unicode_sets; /* if set, is_unicode is also set */
+     BOOL ignore_case;
+     BOOL dotall;
+     int capture_count;
+@@ -102,11 +103,11 @@ static const REOpCode reopcode_info[REOP_COUNT] = {
+ };
+ 
+ #define RE_HEADER_FLAGS         0
+-#define RE_HEADER_CAPTURE_COUNT 1
+-#define RE_HEADER_STACK_SIZE    2
+-#define RE_HEADER_BYTECODE_LEN  3
++#define RE_HEADER_CAPTURE_COUNT 2
++#define RE_HEADER_STACK_SIZE    3
++#define RE_HEADER_BYTECODE_LEN  4
+ 
+-#define RE_HEADER_LEN 7
++#define RE_HEADER_LEN 8
+ 
+ static inline int is_digit(int c) {
+     return c >= '0' && c <= '9';
+@@ -122,6 +123,264 @@ static int dbuf_insert(DynBuf *s, int pos, int len)
+     return 0;
+ }
+ 
++typedef struct REString {
++    struct REString *next;
++    uint32_t hash;
++    uint32_t len;
++    uint32_t buf[];
++} REString;
++
++typedef struct {
++    /* the string list is the union of 'char_range' and of the strings
++       in hash_table[]. The strings in hash_table[] have a length !=
++       1. */
++    CharRange cr;
++    uint32_t n_strings;
++    uint32_t hash_size;
++    int hash_bits;
++    REString **hash_table;
++} REStringList;
++
++static uint32_t re_string_hash(int len, const uint32_t *buf)
++{
++    int i;
++    uint32_t h;
++    h = 1;
++    for(i = 0; i < len; i++)
++        h = h * 263 + buf[i];
++    return h * 0x61C88647;
++}
++
++static void re_string_list_init(REParseState *s1, REStringList *s)
++{
++    cr_init(&s->cr, s1->opaque, lre_realloc);
++    s->n_strings = 0;
++    s->hash_size = 0;
++    s->hash_bits = 0;
++    s->hash_table = NULL;
++}
++
++static void re_string_list_free(REStringList *s)
++{
++    REString *p, *p_next;
++    int i;
++    for(i = 0; i < s->hash_size; i++) {
++        for(p = s->hash_table[i]; p != NULL; p = p_next) {
++            p_next = p->next;
++            lre_realloc(s->cr.mem_opaque, p, 0);
++        }
++    }
++    lre_realloc(s->cr.mem_opaque, s->hash_table, 0);
++
++    cr_free(&s->cr);
++}
++
++static void lre_print_char(int c, BOOL is_range)
++{
++    if (c == '\'' || c == '\\' ||
++        (is_range && (c == '-' || c == ']'))) {
++        printf("\\%c", c);
++    } else if (c >= ' ' && c <= 126) {
++        printf("%c", c);
++    } else {
++        printf("\\u{%04x}", c);
++    }
++}
++
++static __maybe_unused void re_string_list_dump(const char *str, const REStringList *s)
++{
++    REString *p;
++    const CharRange *cr;
++    int i, j, k;
++
++    printf("%s:\n", str);
++    printf("  ranges: [");
++    cr = &s->cr;
++    for(i = 0; i < cr->len; i += 2) {
++        lre_print_char(cr->points[i], TRUE);
++        if (cr->points[i] != cr->points[i + 1] - 1) {
++            printf("-");
++            lre_print_char(cr->points[i + 1] - 1, TRUE);
++        }
++    }
++    printf("]\n");
++    
++    j = 0;
++    for(i = 0; i < s->hash_size; i++) {
++        for(p = s->hash_table[i]; p != NULL; p = p->next) {
++            printf("  %d/%d: '", j, s->n_strings);
++            for(k = 0; k < p->len; k++) {
++                lre_print_char(p->buf[k], FALSE);
++            }
++            printf("'\n");
++            j++;
++        }
++    }
++}
++
++static int re_string_find2(REStringList *s, int len, const uint32_t *buf,
++                           uint32_t h0, BOOL add_flag)
++{
++    uint32_t h = 0; /* avoid warning */
++    REString *p;
++    if (s->n_strings != 0) {
++        h = h0 >> (32 - s->hash_bits);
++        for(p = s->hash_table[h]; p != NULL; p = p->next) {
++            if (p->hash == h0 && p->len == len &&
++                !memcmp(p->buf, buf, len * sizeof(buf[0]))) {
++                return 1;
++            }
++        }
++    }
++    /* not found */
++    if (!add_flag)
++        return 0;
++    /* increase the size of the hash table if needed */
++    if (unlikely((s->n_strings + 1) > s->hash_size)) {
++        REString **new_hash_table, *p_next;
++        int new_hash_bits, i;
++        uint32_t new_hash_size;
++        new_hash_bits = max_int(s->hash_bits + 1, 4);
++        new_hash_size = 1 << new_hash_bits;
++        new_hash_table = lre_realloc(s->cr.mem_opaque, NULL,
++                                     sizeof(new_hash_table[0]) * new_hash_size);
++        if (!new_hash_table)
++            return -1;
++        memset(new_hash_table, 0, sizeof(new_hash_table[0]) * new_hash_size);
++        for(i = 0; i < s->hash_size; i++) {
++            for(p = s->hash_table[i]; p != NULL; p = p_next) {
++                p_next = p->next;
++                h = p->hash >> (32 - new_hash_bits);
++                p->next = new_hash_table[h];
++                new_hash_table[h] = p;
++            }
++        }
++        lre_realloc(s->cr.mem_opaque, s->hash_table, 0);
++        s->hash_bits = new_hash_bits;
++        s->hash_size = new_hash_size;
++        s->hash_table = new_hash_table;
++        h = h0 >> (32 - s->hash_bits);
++    }
++
++    p = lre_realloc(s->cr.mem_opaque, NULL, sizeof(REString) + len * sizeof(buf[0]));
++    if (!p)
++        return -1;
++    p->next = s->hash_table[h];
++    s->hash_table[h] = p;
++    s->n_strings++;
++    p->hash = h0;
++    p->len = len;
++    memcpy(p->buf, buf, sizeof(buf[0]) * len);
++    return 1;
++}
++
++static int re_string_find(REStringList *s, int len, const uint32_t *buf,
++                          BOOL add_flag)
++{
++    uint32_t h0;
++    h0 = re_string_hash(len, buf);
++    return re_string_find2(s, len, buf, h0, add_flag);
++}
++
++/* return -1 if memory error, 0 if OK */
++static int re_string_add(REStringList *s, int len, const uint32_t *buf)
++{
++    if (len == 1) {
++        return cr_union_interval(&s->cr, buf[0], buf[0]);
++    }
++    if (re_string_find(s, len, buf, TRUE) < 0)
++        return -1;
++    return 0;
++}
++
++/* a = a op b */
++static int re_string_list_op(REStringList *a, REStringList *b, int op)
++{
++    int i, ret;
++    REString *p, **pp;
++
++    if (cr_op1(&a->cr, b->cr.points, b->cr.len, op))
++        return -1;
++
++    switch(op) {
++    case CR_OP_UNION:
++        if (b->n_strings != 0) {
++            for(i = 0; i < b->hash_size; i++) {
++                for(p = b->hash_table[i]; p != NULL; p = p->next) {
++                    if (re_string_find2(a, p->len, p->buf, p->hash, TRUE) < 0)
++                        return -1;
++                }
++            }
++        }
++        break;
++    case CR_OP_INTER:
++    case CR_OP_SUB:
++        for(i = 0; i < a->hash_size; i++) {
++            pp = &a->hash_table[i];
++            for(;;) {
++                p = *pp;
++                if (p == NULL)
++                    break;
++                ret = re_string_find2(b, p->len, p->buf, p->hash, FALSE);
++                if (op == CR_OP_SUB)
++                    ret = !ret;
++                if (!ret) {
++                    /* remove it */
++                    *pp = p->next;
++                    a->n_strings--;
++                    lre_realloc(a->cr.mem_opaque, p, 0);
++                } else {
++                    /* keep it */
++                    pp = &p->next;
++                }
++            }
++        }
++        break;
++    default:
++        abort();
++    }
++    return 0;
++}
++
++static int re_string_list_canonicalize(REParseState *s1,
++                                       REStringList *s, BOOL is_unicode)
++{
++    if (cr_regexp_canonicalize(&s->cr, is_unicode))
++        return -1;
++    if (s->n_strings != 0) {
++        REStringList a_s, *a = &a_s;
++        int i, j;
++        REString *p;
++        
++        /* XXX: simplify */
++        re_string_list_init(s1, a);
++
++        a->n_strings = s->n_strings;
++        a->hash_size = s->hash_size;
++        a->hash_bits = s->hash_bits;
++        a->hash_table = s->hash_table;
++        
++        s->n_strings = 0;
++        s->hash_size = 0;
++        s->hash_bits = 0;
++        s->hash_table = NULL;
++
++        for(i = 0; i < a->hash_size; i++) {
++            for(p = a->hash_table[i]; p != NULL; p = p->next) {
++                for(j = 0; j < p->len; j++) {
++                    p->buf[j] = lre_canonicalize(p->buf[j], is_unicode);
++                }
++                if (re_string_add(s, p->len, p->buf)) {
++                    re_string_list_free(a);
++                    return -1;
++                }
++            }
++        }
++        re_string_list_free(a);
++    }
++    return 0;
++}
++
+ static const uint16_t char_range_d[] = {
+     1,
+     0x0030, 0x0039 + 1,
+@@ -170,7 +429,7 @@ static const uint16_t * const char_range_table[] = {
+     char_range_w,
+ };
+ 
+-static int cr_init_char_range(REParseState *s, CharRange *cr, uint32_t c)
++static int cr_init_char_range(REParseState *s, REStringList *cr, uint32_t c)
+ {
+     BOOL invert;
+     const uint16_t *c_pt;
+@@ -179,18 +438,18 @@ static int cr_init_char_range(REParseState *s, CharRange *cr, uint32_t c)
+     invert = c & 1;
+     c_pt = char_range_table[c >> 1];
+     len = *c_pt++;
+-    cr_init(cr, s->opaque, lre_realloc);
++    re_string_list_init(s, cr);
+     for(i = 0; i < len * 2; i++) {
+-        if (cr_add_point(cr, c_pt[i]))
++        if (cr_add_point(&cr->cr, c_pt[i]))
+             goto fail;
+     }
+     if (invert) {
+-        if (cr_invert(cr))
++        if (cr_invert(&cr->cr))
+             goto fail;
+     }
+     return 0;
+  fail:
+-    cr_free(cr);
++    re_string_list_free(cr);
+     return -1;
+ }
+ 
+@@ -533,8 +792,16 @@ static BOOL is_unicode_char(int c)
+             (c == '_'));
+ }
+ 
+-static int parse_unicode_property(REParseState *s, CharRange *cr,
+-                                  const uint8_t **pp, BOOL is_inv)
++/* XXX: memory error test */
++static void seq_prop_cb(void *opaque, const uint32_t *seq, int seq_len)
++{
++    REStringList *sl = opaque;
++    re_string_add(sl, seq_len, seq);
++}
++
++static int parse_unicode_property(REParseState *s, REStringList *cr,
++                                  const uint8_t **pp, BOOL is_inv,
++                                  BOOL allow_sequence_prop)
+ {
+     const uint8_t *p;
+     char name[64], value[64];
+@@ -574,51 +841,76 @@ static int parse_unicode_property(REParseState *s, CharRange *cr,
+     } else if (!strcmp(name, "Script_Extensions") || !strcmp(name, "scx")) {
+         script_ext = TRUE;
+     do_script:
+-        cr_init(cr, s->opaque, lre_realloc);
+-        ret = unicode_script(cr, value, script_ext);
++        re_string_list_init(s, cr);
++        ret = unicode_script(&cr->cr, value, script_ext);
+         if (ret) {
+-            cr_free(cr);
++            re_string_list_free(cr);
+             if (ret == -2)
+                 return re_parse_error(s, "unknown unicode script");
+             else
+                 goto out_of_memory;
+         }
+     } else if (!strcmp(name, "General_Category") || !strcmp(name, "gc")) {
+-        cr_init(cr, s->opaque, lre_realloc);
+-        ret = unicode_general_category(cr, value);
++        re_string_list_init(s, cr);
++        ret = unicode_general_category(&cr->cr, value);
+         if (ret) {
+-            cr_free(cr);
++            re_string_list_free(cr);
+             if (ret == -2)
+                 return re_parse_error(s, "unknown unicode general category");
+             else
+                 goto out_of_memory;
+         }
+     } else if (value[0] == '\0') {
+-        cr_init(cr, s->opaque, lre_realloc);
+-        ret = unicode_general_category(cr, name);
++        re_string_list_init(s, cr);
++        ret = unicode_general_category(&cr->cr, name);
+         if (ret == -1) {
+-            cr_free(cr);
++            re_string_list_free(cr);
+             goto out_of_memory;
+         }
+         if (ret < 0) {
+-            ret = unicode_prop(cr, name);
+-            if (ret) {
+-                cr_free(cr);
+-                if (ret == -2)
+-                    goto unknown_property_name;
+-                else
+-                    goto out_of_memory;
++            ret = unicode_prop(&cr->cr, name);
++            if (ret == -1) {
++                re_string_list_free(cr);
++                goto out_of_memory;
+             }
+         }
++        if (ret < 0 && !is_inv && allow_sequence_prop) {
++            CharRange cr_tmp;
++            cr_init(&cr_tmp, s->opaque, lre_realloc);
++            ret = unicode_sequence_prop(name, seq_prop_cb, cr, &cr_tmp);
++            cr_free(&cr_tmp);
++            if (ret == -1) {
++                re_string_list_free(cr);
++                goto out_of_memory;
++            }
++        }
++        if (ret < 0)
++            goto unknown_property_name;
+     } else {
+     unknown_property_name:
+         return re_parse_error(s, "unknown unicode property name");
+     }
+ 
++    /* the ordering of case folding and inversion  differs with
++       unicode_sets. 'unicode_sets' ordering is more consistent */
++    /* XXX: the spec seems incorrect, we do it as the other engines
++       seem to do it. */
++    if (s->ignore_case && s->unicode_sets) {
++        if (re_string_list_canonicalize(s, cr, s->is_unicode)) {
++            re_string_list_free(cr);
++            goto out_of_memory;
++        }
++    }
+     if (is_inv) {
+-        if (cr_invert(cr)) {
+-            cr_free(cr);
+-            return -1;
++        if (cr_invert(&cr->cr)) {
++            re_string_list_free(cr);
++            goto out_of_memory;
++        }
++    }
++    if (s->ignore_case && !s->unicode_sets) {
++        if (re_string_list_canonicalize(s, cr, s->is_unicode)) {
++            re_string_list_free(cr);
++            goto out_of_memory;
+         }
+     }
+     *pp = p;
+@@ -628,10 +920,61 @@ static int parse_unicode_property(REParseState *s, CharRange *cr,
+ }
+ #endif /* CONFIG_ALL_UNICODE */
+ 
++static int get_class_atom(REParseState *s, REStringList *cr,
++                          const uint8_t **pp, BOOL inclass);
++
++static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
++                                          const uint8_t **pp)
++{
++    const uint8_t *p;
++    DynBuf str;
++    int c;
++    
++    p = *pp;
++    if (*p != '{')
++        return re_parse_error(s, "expecting '{' after \\q");
++
++    dbuf_init2(&str, s->opaque, lre_realloc);
++    re_string_list_init(s, cr);
++    
++    p++;
++    for(;;) {
++        str.size = 0;
++        while (*p != '}' && *p != '|') {
++            c = get_class_atom(s, NULL, &p, FALSE);
++            if (c < 0)
++                goto fail;
++            if (dbuf_put_u32(&str, c)) {
++                re_parse_out_of_memory(s);
++                goto fail;
++            }
++        }
++        if (re_string_add(cr, str.size / 4, (uint32_t *)str.buf)) {
++            re_parse_out_of_memory(s);
++            goto fail;
++        }
++        if (*p == '}')
++            break;
++        p++;
++    }
++    if (s->ignore_case) {
++        if (re_string_list_canonicalize(s, cr, TRUE))
++            goto fail;
++    }
++    p++; /* skip the '}' */
++    dbuf_free(&str);
++    *pp = p;
++    return 0;
++ fail:
++    dbuf_free(&str);
++    re_string_list_free(cr);
++    return -1;
++}
++
+ /* return -1 if error otherwise the character or a class range
+-   (CLASS_RANGE_BASE). In case of class range, 'cr' is
++   (CLASS_RANGE_BASE) if cr != NULL. In case of class range, 'cr' is
+    initialized. Otherwise, it is ignored. */
+-static int get_class_atom(REParseState *s, CharRange *cr,
++static int get_class_atom(REParseState *s, REStringList *cr,
+                           const uint8_t **pp, BOOL inclass)
+ {
+     const uint8_t *p;
+@@ -666,6 +1009,8 @@ static int get_class_atom(REParseState *s, CharRange *cr,
+         case 'W':
+             c = CHAR_RANGE_W;
+         class_range:
++            if (!cr)
++                goto default_escape;
+             if (cr_init_char_range(s, cr, c))
+                 return -1;
+             c = CLASS_RANGE_BASE;
+@@ -690,27 +1035,50 @@ static int get_class_atom(REParseState *s, CharRange *cr,
+             if (!inclass && s->is_unicode)
+                 goto invalid_escape;
+             break;
++        case '^':
++        case '$':
++        case '\\':
++        case '.':
++        case '*':
++        case '+':
++        case '?':
++        case '(':
++        case ')':
++        case '[':
++        case ']':
++        case '{':
++        case '}':
++        case '|':
++        case '/':
++            /* always valid to escape these characters */
++            break;
+ #ifdef CONFIG_ALL_UNICODE
+         case 'p':
+         case 'P':
+-            if (s->is_unicode) {
+-                if (parse_unicode_property(s, cr, &p, (c == 'P')))
++            if (s->is_unicode && cr) {
++                if (parse_unicode_property(s, cr, &p, (c == 'P'), s->unicode_sets))
+                     return -1;
+                 c = CLASS_RANGE_BASE;
+                 break;
+             }
+-            /* fall thru */
++            goto default_escape;
+ #endif
++        case 'q':
++            if (s->unicode_sets && cr && inclass) {
++                if (parse_class_string_disjunction(s, cr, &p))
++                    return -1;
++                c = CLASS_RANGE_BASE;
++                break;
++            }
++            goto default_escape;
+         default:
++        default_escape:
+             p--;
+             ret = lre_parse_escape(&p, s->is_unicode * 2);
+             if (ret >= 0) {
+                 c = ret;
+             } else {
+-                if (ret == -2 && *p != '\0' && strchr("^$\\.*+?()[]{}|/", *p)) {
+-                    /* always valid to escape these characters */
+-                    goto normal_char;
+-                } else if (s->is_unicode) {
++                if (s->is_unicode) {
+                 invalid_escape:
+                     return re_parse_error(s, "invalid escape sequence in regular expression");
+                 } else {
+@@ -727,6 +1095,48 @@ static int get_class_atom(REParseState *s, CharRange *cr,
+             return re_parse_error(s, "unexpected end");
+         }
+         /* fall thru */
++        goto normal_char;
++
++    case '&':
++    case '!':
++    case '#':
++    case '$':
++    case '%':
++    case '*':
++    case '+':
++    case ',':
++    case '.':
++    case ':':
++    case ';':
++    case '<':
++    case '=':
++    case '>':
++    case '?':
++    case '@':
++    case '^':
++    case '`':
++    case '~':
++        if (s->unicode_sets && p[1] == c) {
++            /* forbidden double characters */
++            return re_parse_error(s, "invalid class set operation in regular expression");
++        }
++        goto normal_char;
++
++    case '(':
++    case ')':
++    case '[':
++    case ']':
++    case '{':
++    case '}':
++    case '/':
++    case '-':
++    case '|':
++        if (s->unicode_sets) {
++            /* invalid characters in unicode sets */
++            return re_parse_error(s, "invalid character in class in regular expression");
++        }
++        goto normal_char;
++
+     default:
+     normal_char:
+         /* normal char */
+@@ -754,8 +1164,6 @@ static int re_emit_range(REParseState *s, const CharRange *cr)
+     if (len >= 65535)
+         return re_parse_error(s, "too many ranges");
+     if (len == 0) {
+-        /* not sure it can really happen. Emit a match that is always
+-           false */
+         re_emit_op_u32(s, REOP_char32, -1);
+     } else {
+         high = cr->points[cr->len - 1];
+@@ -783,15 +1191,135 @@ static int re_emit_range(REParseState *s, const CharRange *cr)
+     return 0;
+ }
+ 
+-static int re_parse_char_class(REParseState *s, const uint8_t **pp)
++static int re_string_cmp_len(const void *a, const void *b, void *arg)
++{
++    REString *p1 = *(REString **)a;
++    REString *p2 = *(REString **)b;
++    return (p1->len < p2->len) - (p1->len > p2->len);
++}
++
++static int re_emit_string_list(REParseState *s, const REStringList *sl)
++{
++    REString **tab, *p;
++    int i, j, c, split_pos, last_match_pos, n;
++    BOOL has_empty_string, is_last;
++    
++    //    re_string_list_dump("sl", sl);
++    if (sl->n_strings == 0) {
++        /* simple case: only characters */
++        if (re_emit_range(s, &sl->cr))
++            return -1;
++    } else {
++        /* at least one string list is present : match the longest ones first */
++        /* XXX: add a new op_switch opcode to compile as a trie */
++        tab = lre_realloc(s->opaque, NULL, sizeof(tab[0]) * sl->n_strings);
++        if (!tab) {
++            re_parse_out_of_memory(s);
++            return -1;
++        }
++        has_empty_string = FALSE;
++        n = 0;
++        for(i = 0; i < sl->hash_size; i++) {
++            for(p = sl->hash_table[i]; p != NULL; p = p->next) {
++                if (p->len == 0) {
++                    has_empty_string = TRUE;
++                } else {
++                    tab[n++] = p;
++                }
++            }
++        }
++        assert(n <= sl->n_strings);
++        
++        rqsort(tab, n, sizeof(tab[0]), re_string_cmp_len, NULL);
++
++        last_match_pos = -1;
++        for(i = 0; i < n; i++) {
++            p = tab[i];
++            is_last = !has_empty_string && sl->cr.len == 0 && i == (n - 1);
++            if (!is_last)
++                split_pos = re_emit_op_u32(s, REOP_split_next_first, 0);
++            else
++                split_pos = 0;
++            for(j = 0; j < p->len; j++) {
++                c = p->buf[j];
++                if (c <= 0xffff)
++                    re_emit_op_u16(s, REOP_char, c);
++                else
++                    re_emit_op_u32(s, REOP_char32, c);
++            }
++            if (!is_last) {
++                last_match_pos = re_emit_op_u32(s, REOP_goto, last_match_pos);
++                put_u32(s->byte_code.buf + split_pos, s->byte_code.size - (split_pos + 4));
++            }
++        }
++
++        if (sl->cr.len != 0) {
++            /* char range */
++            is_last = !has_empty_string;
++            if (!is_last)
++                split_pos = re_emit_op_u32(s, REOP_split_next_first, 0);
++            else
++                split_pos = 0; /* not used */
++            if (re_emit_range(s, &sl->cr)) {
++                lre_realloc(s->opaque, tab, 0);
++                return -1;
++            }
++            if (!is_last)
++                put_u32(s->byte_code.buf + split_pos, s->byte_code.size - (split_pos + 4));
++        }
++
++        /* patch the 'goto match' */
++        while (last_match_pos != -1) {
++            int next_pos = get_u32(s->byte_code.buf + last_match_pos);
++            put_u32(s->byte_code.buf + last_match_pos, s->byte_code.size - (last_match_pos + 4));
++            last_match_pos = next_pos;
++        }
++        
++        lre_realloc(s->opaque, tab, 0);
++    }
++    return 0;
++}
++
++static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_t **pp);
++
++static int re_parse_class_set_operand(REParseState *s, REStringList *cr, const uint8_t **pp)
++{
++    int c1;
++    const uint8_t *p = *pp;
++    
++    if (*p == '[') {
++        if (re_parse_nested_class(s, cr, pp))
++            return -1;
++    } else {
++        c1 = get_class_atom(s, cr, pp, TRUE);
++        if (c1 < 0)
++            return -1;
++        if (c1 < CLASS_RANGE_BASE) {
++            /* create a range with a single character */
++            re_string_list_init(s, cr);
++            if (s->ignore_case)
++                c1 = lre_canonicalize(c1, s->is_unicode);
++            if (cr_union_interval(&cr->cr, c1, c1)) {
++                re_string_list_free(cr);
++                return -1;
++            }
++        }
++    }
++    return 0;
++}
++
++static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_t **pp)
+ {
+     const uint8_t *p;
+     uint32_t c1, c2;
+-    CharRange cr_s, *cr = &cr_s;
+-    CharRange cr1_s, *cr1 = &cr1_s;
+-    BOOL invert;
++    int ret;
++    REStringList cr1_s, *cr1 = &cr1_s;
++    BOOL invert, is_first;
++
++    if (lre_check_stack_overflow(s->opaque, 0))
++        return re_parse_error(s, "stack overflow");
+ 
+-    cr_init(cr, s->opaque, lre_realloc);
++    re_string_list_init(s, cr);
+     p = *pp;
+     p++;    /* skip '[' */
+ 
+@@ -800,74 +1328,155 @@ static int re_parse_char_class(REParseState *s, const uint8_t **pp)
+         p++;
+         invert = TRUE;
+     }
+-
++    
++    /* handle unions */
++    is_first = TRUE;
+     for(;;) {
+         if (*p == ']')
+             break;
+-        c1 = get_class_atom(s, cr1, &p, TRUE);
+-        if ((int)c1 < 0)
+-            goto fail;
+-        if (*p == '-' && p[1] != ']') {
+-            const uint8_t *p0 = p + 1;
+-            if (c1 >= CLASS_RANGE_BASE) {
+-                if (s->is_unicode) {
+-                    cr_free(cr1);
+-                    goto invalid_class_range;
+-                }
+-                /* Annex B: match '-' character */
+-                goto class_atom;
+-            }
+-            c2 = get_class_atom(s, cr1, &p0, TRUE);
+-            if ((int)c2 < 0)
+-                goto fail;
+-            if (c2 >= CLASS_RANGE_BASE) {
+-                cr_free(cr1);
+-                if (s->is_unicode) {
+-                    goto invalid_class_range;
+-                }
+-                /* Annex B: match '-' character */
+-                goto class_atom;
+-            }
+-            p = p0;
+-            if (c2 < c1) {
+-            invalid_class_range:
+-                re_parse_error(s, "invalid class range");
++        if (*p == '[' && s->unicode_sets) {
++            if (re_parse_nested_class(s, cr1, &p))
+                 goto fail;
+-            }
+-            if (cr_union_interval(cr, c1, c2))
+-                goto memory_error;
++            goto class_union;
+         } else {
+-        class_atom:
+-            if (c1 >= CLASS_RANGE_BASE) {
+-                int ret;
+-                ret = cr_union1(cr, cr1->points, cr1->len);
+-                cr_free(cr1);
+-                if (ret)
+-                    goto memory_error;
++            c1 = get_class_atom(s, cr1, &p, TRUE);
++            if ((int)c1 < 0)
++                goto fail;
++            if (*p == '-' && p[1] != ']') {
++                const uint8_t *p0 = p + 1;
++                if (p[1] == '-' && s->unicode_sets && is_first)
++                    goto class_atom; /* first character class followed by '--' */
++                if (c1 >= CLASS_RANGE_BASE) {
++                    if (s->is_unicode) {
++                        re_string_list_free(cr1);
++                        goto invalid_class_range;
++                    }
++                    /* Annex B: match '-' character */
++                    goto class_atom;
++                }
++                c2 = get_class_atom(s, cr1, &p0, TRUE);
++                if ((int)c2 < 0)
++                    goto fail;
++                if (c2 >= CLASS_RANGE_BASE) {
++                    re_string_list_free(cr1);
++                    if (s->is_unicode) {
++                        goto invalid_class_range;
++                    }
++                    /* Annex B: match '-' character */
++                    goto class_atom;
++                }
++                p = p0;
++                if (c2 < c1) {
++                invalid_class_range:
++                    re_parse_error(s, "invalid class range");
++                    goto fail;
++                }
++                if (s->ignore_case) {
++                    CharRange cr2_s, *cr2 = &cr2_s;
++                    cr_init(cr2, s->opaque, lre_realloc);
++                    if (cr_add_interval(cr2, c1, c2 + 1) ||
++                        cr_regexp_canonicalize(cr2, s->is_unicode) ||
++                        cr_op1(&cr->cr, cr2->points, cr2->len, CR_OP_UNION)) {
++                        cr_free(cr2);
++                        goto memory_error;
++                    }
++                    cr_free(cr2);
++                } else {
++                    if (cr_union_interval(&cr->cr, c1, c2))
++                        goto memory_error;
++                }
++                is_first = FALSE; /* union operation */
+             } else {
+-                if (cr_union_interval(cr, c1, c1))
+-                    goto memory_error;
++            class_atom:
++                if (c1 >= CLASS_RANGE_BASE) {
++                class_union:
++                    ret = re_string_list_op(cr, cr1, CR_OP_UNION);
++                    re_string_list_free(cr1);
++                    if (ret)
++                        goto memory_error;
++                } else {
++                    if (s->ignore_case)
++                        c1 = lre_canonicalize(c1, s->is_unicode);
++                    if (cr_union_interval(&cr->cr, c1, c1))
++                        goto memory_error;
++                }
+             }
+         }
++        if (s->unicode_sets && is_first) {
++            if (*p == '&' && p[1] == '&' && p[2] != '&') {
++                /* handle '&&' */
++                for(;;) {
++                    if (*p == ']') {
++                        break;
++                    } else if (*p == '&' && p[1] == '&' && p[2] != '&') {
++                        p += 2;
++                    } else {
++                        goto invalid_operation;
++                    }
++                    if (re_parse_class_set_operand(s, cr1, &p))
++                        goto fail;
++                    ret = re_string_list_op(cr, cr1, CR_OP_INTER);
++                    re_string_list_free(cr1);
++                    if (ret)
++                        goto memory_error;
++                }
++            } else if (*p == '-' && p[1] == '-') {
++                /* handle '--' */
++                for(;;) {
++                    if (*p == ']') {
++                        break;
++                    } else if (*p == '-' && p[1] == '-') {
++                        p += 2;
++                    } else {
++                    invalid_operation:
++                        re_parse_error(s, "invalid operation in regular expression");
++                        goto fail;
++                    }
++                    if (re_parse_class_set_operand(s, cr1, &p))
++                        goto fail;
++                    ret = re_string_list_op(cr, cr1, CR_OP_SUB);
++                    re_string_list_free(cr1);
++                    if (ret)
++                        goto memory_error;
++                }
++            }
++        }
++        is_first = FALSE;
+     }
+-    if (s->ignore_case) {
+-        if (cr_regexp_canonicalize(cr, s->is_unicode))
+-            goto memory_error;
+-    }
++
++    p++;    /* skip ']' */
++    *pp = p;
+     if (invert) {
+-        if (cr_invert(cr))
++        /* XXX: add may_contain_string syntax check to be fully
++           compliant. The test here accepts more input than the
++           spec. */
++        if (cr->n_strings != 0) {
++            re_parse_error(s, "negated character class with strings in regular expression debugger eval code");
++            goto fail;
++        }
++        if (cr_invert(&cr->cr))
+             goto memory_error;
+     }
+-    if (re_emit_range(s, cr))
+-        goto fail;
+-    cr_free(cr);
+-    p++;    /* skip ']' */
+-    *pp = p;
+     return 0;
+  memory_error:
+     re_parse_out_of_memory(s);
+  fail:
+-    cr_free(cr);
++    re_string_list_free(cr);
++    return -1;
++}
++
++static int re_parse_char_class(REParseState *s, const uint8_t **pp)
++{
++    REStringList cr_s, *cr = &cr_s;
++
++    if (re_parse_nested_class(s, cr, pp))
++        return -1;
++    if (re_emit_string_list(s, cr))
++        goto fail;
++    re_string_list_free(cr);
++    return 0;
++ fail:
++    re_string_list_free(cr);
+     return -1;
+ }
+ 
+@@ -1121,7 +1730,7 @@ static int re_parse_term(REParseState *s, BOOL is_backward_dir)
+     const uint8_t *p;
+     int c, last_atom_start, quant_min, quant_max, last_capture_count;
+     BOOL greedy, add_zero_advance_check, is_neg, is_backward_lookahead;
+-    CharRange cr_s, *cr = &cr_s;
++    REStringList cr_s, *cr = &cr_s;
+ 
+     last_atom_start = -1;
+     last_capture_count = 0;
+@@ -1385,9 +1994,8 @@ static int re_parse_term(REParseState *s, BOOL is_backward_dir)
+             re_emit_op(s, REOP_prev);
+         if (c >= CLASS_RANGE_BASE) {
+             int ret;
+-            /* Note: canonicalization is not needed */
+-            ret = re_emit_range(s, cr);
+-            cr_free(cr);
++            ret = re_emit_string_list(s, cr);
++            re_string_list_free(cr);
+             if (ret)
+                 return -1;
+         } else {
+@@ -1737,10 +2345,11 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
+     s->buf_end = s->buf_ptr + buf_len;
+     s->buf_start = s->buf_ptr;
+     s->re_flags = re_flags;
+-    s->is_unicode = ((re_flags & LRE_FLAG_UNICODE) != 0);
++    s->is_unicode = ((re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0);
+     is_sticky = ((re_flags & LRE_FLAG_STICKY) != 0);
+     s->ignore_case = ((re_flags & LRE_FLAG_IGNORECASE) != 0);
+     s->dotall = ((re_flags & LRE_FLAG_DOTALL) != 0);
++    s->unicode_sets = ((re_flags & LRE_FLAG_UNICODE_SETS) != 0);
+     s->capture_count = 1;
+     s->total_capture_count = -1;
+     s->has_named_captures = -1;
+@@ -1748,7 +2357,7 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
+     dbuf_init2(&s->byte_code, opaque, lre_realloc);
+     dbuf_init2(&s->group_names, opaque, lre_realloc);
+ 
+-    dbuf_putc(&s->byte_code, re_flags); /* first element is the flags */
++    dbuf_put_u16(&s->byte_code, re_flags); /* first element is the flags */
+     dbuf_putc(&s->byte_code, 0); /* second element is the number of captures */
+     dbuf_putc(&s->byte_code, 0); /* stack size */
+     dbuf_put_u32(&s->byte_code, 0); /* bytecode length */
+@@ -1801,7 +2410,8 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
+     /* add the named groups if needed */
+     if (s->group_names.size > (s->capture_count - 1)) {
+         dbuf_put(&s->byte_code, s->group_names.buf, s->group_names.size);
+-        s->byte_code.buf[RE_HEADER_FLAGS] |= LRE_FLAG_NAMED_GROUPS;
++        put_u16(s->byte_code.buf + RE_HEADER_FLAGS,
++                lre_get_flags(s->byte_code.buf) | LRE_FLAG_NAMED_GROUPS);
+     }
+     dbuf_free(&s->group_names);
+ 
+@@ -2221,6 +2831,8 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
+                     v1 = FALSE;
+                 } else {
+                     PEEK_PREV_CHAR(c, cptr, s->cbuf, cbuf_type);
++                    if (s->ignore_case)
++                        c = lre_canonicalize(c, s->is_unicode);
+                     v1 = is_word_char(c);
+                 }
+                 /* current char */
+@@ -2228,6 +2840,8 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
+                     v2 = FALSE;
+                 } else {
+                     PEEK_CHAR(c, cptr, cbuf_end, cbuf_type);
++                    if (s->ignore_case)
++                        c = lre_canonicalize(c, s->is_unicode);
+                     v2 = is_word_char(c);
+                 }
+                 if (v1 ^ v2 ^ (REOP_not_word_boundary - opcode))
+@@ -2424,7 +3038,7 @@ int lre_exec(uint8_t **capture,
+     re_flags = lre_get_flags(bc_buf);
+     s->multi_line = (re_flags & LRE_FLAG_MULTILINE) != 0;
+     s->ignore_case = (re_flags & LRE_FLAG_IGNORECASE) != 0;
+-    s->is_unicode = (re_flags & LRE_FLAG_UNICODE) != 0;
++    s->is_unicode = (re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
+     s->capture_count = bc_buf[RE_HEADER_CAPTURE_COUNT];
+     s->stack_size_max = bc_buf[RE_HEADER_STACK_SIZE];
+     s->cbuf = cbuf;
+@@ -2459,7 +3073,7 @@ int lre_get_capture_count(const uint8_t *bc_buf)
+ 
+ int lre_get_flags(const uint8_t *bc_buf)
+ {
+-    return bc_buf[RE_HEADER_FLAGS];
++    return get_u16(bc_buf + RE_HEADER_FLAGS);
+ }
+ 
+ /* Return NULL if no group names. Otherwise, return a pointer to
+diff --git a/libregexp.h b/libregexp.h
+index 7475bbea9..da76e4cef 100644
+--- a/libregexp.h
++++ b/libregexp.h
+@@ -35,6 +35,7 @@
+ #define LRE_FLAG_STICKY     (1 << 5)
+ #define LRE_FLAG_INDICES    (1 << 6) /* Unused by libregexp, just recorded. */
+ #define LRE_FLAG_NAMED_GROUPS (1 << 7) /* named groups are present in the regexp */
++#define LRE_FLAG_UNICODE_SETS (1 << 8)
+ 
+ #define LRE_RET_MEMORY_ERROR (-1)
+ #define LRE_RET_TIMEOUT      (-2)
+diff --git a/libunicode-table.h b/libunicode-table.h
+index dc46f16df..0120ea9f6 100644
+--- a/libunicode-table.h
++++ b/libunicode-table.h
+@@ -4054,6 +4054,89 @@ static const uint8_t unicode_prop_Changes_When_NFKC_Casefolded1_table[450] = {
+     0x4f, 0xff,
+ };
+ 
++static const uint8_t unicode_prop_Basic_Emoji1_table[143] = {
++    0x60, 0x23, 0x19, 0x81, 0x40, 0xcc, 0x1a, 0x01,
++    0x80, 0x42, 0x08, 0x81, 0x94, 0x81, 0xb1, 0x8b,
++    0xaa, 0x80, 0x92, 0x80, 0x8c, 0x07, 0x81, 0x90,
++    0x0c, 0x0f, 0x04, 0x80, 0x94, 0x06, 0x08, 0x03,
++    0x01, 0x06, 0x03, 0x81, 0x9b, 0x80, 0xa2, 0x00,
++    0x03, 0x10, 0x80, 0xbc, 0x82, 0x97, 0x80, 0x8d,
++    0x80, 0x43, 0x5a, 0x81, 0xb2, 0x03, 0x80, 0x61,
++    0xc4, 0xad, 0x80, 0x40, 0xc9, 0x80, 0x40, 0xbd,
++    0x01, 0x89, 0xe5, 0x80, 0x97, 0x80, 0x93, 0x01,
++    0x20, 0x82, 0x94, 0x81, 0x40, 0xad, 0xa0, 0x8b,
++    0x88, 0x80, 0xc5, 0x80, 0x95, 0x8b, 0xaa, 0x1c,
++    0x8b, 0x90, 0x10, 0x82, 0xc6, 0x00, 0x80, 0x40,
++    0xba, 0x81, 0xbe, 0x8c, 0x18, 0x97, 0x91, 0x80,
++    0x99, 0x81, 0x8c, 0x80, 0xd5, 0xd4, 0xaf, 0xc5,
++    0x28, 0x12, 0x0a, 0x1b, 0x8a, 0x0e, 0x88, 0x40,
++    0xe2, 0x8b, 0x18, 0x41, 0x1a, 0xae, 0x80, 0x89,
++    0x80, 0x40, 0xb8, 0xef, 0x8c, 0x82, 0x89, 0x84,
++    0xb7, 0x86, 0x8e, 0x81, 0x8a, 0x85, 0x88,
++};
++
++static const uint8_t unicode_prop_Basic_Emoji2_table[183] = {
++    0x40, 0xa8, 0x03, 0x80, 0x5f, 0x8c, 0x80, 0x8b,
++    0x80, 0x40, 0xd7, 0x80, 0x95, 0x80, 0xd9, 0x85,
++    0x8e, 0x81, 0x41, 0x7c, 0x80, 0x40, 0xa5, 0x80,
++    0x9c, 0x10, 0x0c, 0x82, 0x40, 0xc6, 0x80, 0x40,
++    0xe6, 0x81, 0x89, 0x80, 0x88, 0x80, 0xb9, 0x0a,
++    0x84, 0x88, 0x01, 0x05, 0x03, 0x01, 0x00, 0x09,
++    0x02, 0x02, 0x0f, 0x14, 0x00, 0x80, 0x9b, 0x09,
++    0x00, 0x08, 0x80, 0x91, 0x01, 0x80, 0x92, 0x00,
++    0x18, 0x00, 0x0a, 0x05, 0x07, 0x81, 0x95, 0x05,
++    0x00, 0x00, 0x80, 0x94, 0x05, 0x09, 0x01, 0x17,
++    0x04, 0x09, 0x08, 0x01, 0x00, 0x00, 0x05, 0x02,
++    0x80, 0x90, 0x81, 0x8e, 0x01, 0x80, 0x9a, 0x81,
++    0xbb, 0x80, 0x41, 0x91, 0x81, 0x41, 0xce, 0x82,
++    0x45, 0x27, 0x80, 0x8b, 0x80, 0x42, 0x58, 0x00,
++    0x80, 0x61, 0xbe, 0xd5, 0x81, 0x8b, 0x81, 0x40,
++    0x81, 0x80, 0xb3, 0x80, 0x40, 0xe8, 0x01, 0x88,
++    0x88, 0x80, 0xc5, 0x80, 0x97, 0x08, 0x11, 0x81,
++    0xaa, 0x1c, 0x8b, 0x92, 0x00, 0x00, 0x80, 0xc6,
++    0x00, 0x80, 0x40, 0xba, 0x80, 0xca, 0x81, 0xa3,
++    0x09, 0x86, 0x8c, 0x01, 0x19, 0x80, 0x93, 0x01,
++    0x07, 0x81, 0x88, 0x04, 0x82, 0x8b, 0x17, 0x11,
++    0x00, 0x03, 0x05, 0x02, 0x05, 0x80, 0x40, 0xcf,
++    0x00, 0x82, 0x8f, 0x2a, 0x05, 0x01, 0x80,
++};
++
++static const uint8_t unicode_prop_RGI_Emoji_Modifier_Sequence_table[73] = {
++    0x60, 0x26, 0x1c, 0x80, 0x40, 0xda, 0x80, 0x8f,
++    0x83, 0x61, 0xcc, 0x76, 0x80, 0xbb, 0x11, 0x01,
++    0x82, 0xf4, 0x09, 0x8a, 0x94, 0x18, 0x18, 0x88,
++    0x10, 0x1a, 0x02, 0x30, 0x00, 0x97, 0x80, 0x40,
++    0xc8, 0x0b, 0x80, 0x94, 0x03, 0x81, 0x40, 0xad,
++    0x12, 0x84, 0xd2, 0x80, 0x8f, 0x82, 0x88, 0x80,
++    0x8a, 0x80, 0x42, 0x3e, 0x01, 0x07, 0x3d, 0x80,
++    0x88, 0x89, 0x11, 0xb7, 0x80, 0xbc, 0x08, 0x08,
++    0x80, 0x90, 0x10, 0x8c, 0x40, 0xe4, 0x82, 0xa9,
++    0x88,
++};
++
++static const uint8_t unicode_prop_RGI_Emoji_Flag_Sequence_table[128] = {
++    0x0c, 0x00, 0x09, 0x00, 0x04, 0x01, 0x02, 0x06,
++    0x03, 0x03, 0x01, 0x02, 0x01, 0x03, 0x07, 0x0d,
++    0x18, 0x00, 0x09, 0x00, 0x00, 0x89, 0x08, 0x00,
++    0x00, 0x81, 0x88, 0x83, 0x8c, 0x10, 0x00, 0x01,
++    0x07, 0x08, 0x29, 0x10, 0x28, 0x00, 0x80, 0x8a,
++    0x00, 0x0a, 0x00, 0x0e, 0x15, 0x18, 0x83, 0x89,
++    0x06, 0x00, 0x81, 0x8d, 0x00, 0x12, 0x08, 0x00,
++    0x03, 0x00, 0x24, 0x00, 0x05, 0x21, 0x00, 0x00,
++    0x29, 0x90, 0x00, 0x02, 0x00, 0x08, 0x09, 0x00,
++    0x08, 0x18, 0x8b, 0x80, 0x8c, 0x02, 0x19, 0x1a,
++    0x11, 0x00, 0x00, 0x80, 0x9c, 0x80, 0x88, 0x02,
++    0x00, 0x00, 0x02, 0x20, 0x88, 0x0a, 0x00, 0x03,
++    0x01, 0x02, 0x05, 0x08, 0x00, 0x01, 0x09, 0x20,
++    0x21, 0x18, 0x22, 0x00, 0x00, 0x00, 0x00, 0x18,
++    0x28, 0x89, 0x80, 0x8b, 0x80, 0x90, 0x80, 0x92,
++    0x80, 0x8d, 0x05, 0x80, 0x8a, 0x80, 0x88, 0x80,
++};
++
++static const uint8_t unicode_prop_Emoji_Keycap_Sequence_table[4] = {
++    0xa2, 0x05, 0x04, 0x89,
++};
++
+ static const uint8_t unicode_prop_ASCII_Hex_Digit_table[5] = {
+     0xaf, 0x89, 0x35, 0x99, 0x85,
+ };
+@@ -4493,6 +4576,11 @@ typedef enum {
+     UNICODE_PROP_Changes_When_Titlecased1,
+     UNICODE_PROP_Changes_When_Casefolded1,
+     UNICODE_PROP_Changes_When_NFKC_Casefolded1,
++    UNICODE_PROP_Basic_Emoji1,
++    UNICODE_PROP_Basic_Emoji2,
++    UNICODE_PROP_RGI_Emoji_Modifier_Sequence,
++    UNICODE_PROP_RGI_Emoji_Flag_Sequence,
++    UNICODE_PROP_Emoji_Keycap_Sequence,
+     UNICODE_PROP_ASCII_Hex_Digit,
+     UNICODE_PROP_Bidi_Control,
+     UNICODE_PROP_Dash,
+@@ -4633,6 +4721,11 @@ static const uint8_t * const unicode_prop_table[] = {
+     unicode_prop_Changes_When_Titlecased1_table,
+     unicode_prop_Changes_When_Casefolded1_table,
+     unicode_prop_Changes_When_NFKC_Casefolded1_table,
++    unicode_prop_Basic_Emoji1_table,
++    unicode_prop_Basic_Emoji2_table,
++    unicode_prop_RGI_Emoji_Modifier_Sequence_table,
++    unicode_prop_RGI_Emoji_Flag_Sequence_table,
++    unicode_prop_Emoji_Keycap_Sequence_table,
+     unicode_prop_ASCII_Hex_Digit_table,
+     unicode_prop_Bidi_Control_table,
+     unicode_prop_Dash_table,
+@@ -4688,6 +4781,11 @@ static const uint16_t unicode_prop_len_table[] = {
+     countof(unicode_prop_Changes_When_Titlecased1_table),
+     countof(unicode_prop_Changes_When_Casefolded1_table),
+     countof(unicode_prop_Changes_When_NFKC_Casefolded1_table),
++    countof(unicode_prop_Basic_Emoji1_table),
++    countof(unicode_prop_Basic_Emoji2_table),
++    countof(unicode_prop_RGI_Emoji_Modifier_Sequence_table),
++    countof(unicode_prop_RGI_Emoji_Flag_Sequence_table),
++    countof(unicode_prop_Emoji_Keycap_Sequence_table),
+     countof(unicode_prop_ASCII_Hex_Digit_table),
+     countof(unicode_prop_Bidi_Control_table),
+     countof(unicode_prop_Dash_table),
+@@ -4726,5 +4824,325 @@ static const uint16_t unicode_prop_len_table[] = {
+     countof(unicode_prop_Case_Ignorable_table),
+ };
+ 
++typedef enum {
++    UNICODE_SEQUENCE_PROP_Basic_Emoji,
++    UNICODE_SEQUENCE_PROP_Emoji_Keycap_Sequence,
++    UNICODE_SEQUENCE_PROP_RGI_Emoji_Modifier_Sequence,
++    UNICODE_SEQUENCE_PROP_RGI_Emoji_Flag_Sequence,
++    UNICODE_SEQUENCE_PROP_RGI_Emoji_Tag_Sequence,
++    UNICODE_SEQUENCE_PROP_RGI_Emoji_ZWJ_Sequence,
++    UNICODE_SEQUENCE_PROP_RGI_Emoji,
++    UNICODE_SEQUENCE_PROP_COUNT,
++} UnicodeSequencePropertyEnum;
++
++static const char unicode_sequence_prop_name_table[] =
++    "Basic_Emoji"                 "\0"
++    "Emoji_Keycap_Sequence"       "\0"
++    "RGI_Emoji_Modifier_Sequence" "\0"
++    "RGI_Emoji_Flag_Sequence"     "\0"
++    "RGI_Emoji_Tag_Sequence"      "\0"
++    "RGI_Emoji_ZWJ_Sequence"      "\0"
++    "RGI_Emoji"                   "\0"
++;
++
++static const uint8_t unicode_rgi_emoji_tag_sequence[18] = {
++    0x67, 0x62, 0x65, 0x6e, 0x67, 0x00, 0x67, 0x62,
++    0x73, 0x63, 0x74, 0x00, 0x67, 0x62, 0x77, 0x6c,
++    0x73, 0x00,
++};
++
++static const uint8_t unicode_rgi_emoji_zwj_sequence[2320] = {
++    0x02, 0xb8, 0x19, 0x40, 0x86, 0x02, 0xd1, 0x39,
++    0xb0, 0x19, 0x02, 0x26, 0x39, 0x42, 0x86, 0x02,
++    0xb4, 0x36, 0x42, 0x86, 0x03, 0x68, 0x54, 0x64,
++    0x87, 0x68, 0x54, 0x02, 0xdc, 0x39, 0x42, 0x86,
++    0x02, 0xd1, 0x39, 0x73, 0x13, 0x02, 0x39, 0x39,
++    0x40, 0x86, 0x02, 0x69, 0x34, 0xbd, 0x19, 0x03,
++    0xb6, 0x36, 0x40, 0x86, 0xa1, 0x87, 0x03, 0x68,
++    0x74, 0x1d, 0x19, 0x68, 0x74, 0x03, 0x68, 0x34,
++    0xbd, 0x19, 0xa1, 0x87, 0x02, 0xf1, 0x7a, 0xf2,
++    0x7a, 0x02, 0xca, 0x33, 0x42, 0x86, 0x02, 0x69,
++    0x34, 0xb0, 0x19, 0x04, 0x68, 0x14, 0x68, 0x14,
++    0x67, 0x14, 0x66, 0x14, 0x02, 0xf9, 0x26, 0x42,
++    0x86, 0x03, 0x69, 0x74, 0x1d, 0x19, 0x69, 0x74,
++    0x03, 0xd1, 0x19, 0xbc, 0x19, 0xa1, 0x87, 0x02,
++    0x3c, 0x19, 0x40, 0x86, 0x02, 0x68, 0x34, 0xeb,
++    0x13, 0x02, 0xc3, 0x33, 0xa1, 0x87, 0x02, 0x70,
++    0x34, 0x40, 0x86, 0x02, 0xd4, 0x39, 0x42, 0x86,
++    0x02, 0xcf, 0x39, 0x42, 0x86, 0x02, 0x47, 0x36,
++    0x40, 0x86, 0x02, 0x39, 0x39, 0x42, 0x86, 0x04,
++    0xd1, 0x79, 0x64, 0x87, 0x8b, 0x14, 0xd1, 0x79,
++    0x02, 0xd1, 0x39, 0x95, 0x86, 0x02, 0x68, 0x34,
++    0x93, 0x13, 0x02, 0x69, 0x34, 0xed, 0x13, 0x02,
++    0xda, 0x39, 0x40, 0x86, 0x03, 0x69, 0x34, 0xaf,
++    0x19, 0xa1, 0x87, 0x02, 0xd1, 0x39, 0x93, 0x13,
++    0x03, 0xce, 0x39, 0x42, 0x86, 0xa1, 0x87, 0x03,
++    0xd1, 0x79, 0x64, 0x87, 0xd1, 0x79, 0x03, 0xc3,
++    0x33, 0x42, 0x86, 0xa1, 0x87, 0x03, 0x69, 0x74,
++    0x1d, 0x19, 0x68, 0x74, 0x02, 0x69, 0x34, 0x92,
++    0x16, 0x02, 0xd1, 0x39, 0x96, 0x86, 0x04, 0x69,
++    0x14, 0x64, 0x87, 0x8b, 0x14, 0x68, 0x14, 0x02,
++    0x68, 0x34, 0x7c, 0x13, 0x02, 0x47, 0x36, 0x42,
++    0x86, 0x02, 0x86, 0x34, 0x42, 0x86, 0x02, 0xd1,
++    0x39, 0x7c, 0x13, 0x02, 0x69, 0x14, 0xa4, 0x13,
++    0x02, 0xda, 0x39, 0x42, 0x86, 0x02, 0x37, 0x39,
++    0x40, 0x86, 0x02, 0xd1, 0x39, 0x08, 0x87, 0x04,
++    0x68, 0x54, 0x64, 0x87, 0x8b, 0x14, 0x68, 0x54,
++    0x02, 0x4d, 0x36, 0x40, 0x86, 0x02, 0x68, 0x34,
++    0x2c, 0x15, 0x02, 0x69, 0x34, 0xaf, 0x19, 0x02,
++    0x6e, 0x34, 0x40, 0x86, 0x02, 0xcd, 0x39, 0x42,
++    0x86, 0x02, 0xd1, 0x39, 0x2c, 0x15, 0x02, 0x6f,
++    0x14, 0x40, 0x86, 0x03, 0xd1, 0x39, 0xbc, 0x19,
++    0xa1, 0x87, 0x02, 0x68, 0x34, 0xa8, 0x13, 0x02,
++    0x69, 0x34, 0x73, 0x13, 0x04, 0x69, 0x54, 0x64,
++    0x87, 0x8b, 0x14, 0x68, 0x54, 0x02, 0x71, 0x34,
++    0x42, 0x86, 0x02, 0xd1, 0x39, 0xa8, 0x13, 0x02,
++    0x45, 0x36, 0x40, 0x86, 0x03, 0x69, 0x54, 0x64,
++    0x87, 0x68, 0x54, 0x03, 0x69, 0x54, 0x64, 0x87,
++    0x69, 0x54, 0x03, 0xce, 0x39, 0x40, 0x86, 0xa1,
++    0x87, 0x02, 0xd8, 0x39, 0x40, 0x86, 0x03, 0xc3,
++    0x33, 0x40, 0x86, 0xa1, 0x87, 0x02, 0x4d, 0x36,
++    0x42, 0x86, 0x02, 0xd1, 0x19, 0x92, 0x16, 0x02,
++    0xd1, 0x39, 0xeb, 0x13, 0x02, 0x68, 0x34, 0xbc,
++    0x14, 0x02, 0xd1, 0x39, 0xbc, 0x14, 0x02, 0x3d,
++    0x39, 0x40, 0x86, 0x02, 0xb8, 0x39, 0x42, 0x86,
++    0x02, 0xa3, 0x36, 0x40, 0x86, 0x02, 0x75, 0x35,
++    0x40, 0x86, 0x02, 0xd8, 0x39, 0x42, 0x86, 0x02,
++    0x69, 0x34, 0x93, 0x13, 0x02, 0x35, 0x39, 0x40,
++    0x86, 0x02, 0x4b, 0x36, 0x40, 0x86, 0x02, 0x3d,
++    0x39, 0x42, 0x86, 0x02, 0x38, 0x39, 0x42, 0x86,
++    0x02, 0xa3, 0x36, 0x42, 0x86, 0x03, 0x69, 0x14,
++    0x67, 0x14, 0x67, 0x14, 0x02, 0xb6, 0x36, 0x40,
++    0x86, 0x02, 0x69, 0x34, 0x7c, 0x13, 0x02, 0x75,
++    0x35, 0x42, 0x86, 0x02, 0xcc, 0x93, 0x40, 0x86,
++    0x02, 0xcc, 0x33, 0x40, 0x86, 0x03, 0xd1, 0x39,
++    0xbd, 0x19, 0xa1, 0x87, 0x02, 0x82, 0x34, 0x40,
++    0x86, 0x02, 0x87, 0x34, 0x40, 0x86, 0x02, 0x69,
++    0x14, 0x3e, 0x13, 0x02, 0xd6, 0x39, 0x40, 0x86,
++    0x02, 0x68, 0x14, 0xbd, 0x19, 0x02, 0x46, 0x36,
++    0x42, 0x86, 0x02, 0x4b, 0x36, 0x42, 0x86, 0x02,
++    0x69, 0x34, 0x2c, 0x15, 0x03, 0xb6, 0x36, 0x42,
++    0x86, 0xa1, 0x87, 0x02, 0xc4, 0x33, 0x40, 0x86,
++    0x02, 0x26, 0x19, 0x40, 0x86, 0x02, 0x69, 0x14,
++    0xb0, 0x19, 0x02, 0xde, 0x19, 0x42, 0x86, 0x02,
++    0x69, 0x34, 0xa8, 0x13, 0x02, 0xcc, 0x33, 0x42,
++    0x86, 0x02, 0x82, 0x34, 0x42, 0x86, 0x02, 0xd1,
++    0x19, 0x93, 0x13, 0x02, 0x81, 0x14, 0x42, 0x86,
++    0x02, 0x69, 0x34, 0x95, 0x86, 0x02, 0x68, 0x34,
++    0xbb, 0x14, 0x02, 0xd1, 0x39, 0xbb, 0x14, 0x02,
++    0x69, 0x34, 0xeb, 0x13, 0x02, 0xd1, 0x39, 0x84,
++    0x13, 0x02, 0x69, 0x34, 0xbc, 0x14, 0x04, 0x69,
++    0x54, 0x64, 0x87, 0x8b, 0x14, 0x69, 0x54, 0x02,
++    0x26, 0x39, 0x40, 0x86, 0x02, 0xb4, 0x36, 0x40,
++    0x86, 0x02, 0x47, 0x16, 0x42, 0x86, 0x02, 0xdc,
++    0x39, 0x40, 0x86, 0x02, 0xca, 0x33, 0x40, 0x86,
++    0x02, 0xf9, 0x26, 0x40, 0x86, 0x02, 0x69, 0x34,
++    0x08, 0x87, 0x03, 0x69, 0x14, 0x69, 0x14, 0x66,
++    0x14, 0x03, 0xd1, 0x59, 0x1d, 0x19, 0xd1, 0x59,
++    0x02, 0xd4, 0x39, 0x40, 0x86, 0x02, 0xcf, 0x39,
++    0x40, 0x86, 0x02, 0x68, 0x34, 0xa4, 0x13, 0x02,
++    0xd1, 0x39, 0xa4, 0x13, 0x02, 0xd1, 0x19, 0xa8,
++    0x13, 0x02, 0xd7, 0x39, 0x42, 0x86, 0x03, 0x69,
++    0x34, 0xbc, 0x19, 0xa1, 0x87, 0x02, 0x68, 0x14,
++    0xb0, 0x19, 0x02, 0x68, 0x14, 0x73, 0x13, 0x04,
++    0x69, 0x14, 0x69, 0x14, 0x66, 0x14, 0x66, 0x14,
++    0x03, 0x68, 0x34, 0xaf, 0x19, 0xa1, 0x87, 0x02,
++    0x68, 0x34, 0x80, 0x16, 0x02, 0x73, 0x34, 0x42,
++    0x86, 0x02, 0xd1, 0x39, 0x80, 0x16, 0x02, 0x68,
++    0x34, 0xb0, 0x19, 0x02, 0x86, 0x34, 0x40, 0x86,
++    0x02, 0x38, 0x19, 0x42, 0x86, 0x02, 0x69, 0x34,
++    0xbb, 0x14, 0x02, 0xb5, 0x36, 0x42, 0x86, 0x02,
++    0xcd, 0x39, 0x40, 0x86, 0x02, 0x68, 0x34, 0x95,
++    0x86, 0x02, 0x68, 0x34, 0x27, 0x15, 0x03, 0x68,
++    0x14, 0x68, 0x14, 0x66, 0x14, 0x02, 0x71, 0x34,
++    0x40, 0x86, 0x02, 0xd1, 0x39, 0x27, 0x15, 0x02,
++    0x2e, 0x16, 0xa8, 0x14, 0x02, 0xc3, 0x33, 0x42,
++    0x86, 0x02, 0x69, 0x14, 0x66, 0x14, 0x02, 0x68,
++    0x34, 0x96, 0x86, 0x02, 0x69, 0x34, 0xa4, 0x13,
++    0x03, 0x69, 0x14, 0x64, 0x87, 0x68, 0x14, 0x02,
++    0xb8, 0x39, 0x40, 0x86, 0x02, 0x68, 0x34, 0x3e,
++    0x13, 0x03, 0xd1, 0x19, 0xaf, 0x19, 0xa1, 0x87,
++    0x02, 0xd1, 0x39, 0x3e, 0x13, 0x02, 0x68, 0x34,
++    0xbd, 0x19, 0x02, 0xd1, 0x19, 0xbb, 0x14, 0x02,
++    0xd1, 0x19, 0x95, 0x86, 0x02, 0xdb, 0x39, 0x42,
++    0x86, 0x02, 0x38, 0x39, 0x40, 0x86, 0x02, 0x69,
++    0x34, 0x80, 0x16, 0x02, 0x69, 0x14, 0xeb, 0x13,
++    0x04, 0x68, 0x14, 0x69, 0x14, 0x67, 0x14, 0x67,
++    0x14, 0x02, 0x77, 0x34, 0x42, 0x86, 0x02, 0x46,
++    0x36, 0x40, 0x86, 0x02, 0x68, 0x34, 0x92, 0x16,
++    0x02, 0x4e, 0x36, 0x42, 0x86, 0x03, 0x69, 0x14,
++    0xbd, 0x19, 0xa1, 0x87, 0x02, 0xde, 0x19, 0x40,
++    0x86, 0x02, 0x69, 0x34, 0x27, 0x15, 0x03, 0xc3,
++    0x13, 0x40, 0x86, 0xa1, 0x87, 0x02, 0x81, 0x14,
++    0x40, 0x86, 0x03, 0xd1, 0x39, 0xaf, 0x19, 0xa1,
++    0x87, 0x02, 0x68, 0x34, 0xbc, 0x19, 0x02, 0xd1,
++    0x19, 0x80, 0x16, 0x02, 0xd9, 0x39, 0x42, 0x86,
++    0x02, 0xd1, 0x39, 0xbc, 0x19, 0x02, 0xdc, 0x19,
++    0x42, 0x86, 0x02, 0x68, 0x34, 0x73, 0x13, 0x02,
++    0x69, 0x34, 0x3e, 0x13, 0x02, 0x47, 0x16, 0x40,
++    0x86, 0x02, 0xd1, 0x39, 0xbd, 0x19, 0x02, 0x3e,
++    0x39, 0x42, 0x86, 0x02, 0x69, 0x14, 0x95, 0x86,
++    0x02, 0x68, 0x14, 0x96, 0x86, 0x03, 0x69, 0x34,
++    0xbd, 0x19, 0xa1, 0x87, 0x02, 0xd7, 0x39, 0x40,
++    0x86, 0x02, 0x45, 0x16, 0x42, 0x86, 0x02, 0x68,
++    0x34, 0xed, 0x13, 0x03, 0x68, 0x34, 0xbc, 0x19,
++    0xa1, 0x87, 0x02, 0xd1, 0x39, 0xed, 0x13, 0x02,
++    0xd1, 0x39, 0x92, 0x16, 0x02, 0x73, 0x34, 0x40,
++    0x86, 0x02, 0x38, 0x19, 0x40, 0x86, 0x02, 0xb5,
++    0x36, 0x40, 0x86, 0x02, 0x68, 0x34, 0xaf, 0x19,
++    0x02, 0xd1, 0x39, 0xaf, 0x19, 0x02, 0x69, 0x34,
++    0xbc, 0x19, 0x02, 0xb6, 0x16, 0x42, 0x86, 0x02,
++    0x26, 0x14, 0x25, 0x15, 0x02, 0xc3, 0x33, 0x40,
++    0x86, 0x02, 0xdd, 0x39, 0x42, 0x86, 0x02, 0xcb,
++    0x93, 0x42, 0x86, 0x02, 0xcb, 0x33, 0x42, 0x86,
++    0x02, 0x81, 0x34, 0x42, 0x86, 0x02, 0xce, 0x39,
++    0xa1, 0x87, 0x02, 0xdb, 0x39, 0x40, 0x86, 0x02,
++    0x68, 0x34, 0x08, 0x87, 0x02, 0xd1, 0x19, 0xb0,
++    0x19, 0x02, 0x77, 0x34, 0x40, 0x86, 0x02, 0x4e,
++    0x36, 0x40, 0x86, 0x02, 0xce, 0x39, 0x42, 0x86,
++    0x02, 0x4e, 0x16, 0x42, 0x86, 0x02, 0xd9, 0x39,
++    0x40, 0x86, 0x02, 0xdc, 0x19, 0x40, 0x86, 0x02,
++    0x3e, 0x39, 0x40, 0x86, 0x02, 0xb9, 0x39, 0x42,
++    0x86, 0x02, 0xda, 0x19, 0x42, 0x86, 0x02, 0x42,
++    0x16, 0x94, 0x81, 0x02, 0x45, 0x16, 0x40, 0x86,
++    0x02, 0x69, 0x14, 0xbd, 0x19, 0x02, 0x70, 0x34,
++    0x42, 0x86, 0x02, 0xce, 0x19, 0xa1, 0x87, 0x02,
++    0xc3, 0x13, 0x42, 0x86, 0x02, 0x68, 0x14, 0x08,
++    0x87, 0x02, 0xd1, 0x19, 0x7c, 0x13, 0x02, 0x68,
++    0x14, 0x92, 0x16, 0x02, 0xb6, 0x16, 0x40, 0x86,
++    0x02, 0x37, 0x39, 0x42, 0x86, 0x03, 0xce, 0x19,
++    0x42, 0x86, 0xa1, 0x87, 0x03, 0x68, 0x14, 0x67,
++    0x14, 0x67, 0x14, 0x02, 0xdd, 0x39, 0x40, 0x86,
++    0x02, 0xcf, 0x19, 0x42, 0x86, 0x02, 0xd1, 0x19,
++    0x2c, 0x15, 0x02, 0x4b, 0x13, 0xe9, 0x17, 0x02,
++    0x68, 0x14, 0x67, 0x14, 0x02, 0xcb, 0x93, 0x40,
++    0x86, 0x02, 0x6e, 0x34, 0x42, 0x86, 0x02, 0xcb,
++    0x33, 0x40, 0x86, 0x02, 0x81, 0x34, 0x40, 0x86,
++    0x02, 0xb6, 0x36, 0xa1, 0x87, 0x02, 0x45, 0x36,
++    0x42, 0x86, 0x02, 0xb4, 0x16, 0x42, 0x86, 0x02,
++    0x69, 0x14, 0x73, 0x13, 0x04, 0x69, 0x14, 0x69,
++    0x14, 0x67, 0x14, 0x66, 0x14, 0x02, 0x35, 0x39,
++    0x42, 0x86, 0x02, 0x68, 0x14, 0x93, 0x13, 0x02,
++    0xb6, 0x36, 0x42, 0x86, 0x03, 0x68, 0x14, 0x69,
++    0x14, 0x66, 0x14, 0x02, 0xce, 0x39, 0x40, 0x86,
++    0x02, 0x4e, 0x16, 0x40, 0x86, 0x02, 0x87, 0x34,
++    0x42, 0x86, 0x02, 0x86, 0x14, 0x42, 0x86, 0x02,
++    0xd6, 0x39, 0x42, 0x86, 0x02, 0xc4, 0x33, 0x42,
++    0x86, 0x02, 0x69, 0x34, 0x96, 0x86, 0x02, 0xb9,
++    0x39, 0x40, 0x86, 0x02, 0x68, 0x14, 0xa8, 0x13,
++    0x02, 0xd1, 0x19, 0x84, 0x13, 0x02, 0xda, 0x19,
++    0x40, 0x86, 0x02, 0xd8, 0x19, 0x42, 0x86, 0x02,
++    0xc3, 0x13, 0x40, 0x86, 0x02, 0xb9, 0x19, 0x42,
++    0x86, 0x02, 0x3d, 0x19, 0x42, 0x86, 0x02, 0xcf,
++    0x19, 0x40, 0x86, 0x04, 0x68, 0x14, 0x68, 0x14,
++    0x67, 0x14, 0x67, 0x14, 0x03, 0xd1, 0x19, 0xd1,
++    0x19, 0xd2, 0x19, 0x02, 0x68, 0x14, 0xbb, 0x14,
++    0x02, 0x3b, 0x14, 0x44, 0x87, 0x02, 0xd1, 0x19,
++    0x27, 0x15, 0x02, 0xb4, 0x16, 0x40, 0x86, 0x02,
++    0xcd, 0x19, 0x42, 0x86, 0x02, 0xd3, 0x86, 0xa5,
++    0x14, 0x02, 0x70, 0x14, 0x42, 0x86, 0x03, 0xb6,
++    0x16, 0x42, 0x86, 0xa1, 0x87, 0x04, 0x69, 0x14,
++    0x64, 0x87, 0x8b, 0x14, 0x69, 0x14, 0x02, 0x36,
++    0x16, 0x2b, 0x93, 0x02, 0x68, 0x14, 0x80, 0x16,
++    0x02, 0x86, 0x14, 0x40, 0x86, 0x02, 0x08, 0x14,
++    0x1b, 0x0b, 0x02, 0xd1, 0x19, 0xbc, 0x19, 0x02,
++    0xca, 0x13, 0x42, 0x86, 0x02, 0x41, 0x94, 0xe8,
++    0x95, 0x02, 0xd8, 0x19, 0x40, 0x86, 0x02, 0xb9,
++    0x19, 0x40, 0x86, 0x02, 0xd1, 0x19, 0xed, 0x13,
++    0x02, 0xf9, 0x86, 0x42, 0x86, 0x03, 0xd1, 0x19,
++    0xbd, 0x19, 0xa1, 0x87, 0x02, 0x3d, 0x19, 0x40,
++    0x86, 0x02, 0xd6, 0x19, 0x42, 0x86, 0x03, 0x69,
++    0x14, 0x66, 0x14, 0x66, 0x14, 0x02, 0xd1, 0x19,
++    0xaf, 0x19, 0x03, 0x69, 0x14, 0x69, 0x14, 0x67,
++    0x14, 0x02, 0xcd, 0x19, 0x40, 0x86, 0x02, 0x70,
++    0x14, 0x40, 0x86, 0x03, 0x68, 0x14, 0xbc, 0x19,
++    0xa1, 0x87, 0x02, 0x6e, 0x14, 0x42, 0x86, 0x02,
++    0x69, 0x14, 0x92, 0x16, 0x03, 0x68, 0x14, 0x68,
++    0x14, 0x67, 0x14, 0x02, 0x69, 0x14, 0x67, 0x14,
++    0x02, 0x75, 0x95, 0x42, 0x86, 0x03, 0x69, 0x14,
++    0x64, 0x87, 0x69, 0x14, 0x02, 0xd1, 0x19, 0xbc,
++    0x14, 0x02, 0xdf, 0x19, 0x42, 0x86, 0x02, 0xca,
++    0x13, 0x40, 0x86, 0x02, 0x82, 0x14, 0x42, 0x86,
++    0x02, 0x69, 0x14, 0x93, 0x13, 0x02, 0x68, 0x14,
++    0x7c, 0x13, 0x02, 0xf9, 0x86, 0x40, 0x86, 0x02,
++    0xd6, 0x19, 0x40, 0x86, 0x02, 0x68, 0x14, 0x2c,
++    0x15, 0x02, 0x69, 0x14, 0xa8, 0x13, 0x02, 0xd4,
++    0x19, 0x42, 0x86, 0x04, 0x68, 0x14, 0x69, 0x14,
++    0x66, 0x14, 0x66, 0x14, 0x02, 0x77, 0x14, 0x42,
++    0x86, 0x02, 0x39, 0x19, 0x42, 0x86, 0x02, 0xd1,
++    0x19, 0xa4, 0x13, 0x02, 0x6e, 0x14, 0x40, 0x86,
++    0x03, 0xd1, 0x19, 0xd2, 0x19, 0xd2, 0x19, 0x02,
++    0x69, 0x14, 0xbb, 0x14, 0x02, 0xd1, 0x19, 0x96,
++    0x86, 0x02, 0x75, 0x95, 0x40, 0x86, 0x04, 0x68,
++    0x14, 0x64, 0x87, 0x8b, 0x14, 0x68, 0x14, 0x02,
++    0xd1, 0x19, 0x3e, 0x13, 0x02, 0xdf, 0x19, 0x40,
++    0x86, 0x02, 0x82, 0x14, 0x40, 0x86, 0x02, 0x44,
++    0x13, 0xeb, 0x17, 0x02, 0xdd, 0x19, 0x42, 0x86,
++    0x02, 0x69, 0x14, 0x80, 0x16, 0x03, 0x68, 0x14,
++    0xaf, 0x19, 0xa1, 0x87, 0x02, 0xa3, 0x16, 0x42,
++    0x86, 0x02, 0x69, 0x14, 0x96, 0x86, 0x02, 0x46,
++    0x16, 0x42, 0x86, 0x02, 0xb6, 0x16, 0xa1, 0x87,
++    0x02, 0x68, 0x14, 0x27, 0x15, 0x02, 0x26, 0x14,
++    0x1b, 0x0b, 0x02, 0xd4, 0x19, 0x40, 0x86, 0x02,
++    0x77, 0x14, 0x40, 0x86, 0x02, 0x39, 0x19, 0x40,
++    0x86, 0x02, 0x37, 0x19, 0x42, 0x86, 0x03, 0x69,
++    0x14, 0x67, 0x14, 0x66, 0x14, 0x03, 0xc3, 0x13,
++    0x42, 0x86, 0xa1, 0x87, 0x02, 0x68, 0x14, 0xbc,
++    0x19, 0x02, 0xd1, 0x19, 0xeb, 0x13, 0x04, 0x69,
++    0x14, 0x69, 0x14, 0x67, 0x14, 0x67, 0x14, 0x02,
++    0xd1, 0x19, 0x08, 0x87, 0x02, 0x68, 0x14, 0xed,
++    0x13, 0x03, 0x69, 0x14, 0xbc, 0x19, 0xa1, 0x87,
++    0x02, 0xdd, 0x19, 0x40, 0x86, 0x02, 0xc3, 0x13,
++    0xa1, 0x87, 0x03, 0x68, 0x14, 0x66, 0x14, 0x66,
++    0x14, 0x03, 0x68, 0x14, 0x69, 0x14, 0x67, 0x14,
++    0x02, 0xa3, 0x16, 0x40, 0x86, 0x02, 0xdb, 0x19,
++    0x42, 0x86, 0x02, 0x68, 0x14, 0xaf, 0x19, 0x02,
++    0x46, 0x16, 0x40, 0x86, 0x02, 0x35, 0x16, 0xab,
++    0x14, 0x02, 0x68, 0x14, 0x95, 0x86, 0x02, 0x42,
++    0x16, 0x95, 0x81, 0x02, 0xc4, 0x13, 0x42, 0x86,
++    0x02, 0x15, 0x14, 0xba, 0x19, 0x02, 0x69, 0x14,
++    0x08, 0x87, 0x03, 0xd1, 0x19, 0x1d, 0x19, 0xd1,
++    0x19, 0x02, 0x69, 0x14, 0x7c, 0x13, 0x02, 0x37,
++    0x19, 0x40, 0x86, 0x02, 0x73, 0x14, 0x42, 0x86,
++    0x02, 0x69, 0x14, 0x2c, 0x15, 0x02, 0xb5, 0x16,
++    0x42, 0x86, 0x02, 0x35, 0x19, 0x42, 0x86, 0x04,
++    0x68, 0x14, 0x69, 0x14, 0x67, 0x14, 0x66, 0x14,
++    0x02, 0x64, 0x87, 0x25, 0x15, 0x02, 0x64, 0x87,
++    0x79, 0x1a, 0x02, 0x68, 0x14, 0xbc, 0x14, 0x03,
++    0xce, 0x19, 0x40, 0x86, 0xa1, 0x87, 0x02, 0x87,
++    0x14, 0x42, 0x86, 0x02, 0x4d, 0x16, 0x42, 0x86,
++    0x04, 0x68, 0x14, 0x68, 0x14, 0x66, 0x14, 0x66,
++    0x14, 0x02, 0xdb, 0x19, 0x40, 0x86, 0x02, 0xd9,
++    0x19, 0x42, 0x86, 0x02, 0xc4, 0x13, 0x40, 0x86,
++    0x02, 0xd1, 0x19, 0xbd, 0x19, 0x02, 0x68, 0x14,
++    0xa4, 0x13, 0x02, 0x3e, 0x19, 0x42, 0x86, 0x02,
++    0xf3, 0x93, 0xa7, 0x86, 0x03, 0x69, 0x14, 0xaf,
++    0x19, 0xa1, 0x87, 0x02, 0xf3, 0x93, 0x08, 0x13,
++    0x02, 0xd1, 0x19, 0xd2, 0x19, 0x02, 0x73, 0x14,
++    0x40, 0x86, 0x02, 0xb5, 0x16, 0x40, 0x86, 0x02,
++    0x35, 0x19, 0x40, 0x86, 0x02, 0x69, 0x14, 0x27,
++    0x15, 0x02, 0xce, 0x19, 0x42, 0x86, 0x02, 0x71,
++    0x14, 0x42, 0x86, 0x02, 0xd1, 0x19, 0x73, 0x13,
++    0x02, 0x68, 0x14, 0x3e, 0x13, 0x02, 0xf4, 0x13,
++    0x20, 0x86, 0x02, 0x87, 0x14, 0x40, 0x86, 0x03,
++    0xb6, 0x16, 0x40, 0x86, 0xa1, 0x87, 0x02, 0x4d,
++    0x16, 0x40, 0x86, 0x02, 0x69, 0x14, 0xbc, 0x19,
++    0x02, 0x4b, 0x16, 0x42, 0x86, 0x02, 0xd9, 0x19,
++    0x40, 0x86, 0x02, 0x3e, 0x19, 0x40, 0x86, 0x02,
++    0x69, 0x14, 0xed, 0x13, 0x02, 0xd7, 0x19, 0x42,
++    0x86, 0x02, 0xb8, 0x19, 0x42, 0x86, 0x03, 0x68,
++    0x14, 0x67, 0x14, 0x66, 0x14, 0x02, 0x3c, 0x19,
++    0x42, 0x86, 0x02, 0x68, 0x14, 0x66, 0x14, 0x03,
++    0x68, 0x14, 0x64, 0x87, 0x68, 0x14, 0x02, 0x69,
++    0x14, 0xaf, 0x19, 0x02, 0xce, 0x19, 0x40, 0x86,
++    0x02, 0x71, 0x14, 0x40, 0x86, 0x02, 0x68, 0x14,
++    0xeb, 0x13, 0x03, 0x68, 0x14, 0xbd, 0x19, 0xa1,
++    0x87, 0x02, 0x6f, 0x14, 0x42, 0x86, 0x04, 0xd1,
++    0x19, 0xd1, 0x19, 0xd2, 0x19, 0xd2, 0x19, 0x02,
++    0x69, 0x14, 0xbc, 0x14, 0x02, 0xcc, 0x93, 0x42,
++    0x86, 0x02, 0x4b, 0x16, 0x40, 0x86, 0x02, 0x26,
++    0x19, 0x42, 0x86, 0x02, 0xd7, 0x19, 0x40, 0x86,
++};
++
+ #endif /* CONFIG_ALL_UNICODE */
+-/* 64 tables / 33442 bytes, 5 index / 351 bytes */
++/* 71 tables / 36311 bytes, 5 index / 351 bytes */
+diff --git a/libunicode.c b/libunicode.c
+index d1bf1e91c..b4a02062c 100644
+--- a/libunicode.c
++++ b/libunicode.c
+@@ -499,6 +499,9 @@ int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
+         case CR_OP_XOR:
+             is_in = (a_idx & 1) ^ (b_idx & 1);
+             break;
++        case CR_OP_SUB:
++            is_in = (a_idx & 1) & ((b_idx & 1) ^ 1);
++            break;
+         default:
+             abort();
+         }
+@@ -511,14 +514,14 @@ int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
+     return 0;
+ }
+ 
+-int cr_union1(CharRange *cr, const uint32_t *b_pt, int b_len)
++int cr_op1(CharRange *cr, const uint32_t *b_pt, int b_len, int op)
+ {
+     CharRange a = *cr;
+     int ret;
+     cr->len = 0;
+     cr->size = 0;
+     cr->points = NULL;
+-    ret = cr_op(cr, a.points, a.len, b_pt, b_len, CR_OP_UNION);
++    ret = cr_op(cr, a.points, a.len, b_pt, b_len, op);
+     cr_free(&a);
+     return ret;
+ }
+@@ -1554,6 +1557,7 @@ static int unicode_prop_ops(CharRange *cr, ...)
+                 cr2 = &stack[stack_len - 1];
+                 cr3 = &stack[stack_len++];
+                 cr_init(cr3, cr->mem_opaque, cr->realloc_func);
++                /* CR_OP_XOR may be used here */
+                 if (cr_op(cr3, cr1->points, cr1->len,
+                           cr2->points, cr2->len, op - POP_UNION + CR_OP_UNION))
+                     goto fail;
+@@ -1908,3 +1912,210 @@ BOOL lre_is_space_non_ascii(uint32_t c)
+     }
+     return FALSE;
+ }
++
++#define SEQ_MAX_LEN 16
++
++static int unicode_sequence_prop1(int seq_prop_idx, UnicodeSequencePropCB *cb, void *opaque,
++                                  CharRange *cr)
++{
++    int i, c, j;
++    uint32_t seq[SEQ_MAX_LEN];
++    
++    switch(seq_prop_idx) {
++    case UNICODE_SEQUENCE_PROP_Basic_Emoji:
++        if (unicode_prop1(cr, UNICODE_PROP_Basic_Emoji1) < 0)
++            return -1;
++        for(i = 0; i < cr->len; i += 2) {
++            for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
++                seq[0] = c;
++                cb(opaque, seq, 1);
++            }
++        }
++
++        cr->len = 0;
++
++        if (unicode_prop1(cr, UNICODE_PROP_Basic_Emoji2) < 0)
++            return -1;
++        for(i = 0; i < cr->len; i += 2) {
++            for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
++                seq[0] = c;
++                seq[1] = 0xfe0f;
++                cb(opaque, seq, 2);
++            }
++        }
++
++        break;
++    case UNICODE_SEQUENCE_PROP_RGI_Emoji_Modifier_Sequence:
++        if (unicode_prop1(cr, UNICODE_PROP_Emoji_Modifier_Base) < 0)
++            return -1;
++        for(i = 0; i < cr->len; i += 2) {
++            for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
++                for(j = 0; j < 5; j++) {
++                    seq[0] = c;
++                    seq[1] = 0x1f3fb + j;
++                    cb(opaque, seq, 2);
++                }
++            }
++        }
++        break;
++    case UNICODE_SEQUENCE_PROP_RGI_Emoji_Flag_Sequence:
++        if (unicode_prop1(cr, UNICODE_PROP_RGI_Emoji_Flag_Sequence) < 0)
++            return -1;
++        for(i = 0; i < cr->len; i += 2) {
++            for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
++                int c0, c1;
++                c0 = c / 26;
++                c1 = c % 26;
++                seq[0] = 0x1F1E6 + c0;
++                seq[1] = 0x1F1E6 + c1;
++                cb(opaque, seq, 2);
++            }
++        }
++        break;
++    case UNICODE_SEQUENCE_PROP_RGI_Emoji_ZWJ_Sequence:
++        {
++            int len, code, pres, k, mod, mod_count, mod_pos[2], hc_pos, n_mod, n_hc, mod1;
++            int mod_idx, hc_idx, i0, i1;
++            const uint8_t *tab = unicode_rgi_emoji_zwj_sequence;
++            
++            for(i = 0; i < countof(unicode_rgi_emoji_zwj_sequence);) {
++                len = tab[i++];
++                k = 0;
++                mod = 0;
++                mod_count = 0;
++                hc_pos = -1;
++                for(j = 0; j < len; j++) {
++                    code = tab[i++];
++                    code |= tab[i++] << 8;
++                    pres = code >> 15;
++                    mod1 = (code >> 13) & 3;
++                    code &= 0x1fff;
++                    if (code < 0x1000) {
++                        c = code + 0x2000;
++                    } else {
++                        c = 0x1f000 + (code - 0x1000);
++                    }
++                    if (c == 0x1f9b0)
++                        hc_pos = k;
++                    seq[k++] = c;
++                    if (mod1 != 0) {
++                        assert(mod_count < 2);
++                        mod = mod1;
++                        mod_pos[mod_count++] = k;
++                        seq[k++] = 0; /* will be filled later */
++                    }
++                    if (pres) {
++                        seq[k++] = 0xfe0f;
++                    }
++                    if (j < len - 1) {
++                        seq[k++] = 0x200d;
++                    }
++                }
++
++                /* genrate all the variants */
++                switch(mod) {
++                case 1:
++                    n_mod = 5;
++                    break;
++                case 2:
++                    n_mod = 25;
++                    break;
++                case 3:
++                    n_mod = 20;
++                    break;
++                default:
++                    n_mod = 1;
++                    break;
++                }
++                if (hc_pos >= 0)
++                    n_hc = 4;
++                else
++                    n_hc = 1;
++                for(hc_idx = 0; hc_idx < n_hc; hc_idx++) {
++                    for(mod_idx = 0; mod_idx < n_mod; mod_idx++) {
++                        if (hc_pos >= 0)
++                            seq[hc_pos] = 0x1f9b0 + hc_idx;
++                        
++                        switch(mod) {
++                        case 1:
++                            seq[mod_pos[0]] = 0x1f3fb + mod_idx;
++                            break;
++                        case 2:
++                        case 3:
++                            i0 = mod_idx / 5;
++                            i1 = mod_idx % 5;
++                            /* avoid identical values */
++                            if (mod == 3 && i0 >= i1)
++                                i0++;
++                            seq[mod_pos[0]] = 0x1f3fb + i0;
++                            seq[mod_pos[1]] = 0x1f3fb + i1;
++                            break;
++                        default:
++                            break;
++                        }
++#if 0
++                        for(j = 0; j < k; j++)
++                            printf(" %04x", seq[j]);
++                        printf("\n");
++#endif                
++                        cb(opaque, seq, k);
++                    }
++                }
++            }
++        }
++        break;
++    case UNICODE_SEQUENCE_PROP_RGI_Emoji_Tag_Sequence:
++        {
++            for(i = 0; i < countof(unicode_rgi_emoji_tag_sequence);) {
++                j = 0;
++                seq[j++] = 0x1F3F4;
++                for(;;) {
++                    c = unicode_rgi_emoji_tag_sequence[i++];
++                    if (c == 0x00)
++                        break;
++                    seq[j++] = 0xe0000 + c;
++                }
++                seq[j++] = 0xe007f;
++                cb(opaque, seq, j);
++            }
++        }
++        break;
++    case UNICODE_SEQUENCE_PROP_Emoji_Keycap_Sequence:
++        if (unicode_prop1(cr, UNICODE_PROP_Emoji_Keycap_Sequence) < 0)
++            return -1;
++        for(i = 0; i < cr->len; i += 2) {
++            for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
++                seq[0] = c;
++                seq[1] = 0xfe0f;
++                seq[2] = 0x20e3;
++                cb(opaque, seq, 3);
++            }
++        }
++        break;
++    case UNICODE_SEQUENCE_PROP_RGI_Emoji:
++        /* all prevous sequences */
++        for(i = UNICODE_SEQUENCE_PROP_Basic_Emoji; i <= UNICODE_SEQUENCE_PROP_RGI_Emoji_ZWJ_Sequence; i++) {
++            int ret;
++            ret = unicode_sequence_prop1(i, cb, opaque, cr);
++            if (ret < 0)
++                return ret;
++            cr->len = 0;
++        }
++        break;
++    default:
++        return -2;
++    }
++    return 0;
++}
++
++/* build a unicode sequence property */
++/* return -2 if not found, -1 if other error. 'cr' is used as temporary memory. */
++int unicode_sequence_prop(const char *prop_name, UnicodeSequencePropCB *cb, void *opaque,
++                          CharRange *cr)
++{
++    int seq_prop_idx;
++    seq_prop_idx = unicode_find_name(unicode_sequence_prop_name_table, prop_name);
++    if (seq_prop_idx < 0)
++        return -2;
++    return unicode_sequence_prop1(seq_prop_idx, cb, opaque, cr);
++}
+diff --git a/libunicode.h b/libunicode.h
+index cc2f244c7..5d964e40f 100644
+--- a/libunicode.h
++++ b/libunicode.h
+@@ -45,6 +45,7 @@ typedef enum {
+     CR_OP_UNION,
+     CR_OP_INTER,
+     CR_OP_XOR,
++    CR_OP_SUB,
+ } CharRangeOpEnum;
+ 
+ void cr_init(CharRange *cr, void *mem_opaque, void *(*realloc_func)(void *opaque, void *ptr, size_t size));
+@@ -73,19 +74,18 @@ static inline int cr_add_interval(CharRange *cr, uint32_t c1, uint32_t c2)
+     return 0;
+ }
+ 
+-int cr_union1(CharRange *cr, const uint32_t *b_pt, int b_len);
++int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
++          const uint32_t *b_pt, int b_len, int op);
++int cr_op1(CharRange *cr, const uint32_t *b_pt, int b_len, int op);
+ 
+ static inline int cr_union_interval(CharRange *cr, uint32_t c1, uint32_t c2)
+ {
+     uint32_t b_pt[2];
+     b_pt[0] = c1;
+     b_pt[1] = c2 + 1;
+-    return cr_union1(cr, b_pt, 2);
++    return cr_op1(cr, b_pt, 2, CR_OP_UNION);
+ }
+ 
+-int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
+-          const uint32_t *b_pt, int b_len, int op);
+-
+ int cr_invert(CharRange *cr);
+ 
+ int cr_regexp_canonicalize(CharRange *cr, int is_unicode);
+@@ -107,6 +107,10 @@ int unicode_script(CharRange *cr, const char *script_name, int is_ext);
+ int unicode_general_category(CharRange *cr, const char *gc_name);
+ int unicode_prop(CharRange *cr, const char *prop_name);
+ 
++typedef void UnicodeSequencePropCB(void *opaque, const uint32_t *buf, int len);
++int unicode_sequence_prop(const char *prop_name, UnicodeSequencePropCB *cb, void *opaque,
++                          CharRange *cr);
++
+ int lre_case_conv(uint32_t *res, uint32_t c, int conv_type);
+ int lre_canonicalize(uint32_t c, int is_unicode);
+ 
+diff --git a/quickjs-atom.h b/quickjs-atom.h
+index 5e46d1b24..425c2e909 100644
+--- a/quickjs-atom.h
++++ b/quickjs-atom.h
+@@ -177,6 +177,12 @@ DEF(minus_zero, "-0")
+ DEF(Infinity, "Infinity")
+ DEF(minus_Infinity, "-Infinity")
+ DEF(NaN, "NaN")
++DEF(hasIndices, "hasIndices")
++DEF(ignoreCase, "ignoreCase")
++DEF(multiline, "multiline")
++DEF(dotAll, "dotAll")
++DEF(sticky, "sticky")
++DEF(unicodeSets, "unicodeSets")
+ /* the following 3 atoms are only used with CONFIG_ATOMICS */
+ DEF(not_equal, "not-equal")
+ DEF(timed_out, "timed-out")
+diff --git a/quickjs.c b/quickjs.c
+index 611997584..49a8f7913 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -44179,6 +44179,9 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
+             case 'u':
+                 mask = LRE_FLAG_UNICODE;
+                 break;
++            case 'v':
++                mask = LRE_FLAG_UNICODE_SETS;
++                break;
+             case 'y':
+                 mask = LRE_FLAG_STICKY;
+                 break;
+@@ -44188,14 +44191,20 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
+             if ((re_flags & mask) != 0) {
+             bad_flags:
+                 JS_FreeCString(ctx, str);
+-                return JS_ThrowSyntaxError(ctx, "invalid regular expression flags");
++                goto bad_flags1;
+             }
+             re_flags |= mask;
+         }
+         JS_FreeCString(ctx, str);
+     }
+ 
+-    str = JS_ToCStringLen2(ctx, &len, pattern, !(re_flags & LRE_FLAG_UNICODE));
++    /* 'u' and 'v' cannot be both set */
++    if ((re_flags & LRE_FLAG_UNICODE_SETS) && (re_flags & LRE_FLAG_UNICODE)) {
++    bad_flags1:
++        return JS_ThrowSyntaxError(ctx, "invalid regular expression flags");
++    }
++    
++    str = JS_ToCStringLen2(ctx, &len, pattern, !(re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)));
+     if (!str)
+         return JS_EXCEPTION;
+     re_bytecode_buf = lre_compile(&re_bytecode_len, error_msg,
+@@ -44499,49 +44508,34 @@ static JSValue js_regexp_get_flag(JSContext *ctx, JSValueConst this_val, int mas
+     return JS_NewBool(ctx, flags & mask);
+ }
+ 
++#define RE_FLAG_COUNT 8
++
+ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
+ {
+-    char str[8], *p = str;
+-    int res;
+-
++    char str[RE_FLAG_COUNT], *p = str;
++    int res, i;
++    static const int flag_atom[RE_FLAG_COUNT] = {
++        JS_ATOM_hasIndices,
++        JS_ATOM_global,
++        JS_ATOM_ignoreCase,
++        JS_ATOM_multiline,
++        JS_ATOM_dotAll,
++        JS_ATOM_unicode,
++        JS_ATOM_unicodeSets,
++        JS_ATOM_sticky,
++    };
++    static const char flag_char[RE_FLAG_COUNT] = { 'd', 'g', 'i', 'm', 's', 'u', 'v', 'y' };
++    
+     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
+         return JS_ThrowTypeErrorNotAnObject(ctx);
+ 
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "hasIndices"));
+-    if (res < 0)
+-        goto exception;
+-    if (res)
+-        *p++ = 'd';
+-    res = JS_ToBoolFree(ctx, JS_GetProperty(ctx, this_val, JS_ATOM_global));
+-    if (res < 0)
+-        goto exception;
+-    if (res)
+-        *p++ = 'g';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "ignoreCase"));
+-    if (res < 0)
+-        goto exception;
+-    if (res)
+-        *p++ = 'i';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "multiline"));
+-    if (res < 0)
+-        goto exception;
+-    if (res)
+-        *p++ = 'm';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "dotAll"));
+-    if (res < 0)
+-        goto exception;
+-    if (res)
+-        *p++ = 's';
+-    res = JS_ToBoolFree(ctx, JS_GetProperty(ctx, this_val, JS_ATOM_unicode));
+-    if (res < 0)
+-        goto exception;
+-    if (res)
+-        *p++ = 'u';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "sticky"));
+-    if (res < 0)
+-        goto exception;
+-    if (res)
+-        *p++ = 'y';
++    for(i = 0; i < RE_FLAG_COUNT; i++) {
++        res = JS_ToBoolFree(ctx, JS_GetProperty(ctx, this_val, flag_atom[i]));
++        if (res < 0)
++            goto exception;
++        if (res)
++            *p++ = flag_char[i];
++    }
+     return JS_NewStringLen(ctx, str, p - str);
+ 
+ exception:
+@@ -45026,14 +45020,12 @@ static JSValue js_regexp_Symbol_match(JSContext *ctx, JSValueConst this_val,
+         goto exception;
+     p = JS_VALUE_GET_STRING(flags);
+ 
+-    // TODO(bnoordhuis) query 'u' flag the same way?
+     global = (-1 != string_indexof_char(p, 'g', 0));
+     if (!global) {
+         A = JS_RegExpExec(ctx, rx, S);
+     } else {
+-        fullUnicode = JS_ToBoolFree(ctx, JS_GetProperty(ctx, rx, JS_ATOM_unicode));
+-        if (fullUnicode < 0)
+-            goto exception;
++        fullUnicode = (string_indexof_char(p, 'u', 0) >= 0 ||
++                       string_indexof_char(p, 'v', 0) >= 0);
+ 
+         if (JS_SetProperty(ctx, rx, JS_ATOM_lastIndex, JS_NewInt32(ctx, 0)) < 0)
+             goto exception;
+@@ -45217,7 +45209,8 @@ static JSValue js_regexp_Symbol_matchAll(JSContext *ctx, JSValueConst this_val,
+     it->iterated_string = S;
+     strp = JS_VALUE_GET_STRING(flags);
+     it->global = string_indexof_char(strp, 'g', 0) >= 0;
+-    it->unicode = string_indexof_char(strp, 'u', 0) >= 0;
++    it->unicode = (string_indexof_char(strp, 'u', 0) >= 0 ||
++                   string_indexof_char(strp, 'v', 0) >= 0);
+     it->done = FALSE;
+     JS_SetOpaque(iter, it);
+ 
+@@ -45364,13 +45357,11 @@ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
+         goto exception;
+     p = JS_VALUE_GET_STRING(flags);
+ 
+-    // TODO(bnoordhuis) query 'u' flag the same way?
+     fullUnicode = 0;
+     is_global = (-1 != string_indexof_char(p, 'g', 0));
+     if (is_global) {
+-        fullUnicode = JS_ToBoolFree(ctx, JS_GetProperty(ctx, rx, JS_ATOM_unicode));
+-        if (fullUnicode < 0)
+-            goto exception;
++        fullUnicode = (string_indexof_char(p, 'u', 0) >= 0 ||
++                       string_indexof_char(p, 'v', 0) >= 0);
+         if (JS_SetProperty(ctx, rx, JS_ATOM_lastIndex, JS_NewInt32(ctx, 0)) < 0)
+             goto exception;
+     }
+@@ -45596,7 +45587,8 @@ static JSValue js_regexp_Symbol_split(JSContext *ctx, JSValueConst this_val,
+     if (JS_IsException(flags))
+         goto exception;
+     strp = JS_VALUE_GET_STRING(flags);
+-    unicodeMatching = string_indexof_char(strp, 'u', 0) >= 0;
++    unicodeMatching = (string_indexof_char(strp, 'u', 0) >= 0 ||
++                       string_indexof_char(strp, 'v', 0) >= 0);
+     if (string_indexof_char(strp, 'y', 0) < 0) {
+         flags = JS_ConcatString3(ctx, "", flags, "y");
+         if (JS_IsException(flags))
+@@ -45707,6 +45699,7 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
+     JS_CGETSET_MAGIC_DEF("multiline", js_regexp_get_flag, NULL, LRE_FLAG_MULTILINE ),
+     JS_CGETSET_MAGIC_DEF("dotAll", js_regexp_get_flag, NULL, LRE_FLAG_DOTALL ),
+     JS_CGETSET_MAGIC_DEF("unicode", js_regexp_get_flag, NULL, LRE_FLAG_UNICODE ),
++    JS_CGETSET_MAGIC_DEF("unicodeSets", js_regexp_get_flag, NULL, LRE_FLAG_UNICODE_SETS ),
+     JS_CGETSET_MAGIC_DEF("sticky", js_regexp_get_flag, NULL, LRE_FLAG_STICKY ),
+     JS_CGETSET_MAGIC_DEF("hasIndices", js_regexp_get_flag, NULL, LRE_FLAG_INDICES ),
+     JS_CFUNC_DEF("exec", 1, js_regexp_exec ),
+diff --git a/test262.conf b/test262.conf
+index 2781015b1..569211272 100644
+--- a/test262.conf
++++ b/test262.conf
+@@ -180,7 +180,7 @@ regexp-match-indices
+ regexp-modifiers=skip
+ regexp-named-groups
+ regexp-unicode-property-escapes
+-regexp-v-flag=skip
++regexp-v-flag
+ RegExp.escape
+ resizable-arraybuffer=skip
+ rest-parameters
+@@ -250,32 +250,6 @@ test262/test/built-ins/ThrowTypeError/unique-per-realm-function-proto.js
+ #test262/test/built-ins/RegExp/CharacterClassEscapes/
+ #test262/test/built-ins/RegExp/property-escapes/
+ 
+-# feature regexp-v-flag is missing in the tests
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-digit-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-digit-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-digit-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-digit-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-word-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-word-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-word-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-non-word-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-word-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-word-class-escape-negative-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-word-class-escape-positive-cases.js
+-test262/test/built-ins/RegExp/CharacterClassEscapes/character-class-word-class-escape-positive-cases.js
+-
+ # not yet in official specification
+ test262/test/built-ins/String/prototype/match/cstm-matcher-on-bigint-primitive.js
+ test262/test/built-ins/String/prototype/match/cstm-matcher-on-bigint-primitive.js
+@@ -341,8 +315,6 @@ test262/test/staging/sm/Set/symmetric-difference.js
+ test262/test/staging/sm/Set/union.js
+ test262/test/staging/sm/extensions/censor-strict-caller.js
+ test262/test/staging/sm/JSON/parse-with-source.js
+-test262/test/staging/sm/RegExp/flags.js
+-test262/test/staging/sm/RegExp/prototype.js
+ 
+ # not standard
+ test262/test/staging/sm/Function/builtin-no-construct.js
+diff --git a/test262_errors.txt b/test262_errors.txt
+index 6ce51a999..e8cd85394 100644
+--- a/test262_errors.txt
++++ b/test262_errors.txt
+@@ -16,13 +16,9 @@ test262/test/staging/sm/JSON/parse-number-syntax.js:39: Test262Error: parsing st
+ test262/test/staging/sm/JSON/parse-syntax-errors-02.js:51: Test262Error: parsing string <["Illegal backslash escape: \x15"]> threw a non-SyntaxError exception: Test262Error: string <["Illegal backslash escape: \x15"]> shouldn't have parsed as JSON Expected SameValue(«false», «true») to be true Expected SameValue(«true», «false») to be true
+ test262/test/staging/sm/Math/cbrt-approx.js:26: Error: got 1.39561242508609, expected a number near 1.3956124250860895 (relative error: 2)
+ test262/test/staging/sm/RegExp/constructor-ordering-2.js:15: Test262Error: Expected SameValue(«false», «true») to be true
+-test262/test/staging/sm/RegExp/match-trace.js:13: Test262Error: Expected SameValue(«"get:flags,get:unicode,set:lastIndex,get:exec,call:exec,get:result[0],get:exec,call:exec,get:result[0],get:exec,call:exec,"», «"get:flags,set:lastIndex,get:exec,call:exec,get:result[0],get:exec,call:exec,get:result[0],get:exec,call:exec,"») to be true
+ test262/test/staging/sm/RegExp/regress-613820-1.js:13: Test262Error: Expected SameValue(«"aaa"», «"aa"») to be true
+ test262/test/staging/sm/RegExp/regress-613820-2.js:13: Test262Error: Expected SameValue(«"f"», «undefined») to be true
+ test262/test/staging/sm/RegExp/regress-613820-3.js:13: Test262Error: Expected SameValue(«"aab"», «"aa"») to be true
+-test262/test/staging/sm/RegExp/replace-trace.js:13: Test262Error: Expected SameValue(«"get:flags,get:unicode,set:lastIndex,get:exec,call:exec,get:result[0],get:exec,call:exec,get:result[length],get:result[0],get:result[index],get:result[groups],"», «"get:flags,set:lastIndex,get:exec,call:exec,get:result[0],get:exec,call:exec,get:result[length],get:result[0],get:result[index],get:result[groups],"») to be true
+-test262/test/staging/sm/RegExp/unicode-ignoreCase-escape.js:22: Test262Error: Actual argument shouldn't be nullish. 
+-test262/test/staging/sm/RegExp/unicode-ignoreCase-word-boundary.js:13: Test262Error: Expected SameValue(«false», «true») to be true
+ test262/test/staging/sm/String/match-defines-match-elements.js:52: Test262Error: Expected SameValue(«true», «false») to be true
+ test262/test/staging/sm/TypedArray/constructor-buffer-sequence.js:73: Error: Assertion failed: expected exception ExpectedError, got Error: Poisoned Value
+ test262/test/staging/sm/TypedArray/prototype-constructor-identity.js:17: Test262Error: Expected SameValue(«2», «6») to be true
+diff --git a/tests/test_builtin.js b/tests/test_builtin.js
+index 667650a99..ff376ec55 100644
+--- a/tests/test_builtin.js
++++ b/tests/test_builtin.js
+@@ -751,6 +751,34 @@ function test_regexp()
+     assert(a, ["123a23", "3"]);
+     a = /()*?a/.exec(",");
+     assert(a, null);
++
++    /* test \b escape */
++    assert(/[\q{a\b}]/.test("a\b"), true);
++    assert(/[\b]/.test("\b"), true);
++    
++    /* test case insensitive matching (test262 hardly tests it) */
++    assert("aAbBcC#4".replace(/\p{Lower}/gu,"X"), "XAXBXC#4");
++
++    assert("aAbBcC#4".replace(/\p{Lower}/gui,"X"), "XXXXXX#4");
++    assert("aAbBcC#4".replace(/\p{Upper}/gui,"X"), "XXXXXX#4");
++    assert("aAbBcC#4".replace(/\P{Lower}/gui,"X"), "XXXXXXXX");
++    assert("aAbBcC#4".replace(/\P{Upper}/gui,"X"), "XXXXXXXX");
++    assert("aAbBcC".replace(/[^b]/gui, "X"), "XXbBXX");
++    assert("aAbBcC".replace(/[^A-B]/gui, "X"), "aAbBXX");
++
++    assert("aAbBcC#4".replace(/\p{Lower}/gvi,"X"), "XXXXXX#4");
++    assert("aAbBcC#4".replace(/\P{Lower}/gvi,"X"), "aAbBcCXX");
++    assert("aAbBcC#4".replace(/[^\P{Lower}]/gvi,"X"), "XXXXXX#4");
++    assert("aAbBcC#4".replace(/\P{Upper}/gvi,"X"), "aAbBcCXX");
++    assert("aAbBcC".replace(/[^b]/gvi, "X"), "XXbBXX");
++    assert("aAbBcC".replace(/[^A-B]/gvi, "X"), "aAbBXX");
++    assert("aAbBcC".replace(/[[a-c]&&B]/gvi, "X"), "aAXXcC");
++    assert("aAbBcC".replace(/[[a-c]--B]/gvi, "X"), "XXbBXX");
++    
++    assert("abcAbC".replace(/[\q{AbC}]/gvi,"X"), "XX");
++    /* Note: SpiderMonkey and v8 may not be correct */
++    assert("abcAbC".replace(/[\q{BC|A}]/gvi,"X"), "XXXX");
++    assert("abcAbC".replace(/[\q{BC|A}--a]/gvi,"X"), "aXAX");
+ }
+ 
+ function test_symbol()
+diff --git a/unicode_download.sh b/unicode_download.sh
+index e259891b3..ef8b30d2e 100755
+--- a/unicode_download.sh
++++ b/unicode_download.sh
+@@ -1,8 +1,9 @@
+ #!/bin/sh
+ set -e
+ 
+-url="ftp://ftp.unicode.org/Public/16.0.0/ucd"
+-emoji_url="${url}/emoji/emoji-data.txt"
++version="16.0.0"
++emoji_version="16.0"
++url="ftp://ftp.unicode.org/Public"
+ 
+ files="CaseFolding.txt DerivedNormalizationProps.txt PropList.txt \
+ SpecialCasing.txt CompositionExclusions.txt ScriptExtensions.txt \
+@@ -12,8 +13,11 @@ PropertyValueAliases.txt"
+ mkdir -p unicode
+ 
+ for f in $files; do
+-    g="${url}/${f}"
++    g="${url}/${version}/ucd/${f}"
+     wget $g -O unicode/$f
+ done
+ 
+-wget $emoji_url -O unicode/emoji-data.txt
++wget "${url}/${version}/ucd/emoji/emoji-data.txt" -O unicode/emoji-data.txt
++
++wget "${url}/emoji/${emoji_version}/emoji-sequences.txt" -O unicode/emoji-sequences.txt
++wget "${url}/emoji/${emoji_version}/emoji-zwj-sequences.txt" -O unicode/emoji-zwj-sequences.txt
+diff --git a/unicode_gen.c b/unicode_gen.c
+index 0f11ef8fa..1b43538d2 100644
+--- a/unicode_gen.c
++++ b/unicode_gen.c
+@@ -156,6 +156,153 @@ char *get_line(char *buf, int buf_size, FILE *f)
+     return buf;
+ }
+ 
++typedef struct REString {
++    struct REString *next;
++    uint32_t hash;
++    uint32_t len;
++    uint32_t flags;
++    uint32_t buf[];
++} REString;
++
++typedef struct {
++    uint32_t n_strings;
++    uint32_t hash_size;
++    int hash_bits;
++    REString **hash_table;
++} REStringList;
++
++static uint32_t re_string_hash(int len, const uint32_t *buf)
++{
++    int i;
++    uint32_t h;
++    h = 1;
++    for(i = 0; i < len; i++)
++        h = h * 263 + buf[i];
++    return h * 0x61C88647;
++}
++
++static void re_string_list_init(REStringList *s)
++{
++    s->n_strings = 0;
++    s->hash_size = 0;
++    s->hash_bits = 0;
++    s->hash_table = NULL;
++}
++
++static  __maybe_unused void re_string_list_free(REStringList *s)
++{
++    REString *p, *p_next;
++    int i;
++    for(i = 0; i < s->hash_size; i++) {
++        for(p = s->hash_table[i]; p != NULL; p = p_next) {
++            p_next = p->next;
++            free(p);
++        }
++    }
++    free(s->hash_table);
++}
++
++static void lre_print_char(int c, BOOL is_range)
++{
++    if (c == '\'' || c == '\\' ||
++        (is_range && (c == '-' || c == ']'))) {
++        printf("\\%c", c);
++    } else if (c >= ' ' && c <= 126) {
++        printf("%c", c);
++    } else {
++        printf("\\u{%04x}", c);
++    }
++}
++
++static __maybe_unused void re_string_list_dump(const char *str, const REStringList *s)
++{
++    REString *p;
++    int i, j, k;
++
++    printf("%s:\n", str);
++    
++    j = 0;
++    for(i = 0; i < s->hash_size; i++) {
++        for(p = s->hash_table[i]; p != NULL; p = p->next) {
++            printf("  %d/%d: '", j, s->n_strings);
++            for(k = 0; k < p->len; k++) {
++                lre_print_char(p->buf[k], FALSE);
++            }
++            printf("'\n");
++            j++;
++        }
++    }
++}
++
++static REString *re_string_find2(REStringList *s, int len, const uint32_t *buf,
++                                 uint32_t h0, BOOL add_flag)
++{
++    uint32_t h = 0; /* avoid warning */
++    REString *p;
++    if (s->n_strings != 0) {
++        h = h0 >> (32 - s->hash_bits);
++        for(p = s->hash_table[h]; p != NULL; p = p->next) {
++            if (p->hash == h0 && p->len == len &&
++                !memcmp(p->buf, buf, len * sizeof(buf[0]))) {
++                return p;
++            }
++        }
++    }
++    /* not found */
++    if (!add_flag)
++        return NULL;
++    /* increase the size of the hash table if needed */
++    if (unlikely((s->n_strings + 1) > s->hash_size)) {
++        REString **new_hash_table, *p_next;
++        int new_hash_bits, i;
++        uint32_t new_hash_size;
++        new_hash_bits = max_int(s->hash_bits + 1, 4);
++        new_hash_size = 1 << new_hash_bits;
++        new_hash_table = malloc(sizeof(new_hash_table[0]) * new_hash_size);
++        if (!new_hash_table)
++            return NULL;
++        memset(new_hash_table, 0, sizeof(new_hash_table[0]) * new_hash_size);
++        for(i = 0; i < s->hash_size; i++) {
++            for(p = s->hash_table[i]; p != NULL; p = p_next) {
++                p_next = p->next;
++                h = p->hash >> (32 - new_hash_bits);
++                p->next = new_hash_table[h];
++                new_hash_table[h] = p;
++            }
++        }
++        free(s->hash_table);
++        s->hash_bits = new_hash_bits;
++        s->hash_size = new_hash_size;
++        s->hash_table = new_hash_table;
++        h = h0 >> (32 - s->hash_bits);
++    }
++
++    p = malloc(sizeof(REString) + len * sizeof(buf[0]));
++    if (!p)
++        return NULL;
++    p->next = s->hash_table[h];
++    s->hash_table[h] = p;
++    s->n_strings++;
++    p->hash = h0;
++    p->len = len;
++    p->flags = 0;
++    memcpy(p->buf, buf, sizeof(buf[0]) * len);
++    return p;
++}
++
++static REString *re_string_find(REStringList *s, int len, const uint32_t *buf,
++                                BOOL add_flag)
++{
++    uint32_t h0;
++    h0 = re_string_hash(len, buf);
++    return re_string_find2(s, len, buf, h0, add_flag);
++}
++
++static void re_string_add(REStringList *s, int len, const uint32_t *buf)
++{
++    re_string_find(s, len, buf, TRUE);
++}
++
+ #define UNICODE_GENERAL_CATEGORY
+ 
+ typedef enum {
+@@ -225,6 +372,23 @@ static const char *unicode_prop_short_name[] = {
+ 
+ #undef UNICODE_PROP_LIST
+ 
++#define UNICODE_SEQUENCE_PROP_LIST
++
++typedef enum {
++#define DEF(id) SEQUENCE_PROP_ ## id,
++#include "unicode_gen_def.h"
++#undef DEF
++    SEQUENCE_PROP_COUNT,
++} UnicodeSequencePropEnum1;
++
++static const char *unicode_sequence_prop_name[] = {
++#define DEF(id) #id,
++#include "unicode_gen_def.h"
++#undef DEF
++};
++
++#undef UNICODE_SEQUENCE_PROP_LIST
++
+ typedef struct {
+     /* case conv */
+     uint8_t u_len;
+@@ -247,7 +411,15 @@ typedef struct {
+     int *decomp_data;
+ } CCInfo;
+ 
++typedef struct {
++    int count;
++    int size;
++    int *tab;
++} UnicodeSequenceProperties;
++
+ CCInfo *unicode_db;
++REStringList rgi_emoji_zwj_sequence;
++DynBuf rgi_emoji_tag_sequence;
+ 
+ int find_name(const char **tab, int tab_len, const char *name)
+ {
+@@ -751,6 +923,147 @@ void parse_prop_list(const char *filename)
+     fclose(f);
+ }
+ 
++#define SEQ_MAX_LEN 16
++
++static BOOL is_emoji_modifier(uint32_t c)
++{
++    return (c >= 0x1f3fb && c <= 0x1f3ff);
++}
++
++static void add_sequence_prop(int idx, int seq_len, int *seq)
++{
++    int i;
++    
++    assert(idx < SEQUENCE_PROP_COUNT);
++    switch(idx) {
++    case SEQUENCE_PROP_Basic_Emoji:
++        /* convert to 2 properties lists */
++        if (seq_len == 1) {
++            set_prop(seq[0], PROP_Basic_Emoji1, 1);
++        } else if (seq_len == 2 && seq[1] == 0xfe0f) {
++            set_prop(seq[0], PROP_Basic_Emoji2, 1);
++        } else {
++            abort();
++        }
++        break;
++    case SEQUENCE_PROP_RGI_Emoji_Modifier_Sequence:
++        assert(seq_len == 2);
++        assert(is_emoji_modifier(seq[1]));
++        assert(get_prop(seq[0], PROP_Emoji_Modifier_Base));
++        set_prop(seq[0], PROP_RGI_Emoji_Modifier_Sequence, 1);
++        break;
++    case SEQUENCE_PROP_RGI_Emoji_Flag_Sequence:
++        {
++            int code;
++            assert(seq_len == 2);
++            assert(seq[0] >= 0x1F1E6 && seq[0] <= 0x1F1FF);
++            assert(seq[1] >= 0x1F1E6 && seq[1] <= 0x1F1FF);
++            code = (seq[0] - 0x1F1E6) * 26 + (seq[1] - 0x1F1E6);
++            /* XXX: would be more compact with a simple bitmap -> 676 bits */
++            set_prop(code, PROP_RGI_Emoji_Flag_Sequence, 1);
++        }
++        break;
++    case SEQUENCE_PROP_RGI_Emoji_ZWJ_Sequence:
++        re_string_add(&rgi_emoji_zwj_sequence, seq_len, (uint32_t *)seq);
++        break;
++    case SEQUENCE_PROP_RGI_Emoji_Tag_Sequence:
++        {
++            assert(seq_len >= 3);
++            assert(seq[0] == 0x1F3F4);
++            assert(seq[seq_len - 1] == 0xE007F);
++            for(i = 1; i < seq_len - 1; i++) {
++                assert(seq[i] >= 0xe0001 && seq[i] <= 0xe007e);
++                dbuf_putc(&rgi_emoji_tag_sequence, seq[i] - 0xe0000);
++            }
++            dbuf_putc(&rgi_emoji_tag_sequence, 0);
++        }
++        break;
++    case SEQUENCE_PROP_Emoji_Keycap_Sequence:
++        assert(seq_len == 3);
++        assert(seq[1] == 0xfe0f);
++        assert(seq[2] == 0x20e3);
++        set_prop(seq[0], PROP_Emoji_Keycap_Sequence, 1);
++        break;
++    default:
++        assert(0);
++    }
++}
++
++void parse_sequence_prop_list(const char *filename)
++{
++    FILE *f;
++    char line[4096], *p, buf[256], *q, *p_start;
++    uint32_t c0, c1, c;
++    int idx, seq_len;
++    int seq[SEQ_MAX_LEN];
++    
++    f = fopen(filename, "rb");
++    if (!f) {
++        perror(filename);
++        exit(1);
++    }
++
++    for(;;) {
++        if (!get_line(line, sizeof(line), f))
++            break;
++        p = line;
++        while (isspace(*p))
++            p++;
++        if (*p == '#' || *p == '@' || *p == '\0')
++            continue;
++        p_start = p;
++
++        /* find the sequence property name */
++        p = strchr(p, ';');
++        if (!p)
++            continue;
++        p++;
++        p += strspn(p, " \t");
++        q = buf;
++        while (*p != '\0' && *p != ' ' && *p != '#' && *p != '\t' && *p != ';') {
++            if ((q - buf) < sizeof(buf) - 1)
++                *q++ = *p;
++            p++;
++        }
++        *q = '\0';
++        idx = find_name(unicode_sequence_prop_name,
++                      countof(unicode_sequence_prop_name), buf);
++        if (idx < 0) {
++            fprintf(stderr, "Property not found: %s\n", buf);
++            exit(1);
++        }
++        
++        p = p_start;
++        c0 = strtoul(p, (char **)&p, 16);
++        assert(c0 <= CHARCODE_MAX);
++        
++        if (*p == '.' && p[1] == '.') {
++            p += 2;
++            c1 = strtoul(p, (char **)&p, 16);
++            assert(c1 <= CHARCODE_MAX);
++            for(c = c0; c <= c1; c++) {
++                seq[0] = c;
++                add_sequence_prop(idx, 1, seq);
++            }
++        } else {
++            seq_len = 0;
++            seq[seq_len++] = c0;
++            for(;;) {
++                while (isspace(*p))
++                    p++;
++                if (*p == ';' || *p == '\0')
++                    break;
++                c0 = strtoul(p, (char **)&p, 16);
++                assert(c0 <= CHARCODE_MAX);
++                assert(seq_len < countof(seq));
++                seq[seq_len++] = c0;
++            }
++            add_sequence_prop(idx, seq_len, seq);
++        }
++    }
++    fclose(f);
++}
++
+ void parse_scripts(const char *filename)
+ {
+     FILE *f;
+@@ -1654,7 +1967,7 @@ void dump_name_table(FILE *f, const char *cname, const char **tab_name, int len,
+     maxw = 0;
+     for(i = 0; i < len; i++) {
+         w = strlen(tab_name[i]);
+-        if (tab_short_name[i][0] != '\0') {
++        if (tab_short_name && tab_short_name[i][0] != '\0') {
+             w += 1 + strlen(tab_short_name[i]);
+         }
+         if (maxw < w)
+@@ -1666,7 +1979,7 @@ void dump_name_table(FILE *f, const char *cname, const char **tab_name, int len,
+     for(i = 0; i < len; i++) {
+         fprintf(f, "    \"");
+         w = fprintf(f, "%s", tab_name[i]);
+-        if (tab_short_name[i][0] != '\0') {
++        if (tab_short_name && tab_short_name[i][0] != '\0') {
+             w += fprintf(f, ",%s", tab_short_name[i]);
+         }
+         fprintf(f, "\"%*s\"\\0\"\n", 1 + maxw - w, "");
+@@ -1930,6 +2243,218 @@ void build_prop_list_table(FILE *f)
+     fprintf(f, "};\n\n");
+ }
+ 
++static BOOL is_emoji_hair_color(uint32_t c)
++{
++    return (c >= 0x1F9B0 && c <= 0x1F9B3);
++}
++
++#define EMOJI_MOD_NONE   0
++#define EMOJI_MOD_TYPE1  1
++#define EMOJI_MOD_TYPE2  2
++#define EMOJI_MOD_TYPE2D 3
++
++static BOOL mark_zwj_string(REStringList *sl, uint32_t *buf, int len, int mod_type, int *mod_pos,
++                            int hc_pos, BOOL mark_flag)
++{
++    REString *p;
++    int i, n_mod, i0, i1, hc_count, j;
++
++#if 0
++    if (mark_flag)
++        printf("mod_type=%d\n", mod_type);
++#endif
++    
++    switch(mod_type) {
++    case EMOJI_MOD_NONE:
++        n_mod = 1;
++        break;
++    case EMOJI_MOD_TYPE1:
++        n_mod = 5;
++        break;
++    case EMOJI_MOD_TYPE2:
++        n_mod = 25;
++        break;
++    case EMOJI_MOD_TYPE2D:
++        n_mod = 20;
++        break;
++    default:
++        assert(0);
++    }
++    if (hc_pos >= 0)
++        hc_count = 4;
++    else
++        hc_count = 1;
++    /* check that all the related strings are present */
++    for(j = 0; j < hc_count; j++) {
++        for(i = 0; i < n_mod; i++) {
++            switch(mod_type) {
++            case EMOJI_MOD_NONE:
++                break;
++            case EMOJI_MOD_TYPE1:
++                buf[mod_pos[0]] = 0x1f3fb + i;
++                break;
++            case EMOJI_MOD_TYPE2:
++            case EMOJI_MOD_TYPE2D:
++                i0 = i / 5;
++                i1 = i % 5;
++                /* avoid identical values */
++                if (mod_type == EMOJI_MOD_TYPE2D && i0 >= i1)
++                    i0++;
++                buf[mod_pos[0]] = 0x1f3fb + i0;
++                buf[mod_pos[1]] = 0x1f3fb + i1;
++                break;
++            default:
++                assert(0);
++            }
++
++            if (hc_pos >= 0)
++                buf[hc_pos] = 0x1F9B0 + j;
++            
++            p = re_string_find(sl, len, buf, FALSE);
++            if (!p)
++                return FALSE;
++            if (mark_flag)
++                p->flags |= 1;
++        }
++    }
++    return TRUE;
++}
++
++static void zwj_encode_string(DynBuf *dbuf, const uint32_t *buf, int len, int mod_type, int *mod_pos,
++                              int hc_pos)
++{
++    int i, j;
++    int c, code;
++    uint32_t buf1[SEQ_MAX_LEN];
++    
++    j = 0;
++    for(i = 0; i < len;) {
++        c = buf[i++];
++        if (c >= 0x2000 && c <= 0x2fff) {
++            code = c - 0x2000;
++        } else if (c >= 0x1f000 && c <= 0x1ffff) {
++            code = c - 0x1f000 + 0x1000;
++        } else {
++            assert(0);
++        }
++        if (i < len && is_emoji_modifier(buf[i])) {
++            /* modifier */
++            code |= (mod_type << 13);
++            i++;
++        }
++        if (i < len && buf[i] == 0xfe0f) {
++            /* presentation selector present */
++            code |= 0x8000;
++            i++;
++        }
++        if (i < len) {
++            /* zero width join */
++            assert(buf[i] == 0x200d);
++            i++;
++        }
++        buf1[j++] = code;
++    }
++    dbuf_putc(dbuf, j);
++    for(i = 0; i < j; i++) {
++        dbuf_putc(dbuf, buf1[i]);
++        dbuf_putc(dbuf, buf1[i] >> 8);
++    }
++}
++
++static void build_rgi_emoji_zwj_sequence(FILE *f, REStringList *sl)
++{
++    int mod_pos[2], mod_count, hair_color_pos, j, h;
++    REString *p;
++    uint32_t buf[SEQ_MAX_LEN];
++    DynBuf dbuf;
++
++#if 0
++    {
++        for(h = 0; h < sl->hash_size; h++) {
++            for(p = sl->hash_table[h]; p != NULL; p = p->next) {
++                for(j = 0; j < p->len; j++)
++                    printf(" %04x", p->buf[j]);
++                printf("\n");
++            }
++        }
++        exit(0);
++    }
++#endif
++    //    printf("rgi_emoji_zwj_sequence: n=%d\n", sl->n_strings);
++
++    dbuf_init(&dbuf);
++    
++    /* avoid duplicating strings with emoji modifiers or hair colors */
++    for(h = 0; h < sl->hash_size; h++) {
++        for(p = sl->hash_table[h]; p != NULL; p = p->next) {
++            if (p->flags) /* already examined */
++                continue;
++            mod_count = 0;
++            hair_color_pos = -1;
++            for(j = 0; j < p->len; j++) {
++                if (is_emoji_modifier(p->buf[j])) {
++                    assert(mod_count < 2);
++                    mod_pos[mod_count++] = j;
++                } else if (is_emoji_hair_color(p->buf[j])) {
++                    hair_color_pos = j;
++                }
++                buf[j] = p->buf[j];
++            }
++            
++            if (mod_count != 0 || hair_color_pos >= 0) {
++                int mod_type;
++                if (mod_count == 0)
++                    mod_type = EMOJI_MOD_NONE;
++                else if (mod_count == 1)
++                    mod_type = EMOJI_MOD_TYPE1;
++                else
++                    mod_type = EMOJI_MOD_TYPE2;
++                
++                if (mark_zwj_string(sl, buf, p->len, mod_type, mod_pos, hair_color_pos, FALSE)) {
++                    mark_zwj_string(sl, buf, p->len, mod_type, mod_pos, hair_color_pos, TRUE);
++                } else if (mod_type == EMOJI_MOD_TYPE2) {
++                    mod_type = EMOJI_MOD_TYPE2D;
++                    if (mark_zwj_string(sl, buf, p->len, mod_type, mod_pos, hair_color_pos, FALSE)) {
++                        mark_zwj_string(sl, buf, p->len, mod_type, mod_pos, hair_color_pos, TRUE);
++                    } else {
++                        dump_str("not_found", (int *)p->buf, p->len);
++                        goto keep;
++                    }
++                }
++                if (hair_color_pos >= 0)
++                    buf[hair_color_pos] = 0x1f9b0;
++                /* encode the string */
++                zwj_encode_string(&dbuf, buf, p->len, mod_type, mod_pos, hair_color_pos);
++            } else {
++            keep:
++                zwj_encode_string(&dbuf, buf, p->len, EMOJI_MOD_NONE, NULL, -1);
++            }
++        }
++    }
++    
++    /* Encode */
++    dump_byte_table(f, "unicode_rgi_emoji_zwj_sequence", dbuf.buf, dbuf.size);
++
++    dbuf_free(&dbuf);
++}
++
++void build_sequence_prop_list_table(FILE *f)
++{
++    int i;
++    fprintf(f, "typedef enum {\n");
++    for(i = 0; i < SEQUENCE_PROP_COUNT; i++)
++        fprintf(f, "    UNICODE_SEQUENCE_PROP_%s,\n", unicode_sequence_prop_name[i]);
++    fprintf(f, "    UNICODE_SEQUENCE_PROP_COUNT,\n");
++    fprintf(f, "} UnicodeSequencePropertyEnum;\n\n");
++
++    dump_name_table(f, "unicode_sequence_prop_name_table",
++                    unicode_sequence_prop_name, SEQUENCE_PROP_COUNT, NULL);
++
++    dump_byte_table(f, "unicode_rgi_emoji_tag_sequence", rgi_emoji_tag_sequence.buf, rgi_emoji_tag_sequence.size);
++
++    build_rgi_emoji_zwj_sequence(f, &rgi_emoji_zwj_sequence);
++}
++
+ #ifdef USE_TEST
+ int check_conv(uint32_t *res, uint32_t c, int conv_type)
+ {
+@@ -3156,6 +3681,8 @@ int main(int argc, char *argv[])
+         outfilename = argv[arg++];
+ 
+     unicode_db = mallocz(sizeof(unicode_db[0]) * (CHARCODE_MAX + 1));
++    re_string_list_init(&rgi_emoji_zwj_sequence);
++    dbuf_init(&rgi_emoji_tag_sequence);
+ 
+     snprintf(filename, sizeof(filename), "%s/UnicodeData.txt", unicode_db_path);
+ 
+@@ -3190,6 +3717,14 @@ int main(int argc, char *argv[])
+              unicode_db_path);
+     parse_prop_list(filename);
+ 
++    snprintf(filename, sizeof(filename), "%s/emoji-sequences.txt",
++             unicode_db_path);
++    parse_sequence_prop_list(filename);
++
++    snprintf(filename, sizeof(filename), "%s/emoji-zwj-sequences.txt",
++             unicode_db_path);
++    parse_sequence_prop_list(filename);
++
+     //    dump_unicode_data(unicode_db);
+     build_conv_table(unicode_db);
+ 
+@@ -3234,10 +3769,12 @@ int main(int argc, char *argv[])
+         build_script_table(fo);
+         build_script_ext_table(fo);
+         build_prop_list_table(fo);
++        build_sequence_prop_list_table(fo);
+         fprintf(fo, "#endif /* CONFIG_ALL_UNICODE */\n");
+         fprintf(fo, "/* %u tables / %u bytes, %u index / %u bytes */\n",
+                 total_tables, total_table_bytes, total_index, total_index_bytes);
+         fclose(fo);
+     }
++    re_string_list_free(&rgi_emoji_zwj_sequence);
+     return 0;
+ }
+diff --git a/unicode_gen_def.h b/unicode_gen_def.h
+index f2a32168e..95c369fab 100644
+--- a/unicode_gen_def.h
++++ b/unicode_gen_def.h
+@@ -234,6 +234,11 @@ DEF(XID_Continue1, "")
+ DEF(Changes_When_Titlecased1, "")
+ DEF(Changes_When_Casefolded1, "")
+ DEF(Changes_When_NFKC_Casefolded1, "")
++DEF(Basic_Emoji1, "")
++DEF(Basic_Emoji2, "")
++DEF(RGI_Emoji_Modifier_Sequence, "")
++DEF(RGI_Emoji_Flag_Sequence, "") 
++DEF(Emoji_Keycap_Sequence, "")
+ 
+ /* Prop list exported to JS */
+ DEF(ASCII_Hex_Digit, "AHex")
+@@ -301,3 +306,13 @@ DEF(XID_Start, "XIDS")
+ DEF(Cased1, "")
+ 
+ #endif
++
++#ifdef UNICODE_SEQUENCE_PROP_LIST
++DEF(Basic_Emoji)
++DEF(Emoji_Keycap_Sequence)
++DEF(RGI_Emoji_Modifier_Sequence)
++DEF(RGI_Emoji_Flag_Sequence)
++DEF(RGI_Emoji_Tag_Sequence)
++DEF(RGI_Emoji_ZWJ_Sequence)
++DEF(RGI_Emoji)
++#endif

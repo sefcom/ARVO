@@ -1,0 +1,794 @@
+From 555ab6f1feceb1118492e91970b14cb901f82229 Mon Sep 17 00:00:00 2001
+From: Greg Landrum <greg.landrum@gmail.com>
+Date: Wed, 9 Feb 2022 14:20:49 +0100
+Subject: [PATCH] Start adding move constructors and move-assignment operators
+ (#4909)
+
+* some initial work...
+Still some real questions here about what should be done with dp_mol data members
+
+* add some tests for move semantics of Dict and Props
+remove extraneous clear()
+
+* more in-depth testing of the molecule results
+
+* test refactoring
+
+* improve the molecule move test
+
+* fix some leaks found by valgrind
+the new tests are now all clean in valgrind
+
+* additional classes
+QueryAtom, QueryBond, RingInfo, Conformer
+
+* get swig working again.
+Not sure why this is necessary, but SWIG is a mysterious beast
+
+* fixes in response to review
+
+* updates in response to review
+---
+ Code/GraphMol/Atom.h             |   7 +-
+ Code/GraphMol/Bond.h             |  33 ++++++++
+ Code/GraphMol/Conformer.h        |  17 ++++-
+ Code/GraphMol/QueryAtom.h        |  19 ++++-
+ Code/GraphMol/QueryBond.h        |  14 +++-
+ Code/GraphMol/ROMol.h            |  66 +++++++++++++++-
+ Code/GraphMol/RWMol.h            |   6 ++
+ Code/GraphMol/RingInfo.h         |  27 ++-----
+ Code/GraphMol/StereoGroup.h      |   7 +-
+ Code/GraphMol/SubstanceGroup.h   |  30 +++++++-
+ Code/GraphMol/catch_graphmol.cpp | 127 ++++++++++++++++++++++++++++++-
+ Code/RDGeneral/CMakeLists.txt    |   2 +
+ Code/RDGeneral/Dict.h            |  25 +++++-
+ Code/RDGeneral/RDProps.h         |  11 ++-
+ Code/RDGeneral/catch_dict.cpp    |  72 ++++++++++++++++++
+ Code/RDGeneral/catch_main.cpp    |  20 +++++
+ 16 files changed, 443 insertions(+), 40 deletions(-)
+ create mode 100644 Code/RDGeneral/catch_dict.cpp
+ create mode 100644 Code/RDGeneral/catch_main.cpp
+
+diff --git a/Code/GraphMol/Atom.h b/Code/GraphMol/Atom.h
+index 69f83b2dd7c..29443d64f12 100644
+--- a/Code/GraphMol/Atom.h
++++ b/Code/GraphMol/Atom.h
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (C) 2001-2014 Greg Landrum and Rational Discovery LLC
++//  Copyright (C) 2001-2021 Greg Landrum and other RDKit contributors
+ //
+ //   @@ All Rights Reserved @@
+ //  This file is part of the RDKit.
+@@ -103,6 +103,11 @@ class RDKIT_GRAPHMOL_EXPORT Atom : public RDProps {
+   explicit Atom(const std::string &what);
+   Atom(const Atom &other);
+   Atom &operator=(const Atom &other);
++  // NOTE: the move methods are somewhat fraught for atoms associated with
++  // molecules since the molecule will still be pointing to the original object
++  Atom(Atom &&other) = default;
++  Atom &operator=(Atom &&other) = default;
++
+   virtual ~Atom();
+ 
+   //! makes a copy of this Atom and returns a pointer to it.
+diff --git a/Code/GraphMol/Bond.h b/Code/GraphMol/Bond.h
+index 02b661e06e6..97de162a863 100644
+--- a/Code/GraphMol/Bond.h
++++ b/Code/GraphMol/Bond.h
+@@ -109,6 +109,39 @@ class RDKIT_GRAPHMOL_EXPORT Bond : public RDProps {
+   virtual ~Bond();
+   Bond &operator=(const Bond &other);
+ 
++  Bond(Bond &&o) noexcept : RDProps(std::move(o)) {
++    df_isAromatic = o.df_isAromatic;
++    df_isConjugated = o.df_isConjugated;
++    d_bondType = o.d_bondType;
++    d_dirTag = o.d_dirTag;
++    d_stereo = o.d_stereo;
++    d_index = o.d_index;
++    d_beginAtomIdx = o.d_beginAtomIdx;
++    d_endAtomIdx = o.d_endAtomIdx;
++    // NOTE: this is somewhat fraught for bonds associated with molecules since
++    // the molecule will still be pointing to the original object
++    dp_mol = std::exchange(o.dp_mol, nullptr);
++    dp_stereoAtoms = std::exchange(o.dp_stereoAtoms, nullptr);
++  }
++  Bond &operator=(Bond &&o) noexcept {
++    if (this == &o) return *this;
++    RDProps::operator=(std::move(o));
++    df_isAromatic = o.df_isAromatic;
++    df_isConjugated = o.df_isConjugated;
++    d_bondType = o.d_bondType;
++    d_dirTag = o.d_dirTag;
++    d_stereo = o.d_stereo;
++    d_index = o.d_index;
++    d_beginAtomIdx = o.d_beginAtomIdx;
++    d_endAtomIdx = o.d_endAtomIdx;
++    // NOTE: this is somewhat fraught for bonds associated with molecules since
++    // the molecule will still be pointing to the original object
++    delete dp_stereoAtoms;
++    dp_mol = std::exchange(o.dp_mol, nullptr);
++    dp_stereoAtoms = std::exchange(o.dp_stereoAtoms, nullptr);
++    return *this;
++  }
++
+   //! returns a copy
+   /*!
+     <b>Note:</b> the caller is responsible for <tt>delete</tt>ing
+diff --git a/Code/GraphMol/Conformer.h b/Code/GraphMol/Conformer.h
+index 19d53f667ca..83ded52f115 100644
+--- a/Code/GraphMol/Conformer.h
++++ b/Code/GraphMol/Conformer.h
+@@ -62,7 +62,22 @@ class RDKIT_GRAPHMOL_EXPORT Conformer : public RDProps {
+   //! Copy Constructor: initialize from a second conformation.
+   Conformer(const Conformer &other);
+   Conformer &operator=(const Conformer &other);
+-
++  Conformer(Conformer &&o) noexcept
++      : RDProps(std::move(o)),
++        df_is3D(std::move(o.df_is3D)),
++        d_id(std::move(o.d_id)),
++        dp_mol(std::move(o.dp_mol)),
++        d_positions(std::move(o.d_positions)){};
++  Conformer &operator=(Conformer &&o) noexcept {
++    if (this == &o) {
++      return *this;
++    }
++    RDProps::operator=(std::move(o));
++    df_is3D = std::move(o.df_is3D);
++    d_id = std::move(o.d_id);
++    dp_mol = std::move(o.dp_mol);
++    d_positions = std::move(o.d_positions);
++  }
+   //! Destructor
+   ~Conformer() = default;
+ 
+diff --git a/Code/GraphMol/QueryAtom.h b/Code/GraphMol/QueryAtom.h
+index 83ac0acc6a0..b7d240a07a1 100644
+--- a/Code/GraphMol/QueryAtom.h
++++ b/Code/GraphMol/QueryAtom.h
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (C) 2001-2017 Greg Landrum and Rational Discovery LLC
++//  Copyright (C) 2001-2022 Greg Landrum and other RDKit contributors
+ //
+ //   @@ All Rights Reserved @@
+ //  This file is part of the RDKit.
+@@ -8,8 +8,8 @@
+ //  of the RDKit source tree.
+ //
+ #include <RDGeneral/export.h>
+-#ifndef _RD_QUERYATOM_H_
+-#define _RD_QUERYATOM_H_
++#ifndef RD_QUERYATOM_H
++#define RD_QUERYATOM_H
+ 
+ #include "Atom.h"
+ #include <Query/QueryObjects.h>
+@@ -64,6 +64,19 @@ class RDKIT_GRAPHMOL_EXPORT QueryAtom : public Atom {
+     }
+     return *this;
+   }
++
++  QueryAtom(QueryAtom &&other) noexcept : Atom(std::move(other)) {
++    dp_query = std::exchange(other.dp_query, nullptr);
++  }
++  QueryAtom &operator=(QueryAtom &&other) noexcept {
++    if (this == &other) {
++      return *this;
++    }
++    QueryAtom::operator=(std::move(other));
++    dp_query = std::exchange(other.dp_query, nullptr);
++    return *this;
++  }
++
+   ~QueryAtom() override;
+ 
+   //! returns a copy of this query, owned by the caller
+diff --git a/Code/GraphMol/QueryBond.h b/Code/GraphMol/QueryBond.h
+index 8d3fadee6b3..1bfc52b7aca 100644
+--- a/Code/GraphMol/QueryBond.h
++++ b/Code/GraphMol/QueryBond.h
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (C) 2001-2021 Greg Landrum and other RDKit contributors
++//  Copyright (C) 2001-2022 Greg Landrum and other RDKit contributors
+ //
+ //   @@ All Rights Reserved @@
+ //  This file is part of the RDKit.
+@@ -42,6 +42,18 @@ class RDKIT_GRAPHMOL_EXPORT QueryBond : public Bond {
+       dp_query = nullptr;
+     }
+   }
++  QueryBond(QueryBond &&other) noexcept : Bond(std::move(other)) {
++    dp_query = std::move(other.dp_query);
++  }
++  QueryBond &operator=(QueryBond &&other) noexcept {
++    if (this == &other) {
++      return *this;
++    }
++    QueryBond::operator=(std::move(other));
++    dp_query = std::move(other.dp_query);
++    return *this;
++  }
++
+   ~QueryBond() override;
+ 
+   //! returns a copy of this query, owned by the caller
+diff --git a/Code/GraphMol/ROMol.h b/Code/GraphMol/ROMol.h
+index 6d1c370e482..a2b46566619 100644
+--- a/Code/GraphMol/ROMol.h
++++ b/Code/GraphMol/ROMol.h
+@@ -37,6 +37,7 @@
+ #include "Conformer.h"
+ #include "SubstanceGroup.h"
+ #include "StereoGroup.h"
++#include "RingInfo.h"
+ 
+ namespace RDKit {
+ class SubstanceGroup;
+@@ -322,6 +323,68 @@ class RDKIT_GRAPHMOL_EXPORT ROMol : public RDProps {
+   //! construct a molecule from a pickle string
+   ROMol(const std::string &binStr, unsigned int propertyFlags);
+ 
++  ROMol(ROMol &&o) noexcept
++      : RDProps(std::move(o)),
++        d_graph(std::move(o.d_graph)),
++        d_atomBookmarks(std::move(o.d_atomBookmarks)),
++        d_bondBookmarks(std::move(o.d_bondBookmarks)),
++        d_confs(std::move(o.d_confs)),
++        d_sgroups(std::move(o.d_sgroups)),
++        d_stereo_groups(std::move(o.d_stereo_groups)),
++        numBonds(o.numBonds) {
++    for (auto atom : atoms()) {
++      atom->setOwningMol(this);
++    }
++    for (auto bond : bonds()) {
++      bond->setOwningMol(this);
++    }
++    for (auto conf : d_confs) {
++      conf->setOwningMol(this);
++    }
++    o.d_graph.clear();
++    o.numBonds = 0;
++    dp_ringInfo = std::exchange(o.dp_ringInfo, nullptr);
++    dp_delAtoms = std::exchange(o.dp_delAtoms, nullptr);
++    dp_delBonds = std::exchange(o.dp_delBonds, nullptr);
++  }
++  ROMol &operator=(ROMol &&o) noexcept {
++    if (this == &o) {
++      return *this;
++    }
++    RDProps::operator=(std::move(o));
++    d_graph = std::move(o.d_graph);
++    d_atomBookmarks = std::move(o.d_atomBookmarks);
++    d_bondBookmarks = std::move(o.d_bondBookmarks);
++    if (dp_ringInfo) {
++      delete dp_ringInfo;
++    }
++    dp_ringInfo = std::exchange(o.dp_ringInfo, nullptr);
++
++    d_confs = std::move(o.d_confs);
++    d_sgroups = std::move(o.d_sgroups);
++    d_stereo_groups = std::move(o.d_stereo_groups);
++    dp_delAtoms = std::exchange(o.dp_delAtoms, nullptr);
++    dp_delBonds = std::exchange(o.dp_delBonds, nullptr);
++    numBonds = o.numBonds;
++    o.numBonds = 0;
++
++    for (auto atom : atoms()) {
++      atom->setOwningMol(this);
++    }
++    for (auto bond : bonds()) {
++      bond->setOwningMol(this);
++    }
++    for (auto conf : d_confs) {
++      conf->setOwningMol(this);
++    }
++
++    o.d_graph.clear();
++    return *this;
++  }
++
++  ROMol &operator=(const ROMol &) =
++      delete;  // disable assignment, RWMol's support assignment
++
+   virtual ~ROMol() { destroy(); }
+ 
+   //@}
+@@ -725,9 +788,6 @@ class RDKIT_GRAPHMOL_EXPORT ROMol : public RDProps {
+       &getSubstanceGroups(const ROMol &);
+   void clearSubstanceGroups() { d_sgroups.clear(); }
+ 
+-  ROMol &operator=(
+-      const ROMol &);  // disable assignment, RWMol's support assignment
+-
+  protected:
+   unsigned int numBonds{0};
+ #ifndef WIN32
+diff --git a/Code/GraphMol/RWMol.h b/Code/GraphMol/RWMol.h
+index 09a281321af..ff2aa218db5 100644
+--- a/Code/GraphMol/RWMol.h
++++ b/Code/GraphMol/RWMol.h
+@@ -46,6 +46,12 @@ class RDKIT_GRAPHMOL_EXPORT RWMol : public ROMol {
+       : ROMol(other, quickCopy, confId) {}
+   RWMol(const RWMol &other) : ROMol(other) {}
+   RWMol &operator=(const RWMol &);
++  RWMol(RWMol &&other) noexcept : ROMol(std::move(other)) {}
++  RWMol &operator=(RWMol &&other) noexcept { 
++    ROMol::operator=(std::move(other)); 
++    return *this;
++  }
++
+ 
+   //! insert the atoms and bonds from \c other into this molecule
+   void insertMol(const ROMol &other);
+diff --git a/Code/GraphMol/RingInfo.h b/Code/GraphMol/RingInfo.h
+index 4c4280c88f8..f036a4d358a 100644
+--- a/Code/GraphMol/RingInfo.h
++++ b/Code/GraphMol/RingInfo.h
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (C) 2004-2019 Greg Landrum and Rational Discovery LLC
++//  Copyright (C) 2004-2022 Greg Landrum and other RDKit contributors
+ //
+ //   @@ All Rights Reserved @@
+ //  This file is part of the RDKit.
+@@ -8,15 +8,15 @@
+ //  of the RDKit source tree.
+ //
+ #include <RDGeneral/export.h>
+-#ifndef _RD_RINGINFO_H
+-#define _RD_RINGINFO_H
++#ifndef RD_RINGINFO_H
++#define RD_RINGINFO_H
+ 
+ #include <map>
+ #include <vector>
++#ifdef RDK_USE_URF
+ #include <RDGeneral/BoostStartInclude.h>
+ #include <boost/shared_ptr.hpp>
+ #include <RDGeneral/BoostEndInclude.h>
+-#ifdef RDK_USE_URF
+ #include <RingDecomposerLib.h>
+ #endif
+ 
+@@ -35,21 +35,10 @@ class RDKIT_GRAPHMOL_EXPORT RingInfo {
+   typedef std::vector<INT_VECT> VECT_INT_VECT;
+ 
+   RingInfo() {}
+-  RingInfo(const RingInfo &other)
+-      : df_init(other.df_init),
+-        d_atomMembers(other.d_atomMembers),
+-        d_bondMembers(other.d_bondMembers),
+-        d_atomRings(other.d_atomRings),
+-        d_bondRings(other.d_bondRings),
+-        d_atomRingFamilies(other.d_atomRingFamilies),
+-        d_bondRingFamilies(other.d_bondRingFamilies)
+-#ifdef RDK_USE_URF
+-        ,
+-        dp_urfData(other.dp_urfData)
+-#endif
+-  {
+-  }
+-
++  RingInfo(const RingInfo &other) = default;
++  RingInfo &operator=(const RingInfo &other) = default;
++  RingInfo(RingInfo &&other) noexcept = default;
++  RingInfo &operator=(RingInfo &&other) noexcept = default;
+   //! checks to see if we've been properly initialized
+   bool isInitialized() const { return df_init; }
+   //! does initialization
+diff --git a/Code/GraphMol/StereoGroup.h b/Code/GraphMol/StereoGroup.h
+index 6d5e2bc6117..724f1c02ff8 100644
+--- a/Code/GraphMol/StereoGroup.h
++++ b/Code/GraphMol/StereoGroup.h
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (C) 2018 T5 Informatics GmbH
++//  Copyright (C) 2018-2021 Greg Landrum and other RDKit contributors
+ //
+ //   @@ All Rights Reserved @@
+ //  This file is part of the RDKit.
+@@ -48,6 +48,11 @@ class RDKIT_GRAPHMOL_EXPORT StereoGroup {
+   // Takes control of atoms if possible.
+   StereoGroup(StereoGroupType grouptype, std::vector<Atom*>&& atoms);
+   StereoGroup(StereoGroupType grouptype, const std::vector<Atom*>& atoms);
++  StereoGroup(const StereoGroup& other) = default;
++  StereoGroup& operator=(const StereoGroup& other) = default;
++  StereoGroup(StereoGroup&& other) = default;
++  StereoGroup& operator=(StereoGroup&& other) = default;
++
+   StereoGroupType getGroupType() const;
+   const std::vector<Atom*>& getAtoms() const;
+   // Seems odd to have to define these, but otherwise the SWIG wrappers
+diff --git a/Code/GraphMol/SubstanceGroup.h b/Code/GraphMol/SubstanceGroup.h
+index 50c4091dc0e..b1b25c86d91 100644
+--- a/Code/GraphMol/SubstanceGroup.h
++++ b/Code/GraphMol/SubstanceGroup.h
+@@ -95,10 +95,32 @@ class RDKIT_GRAPHMOL_EXPORT SubstanceGroup : public RDProps {
+   SubstanceGroup(ROMol *owning_mol, const std::string &type);
+ 
+   SubstanceGroup(const SubstanceGroup &other) = default;
+-  SubstanceGroup(SubstanceGroup &&other) = default;
+-
+   SubstanceGroup &operator=(const SubstanceGroup &other) = default;
+-  SubstanceGroup &operator=(SubstanceGroup &&other) = default;
++
++  SubstanceGroup(SubstanceGroup &&other) noexcept : RDProps(std::move(other)) {
++    dp_mol = std::exchange(other.dp_mol, nullptr);
++    d_atoms = std::move(other.d_atoms);
++    d_patoms = std::move(other.d_patoms);
++    d_bonds = std::move(other.d_bonds);
++    d_brackets = std::move(other.d_brackets);
++    d_cstates = std::move(other.d_cstates);
++    d_saps = std::move(other.d_saps);
++  }
++
++  SubstanceGroup &operator=(SubstanceGroup &&other) noexcept {
++    if (this == &other) {
++      return *this;
++    }
++    RDProps::operator=(std::move(other));
++    dp_mol = std::exchange(other.dp_mol, nullptr);
++    d_atoms = std::move(other.d_atoms);
++    d_patoms = std::move(other.d_patoms);
++    d_bonds = std::move(other.d_bonds);
++    d_brackets = std::move(other.d_brackets);
++    d_cstates = std::move(other.d_cstates);
++    d_saps = std::move(other.d_saps);
++    return *this;
++  }
+ 
+   //! Destructor
+   ~SubstanceGroup() = default;
+@@ -208,7 +230,7 @@ class RDKIT_GRAPHMOL_EXPORT SubstanceGroup : public RDProps {
+   std::vector<Bracket> d_brackets;
+   std::vector<CState> d_cstates;
+   std::vector<AttachPoint> d_saps;
+-};
++};  // namespace RDKit
+ 
+ namespace SubstanceGroupChecks {
+ 
+diff --git a/Code/GraphMol/catch_graphmol.cpp b/Code/GraphMol/catch_graphmol.cpp
+index 485e85940b6..ca3a2fdeb9b 100644
+--- a/Code/GraphMol/catch_graphmol.cpp
++++ b/Code/GraphMol/catch_graphmol.cpp
+@@ -2491,4 +2491,129 @@ TEST_CASE(
+   SECTION("can still get kekulization errors") {
+     CHECK_THROWS_AS(SmilesToMol("C1:C:C:C:C:1"), KekulizeException);
+   }
+-}
+\ No newline at end of file
++}
++
++namespace {
++void check_dest(RWMol *m1, const ROMol &m2) {
++  CHECK(m2.getNumAtoms() == 8);
++  CHECK(m2.getNumBonds() == 7);
++  for (const auto atom : m2.atoms()) {
++    CHECK(&atom->getOwningMol() == &m2);
++    CHECK(&atom->getOwningMol() != m1);
++  }
++  for (const auto bond : m2.bonds()) {
++    CHECK(&bond->getOwningMol() == &m2);
++    CHECK(&bond->getOwningMol() != m1);
++  }
++  CHECK(m2.getStereoGroups().size() == 2);
++  CHECK(m2.getStereoGroups()[0].getAtoms().size() == 2);
++  CHECK(m2.getStereoGroups()[0].getAtoms()[0]->getIdx() == 1);
++  CHECK(m2.getStereoGroups()[0].getAtoms()[1]->getIdx() == 5);
++  CHECK(m2.getStereoGroups()[1].getAtoms().size() == 1);
++  CHECK(m2.getStereoGroups()[1].getAtoms()[0]->getIdx() == 3);
++
++  const auto &sgs = getSubstanceGroups(m2);
++  CHECK(sgs.size() == 1);
++  CHECK(sgs[0].getAtoms().size() == 1);
++  CHECK(sgs[0].getAtoms()[0] == 4);
++
++  // check the state of m1:
++  CHECK(m1->getNumAtoms() == 0);
++  CHECK(m1->getNumBonds() == 0);
++  CHECK(m1->getPropList().empty());
++  CHECK(m1->getDict().getData().empty());
++  CHECK(m1->getStereoGroups().empty());
++  CHECK(getSubstanceGroups(*m1).empty());
++  CHECK(m1->getRingInfo() == nullptr);
++
++  // make sure we can still do something with m1:
++  *m1 = m2;
++  CHECK(!m1->getDict().getData().empty());
++  CHECK(m1->getNumAtoms() == 8);
++  CHECK(m1->getNumBonds() == 7);
++  CHECK(m1->getRingInfo() != nullptr);
++  CHECK(m1->getRingInfo()->isInitialized() ==
++        m2.getRingInfo()->isInitialized());
++}
++}  // namespace
++TEST_CASE("moves") {
++  auto m1 =
++      "C[C@H](O)C(F)[C@H](C)O |o2:1,5,&1:3,r,@:3,SgD:4:atom_data:foo::::|"_smiles;
++  REQUIRE(m1);
++  m1->setProp("foo", 1u);
++  SECTION("molecule move") {
++    ROMol m2 = std::move(*m1);
++    check_dest(m1.get(), m2);
++  }
++  SECTION("molecule move-assign") {
++    ROMol m2;
++    m2 = std::move(*m1);
++    check_dest(m1.get(), m2);
++  }
++}
++
++TEST_CASE("query moves") {
++  auto m1 =
++      "C[C@H](O)C(F)[C@H](C)O |o2:1,5,&1:3,r,@:3,SgD:4:atom_data:foo::::|"_smarts;
++  REQUIRE(m1);
++  m1->setProp("foo", 1u);
++  SECTION("molecule move") {
++    ROMol m2 = std::move(*m1);
++    check_dest(m1.get(), m2);
++  }
++  SECTION("molecule move-assign") {
++    ROMol m2;
++    m2 = std::move(*m1);
++    check_dest(m1.get(), m2);
++  }
++}
++
++TEST_CASE("moves with conformer") {
++  auto m1 = R"CTAB(
++  Mrv2108 01192209042D          
++
++  0  0  0     0  0            999 V3000
++M  V30 BEGIN CTAB
++M  V30 COUNTS 8 7 1 0 0
++M  V30 BEGIN ATOM
++M  V30 1 C 2.31 4.001 0 0
++M  V30 2 C 1.54 2.6674 0 0 CFG=2
++M  V30 3 O -0 2.6674 0 0
++M  V30 4 C 2.31 1.3337 0 0 CFG=1
++M  V30 5 F 3.85 1.3337 0 0
++M  V30 6 C 1.54 0 0 0 CFG=2
++M  V30 7 C 2.31 -1.3337 0 0
++M  V30 8 O 0 0 0 0
++M  V30 END ATOM
++M  V30 BEGIN BOND
++M  V30 1 1 2 1
++M  V30 2 1 2 3 CFG=1
++M  V30 3 1 4 2
++M  V30 4 1 4 5 CFG=1
++M  V30 5 1 4 6
++M  V30 6 1 6 7
++M  V30 7 1 6 8 CFG=3
++M  V30 END BOND
++M  V30 BEGIN SGROUP
++M  V30 1 DAT 0 ATOMS=(1 5) FIELDNAME=atom_data -
++M  V30 FIELDDISP="    4.6200    0.5637    DA    ALL  0       0" FIELDDATA=foo
++M  V30 END SGROUP
++M  V30 BEGIN COLLECTION
++M  V30 MDLV30/STEREL2 ATOMS=(2 2 6)
++M  V30 MDLV30/STERAC1 ATOMS=(1 4)
++M  V30 END COLLECTION
++M  V30 END CTAB
++M  END
++)CTAB"_ctab;
++  REQUIRE(m1);
++  m1->setProp("foo", 1u);
++  SECTION("molecule move") {
++    ROMol m2 = std::move(*m1);
++    check_dest(m1.get(), m2);
++  }
++  SECTION("molecule move-assign") {
++    ROMol m2;
++    m2 = std::move(*m1);
++    check_dest(m1.get(), m2);
++  }
++}
+diff --git a/Code/RDGeneral/CMakeLists.txt b/Code/RDGeneral/CMakeLists.txt
+index 054e82c8bcc..82ef14df5f1 100644
+--- a/Code/RDGeneral/CMakeLists.txt
++++ b/Code/RDGeneral/CMakeLists.txt
+@@ -79,3 +79,5 @@ if(RDK_BUILD_THREADSAFE_SSS)
+ rdkit_test(testConcurrentQueue testConcurrentQueue.cpp LINK_LIBRARIES RDGeneral)
+ endif(RDK_BUILD_THREADSAFE_SSS)
+ 
++rdkit_catch_test(dictTestsCatch catch_dict.cpp catch_main.cpp
++           LINK_LIBRARIES RDGeneral )
+\ No newline at end of file
+diff --git a/Code/RDGeneral/Dict.h b/Code/RDGeneral/Dict.h
+index ed8d466fc26..094d29baa32 100644
+--- a/Code/RDGeneral/Dict.h
++++ b/Code/RDGeneral/Dict.h
+@@ -1,5 +1,5 @@
+ //
+-// Copyright (C) 2003-2020 Greg Landrum and Rational Discovery LLC
++// Copyright (C) 2003-2021 Greg Landrum and other RDKit contributors
+ //
+ //  @@ All Rights Reserved @@
+ //  This file is part of the RDKit.
+@@ -60,6 +60,8 @@ class RDKIT_RDGENERAL_EXPORT Dict {
+     }
+   }
+ 
++  Dict(Dict &&other) noexcept = default;
++
+   ~Dict() {
+     reset();  // to clear pointers if necessary
+   }
+@@ -92,8 +94,12 @@ class RDKIT_RDGENERAL_EXPORT Dict {
+   }
+ 
+   Dict &operator=(const Dict &other) {
+-    if (this == &other) return *this;
+-    if (_hasNonPodData) reset();
++    if (this == &other) {
++      return *this;
++    }
++    if (_hasNonPodData) {
++      reset();
++    }
+ 
+     if (other._hasNonPodData) {
+       std::vector<Pair> data(other._data.size());
+@@ -109,6 +115,19 @@ class RDKIT_RDGENERAL_EXPORT Dict {
+     return *this;
+   }
+ 
++  Dict &operator=(Dict &&other) noexcept {
++    if (this == &other) {
++      return *this;
++    }
++    if (_hasNonPodData) {
++      reset();
++    }
++    _hasNonPodData = other._hasNonPodData;
++    other._hasNonPodData = false;
++    _data = std::move(other._data);
++    return *this;
++  }
++
+   //----------------------------------------------------------
+   //! \brief Access to the underlying non-POD containment flag
+   //! This is meant to be used only in bulk updates of _data.
+diff --git a/Code/RDGeneral/RDProps.h b/Code/RDGeneral/RDProps.h
+index 0e648871804..a240e25252a 100644
+--- a/Code/RDGeneral/RDProps.h
++++ b/Code/RDGeneral/RDProps.h
+@@ -22,10 +22,15 @@ class RDProps {
+   RDProps() : d_props() {}
+   RDProps(const RDProps &rhs) : d_props(rhs.d_props) {}
+   RDProps &operator=(const RDProps &rhs) {
+-    if (this == &rhs) return *this;
++    if (this == &rhs) {
++      return *this;
++    }
+     d_props = rhs.d_props;
+     return *this;
+   }
++  RDProps(RDProps &&o) noexcept = default;
++  RDProps &operator=(RDProps &&rhs) noexcept = default;
++
+   void clear() { d_props.reset(); }
+   //! gets the underlying Dictionary
+   const Dict &getDict() const { return d_props; }
+@@ -156,8 +161,8 @@ class RDProps {
+   //! update the properties from another
+   /*
+     \param source    Source to update the properties from
+-    \param preserve  Existing If true keep existing data, else override from the
+-    source
++    \param preserve  Existing If true keep existing data, else override from
++    the source
+   */
+   void updateProps(const RDProps &source, bool preserveExisting = false) {
+     d_props.update(source.getDict(), preserveExisting);
+diff --git a/Code/RDGeneral/catch_dict.cpp b/Code/RDGeneral/catch_dict.cpp
+new file mode 100644
+index 00000000000..bcecc6fc547
+--- /dev/null
++++ b/Code/RDGeneral/catch_dict.cpp
+@@ -0,0 +1,72 @@
++//
++//  Copyright (C) 2021 Greg Landrum
++//
++//   @@ All Rights Reserved @@
++//  This file is part of the RDKit.
++//  The contents are covered by the terms of the BSD license
++//  which is included in the file license.txt, found at the root
++//  of the RDKit source tree.
++//
++#include <string>
++#include "catch.hpp"
++#include "Dict.h"
++#include "RDProps.h"
++using namespace std::string_literals;
++
++TEST_CASE("Dict move semantics") {
++  RDKit::Dict d1;
++  d1.setVal("foo"s, 1);
++  d1.setVal("bar"s, "yep");
++  SECTION("move constructor") {
++    CHECK(d1.hasVal("foo"s));
++    CHECK(d1.hasVal("bar"s));
++    CHECK(d1.getVal<std::string>("bar"s) == "yep"s);
++    auto d2 = std::move(d1);
++    CHECK(d2.hasVal("foo"s));
++    CHECK(d2.hasVal("bar"s));
++    CHECK(d2.getVal<std::string>("bar"s) == "yep"s);
++    CHECK(!d1.hasVal("foo"s));
++    CHECK(!d1.hasVal("bar"s));
++  }
++  SECTION("move assignment") {
++    CHECK(d1.hasVal("foo"s));
++    CHECK(d1.hasVal("bar"s));
++    CHECK(d1.getVal<std::string>("bar"s) == "yep"s);
++    RDKit::Dict d2;
++    d2 = std::move(d1);
++    CHECK(d2.hasVal("foo"s));
++    CHECK(d2.hasVal("bar"s));
++    CHECK(d2.getVal<std::string>("bar"s) == "yep"s);
++    CHECK(!d1.hasVal("foo"s));
++    CHECK(!d1.hasVal("bar"s));
++  }
++}
++
++TEST_CASE("RDProps move semantics") {
++  RDKit::RDProps d1;
++  d1.setProp("foo"s, 1);
++  d1.setProp("bar"s, "yep");
++  SECTION("move constructor") {
++    CHECK(d1.hasProp("foo"s));
++    CHECK(d1.hasProp("bar"s));
++    CHECK(d1.getProp<std::string>("bar"s) == "yep"s);
++    auto d2 = std::move(d1);
++    CHECK(d2.hasProp("foo"s));
++    CHECK(d2.hasProp("bar"s));
++    CHECK(d2.getProp<std::string>("bar"s) == "yep"s);
++    CHECK(!d1.hasProp("foo"s));
++    CHECK(!d1.hasProp("bar"s));
++  }
++  SECTION("move assignment") {
++    CHECK(d1.hasProp("foo"s));
++    CHECK(d1.hasProp("bar"s));
++    CHECK(d1.getProp<std::string>("bar"s) == "yep"s);
++    RDKit::RDProps d2;
++    d2 = std::move(d1);
++    CHECK(d2.hasProp("foo"s));
++    CHECK(d2.hasProp("bar"s));
++    CHECK(d2.getProp<std::string>("bar"s) == "yep"s);
++    CHECK(!d1.hasProp("foo"s));
++    CHECK(!d1.hasProp("bar"s));
++  }
++}
+\ No newline at end of file
+diff --git a/Code/RDGeneral/catch_main.cpp b/Code/RDGeneral/catch_main.cpp
+new file mode 100644
+index 00000000000..e94b210fef7
+--- /dev/null
++++ b/Code/RDGeneral/catch_main.cpp
+@@ -0,0 +1,20 @@
++//
++//  Copyright (C) 2021 Greg Landrum
++//   @@ All Rights Reserved @@
++//  This file is part of the RDKit.
++//  The contents are covered by the terms of the BSD license
++//  which is included in the file license.txt, found at the root
++//  of the RDKit source tree.
++//
++
++#define CATCH_CONFIG_RUNNER
++#include "catch.hpp"
++#include <RDGeneral/RDLog.h>
++
++int main(int argc, char* argv[]) {
++  RDLog::InitLogs();
++
++  int result = Catch::Session().run(argc, argv);
++
++  return result;
++}
+\ No newline at end of file

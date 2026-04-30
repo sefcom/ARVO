@@ -1,0 +1,91 @@
+From 3614747af54e60229a2bf11e8f40e1b975cc9ae6 Mon Sep 17 00:00:00 2001
+From: Grzegorz Antoniak <ga@anadoxin.org>
+Date: Wed, 1 May 2019 07:32:58 +0200
+Subject: [PATCH] RAR5 reader: handle a case with truncated huffman tables.
+
+RAR5 reader did assume that the block contains full huffman table data.
+In invalid files that declare existence of huffman tables, but also
+declare too small block size to fit the huffman tables in, RAR5 reader
+was interpreting memory beyond the allocated block.
+
+The commit adds necessary buffer overflow checks and fails the huffman
+table reading function in case truncated data will be detected.
+
+The commit also provides a unit test for this case.
+
+Should fix OSSFuzz issue #12817.
+---
+ libarchive/archive_read_support_format_rar5.c     | 14 ++++++++++++++
+ libarchive/test/test_read_format_rar5.c           | 15 +++++++++++++++
+ .../test_read_format_rar5_truncated_huff.rar.uu   |  7 +++++++
+ 3 files changed, 36 insertions(+)
+ create mode 100644 libarchive/test/test_read_format_rar5_truncated_huff.rar.uu
+
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index aac74cd47..e3c3b62d1 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -2298,6 +2298,13 @@ static int parse_tables(struct archive_read* a, struct rar5* rar,
+     /* The data for table generation is compressed using a simple RLE-like
+      * algorithm when storing zeroes, so we need to unpack it first. */
+     for(w = 0, i = 0; w < HUFF_BC;) {
++        if(i >= rar->cstate.cur_block_size) {
++            /* Truncated data, can't continue. */
++            archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++                    "Truncated data in huffman tables");
++            return ARCHIVE_FATAL;
++        }
++
+         value = (p[i] & nibble_mask) >> nibble_shift;
+ 
+         if(nibble_mask == 0x0F)
+@@ -2345,6 +2352,13 @@ static int parse_tables(struct archive_read* a, struct rar5* rar,
+     for(i = 0; i < HUFF_TABLE_SIZE;) {
+         uint16_t num;
+ 
++        if((rar->bits.in_addr + 6) >= rar->cstate.cur_block_size) {
++            /* Truncated data, can't continue. */
++            archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++                    "Truncated data in huffman tables (#2)");
++            return ARCHIVE_FATAL;
++        }
++
+         ret = decode_number(a, &rar->cstate.bd, p, &num);
+         if(ret != ARCHIVE_OK) {
+             archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+diff --git a/libarchive/test/test_read_format_rar5.c b/libarchive/test/test_read_format_rar5.c
+index 9b03af13b..cc1c4b896 100644
+--- a/libarchive/test/test_read_format_rar5.c
++++ b/libarchive/test/test_read_format_rar5.c
+@@ -995,3 +995,18 @@ DEFINE_TEST(test_read_format_rar5_leftshift2)
+ 
+     EPILOGUE();
+ }
++
++DEFINE_TEST(test_read_format_rar5_truncated_huff)
++{
++    uint8_t buf[16];
++
++    PROLOGUE("test_read_format_rar5_truncated_huff.rar");
++
++    assertA(0 == archive_read_next_header(a, &ae));
++    /* This archive is invalid. However, processing it shouldn't cause any
++     * errors related to undefined operations when using -fsanitize. */
++    assertA(ARCHIVE_FATAL == archive_read_data(a, buf, sizeof(buf)));
++    assertA(ARCHIVE_FATAL == archive_read_next_header(a, &ae));
++
++    EPILOGUE();
++}
+diff --git a/libarchive/test/test_read_format_rar5_truncated_huff.rar.uu b/libarchive/test/test_read_format_rar5_truncated_huff.rar.uu
+new file mode 100644
+index 000000000..12d9e2550
+--- /dev/null
++++ b/libarchive/test/test_read_format_rar5_truncated_huff.rar.uu
+@@ -0,0 +1,7 @@
++begin 644 test_read_format_rar5_truncated_huff.rar
++M4F%R(1H'`0"-[P+2``'#]#P\7P$'`0"-[P+2``+2`!;#M#Q::7!)2?__'`!I
++M?_O_0B\*0RX-,'%O.\(#!-'^T#4````0`P1_``!#(3`P,./H`P```*^OKZ^O
++MKZ^OKZ^OKZ^OKZ^OKZ^OKZ^OKZ^OKZ^OKZ^OKZ\0`*^OKZ^A``KZ``$`2^\#
++9T>WMNP$+-5H*^@`!`$OOB]$````0"S5:*@``
++`
++end

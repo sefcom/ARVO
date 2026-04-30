@@ -1,0 +1,231 @@
+From ae88980c45691aeaa6ad0a63b6281470dfb311d9 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Sat, 3 Mar 2018 12:09:51 +0000
+Subject: [PATCH] ogr2ogr: preserve source geometry field name for output
+ drivers that support GEOMETRY_NAME layer creation option (such as GPKG)
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@41604 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ autotest/ogr/ogr_sqlite.py             |  2 +-
+ autotest/utilities/test_ogr2ogr.py     | 10 ++--
+ autotest/utilities/test_ogr2ogr_lib.py | 40 +++++++++++++
+ gdal/apps/ogr2ogr_lib.cpp              | 83 +++++++++++++++++---------
+ 4 files changed, 102 insertions(+), 33 deletions(-)
+
+diff --git a/autotest/ogr/ogr_sqlite.py b/autotest/ogr/ogr_sqlite.py
+index a719d7a14120..8d51dc5c02fe 100755
+--- a/autotest/ogr/ogr_sqlite.py
++++ b/autotest/ogr/ogr_sqlite.py
+@@ -3442,7 +3442,7 @@ def ogr_sqlite_44():
+     if gdaltest.sl_ds is None:
+         return 'skip'
+ 
+-    gdal.FileFromMemBuffer('/vsimem/ogr_sqlite_44.csvt', 'JsonStringList,JsonIntegerList,JsonInteger64List,JsonRealList,WKT\n')
++    gdal.FileFromMemBuffer('/vsimem/ogr_sqlite_44.csvt', 'JsonStringList,JsonIntegerList,JsonInteger64List,JsonRealList,WKT')
+     gdal.FileFromMemBuffer('/vsimem/ogr_sqlite_44.csv',
+ """stringlist,intlist,int64list,reallist,WKT
+ "[""a"",null]","[1]","[1234567890123]","[0.125]",
+diff --git a/autotest/utilities/test_ogr2ogr.py b/autotest/utilities/test_ogr2ogr.py
+index 27ebc4c38089..c88a277af7f3 100755
+--- a/autotest/utilities/test_ogr2ogr.py
++++ b/autotest/utilities/test_ogr2ogr.py
+@@ -2191,7 +2191,7 @@ def test_ogr2ogr_54():
+     content = f.read()
+     f.close()
+ 
+-    if content.find('<xs:element name="geometryProperty" type="gml:GeometryPropertyType" nillable="true" minOccurs="0" maxOccurs="1"/>') < 0 or \
++    if content.find('<xs:element name="WKT" type="gml:GeometryPropertyType" nillable="true" minOccurs="0" maxOccurs="1"/>') < 0 or \
+        content.find('<xs:element name="fld1" nillable="true" minOccurs="0" maxOccurs="1">') < 0 or \
+        content.find('<xs:element name="fld2" nillable="true" minOccurs="0" maxOccurs="1">') < 0:
+         gdaltest.post_reason('fail')
+@@ -2341,8 +2341,8 @@ def test_ogr2ogr_57():
+     content = f.read()
+     f.close()
+ 
+-    if content.find("""CREATE TABLE "public"."test_ogr2ogr_57" ( "id" SERIAL, CONSTRAINT "test_ogr2ogr_57_pk" PRIMARY KEY ("id") )""") < 0 or \
+-       content.find("""INSERT INTO "public"."test_ogr2ogr_57" ("wkb_geometry" , "id" , "str") VALUES ('010100000000000000000000000000000000000000', 10, 'a')""") < 0:
++    if content.find("""CREATE TABLE "public"."test_ogr2ogr_57" (    "id" SERIAL,    CONSTRAINT "test_ogr2ogr_57_pk" PRIMARY KEY ("id") )""") < 0 or \
++       content.find("""INSERT INTO "public"."test_ogr2ogr_57" ("wkt" , "id" , "str") VALUES ('010100000000000000000000000000000000000000', 10, 'a')""") < 0:
+         gdaltest.post_reason('fail')
+         print(content)
+         return 'fail'
+@@ -2356,8 +2356,8 @@ def test_ogr2ogr_57():
+     content = f.read()
+     f.close()
+ 
+-    if content.find("""CREATE TABLE "public"."test_ogr2ogr_57" ( "ogc_fid" SERIAL, CONSTRAINT "test_ogr2ogr_57_pk" PRIMARY KEY ("ogc_fid") )""") < 0 or \
+-       content.find("""INSERT INTO "public"."test_ogr2ogr_57" ("wkb_geometry" , "str") VALUES ('010100000000000000000000000000000000000000', 'a')""") < 0:
++    if content.find("""CREATE TABLE "public"."test_ogr2ogr_57" (    "ogc_fid" SERIAL,    CONSTRAINT "test_ogr2ogr_57_pk" PRIMARY KEY ("ogc_fid") )""") < 0 or \
++       content.find("""INSERT INTO "public"."test_ogr2ogr_57" ("wkt" , "str") VALUES ('010100000000000000000000000000000000000000', 'a')""") < 0:
+         gdaltest.post_reason('fail')
+         print(content)
+         return 'fail'
+diff --git a/autotest/utilities/test_ogr2ogr_lib.py b/autotest/utilities/test_ogr2ogr_lib.py
+index bbb0095ca923..c9a096e9ac54 100755
+--- a/autotest/utilities/test_ogr2ogr_lib.py
++++ b/autotest/utilities/test_ogr2ogr_lib.py
+@@ -439,6 +439,45 @@ def test_ogr2ogr_lib_19():
+ 
+     return 'success'
+ 
++
++###############################################################################
++# Test preservation of source geometry field name
++
++def test_ogr2ogr_lib_20():
++
++    if ogr.GetDriverByName('GPKG') is None:
++        return 'skip'
++
++    src_ds = gdal.GetDriverByName('Memory').Create('', 0, 0, 0)
++    lyr = src_ds.CreateLayer('layer', geom_type = ogr.wkbNone)
++    lyr.CreateGeomField(ogr.GeomFieldDefn('foo'))
++
++    ds = gdal.VectorTranslate('/vsimem/out.gpkg', src_ds, format = 'GPKG')
++    lyr = ds.GetLayer(0)
++    if lyr.GetGeometryColumn() != 'foo':
++        gdaltest.post_reason('fail')
++        print(lyr.GetGeometryColumn())
++        return 'fail'
++    ds = None
++    gdal.Unlink('/vsimem/out.gpkg')
++
++
++    src_ds = gdal.GetDriverByName('Memory').Create('', 0, 0, 0)
++    lyr = src_ds.CreateLayer('layer', geom_type = ogr.wkbNone)
++    lyr.CreateGeomField(ogr.GeomFieldDefn('foo'))
++    lyr.CreateGeomField(ogr.GeomFieldDefn('bar'))
++
++    ds = gdal.VectorTranslate('/vsimem/out.gpkg', src_ds, format = 'GPKG', selectFields = ['bar'])
++    lyr = ds.GetLayer(0)
++    if lyr.GetGeometryColumn() != 'bar':
++        gdaltest.post_reason('fail')
++        print(lyr.GetGeometryColumn())
++        return 'fail'
++    ds = None
++    gdal.Unlink('/vsimem/out.gpkg')
++
++    return 'success'
++
+ gdaltest_list = [
+     test_ogr2ogr_lib_1,
+     test_ogr2ogr_lib_2,
+@@ -459,6 +498,7 @@ def test_ogr2ogr_lib_19():
+     test_ogr2ogr_lib_17,
+     test_ogr2ogr_lib_18,
+     test_ogr2ogr_lib_19,
++    test_ogr2ogr_lib_20,
+     ]
+ 
+ if __name__ == '__main__':
+diff --git a/gdal/apps/ogr2ogr_lib.cpp b/gdal/apps/ogr2ogr_lib.cpp
+index 62b7d9bc3de1..37fe44f4f6f6 100644
+--- a/gdal/apps/ogr2ogr_lib.cpp
++++ b/gdal/apps/ogr2ogr_lib.cpp
+@@ -3562,50 +3562,79 @@ TargetLayerInfo* SetupTargetLayer::Setup(OGRLayer* poSrcLayer,
+         {
+             eGCreateLayerType = wkbNone;
+         }
+-        else if( anRequestedGeomFields.size() == 1 &&
+-                 m_poDstDS->TestCapability(ODsCCreateGeomFieldAfterCreateLayer) )
+-        {
+-            eGCreateLayerType = wkbNone;
+-        }
+-        // If the source feature has a single geometry column that is not nullable
++        // If the source layer has a single geometry column that is not nullable
+         // and that ODsCCreateGeomFieldAfterCreateLayer is available, use it
+         // so as to be able to set the not null constraint (if the driver supports it)
++        // Same if the source geometry column has a non empty name that is not
++        // overriden
+         else if( anRequestedGeomFields.empty() &&
+                  nSrcGeomFieldCount == 1 &&
+                  m_poDstDS->TestCapability(ODsCCreateGeomFieldAfterCreateLayer) &&
+-                 !poSrcFDefn->GetGeomFieldDefn(0)->IsNullable() &&
+-                 !m_bForceNullable)
++                 ((!poSrcFDefn->GetGeomFieldDefn(0)->IsNullable() &&
++                   CSLFetchNameValue(m_papszLCO, "GEOMETRY_NULLABLE") == nullptr &&
++                   !m_bForceNullable) ||
++                  (poSrcLayer->GetGeometryColumn() != nullptr &&
++                   CSLFetchNameValue(m_papszLCO, "GEOMETRY_NAME") == nullptr &&
++                   !EQUAL(poSrcLayer->GetGeometryColumn(), "") &&
++                   poSrcFDefn->GetFieldIndex(poSrcLayer->GetGeometryColumn()) < 0)) )
+         {
+             anRequestedGeomFields.push_back(0);
+             eGCreateLayerType = wkbNone;
+         }
++        else if( anRequestedGeomFields.size() == 1 &&
++                 m_poDstDS->TestCapability(ODsCCreateGeomFieldAfterCreateLayer) )
++        {
++            eGCreateLayerType = wkbNone;
++        }
++
+         // If the source feature first geometry column is not nullable
+         // and that GEOMETRY_NULLABLE creation option is available, use it
+         // so as to be able to set the not null constraint (if the driver supports it)
+-        else if( anRequestedGeomFields.empty() &&
+-                 nSrcGeomFieldCount >= 1 &&
+-                 !poSrcFDefn->GetGeomFieldDefn(0)->IsNullable() &&
+-                 m_poDstDS->GetDriver()->GetMetadataItem(GDAL_DS_LAYER_CREATIONOPTIONLIST) != nullptr &&
+-                 strstr(m_poDstDS->GetDriver()->GetMetadataItem(GDAL_DS_LAYER_CREATIONOPTIONLIST), "GEOMETRY_NULLABLE") != nullptr &&
+-                 CSLFetchNameValue(m_papszLCO, "GEOMETRY_NULLABLE") == nullptr &&
+-                 !m_bForceNullable )
++        if( anRequestedGeomFields.empty() &&
++            nSrcGeomFieldCount >= 1 &&
++            !poSrcFDefn->GetGeomFieldDefn(0)->IsNullable() &&
++            m_poDstDS->GetDriver()->GetMetadataItem(
++                GDAL_DS_LAYER_CREATIONOPTIONLIST) != nullptr &&
++            strstr(m_poDstDS->GetDriver()->GetMetadataItem(
++                GDAL_DS_LAYER_CREATIONOPTIONLIST), "GEOMETRY_NULLABLE") != nullptr &&
++            CSLFetchNameValue(m_papszLCO, "GEOMETRY_NULLABLE") == nullptr &&
++            !m_bForceNullable )
+         {
+             papszLCOTemp = CSLSetNameValue(papszLCOTemp, "GEOMETRY_NULLABLE", "NO");
+             CPLDebug("GDALVectorTranslate", "Using GEOMETRY_NULLABLE=NO");
+         }
+-        // Special case for conversion from GMLAS driver to ensure that
+-        // source geometry field name will be used as much as possible
+-        // FIXME: why not make this general behaviour ?
+-        else if( anRequestedGeomFields.empty() &&
+-                 nSrcGeomFieldCount == 1 &&
+-                 m_poDstDS->TestCapability(ODsCCreateGeomFieldAfterCreateLayer) &&
+-                 m_poSrcDS != nullptr &&
+-                 m_poSrcDS->GetDriver() != nullptr &&
+-                 ( EQUAL(m_poSrcDS->GetDriver()->GetDescription(), "GMLAS") ||
+-                   EQUAL(m_poSrcDS->GetDriver()->GetDescription(), "NAS") ) )
++
++        // Use source geometry field name as much as possible
++        if( m_poDstDS->GetDriver()->GetMetadataItem(
++                GDAL_DS_LAYER_CREATIONOPTIONLIST) != nullptr &&
++            strstr(m_poDstDS->GetDriver()->GetMetadataItem(
++                GDAL_DS_LAYER_CREATIONOPTIONLIST), "GEOMETRY_NAME") != nullptr &&
++            CSLFetchNameValue(m_papszLCO, "GEOMETRY_NAME") == nullptr )
+         {
+-            anRequestedGeomFields.push_back(0);
+-            eGCreateLayerType = wkbNone;
++            int iSrcGeomField = -1;
++            if( anRequestedGeomFields.empty() &&
++                (nSrcGeomFieldCount == 1 ||
++                 (!m_poDstDS->TestCapability(ODsCCreateGeomFieldAfterCreateLayer) &&
++                  nSrcGeomFieldCount > 1) ) )
++            {
++                iSrcGeomField = 0;
++            }
++            else if( anRequestedGeomFields.size() == 1 )
++            {
++                iSrcGeomField = anRequestedGeomFields[0];
++            }
++
++            if( iSrcGeomField >= 0 )
++            {
++                const char* pszGFldName = poSrcFDefn->GetGeomFieldDefn(
++                                                iSrcGeomField)->GetNameRef();
++                if( pszGFldName != nullptr && !EQUAL(pszGFldName, "") &&
++                    poSrcFDefn->GetFieldIndex(pszGFldName) < 0 )
++                {
++                    papszLCOTemp = CSLSetNameValue(papszLCOTemp,
++                                                "GEOMETRY_NAME", pszGFldName);
++                }
++            }
+         }
+ 
+         // Force FID column as 64 bit if the source feature has a 64 bit FID,

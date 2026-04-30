@@ -1,0 +1,69 @@
+From 52afc10adc0c65e3c999665fad28ce78944e23b0 Mon Sep 17 00:00:00 2001
+From: Antoine Pitrou <antoine@python.org>
+Date: Wed, 8 Jul 2020 09:08:06 -0500
+Subject: [PATCH] ARROW-9330: [C++] Fix crash and undefined behaviour on
+ corrupt IPC input
+
+Should fix the following issues:
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=23910
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=23916
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=23921
+
+Closes #7644 from pitrou/ARROW-9330-oss-fuzz-ipc
+
+Authored-by: Antoine Pitrou <antoine@python.org>
+Signed-off-by: Wes McKinney <wesm@apache.org>
+---
+ cpp/src/arrow/array/concatenate.cc | 17 +++++++++++++++--
+ testing                            |  2 +-
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/cpp/src/arrow/array/concatenate.cc b/cpp/src/arrow/array/concatenate.cc
+index bcb7843d9aa..c5ae78985b7 100644
+--- a/cpp/src/arrow/array/concatenate.cc
++++ b/cpp/src/arrow/array/concatenate.cc
+@@ -36,6 +36,7 @@
+ #include "arrow/util/bit_util.h"
+ #include "arrow/util/bitmap_ops.h"
+ #include "arrow/util/checked_cast.h"
++#include "arrow/util/int_util.h"
+ #include "arrow/util/logging.h"
+ #include "arrow/visitor_inline.h"
+ 
+@@ -131,6 +132,14 @@ static Status ConcatenateOffsets(const BufferVector& buffers, MemoryPool* pool,
+ template <typename Offset>
+ static Status PutOffsets(const std::shared_ptr<Buffer>& src, Offset first_offset,
+                          Offset* dst, Range* values_range) {
++  if (src->size() == 0) {
++    // It's allowed to have an empty offsets buffer for a 0-length array
++    // (see Array::Validate)
++    values_range->offset = 0;
++    values_range->length = 0;
++    return Status::OK();
++  }
++
+   // Get the range of offsets to transfer from src
+   auto src_begin = reinterpret_cast<const Offset*>(src->data());
+   auto src_end = reinterpret_cast<const Offset*>(src->data() + src->size());
+@@ -145,8 +154,12 @@ static Status PutOffsets(const std::shared_ptr<Buffer>& src, Offset first_offset
+   // Write offsets into dst, ensuring that the first offset written is
+   // first_offset
+   auto adjustment = first_offset - src_begin[0];
+-  std::transform(src_begin, src_end, dst,
+-                 [adjustment](Offset offset) { return offset + adjustment; });
++  // NOTE: Concatenate can be called during IPC reads to append delta dictionaries.
++  // Avoid UB on non-validated input by doing the addition in the unsigned domain.
++  // (the result can later be validated using Array::ValidateFull)
++  std::transform(src_begin, src_end, dst, [adjustment](Offset offset) {
++    return internal::SafeSignedAdd(offset, adjustment);
++  });
+   return Status::OK();
+ }
+ 
+diff --git a/testing b/testing
+index 10ab9dd6d4b..90b987c4fd6 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit 10ab9dd6d4bd8276574d9efe55b759c1ad1a27a4
++Subproject commit 90b987c4fd696ca7fabcf53fdbb49c62cd39c47c

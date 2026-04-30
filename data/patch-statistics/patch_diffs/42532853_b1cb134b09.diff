@@ -1,0 +1,938 @@
+From 98d36de8b5eb7981dc5a1a759b12c8c4e6675c14 Mon Sep 17 00:00:00 2001
+From: Dimitar Krastev <dimi1010100@gmail.com>
+Date: Mon, 14 Apr 2025 21:14:48 +0300
+Subject: [PATCH] Templated next layer sub-construction. (#1748)
+
+* Added templated helper functions for validating and constructing new layers.
+
+* Replaced new statements with constructNextLayer<T>
+
+* Fixed gcc template errors (hopefully).
+
+* Lint
+
+* Fixed docstring
+
+* Merged tryConstructNextLayerChain into tryConstructNextLayer.
+
+* Removed void specialization
+
+* Simplified recursive implementation.
+
+* Added basic isDataValid  for IGMP layers.
+
+* Fixed `IPv4::isDataValid` not checking if the `data` pointer is nullptr before dereferencing.
+
+* Added check for IPHeader version constant to `IPv6Layer::isDataValid`.
+
+* C cast -> C++ cast.
+
+* Added `isDataValid` to VrrpV2Layer.
+
+* Added sanity check if attempting to overwrite the next layer.
+
+* Refactored IPv4Layer to use new helper functions.
+
+* Fixed include
+
+* Changed isDataValid for payload layer to be non-nullptr.
+
+* Lint
+
+* Changed PayloadLayer::isDataValid to accept a buffer if the data is nullptr and the dataLen is 0.
+
+* Changed IPAddress::AddressType to `enum class`.
+
+- Added new values Unknown, IPv4, IPv6.
+- Deprecated values `IPv4AddressType` and `IPv6AddressType`
+- Added compatibility constants `IPv4AddressType` and `IPv6AddressType` in `IPAddress` to mimic the unscoped nature of C enums.
+
+* Added IP header version checker to IPLayer.
+
+* Added `VrrpV3Layer::isDataValid`
+
+* Refactored `tryConstructNextLayer` to allow extra arguments into the layer constructor.
+
+Removed the chain overload of the function.
+
+* Lint
+
+* Changed tryConstruct to construct for the payload fallback.
+
+* Added todo.
+
+* Added a helper method canReinterpretAs to standardize the basic isDataValid checks.
+
+* Fixed warning about unhandled enumeration value.
+
+* Lint
+
+* Changed `getIPVersion` to return ProtocolType for consistency with other layers.
+
+* Revert "Changed IPAddress::AddressType to `enum class`."
+
+This reverts commit 7f7fffc4a2184eb2ef13c3ada86ca410050ec438.
+
+# Conflicts:
+#	Common++/header/IpAddress.h
+
+* Fixed documentation.
+
+* Added isDataValid to more layers.
+
+* Fixed using IPv4Layer to call static function instead of IPLayer.
+
+* Changed `canReinterpretAs` to a static protected helper function to Layer.
+
+* Added docstring to `IPLayer::getIPVersion`.
+
+* Lint.
+
+* Added a tryConstructWithFallback overload that automatically handles a construction of a fallback class.
+
+* Lint
+
+* Fixed docstring.
+
+* Marked `tryConstructNextLayer` as private to promote usage of `tryConstructNextLayerWithFallback`
+
+* Moved `tryConstructNextLayer` below protected methods.
+
+* Added default cases.
+
+* Simplified else clause.
+
+* Added full docstrings for isDataValid methods.
+
+* Basic transition to constructNextLayer API for TcpLayer.
+
+* Lint
+---
+ Packet++/CMakeLists.txt        |   1 +
+ Packet++/header/ArpLayer.h     |   9 +++
+ Packet++/header/IPLayer.h      |  11 +++
+ Packet++/header/IPv4Layer.h    |   2 +-
+ Packet++/header/IPv6Layer.h    |   3 +-
+ Packet++/header/IgmpLayer.h    |  36 +++++++++
+ Packet++/header/Layer.h        |  88 ++++++++++++++++++++++
+ Packet++/header/MplsLayer.h    |   9 +++
+ Packet++/header/PayloadLayer.h |  10 +++
+ Packet++/header/StpLayer.h     |   8 +-
+ Packet++/header/TpktLayer.h    |   2 +-
+ Packet++/header/VlanLayer.h    |   9 +++
+ Packet++/header/VrrpLayer.h    |  20 ++++-
+ Packet++/src/EthLayer.cpp      |  32 +++-----
+ Packet++/src/IPLayer.cpp       |  26 +++++++
+ Packet++/src/IPv4Layer.cpp     | 132 ++++++++++++++++++---------------
+ Packet++/src/TcpLayer.cpp      |  76 ++++++++++++++-----
+ 17 files changed, 368 insertions(+), 106 deletions(-)
+ create mode 100644 Packet++/src/IPLayer.cpp
+
+diff --git a/Packet++/CMakeLists.txt b/Packet++/CMakeLists.txt
+index 500d078053..3d8ce81851 100644
+--- a/Packet++/CMakeLists.txt
++++ b/Packet++/CMakeLists.txt
+@@ -20,6 +20,7 @@ add_library(
+   src/IcmpLayer.cpp
+   src/IcmpV6Layer.cpp
+   src/IgmpLayer.cpp
++  src/IPLayer.cpp
+   src/IPReassembly.cpp
+   src/IPSecLayer.cpp
+   src/IPv4Layer.cpp
+diff --git a/Packet++/header/ArpLayer.h b/Packet++/header/ArpLayer.h
+index 02251c4207..6402a5b753 100644
+--- a/Packet++/header/ArpLayer.h
++++ b/Packet++/header/ArpLayer.h
+@@ -271,6 +271,15 @@ namespace pcpp
+ 		{
+ 			return OsiModelNetworkLayer;
+ 		}
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an ARP layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an ARP layer
++		static bool isDataValid(const uint8_t* data, size_t dataLen)
++		{
++			return canReinterpretAs<arphdr>(data, dataLen);
++		}
+ 	};
+ 
+ }  // namespace pcpp
+diff --git a/Packet++/header/IPLayer.h b/Packet++/header/IPLayer.h
+index 9e87eff0a6..2c2278481c 100644
+--- a/Packet++/header/IPLayer.h
++++ b/Packet++/header/IPLayer.h
+@@ -30,5 +30,16 @@ namespace pcpp
+ 
+ 		/// An empty destructor
+ 		virtual ~IPLayer() = default;
++
++		/// @brief Get the IP version of a given packet data.
++		///
++		/// The buffer is expected to start with the IP header and contain at least the first byte of it.
++		/// The method will recognize IPv4 and IPv6 headers and return the respective protocol constant.
++		/// If the IP version is not recognized or the buffer is malformed, UnknownProtocol will be returned.
++		///
++		/// @param[in] data A pointer to the packet data
++		/// @param[in] dataLen The length of the packet data in bytes
++		/// @return A ProtocolType representing the IP version of the packet data.
++		static ProtocolType getIPVersion(uint8_t const* data, size_t dataLen);
+ 	};
+ }  // namespace pcpp
+diff --git a/Packet++/header/IPv4Layer.h b/Packet++/header/IPv4Layer.h
+index ec89dcf9ee..20829b9f4e 100644
+--- a/Packet++/header/IPv4Layer.h
++++ b/Packet++/header/IPv4Layer.h
+@@ -626,7 +626,7 @@ namespace pcpp
+ 	bool IPv4Layer::isDataValid(const uint8_t* data, size_t dataLen)
+ 	{
+ 		const iphdr* hdr = reinterpret_cast<const iphdr*>(data);
+-		return dataLen >= sizeof(iphdr) && hdr->ipVersion == 4 && hdr->internetHeaderLength >= 5;
++		return canReinterpretAs<iphdr>(data, dataLen) && hdr->ipVersion == 4 && hdr->internetHeaderLength >= 5;
+ 	}
+ 
+ }  // namespace pcpp
+diff --git a/Packet++/header/IPv6Layer.h b/Packet++/header/IPv6Layer.h
+index 2d78473753..87cffaafbe 100644
+--- a/Packet++/header/IPv6Layer.h
++++ b/Packet++/header/IPv6Layer.h
+@@ -244,7 +244,8 @@ namespace pcpp
+ 
+ 	bool IPv6Layer::isDataValid(const uint8_t* data, size_t dataLen)
+ 	{
+-		return data && dataLen >= sizeof(ip6_hdr);
++		auto ip6Header = reinterpret_cast<const ip6_hdr*>(data);
++		return canReinterpretAs<ip6_hdr>(data, dataLen) && ip6Header->ipVersion == 6;
+ 	}
+ 
+ }  // namespace pcpp
+diff --git a/Packet++/header/IgmpLayer.h b/Packet++/header/IgmpLayer.h
+index c6418cc865..45e00a391a 100644
+--- a/Packet++/header/IgmpLayer.h
++++ b/Packet++/header/IgmpLayer.h
+@@ -235,6 +235,15 @@ namespace pcpp
+ 
+ 		/// Calculate the IGMP checksum and set igmp_header#maxResponseTime to 0 (this field is unused in IGMPv1)
+ 		void computeCalculateFields() override;
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an IGMPv1 layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an IGMPv1 layer
++		static bool isDataValid(uint8_t const* data, size_t dataLen)
++		{
++			return canReinterpretAs<igmp_header>(data, dataLen);
++		}
+ 	};
+ 
+ 	/// @class IgmpV2Layer
+@@ -269,6 +278,15 @@ namespace pcpp
+ 
+ 		/// Calculate the IGMP checksum
+ 		void computeCalculateFields() override;
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an IGMPv2 layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an IGMPv2 layer
++		static bool isDataValid(uint8_t const* data, size_t dataLen)
++		{
++			return canReinterpretAs<igmp_header>(data, dataLen);
++		}
+ 	};
+ 
+ 	/// @class IgmpV3QueryLayer
+@@ -347,6 +365,15 @@ namespace pcpp
+ 		/// @return The message size in bytes which include the size of the basic header + the size of the source
+ 		/// address list
+ 		size_t getHeaderLen() const override;
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an IGMPv3 Query layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an IGMPv3 Query layer
++		static bool isDataValid(uint8_t const* data, size_t dataLen)
++		{
++			return canReinterpretAs<igmpv3_query_header>(data, dataLen);
++		}
+ 	};
+ 
+ 	/// @class IgmpV3ReportLayer
+@@ -441,6 +468,15 @@ namespace pcpp
+ 		{
+ 			return m_DataLen;
+ 		}
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an IGMPv3 Report layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an IGMPv3 Report layer
++		static bool isDataValid(uint8_t const* data, size_t dataLen)
++		{
++			return canReinterpretAs<igmpv3_report_header>(data, dataLen);
++		}
+ 	};
+ 
+ }  // namespace pcpp
+diff --git a/Packet++/header/Layer.h b/Packet++/header/Layer.h
+index a6c22be5f6..eeb7eaa238 100644
+--- a/Packet++/header/Layer.h
++++ b/Packet++/header/Layer.h
+@@ -4,6 +4,8 @@
+ #include <stdio.h>
+ #include "ProtocolType.h"
+ #include <string>
++#include <stdexcept>
++#include <utility>
+ 
+ /// @file
+ 
+@@ -189,6 +191,92 @@ namespace pcpp
+ 
+ 		virtual bool extendLayer(int offsetInLayer, size_t numOfBytesToExtend);
+ 		virtual bool shortenLayer(int offsetInLayer, size_t numOfBytesToShorten);
++
++		bool hasNextLayer() const
++		{
++			return m_NextLayer != nullptr;
++		}
++
++		/// Construct the next layer in the protocol stack. No validation is performed on the data.
++		/// @tparam T The type of the layer to construct
++		/// @tparam Args The types of the arguments to pass to the layer constructor
++		/// @param[in] data The data to construct the layer from
++		/// @param[in] dataLen The length of the data
++		/// @param[in] packet The packet the layer belongs to
++		/// @param[in] extraArgs Extra arguments to be forwarded to the layer constructor
++		/// @return The constructed layer
++		template <typename T, typename... Args>
++		Layer* constructNextLayer(uint8_t* data, size_t dataLen, Packet* packet, Args&&... extraArgs)
++		{
++			if (hasNextLayer())
++			{
++				throw std::runtime_error("Next layer already exists");
++			}
++
++			Layer* newLayer = new T(data, dataLen, this, packet, std::forward<Args>(extraArgs)...);
++			setNextLayer(newLayer);
++			return newLayer;
++		}
++
++		/// Try to construct the next layer in the protocol stack with a fallback option.
++		///
++		/// The method checks if the data is valid for the layer type T before constructing it by calling
++		/// T::isDataValid(data, dataLen). If the data is invalid, it constructs the layer of type TFallback.
++		///
++		/// @tparam T The type of the layer to construct
++		/// @tparam TFallback The fallback layer type to construct if T fails
++		/// @tparam Args The types of the extra arguments to pass to the layer constructor of T
++		/// @param[in] data The data to construct the layer from
++		/// @param[in] dataLen The length of the data
++		/// @param[in] packet The packet the layer belongs to
++		///	@param[in] extraArgs Extra arguments to be forwarded to the layer constructor of T
++		/// @return The constructed layer of type T or TFallback
++		template <typename T, typename TFallback, typename... Args>
++		Layer* tryConstructNextLayerWithFallback(uint8_t* data, size_t dataLen, Packet* packet, Args&&... extraArgs)
++		{
++			if (tryConstructNextLayer<T>(data, dataLen, packet, std::forward<Args>(extraArgs)...))
++			{
++				return m_NextLayer;
++			}
++
++			return constructNextLayer<TFallback>(data, dataLen, packet);
++		}
++
++		/// @brief Check if the data is large enough to reinterpret as a type
++		///
++		/// The data must be non-null and at least as large as the type
++		///
++		/// @tparam T The type to reinterpret as
++		/// @param data The data to check
++		/// @param dataLen The length of the data
++		/// @return True if the data is large enough to reinterpret as T, false otherwise
++		template <typename T> static bool canReinterpretAs(const uint8_t* data, size_t dataLen)
++		{
++			return data != nullptr && dataLen >= sizeof(T);
++		}
++
++	private:
++		/// Try to construct the next layer in the protocol stack.
++		///
++		/// The method checks if the data is valid for the layer type T before constructing it by calling
++		/// T::isDataValid(data, dataLen). If the data is invalid, a nullptr is returned.
++		///
++		/// @tparam T The type of the layer to construct
++		/// @tparam Args The types of the extra arguments to pass to the layer constructor
++		/// @param[in] data The data to construct the layer from
++		/// @param[in] dataLen The length of the data
++		/// @param[in] packet The packet the layer belongs to
++		/// @param[in] extraArgs Extra arguments to be forwarded to the layer constructor
++		/// @return The constructed layer or nullptr if the data is invalid
++		template <typename T, typename... Args>
++		Layer* tryConstructNextLayer(uint8_t* data, size_t dataLen, Packet* packet, Args&&... extraArgs)
++		{
++			if (T::isDataValid(data, dataLen))
++			{
++				return constructNextLayer<T>(data, dataLen, packet, std::forward<Args>(extraArgs)...);
++			}
++			return nullptr;
++		}
+ 	};
+ 
+ 	inline std::ostream& operator<<(std::ostream& os, const pcpp::Layer& layer)
+diff --git a/Packet++/header/MplsLayer.h b/Packet++/header/MplsLayer.h
+index 2cebbcbbc0..12ea1cd817 100644
+--- a/Packet++/header/MplsLayer.h
++++ b/Packet++/header/MplsLayer.h
+@@ -106,6 +106,15 @@ namespace pcpp
+ 		{
+ 			return OsiModelNetworkLayer;
+ 		}
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an MPLS layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an MPLS layer
++		static bool isDataValid(const uint8_t* data, size_t dataLen)
++		{
++			return canReinterpretAs<mpls_header>(data, dataLen);
++		}
+ 	};
+ 
+ }  // namespace pcpp
+diff --git a/Packet++/header/PayloadLayer.h b/Packet++/header/PayloadLayer.h
+index fb368c342f..2c760d1178 100644
+--- a/Packet++/header/PayloadLayer.h
++++ b/Packet++/header/PayloadLayer.h
+@@ -79,5 +79,15 @@ namespace pcpp
+ 		{
+ 			return OsiModelApplicationLayer;
+ 		}
++
++		/// A static method that takes a byte array and detects if it can be parsed as a PayloadLayer.
++		/// @param[in] data A byte array
++		/// @param[in] dataLen The byte array size (in bytes)
++		/// @return True if the data is non-nullptr and dataLen is greater than 0, or data is nullptr and dataLen is 0.
++		static bool isDataValid(const uint8_t* data, size_t dataLen)
++		{
++			// PayloadLayer is special as it can be empty. So, it's valid if data is nullptr and dataLen is 0.
++			return (data == nullptr) != (dataLen != 0);  // XOR
++		};
+ 	};
+ }  // namespace pcpp
+diff --git a/Packet++/header/StpLayer.h b/Packet++/header/StpLayer.h
+index 3b15fcbcfe..26c90312f4 100644
+--- a/Packet++/header/StpLayer.h
++++ b/Packet++/header/StpLayer.h
+@@ -277,7 +277,7 @@ namespace pcpp
+ 		/// @return True if the data is valid and can represent an Spanning Tree packet
+ 		static bool isDataValid(const uint8_t* data, size_t dataLen)
+ 		{
+-			return data && dataLen >= sizeof(stp_tcn_bpdu);
++			return canReinterpretAs<stp_tcn_bpdu>(data, dataLen);
+ 		}
+ 	};
+ 
+@@ -465,7 +465,7 @@ namespace pcpp
+ 		/// @return True if the data is valid and can represent an Spanning Tree packet
+ 		static bool isDataValid(const uint8_t* data, size_t dataLen)
+ 		{
+-			return data && dataLen >= sizeof(stp_conf_bpdu);
++			return canReinterpretAs<stp_conf_bpdu>(data, dataLen);
+ 		}
+ 	};
+ 
+@@ -535,7 +535,7 @@ namespace pcpp
+ 		/// @return True if the data is valid and can represent an Spanning Tree packet
+ 		static bool isDataValid(const uint8_t* data, size_t dataLen)
+ 		{
+-			return data && dataLen >= sizeof(rstp_conf_bpdu);
++			return canReinterpretAs<rstp_conf_bpdu>(data, dataLen);
+ 		}
+ 	};
+ 
+@@ -703,7 +703,7 @@ namespace pcpp
+ 		/// @return True if the data is valid and can represent an Spanning Tree packet
+ 		static bool isDataValid(const uint8_t* data, size_t dataLen)
+ 		{
+-			return data && dataLen >= sizeof(mstp_conf_bpdu);
++			return canReinterpretAs<mstp_conf_bpdu>(data, dataLen);
+ 		}
+ 	};
+ }  // namespace pcpp
+diff --git a/Packet++/header/TpktLayer.h b/Packet++/header/TpktLayer.h
+index 8122e6bd1c..073942ca54 100644
+--- a/Packet++/header/TpktLayer.h
++++ b/Packet++/header/TpktLayer.h
+@@ -90,7 +90,7 @@ namespace pcpp
+ 		/// @return True if the data size is greater or equal than the size of tpkthdr
+ 		static bool isDataValid(const uint8_t* data, size_t dataSize)
+ 		{
+-			return data && dataSize >= sizeof(tpkthdr);
++			return canReinterpretAs<tpkthdr>(data, dataSize);
+ 		}
+ 
+ 		std::string toString() const override;
+diff --git a/Packet++/header/VlanLayer.h b/Packet++/header/VlanLayer.h
+index 4dc169cbc1..238d36bd1d 100644
+--- a/Packet++/header/VlanLayer.h
++++ b/Packet++/header/VlanLayer.h
+@@ -111,5 +111,14 @@ namespace pcpp
+ 		{
+ 			return OsiModelDataLinkLayer;
+ 		}
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an VLAN layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an VLAN layer
++		static bool isDataValid(const uint8_t* data, size_t dataLen)
++		{
++			return canReinterpretAs<vlan_header>(data, dataLen);
++		}
+ 	};
+ }  // namespace pcpp
+diff --git a/Packet++/header/VrrpLayer.h b/Packet++/header/VrrpLayer.h
+index ea33189a08..eb6f888d88 100644
+--- a/Packet++/header/VrrpLayer.h
++++ b/Packet++/header/VrrpLayer.h
+@@ -133,7 +133,7 @@ namespace pcpp
+ 
+ 		vrrp_header* getVrrpHeader() const
+ 		{
+-			return (vrrp_header*)m_Data;
++			return reinterpret_cast<vrrp_header*>(m_Data);
+ 		}
+ 
+ 		void setAddressType(IPAddress::AddressType addressType);
+@@ -334,6 +334,15 @@ namespace pcpp
+ 		/// Calculate the checksum from header and data and write the result to @ref vrrp_header#checksum
+ 		/// @return The checksum result
+ 		uint16_t calculateChecksum() const override;
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an VRRPv2 layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an VRRPv2 layer
++		static bool isDataValid(uint8_t const* data, size_t dataLen)
++		{
++			return canReinterpretAs<vrrp_header>(data, dataLen);
++		}
+ 	};
+ 
+ 	/// @class VrrpV3Layer
+@@ -381,5 +390,14 @@ namespace pcpp
+ 		/// Calculate the checksum from header and data and write the result to @ref vrrp_header#checksum
+ 		/// @return The checksum result
+ 		uint16_t calculateChecksum() const override;
++
++		/// A static method that validates the input data
++		/// @param[in] data The pointer to the beginning of a byte stream of an VRRPv3 layer
++		/// @param[in] dataLen The length of the byte stream
++		/// @return True if the data is valid and can represent an VRRPv3 layer
++		static bool isDataValid(uint8_t const* data, size_t dataLen)
++		{
++			return canReinterpretAs<vrrp_header>(data, dataLen);
++		}
+ 	};
+ }  // namespace pcpp
+diff --git a/Packet++/src/EthLayer.cpp b/Packet++/src/EthLayer.cpp
+index 564e804196..40954d3174 100644
+--- a/Packet++/src/EthLayer.cpp
++++ b/Packet++/src/EthLayer.cpp
+@@ -39,43 +39,35 @@ namespace pcpp
+ 		switch (be16toh(hdr->etherType))
+ 		{
+ 		case PCPP_ETHERTYPE_IP:
+-			m_NextLayer = IPv4Layer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new IPv4Layer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<IPv4Layer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PCPP_ETHERTYPE_IPV6:
+-			m_NextLayer = IPv6Layer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new IPv6Layer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<IPv6Layer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PCPP_ETHERTYPE_ARP:
+-			m_NextLayer = new ArpLayer(payload, payloadLen, this, m_Packet);
++			tryConstructNextLayerWithFallback<ArpLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PCPP_ETHERTYPE_VLAN:
+ 		case PCPP_ETHERTYPE_IEEE_802_1AD:
+-			m_NextLayer = new VlanLayer(payload, payloadLen, this, m_Packet);
++			tryConstructNextLayerWithFallback<VlanLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PCPP_ETHERTYPE_PPPOES:
+-			m_NextLayer = PPPoESessionLayer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new PPPoESessionLayer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<PPPoESessionLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PCPP_ETHERTYPE_PPPOED:
+-			m_NextLayer = PPPoEDiscoveryLayer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new PPPoEDiscoveryLayer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<PPPoEDiscoveryLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PCPP_ETHERTYPE_MPLS:
+-			m_NextLayer = new MplsLayer(payload, payloadLen, this, m_Packet);
++			tryConstructNextLayerWithFallback<MplsLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PCPP_ETHERTYPE_WAKE_ON_LAN:
+-			m_NextLayer = WakeOnLanLayer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new WakeOnLanLayer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<WakeOnLanLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+-		default:
+-			m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
+ 		}
++
++		// If no next layer was constructed, assume it's a payload layer
++		if (!hasNextLayer())
++			constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
+ 	}
+ 
+ 	void EthLayer::computeCalculateFields()
+diff --git a/Packet++/src/IPLayer.cpp b/Packet++/src/IPLayer.cpp
+new file mode 100644
+index 0000000000..fc2d40d3e9
+--- /dev/null
++++ b/Packet++/src/IPLayer.cpp
+@@ -0,0 +1,26 @@
++#include "IPLayer.h"
++
++namespace pcpp
++{
++	ProtocolType IPLayer::getIPVersion(uint8_t const* data, size_t dataLen)
++	{
++		// The data requires at least 1 byte of valid buffer
++		if (data == nullptr || dataLen < 1)
++		{
++			return UnknownProtocol;
++		}
++
++		// The first 4 bits of the first byte of the IP header represent the IP version
++		uint8_t version = data[0] >> 4;
++
++		switch (version)
++		{
++		case 4:
++			return IPv4;
++		case 6:
++			return IPv6;
++		default:
++			return UnknownProtocol;
++		}
++	}
++}  // namespace pcpp
+diff --git a/Packet++/src/IPv4Layer.cpp b/Packet++/src/IPv4Layer.cpp
+index 47024828b5..93efd929e0 100644
+--- a/Packet++/src/IPv4Layer.cpp
++++ b/Packet++/src/IPv4Layer.cpp
+@@ -248,12 +248,6 @@ namespace pcpp
+ 
+ 		iphdr* ipHdr = getIPv4Header();
+ 
+-		ProtocolType greVer = UnknownProtocol;
+-		ProtocolType igmpVer = UnknownProtocol;
+-		bool igmpQuery = false;
+-
+-		uint8_t ipVersion = 0;
+-
+ 		uint8_t* payload = m_Data + hdrLen;
+ 		size_t payloadLen = m_DataLen - hdrLen;
+ 
+@@ -261,91 +255,113 @@ namespace pcpp
+ 		// TODO: assuming first fragment contains at least L4 header, what if it's not true?
+ 		if (isFragment())
+ 		{
+-			m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
++			constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
+ 			return;
+ 		}
+ 
+ 		switch (ipHdr->protocol)
+ 		{
+ 		case PACKETPP_IPPROTO_UDP:
+-			m_NextLayer = UdpLayer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new UdpLayer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<UdpLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PACKETPP_IPPROTO_TCP:
+-			m_NextLayer = TcpLayer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new TcpLayer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<TcpLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PACKETPP_IPPROTO_ICMP:
+-			m_NextLayer = IcmpLayer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new IcmpLayer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<IcmpLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PACKETPP_IPPROTO_IPIP:
+-			ipVersion = *payload >> 4;
+-			if (ipVersion == 4 && IPv4Layer::isDataValid(payload, payloadLen))
+-				m_NextLayer = new IPv4Layer(payload, payloadLen, this, m_Packet);
+-			else if (ipVersion == 6 && IPv6Layer::isDataValid(payload, payloadLen))
+-				m_NextLayer = new IPv6Layer(payload, payloadLen, this, m_Packet);
+-			else
+-				m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
++		{
++			// todo: no tests for this case
++			switch (IPLayer::getIPVersion(payload, payloadLen))
++			{
++			case IPv4:
++				tryConstructNextLayerWithFallback<IPv4Layer, PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			case IPv6:
++				tryConstructNextLayerWithFallback<IPv6Layer, PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			default:
++				constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			}
+ 			break;
++		}
+ 		case PACKETPP_IPPROTO_GRE:
+-			greVer = GreLayer::getGREVersion(payload, payloadLen);
+-			if (greVer == GREv0 && GREv0Layer::isDataValid(payload, payloadLen))
+-				m_NextLayer = new GREv0Layer(payload, payloadLen, this, m_Packet);
+-			else if (greVer == GREv1 && GREv1Layer::isDataValid(payload, payloadLen))
+-				m_NextLayer = new GREv1Layer(payload, payloadLen, this, m_Packet);
+-			else
+-				m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
++		{
++			switch (GreLayer::getGREVersion(payload, payloadLen))
++			{
++			case GREv0:
++				tryConstructNextLayerWithFallback<GREv0Layer, PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			case GREv1:
++				tryConstructNextLayerWithFallback<GREv1Layer, PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			default:
++				constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			};
+ 			break;
++		}
+ 		case PACKETPP_IPPROTO_IGMP:
+-			igmpVer = IgmpLayer::getIGMPVerFromData(
++		{
++			bool igmpQuery = false;
++			ProtocolType igmpVer = IgmpLayer::getIGMPVerFromData(
+ 			    payload, std::min<size_t>(payloadLen, be16toh(getIPv4Header()->totalLength) - hdrLen), igmpQuery);
+-			if (igmpVer == IGMPv1)
+-				m_NextLayer = new IgmpV1Layer(payload, payloadLen, this, m_Packet);
+-			else if (igmpVer == IGMPv2)
+-				m_NextLayer = new IgmpV2Layer(payload, payloadLen, this, m_Packet);
+-			else if (igmpVer == IGMPv3)
++
++			switch (igmpVer)
++			{
++			case IGMPv1:
++				tryConstructNextLayerWithFallback<IgmpV1Layer, PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			case IGMPv2:
++				tryConstructNextLayerWithFallback<IgmpV2Layer, PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			case IGMPv3:
+ 			{
+ 				if (igmpQuery)
+-					m_NextLayer = new IgmpV3QueryLayer(payload, payloadLen, this, m_Packet);
++					tryConstructNextLayerWithFallback<IgmpV3QueryLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 				else
+-					m_NextLayer = new IgmpV3ReportLayer(payload, payloadLen, this, m_Packet);
++					tryConstructNextLayerWithFallback<IgmpV3ReportLayer, PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			}
++			default:
++				constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
+ 			}
+-			else
+-				m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
+ 			break;
++		}
+ 		case PACKETPP_IPPROTO_AH:
+-			m_NextLayer = AuthenticationHeaderLayer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new AuthenticationHeaderLayer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<AuthenticationHeaderLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PACKETPP_IPPROTO_ESP:
+-			m_NextLayer = ESPLayer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new ESPLayer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<ESPLayer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PACKETPP_IPPROTO_IPV6:
+-			m_NextLayer = IPv6Layer::isDataValid(payload, payloadLen)
+-			                  ? static_cast<Layer*>(new IPv6Layer(payload, payloadLen, this, m_Packet))
+-			                  : static_cast<Layer*>(new PayloadLayer(payload, payloadLen, this, m_Packet));
++			tryConstructNextLayerWithFallback<IPv6Layer, PayloadLayer>(payload, payloadLen, m_Packet);
+ 			break;
+ 		case PACKETPP_IPPROTO_VRRP:
+ 		{
+-			auto vrrpVer = VrrpLayer::getVersionFromData(payload, payloadLen);
+-			if (vrrpVer == VRRPv2)
+-				m_NextLayer = new VrrpV2Layer(payload, payloadLen, this, m_Packet);
+-			else if (vrrpVer == VRRPv3)
+-				m_NextLayer = new VrrpV3Layer(payload, payloadLen, this, m_Packet, IPAddress::IPv4AddressType);
+-			else
+-				m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
++			switch (VrrpLayer::getVersionFromData(payload, payloadLen))
++			{
++			case VRRPv2:
++				tryConstructNextLayerWithFallback<VrrpV2Layer, PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			case VRRPv3:
++				tryConstructNextLayerWithFallback<VrrpV3Layer, PayloadLayer>(payload, payloadLen, m_Packet,
++				                                                             IPAddress::IPv4AddressType);
++				break;
++			default:
++				constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
++				break;
++			}
+ 			break;
+ 		}
+-		default:
+-			m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
+ 		}
++
++		// If no next layer was constructed, assume it's a payload layer
++		if (!hasNextLayer())
++			constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
+ 	}
+ 
+ 	void IPv4Layer::computeCalculateFields()
+diff --git a/Packet++/src/TcpLayer.cpp b/Packet++/src/TcpLayer.cpp
+index 45d1a1e140..5fe34027ba 100644
+--- a/Packet++/src/TcpLayer.cpp
++++ b/Packet++/src/TcpLayer.cpp
+@@ -368,62 +368,98 @@ namespace pcpp
+ 
+ 		if (HttpMessage::isHttpPort(portDst) &&
+ 		    HttpRequestFirstLine::parseMethod(payloadChar, payloadLen) != HttpRequestLayer::HttpMethodUnknown)
+-			m_NextLayer = new HttpRequestLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<HttpRequestLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (HttpMessage::isHttpPort(portSrc) &&
+ 		         HttpResponseFirstLine::parseVersion(payloadChar, payloadLen) != HttpVersion::HttpVersionUnknown &&
+ 		         !HttpResponseFirstLine::parseStatusCode(payloadChar, payloadLen).isUnsupportedCode())
+-			m_NextLayer = new HttpResponseLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<HttpResponseLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (SSLLayer::IsSSLMessage(portSrc, portDst, payload, payloadLen))
+-			m_NextLayer = SSLLayer::createSSLMessage(payload, payloadLen, this, m_Packet);
++		{
++			setNextLayer(SSLLayer::createSSLMessage(payload, payloadLen, this, m_Packet));
++		}
+ 		else if (SipLayer::isSipPort(portDst) || SipLayer::isSipPort(portSrc))
+ 		{
+ 			if (SipRequestFirstLine::parseMethod(payloadChar, payloadLen) != SipRequestLayer::SipMethodUnknown)
+-				m_NextLayer = new SipRequestLayer(payload, payloadLen, this, m_Packet);
++			{
++				constructNextLayer<SipRequestLayer>(payload, payloadLen, m_Packet);
++			}
+ 			else if (SipResponseFirstLine::parseStatusCode(payloadChar, payloadLen) !=
+ 			         SipResponseLayer::SipStatusCodeUnknown)
+-				m_NextLayer = new SipResponseLayer(payload, payloadLen, this, m_Packet);
++			{
++				constructNextLayer<SipResponseLayer>(payload, payloadLen, m_Packet);
++			}
+ 			else
+-				m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
++			{
++				constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
++			}
+ 		}
+ 		else if (BgpLayer::isBgpPort(portSrc, portDst))
+ 		{
+ 			m_NextLayer = BgpLayer::parseBgpLayer(payload, payloadLen, this, m_Packet);
+ 			if (!m_NextLayer)
+-				m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
++				constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
+ 		}
+ 		else if (SSHLayer::isSSHPort(portSrc, portDst))
+-			m_NextLayer = SSHLayer::createSSHMessage(payload, payloadLen, this, m_Packet);
++		{
++			setNextLayer(SSHLayer::createSSHMessage(payload, payloadLen, this, m_Packet));
++		}
+ 		else if (DnsLayer::isDataValid(payload, payloadLen, true) &&
+ 		         (DnsLayer::isDnsPort(portDst) || DnsLayer::isDnsPort(portSrc)))
+-			m_NextLayer = new DnsOverTcpLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<DnsOverTcpLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (TelnetLayer::isDataValid(payload, payloadLen) &&
+ 		         (TelnetLayer::isTelnetPort(portDst) || TelnetLayer::isTelnetPort(portSrc)))
+-			m_NextLayer = new TelnetLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<TelnetLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (FtpLayer::isFtpPort(portSrc) && FtpLayer::isDataValid(payload, payloadLen))
+-			m_NextLayer = new FtpResponseLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<FtpResponseLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (FtpLayer::isFtpPort(portDst) && FtpLayer::isDataValid(payload, payloadLen))
+-			m_NextLayer = new FtpRequestLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<FtpRequestLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (FtpLayer::isFtpDataPort(portSrc) || FtpLayer::isFtpDataPort(portDst))
+-			m_NextLayer = new FtpDataLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<FtpDataLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (SomeIpLayer::isSomeIpPort(portSrc) || SomeIpLayer::isSomeIpPort(portDst))
+-			m_NextLayer = SomeIpLayer::parseSomeIpLayer(payload, payloadLen, this, m_Packet);
++		{
++			setNextLayer(SomeIpLayer::parseSomeIpLayer(payload, payloadLen, this, m_Packet));
++		}
+ 		else if (TpktLayer::isDataValid(payload, payloadLen) && TpktLayer::isTpktPort(portSrc, portDst))
+-			m_NextLayer = new TpktLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<TpktLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (SmtpLayer::isSmtpPort(portSrc) && SmtpLayer::isDataValid(payload, payloadLen))
+-			m_NextLayer = new SmtpResponseLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<SmtpResponseLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (SmtpLayer::isSmtpPort(portDst) && SmtpLayer::isDataValid(payload, payloadLen))
+-			m_NextLayer = new SmtpRequestLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<SmtpRequestLayer>(payload, payloadLen, m_Packet);
++		}
+ 		else if (LdapLayer::isLdapPort(portDst) || LdapLayer::isLdapPort(portSrc))
+ 		{
+ 			m_NextLayer = LdapLayer::parseLdapMessage(payload, payloadLen, this, m_Packet);
+ 			if (!m_NextLayer)
+-				m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
++				constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
+ 		}
+ 		else if ((GtpV2Layer::isGTPv2Port(portDst) || GtpV2Layer::isGTPv2Port(portSrc)) &&
+ 		         GtpV2Layer::isDataValid(payload, payloadLen))
+-			m_NextLayer = new GtpV2Layer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<GtpV2Layer>(payload, payloadLen, m_Packet);
++		}
+ 		else
+-			m_NextLayer = new PayloadLayer(payload, payloadLen, this, m_Packet);
++		{
++			constructNextLayer<PayloadLayer>(payload, payloadLen, m_Packet);
++		}
+ 	}
+ 
+ 	void TcpLayer::computeCalculateFields()

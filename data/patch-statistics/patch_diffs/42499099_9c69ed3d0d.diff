@@ -1,0 +1,237 @@
+From 53aed48e5de2493787738f2945653110c30d694f Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Mon, 14 Jun 2021 12:23:24 +0200
+Subject: [PATCH] Allow objects in define()
+
+This was separately discussed in https://externals.io/message/114863,
+but also necessary for consistency now that
+https://wiki.php.net/rfc/new_in_initializers has landed.
+
+Closes GH-7149.
+---
+ UPGRADING                       |  2 +-
+ Zend/tests/008.phpt             |  7 +----
+ Zend/tests/bug37811.phpt        | 22 ++++++-------
+ Zend/tests/constant_arrays.phpt | 15 ++++-----
+ Zend/tests/constants_002.phpt   | 25 +++++----------
+ Zend/zend_builtin_functions.c   | 56 +++++++++------------------------
+ 6 files changed, 43 insertions(+), 84 deletions(-)
+
+diff --git a/UPGRADING b/UPGRADING
+index e16bddb0ae1ff..b9cc1e2b80a5a 100644
+--- a/UPGRADING
++++ b/UPGRADING
+@@ -195,7 +195,7 @@ PHP 8.1 UPGRADE NOTES
+     RFC: https://wiki.php.net/rfc/fibers
+   . It is now possible to use "new ClassName()" expressions as parameter
+     default values, static variable and global constant initializers, as well
+-    as attribute arguments.
++    as attribute arguments. Objects can also be passed to `define()` now.
+     RFC: https://wiki.php.net/rfc/new_in_initializers
+   . Closures for callables can now be created using the syntax `myFunc(...)`,
+     which is the same as `Closure::fromCallable('myFunc')`. Yes, the `...` is
+diff --git a/Zend/tests/008.phpt b/Zend/tests/008.phpt
+index 1057c82b95242..f690cee8e9835 100644
+--- a/Zend/tests/008.phpt
++++ b/Zend/tests/008.phpt
+@@ -16,12 +16,7 @@ var_dump(define("test const", 3));
+ var_dump(define("test const", 3));
+ var_dump(define("test", array(1)));
+ var_dump(define("test1", fopen(__FILE__, 'r')));
+-
+-try {
+ var_dump(define("test2", new stdclass));
+-} catch (TypeError $exception) {
+-    echo $exception->getMessage() . "\n";
+-}
+ 
+ var_dump(constant(" "));
+ var_dump(constant("[[["));
+@@ -42,7 +37,7 @@ Warning: Constant test const already defined in %s on line %d
+ bool(false)
+ bool(true)
+ bool(true)
+-define(): Argument #2 ($value) cannot be an object, stdClass given
++bool(true)
+ int(1)
+ int(2)
+ int(3)
+diff --git a/Zend/tests/bug37811.phpt b/Zend/tests/bug37811.phpt
+index 3e433a0da6d7e..b066ecd7abb98 100644
+--- a/Zend/tests/bug37811.phpt
++++ b/Zend/tests/bug37811.phpt
+@@ -13,21 +13,21 @@ class TestClass
+ 
+ define("Bar", new TestClass);
+ var_dump(Bar);
++var_dump((string) Bar);
+ 
++define("Baz", new stdClass);
++var_dump(Baz);
+ try {
+-    define("Baz", new stdClass);
+-} catch (TypeError $exception) {
+-    echo $exception->getMessage() . "\n";
+-}
+-
+-try {
+-    var_dump(Baz);
+-} catch (Error $exception) {
+-    echo $exception->getMessage() . "\n";
++    var_dump((string) Baz);
++} catch (Error $e) {
++    echo $e->getMessage(), "\n";
+ }
+ 
+ ?>
+ --EXPECT--
++object(TestClass)#1 (0) {
++}
+ string(3) "Foo"
+-define(): Argument #2 ($value) cannot be an object, stdClass given
+-Undefined constant "Baz"
++object(stdClass)#2 (0) {
++}
++Object of class stdClass could not be converted to string
+diff --git a/Zend/tests/constant_arrays.phpt b/Zend/tests/constant_arrays.phpt
+index c7e6089c02250..eecc76847545b 100644
+--- a/Zend/tests/constant_arrays.phpt
++++ b/Zend/tests/constant_arrays.phpt
+@@ -23,12 +23,9 @@ define('QUX', $y);
+ $y[0] = 3;
+ var_dump($x, $y, QUX);
+ 
+-// ensure objects not allowed in arrays
+-try {
+-    define('ELEPHPANT', [new StdClass]);
+-} catch (TypeError $exception) {
+-    echo $exception->getMessage() . "\n";
+-}
++// objects are allowed in arrays
++define('ELEPHPANT', [new StdClass]);
++var_dump(ELEPHPANT);
+ 
+ // ensure recursion doesn't crash
+ $recursive = [];
+@@ -102,5 +99,9 @@ array(1) {
+   [0]=>
+   int(7)
+ }
+-define(): Argument #2 ($value) cannot be an object, stdClass given
++array(1) {
++  [0]=>
++  object(stdClass)#1 (0) {
++  }
++}
+ define(): Argument #2 ($value) cannot be a recursive array
+diff --git a/Zend/tests/constants_002.phpt b/Zend/tests/constants_002.phpt
+index 309b9c7f9c776..cfbfb69ce5a4b 100644
+--- a/Zend/tests/constants_002.phpt
++++ b/Zend/tests/constants_002.phpt
+@@ -3,23 +3,14 @@ Defining constants with non-scalar values
+ --FILE--
+ <?php
+ 
+-try {
+-    define('foo', new stdClass);
+-} catch (TypeError $exception) {
+-    echo $exception->getMessage() . "\n";
+-}
+-
+-try {
+-    var_dump(foo);
+-} catch (Error $e) {
+-    echo $e->getMessage(), "\n";
+-}
+-
+-define('foo', fopen(__FILE__, 'r'));
++define('foo', new stdClass);
+ var_dump(foo);
+ 
++define('bar', fopen(__FILE__, 'r'));
++var_dump(bar);
++
+ ?>
+---EXPECT--
+-define(): Argument #2 ($value) cannot be an object, stdClass given
+-Undefined constant "foo"
+-resource(5) of type (stream)
++--EXPECTF--
++object(stdClass)#1 (0) {
++}
++resource(%d) of type (stream)
+diff --git a/Zend/zend_builtin_functions.c b/Zend/zend_builtin_functions.c
+index c9f77b1c0ead6..c273857dd2eff 100644
+--- a/Zend/zend_builtin_functions.c
++++ b/Zend/zend_builtin_functions.c
+@@ -420,20 +420,12 @@ static bool validate_constant_array_argument(HashTable *ht, int argument_number)
+ 	GC_PROTECT_RECURSION(ht);
+ 	ZEND_HASH_FOREACH_VAL(ht, val) {
+ 		ZVAL_DEREF(val);
+-		if (Z_REFCOUNTED_P(val)) {
+-			if (Z_TYPE_P(val) == IS_ARRAY) {
+-				if (Z_REFCOUNTED_P(val)) {
+-					if (Z_IS_RECURSIVE_P(val)) {
+-						zend_argument_value_error(argument_number, "cannot be a recursive array");
+-						ret = 0;
+-						break;
+-					} else if (!validate_constant_array_argument(Z_ARRVAL_P(val), argument_number)) {
+-						ret = 0;
+-						break;
+-					}
+-				}
+-			} else if (Z_TYPE_P(val) != IS_STRING && Z_TYPE_P(val) != IS_RESOURCE) {
+-				zend_argument_type_error(argument_number, "cannot be an object, %s given", zend_zval_type_name(val));
++		if (Z_TYPE_P(val) == IS_ARRAY && Z_REFCOUNTED_P(val)) {
++			if (Z_IS_RECURSIVE_P(val)) {
++				zend_argument_value_error(argument_number, "cannot be a recursive array");
++				ret = 0;
++				break;
++			} else if (!validate_constant_array_argument(Z_ARRVAL_P(val), argument_number)) {
+ 				ret = 0;
+ 				break;
+ 			}
+@@ -496,35 +488,15 @@ ZEND_FUNCTION(define)
+ 
+ 	ZVAL_UNDEF(&val_free);
+ 
+-	switch (Z_TYPE_P(val)) {
+-		case IS_LONG:
+-		case IS_DOUBLE:
+-		case IS_STRING:
+-		case IS_FALSE:
+-		case IS_TRUE:
+-		case IS_NULL:
+-		case IS_RESOURCE:
+-			break;
+-		case IS_ARRAY:
+-			if (Z_REFCOUNTED_P(val)) {
+-				if (!validate_constant_array_argument(Z_ARRVAL_P(val), 2)) {
+-					RETURN_THROWS();
+-				} else {
+-					copy_constant_array(&c.value, val);
+-					goto register_constant;
+-				}
+-			}
+-			break;
+-		case IS_OBJECT:
+-			if (Z_OBJ_HT_P(val)->cast_object(Z_OBJ_P(val), &val_free, IS_STRING) == SUCCESS) {
+-				val = &val_free;
+-				break;
++	if (Z_TYPE_P(val) == IS_ARRAY) {
++		if (Z_REFCOUNTED_P(val)) {
++			if (!validate_constant_array_argument(Z_ARRVAL_P(val), 2)) {
++				RETURN_THROWS();
++			} else {
++				copy_constant_array(&c.value, val);
++				goto register_constant;
+ 			}
+-			ZEND_FALLTHROUGH;
+-		default:
+-			zval_ptr_dtor(&val_free);
+-			zend_argument_type_error(2, "cannot be an object, %s given", zend_zval_type_name(val));
+-			RETURN_THROWS();
++		}
+ 	}
+ 
+ 	ZVAL_COPY(&c.value, val);

@@ -1,0 +1,190 @@
+From 8ca44d0e6f3fd376d52e7061cdecee88c068f1f6 Mon Sep 17 00:00:00 2001
+From: Cristy <urban-warrior@imagemagick.org>
+Date: Thu, 7 Sep 2023 21:40:09 -0400
+Subject: [PATCH] check for cache offset boundaries
+
+---
+ MagickCore/cache.c          | 30 +++++++++++++++++++++++++++---
+ MagickCore/visual-effects.c |  2 +-
+ configure                   | 14 +++++++++++++-
+ configure.ac                |  2 ++
+ 4 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/MagickCore/cache.c b/MagickCore/cache.c
+index 874cee40521..d768e17a686 100644
+--- a/MagickCore/cache.c
++++ b/MagickCore/cache.c
+@@ -2694,6 +2694,16 @@ static inline ssize_t EdgeY(const ssize_t y,const size_t rows)
+   return(y);
+ }
+ 
++static inline MagickBooleanType IsOffsetOverflow(const ssize_t y,
++  const size_t columns)
++{
++  if ((y == 0) || (columns == 0))
++    return(MagickFalse);
++  if (y > (MAGICK_SSIZE_MAX/columns))
++    return(MagickTrue);
++  return(MagickFalse);
++}
++
+ static inline ssize_t RandomX(RandomInfo *random_info,const size_t columns)
+ {
+   return((ssize_t) (columns*GetPseudoRandomValue(random_info)));
+@@ -2788,7 +2798,8 @@ MagickPrivate const Quantum *GetVirtualPixelCacheNexus(const Image *image,
+     nexus_info,exception);
+   if (pixels == (Quantum *) NULL)
+     return((const Quantum *) NULL);
+-  q=pixels;
++  if (IsOffsetOverflow(nexus_info->region.y,cache_info->columns) != MagickFalse)
++    return((const Quantum *) NULL);
+   offset=nexus_info->region.y*(MagickOffsetType) cache_info->columns+
+     nexus_info->region.x;
+   length=(MagickSizeType) (nexus_info->region.height-1L)*cache_info->columns+
+@@ -2805,7 +2816,7 @@ MagickPrivate const Quantum *GetVirtualPixelCacheNexus(const Image *image,
+           Pixel request is inside cache extents.
+         */
+         if (nexus_info->authentic_pixel_cache != MagickFalse)
+-          return(q);
++          return(pixels);
+         status=ReadPixelCachePixels(cache_info,nexus_info,exception);
+         if (status == MagickFalse)
+           return((const Quantum *) NULL);
+@@ -2815,12 +2826,13 @@ MagickPrivate const Quantum *GetVirtualPixelCacheNexus(const Image *image,
+             if (status == MagickFalse)
+               return((const Quantum *) NULL);
+           }
+-        return(q);
++        return(pixels);
+       }
+   /*
+     Pixel request is outside cache extents.
+   */
+   virtual_nexus=nexus_info->virtual_nexus;
++  q=pixels;
+   s=(unsigned char *) nexus_info->metacontent;
+   (void) memset(virtual_pixel,0,cache_info->number_channels*
+     sizeof(*virtual_pixel));
+@@ -4194,6 +4206,8 @@ MagickPrivate Quantum *QueueAuthenticPixelCacheNexus(Image *image,
+         "PixelsAreNotAuthentic","`%s'",image->filename);
+       return((Quantum *) NULL);
+     }
++  if (IsOffsetOverflow(y,cache_info->columns) != MagickFalse)
++    return((Quantum *) NULL);
+   offset=y*(MagickOffsetType) cache_info->columns+x;
+   if (offset < 0)
+     return((Quantum *) NULL);
+@@ -4443,6 +4457,8 @@ static MagickBooleanType ReadPixelCacheMetacontent(
+     return(MagickFalse);
+   if (nexus_info->authentic_pixel_cache != MagickFalse)
+     return(MagickTrue);
++  if (IsOffsetOverflow(nexus_info->region.y,cache_info->columns) != MagickFalse)
++    return(MagickFalse);
+   offset=nexus_info->region.y*(MagickOffsetType) cache_info->columns+
+     nexus_info->region.x;
+   length=(MagickSizeType) nexus_info->region.width*
+@@ -4615,6 +4631,8 @@ static MagickBooleanType ReadPixelCachePixels(
+ 
+   if (nexus_info->authentic_pixel_cache != MagickFalse)
+     return(MagickTrue);
++  if (IsOffsetOverflow(nexus_info->region.y,cache_info->columns) != MagickFalse)
++    return(MagickFalse);
+   offset=nexus_info->region.y*(MagickOffsetType) cache_info->columns;
+   if ((offset/(MagickOffsetType) cache_info->columns) != nexus_info->region.y)
+     return(MagickFalse);
+@@ -5148,6 +5166,8 @@ static Quantum *SetPixelCacheNexusPixels(
+           /*
+             Pixels are accessed directly from memory.
+           */
++          if (IsOffsetOverflow(y,cache_info->columns) != MagickFalse)
++            return(MagickFalse);
+           offset=y*(MagickOffsetType) cache_info->columns+x;
+           nexus_info->pixels=cache_info->pixels+(MagickOffsetType)
+             cache_info->number_channels*offset;
+@@ -5646,6 +5666,8 @@ static MagickBooleanType WritePixelCacheMetacontent(CacheInfo *cache_info,
+     return(MagickTrue);
+   if (nexus_info->metacontent == (unsigned char *) NULL)
+     return(MagickFalse);
++  if (IsOffsetOverflow(nexus_info->region.y,cache_info->columns) != MagickFalse)
++    return(MagickFalse);
+   offset=nexus_info->region.y*(MagickOffsetType) cache_info->columns+
+     nexus_info->region.x;
+   length=(MagickSizeType) nexus_info->region.width*
+@@ -5817,6 +5839,8 @@ static MagickBooleanType WritePixelCachePixels(
+ 
+   if (nexus_info->authentic_pixel_cache != MagickFalse)
+     return(MagickTrue);
++  if (IsOffsetOverflow(nexus_info->region.y,cache_info->columns) != MagickFalse)
++    return(MagickFalse);
+   offset=nexus_info->region.y*(MagickOffsetType) cache_info->columns+
+     nexus_info->region.x;
+   length=(MagickSizeType) cache_info->number_channels*nexus_info->region.width*
+diff --git a/MagickCore/visual-effects.c b/MagickCore/visual-effects.c
+index efcb512329f..2c307c688f4 100644
+--- a/MagickCore/visual-effects.c
++++ b/MagickCore/visual-effects.c
+@@ -1082,7 +1082,7 @@ MagickExport Image *ImplodeImage(const Image *image,const double amount,
+             Implode the pixel.
+           */
+           factor=1.0;
+-          if (distance > 1.0)
++          if (distance > 0.0)
+             factor=pow(sin(MagickPI*sqrt((double) distance)*
+               PerceptibleReciprocal(radius)/2),-amount);
+           status=InterpolatePixelChannels(canvas_image,interpolate_view,
+diff --git a/configure b/configure
+index 95e15bcee4d..e3f2163d0f1 100755
+--- a/configure
++++ b/configure
+@@ -5174,7 +5174,7 @@ MAGICK_PATCHLEVEL_VERSION=16
+ 
+ MAGICK_VERSION=7.1.1-16
+ 
+-MAGICK_GIT_REVISION=58fc88cbc:20230907
++MAGICK_GIT_REVISION=c3a856986:20230907
+ 
+ 
+ # Substitute library versioning
+@@ -26324,6 +26324,12 @@ fi
+ #
+ # Find math library
+ #
++ac_ext=c
++ac_cpp='$CPP $CPPFLAGS'
++ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
++ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
++ac_compiler_gnu=$ac_cv_c_compiler_gnu
++
+ MATH_LIBS=''
+ { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for sqrt in -lm" >&5
+ printf %s "checking for sqrt in -lm... " >&6; }
+@@ -26367,6 +26373,12 @@ fi
+ 
+ LIBS="$MATH_LIBS $LIBS"
+ 
++ac_ext=c
++ac_cpp='$CPP $CPPFLAGS'
++ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
++ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
++ac_compiler_gnu=$ac_cv_c_compiler_gnu
++
+ 
+ #
+ # Find socket library
+diff --git a/configure.ac b/configure.ac
+index aa740cbab30..b05c17e0c18 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1105,10 +1105,12 @@ AC_FUNC_STRERROR_R
+ #
+ # Find math library
+ #
++AC_LANG_PUSH([C])
+ MATH_LIBS=''
+ AC_CHECK_LIB([m],[sqrt],[MATH_LIBS="-lm"],[])
+ LIBS="$MATH_LIBS $LIBS"
+ AC_SUBST([MATH_LIBS])
++AC_LANG_POP([C])
+ 
+ #
+ # Find socket library

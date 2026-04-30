@@ -1,0 +1,205 @@
+From 9f5e723974420af0014a397bb390b57f3b9a9431 Mon Sep 17 00:00:00 2001
+From: Stephan Bosch <stephan.bosch@open-xchange.com>
+Date: Thu, 6 May 2021 11:58:21 +0200
+Subject: [PATCH] lib-smtp: smtp-server-cmd-data - Fix global state cleanup
+ upon DATA command destroy.
+
+Should cleanup global state only when it belongs to the DATA/BDAT command
+currently being destroyed.
+
+Fixes NULL-dereference in i_stream_read() found by OSS-Fuzz.
+---
+ src/lib-smtp/smtp-server-cmd-data.c    |   9 +-
+ src/lib-smtp/test-smtp-server-errors.c | 128 +++++++++++++++++++++++++
+ 2 files changed, 135 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib-smtp/smtp-server-cmd-data.c b/src/lib-smtp/smtp-server-cmd-data.c
+index 44e292701ea..01965222c94 100644
+--- a/src/lib-smtp/smtp-server-cmd-data.c
++++ b/src/lib-smtp/smtp-server-cmd-data.c
+@@ -12,6 +12,7 @@
+ /* DATA/BDAT/B... commands */
+ 
+ struct cmd_data_context {
++	struct istream *main_input;
+ 	struct istream *chunk_input;
+ 	uoff_t chunk_size;
+ 
+@@ -135,8 +136,9 @@ cmd_data_destroy(struct smtp_server_cmd_ctx *cmd,
+ 
+ 	i_assert(data_cmd != NULL);
+ 
+-	if (data_cmd->chunk_last ||
+-		!smtp_server_command_replied_success(command)) {
++	if (data_cmd->main_input == conn->state.data_input &&
++	    (data_cmd->chunk_last ||
++	     !smtp_server_command_replied_success(command))) {
+ 		/* clean up */
+ 		i_stream_destroy(&conn->state.data_input);
+ 		i_stream_destroy(&conn->state.data_chain_input);
+@@ -392,6 +394,7 @@ cmd_data_next(struct smtp_server_cmd_ctx *cmd,
+ 		smtp_server_command_ref(cmd_temp);
+ 		i_assert(callbacks != NULL &&
+ 			 callbacks->conn_cmd_data_begin != NULL);
++		i_assert(conn->state.data_input != NULL);
+ 		if (callbacks->conn_cmd_data_begin(conn->context,
+ 			cmd, conn->state.trans, conn->state.data_input) < 0) {
+ 			i_assert(smtp_server_command_is_replied(cmd_temp));
+@@ -427,9 +430,11 @@ cmd_data_start_input(struct smtp_server_cmd_ctx *cmd,
+ 	i_assert(data_cmd != NULL);
+ 
+ 	if (input != NULL) {
++		i_assert(conn->state.data_input == NULL);
+ 		conn->state.data_input = input;
+ 		i_stream_ref(input);
+ 	}
++	data_cmd->main_input = conn->state.data_input;
+ 
+ 	if (data_cmd->client_input)
+ 		smtp_server_command_input_lock(cmd);
+diff --git a/src/lib-smtp/test-smtp-server-errors.c b/src/lib-smtp/test-smtp-server-errors.c
+index 50f3e629490..25d6a048639 100644
+--- a/src/lib-smtp/test-smtp-server-errors.c
++++ b/src/lib-smtp/test-smtp-server-errors.c
+@@ -2584,6 +2584,133 @@ static void test_bad_pipelined_data(void)
+ 	test_end();
+ }
+ 
++/*
++ * Bad pipelined DATA #2
++ */
++
++/* client */
++
++static void test_bad_pipelined_data2_connected(struct client_connection *conn)
++{
++	o_stream_nsend_str(conn->conn.output,
++			   "MAIL FROM:<frop@example.com>\r\n"
++			   "DATA\r\n"
++			   "DATA\r\n"
++			   "RCPT TO:<frop@example.com>\r\n"
++			   "BDAT 0\r\n");
++}
++
++static void test_client_bad_pipelined_data2(unsigned int index)
++{
++	test_client_connected = test_bad_pipelined_data2_connected;
++	test_client_run(index);
++}
++
++/* server */
++
++struct _bad_pipelined_data2 {
++	struct istream *payload_input;
++	struct io *io;
++};
++
++static void
++test_server_bad_pipelined_data2_trans_free(
++	void *conn_ctx ATTR_UNUSED, struct smtp_server_transaction *trans)
++{
++	struct _bad_pipelined_data2 *ctx = trans->context;
++
++	i_free(ctx);
++	io_loop_stop(ioloop);
++}
++
++static int
++test_server_bad_pipelined_data2_rcpt(
++	void *conn_ctx ATTR_UNUSED, struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
++	struct smtp_server_recipient *rcpt)
++{
++	if (debug) {
++		i_debug("RCPT TO:%s",
++			smtp_address_encode(rcpt->path));
++	}
++	return 1;
++}
++
++static int
++test_server_bad_pipelined_data2_data_begin(
++	void *conn_ctx ATTR_UNUSED, struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
++	struct smtp_server_transaction *trans, struct istream *data_input)
++{
++	struct _bad_pipelined_data2 *ctx;
++
++	if (debug)
++		i_debug("DATA");
++
++	ctx = i_new(struct _bad_pipelined_data2, 1);
++	trans->context = ctx;
++
++	ctx->payload_input = data_input;
++	return 0;
++}
++
++static int
++test_server_bad_pipelined_data2_data_continue(
++	void *conn_ctx ATTR_UNUSED, struct smtp_server_cmd_ctx *cmd,
++	struct smtp_server_transaction *trans ATTR_UNUSED)
++{
++	struct _bad_pipelined_data2 *ctx = trans->context;
++	size_t size;
++	ssize_t ret;
++
++	while ((ret = i_stream_read(ctx->payload_input)) > 0 || ret == -2) {
++		size = i_stream_get_data_size(ctx->payload_input);
++		i_stream_skip(ctx->payload_input, size);
++	}
++
++	if (ret == 0)
++		return 0;
++	if (ret < 0 && ctx->payload_input->stream_errno != 0) {
++		/* Client probably disconnected */
++		return -1;
++	}
++
++	smtp_server_reply_all(cmd, 250, "2.0.0", "Accepted");
++	return 1;
++}
++
++static void
++test_server_bad_pipelined_data2(const struct smtp_server_settings *server_set)
++{
++	server_callbacks.conn_trans_free =
++		test_server_bad_pipelined_data2_trans_free;
++	server_callbacks.conn_cmd_rcpt =
++		test_server_bad_pipelined_data2_rcpt;
++	server_callbacks.conn_cmd_data_begin =
++		test_server_bad_pipelined_data2_data_begin;
++	server_callbacks.conn_cmd_data_continue =
++		test_server_bad_pipelined_data2_data_continue;
++	test_server_run(server_set);
++}
++
++/* test */
++
++static void test_bad_pipelined_data2(void)
++{
++	struct smtp_server_settings smtp_server_set;
++
++	test_server_defaults(&smtp_server_set);
++	smtp_server_set.capabilities =
++		SMTP_CAPABILITY_BINARYMIME | SMTP_CAPABILITY_CHUNKING;
++	smtp_server_set.max_client_idle_time_msecs = 1000;
++	smtp_server_set.max_recipients = 10;
++	smtp_server_set.max_pipelined_commands = 16;
++
++	test_begin("Bad pipelined DATA #2");
++	test_run_client_server(&smtp_server_set,
++			       test_server_bad_pipelined_data2,
++			       test_client_bad_pipelined_data2, 1);
++	test_end();
++}
++
+ /*
+  * DATA with BINARYMIME
+  */
+@@ -2929,6 +3056,7 @@ static void (*const test_functions[])(void) = {
+ 	test_data_no_mail,
+ 	test_data_no_rcpt,
+ 	test_bad_pipelined_data,
++	test_bad_pipelined_data2,
+ 	test_data_binarymime,
+ 	test_mail_broken_path,
+ 	NULL

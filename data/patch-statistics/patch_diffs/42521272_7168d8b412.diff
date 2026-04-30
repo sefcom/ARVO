@@ -1,0 +1,287 @@
+From 45188d4a05086ea7b1103617370b5c6af1844aa1 Mon Sep 17 00:00:00 2001
+From: Allen Winter <winter@kde.org>
+Date: Wed, 5 Jun 2024 12:52:59 -0400
+Subject: [PATCH] Fix more fuzzer issues
+
+icalmemory.c - icalmemory_tmp_copy(): don't allocate memory
+for an empty string (i.e a string that starts with '\0')
+
+icalparser.c - icalparser_add_line(): END is encountered
+before the BEGIN becomes an error, not just a warning
+
+icaltypes.c -  icalreqstattype_from_string(): don't allow
+garbage (non-printable chars) in the reqstattype.
+for unknown reasons the icalmemory tmp memory ring doesn't
+work properly on garbage; additionally the snprintf in
+icalreqstattype_as_string_r() uses the "%s" format which
+is not intended for unprintable chars.
+
+pvl.c - in pvl_insert_ordered(): don't assert when
+no valid return conditions are encountered.
+---
+ .github/workflows/build.yml |   4 +-
+ src/libical/icalmemory.c    |   2 +-
+ src/libical/icalparser.c    |   4 +-
+ src/libical/icaltypes.c     |  14 +++-
+ src/libical/pvl.c           |   6 +-
+ src/test/CMakeLists.txt     |   1 +
+ test-data/fuzz69527         | 131 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 151 insertions(+), 11 deletions(-)
+ create mode 100644 test-data/fuzz69527
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index a5158142c..ffc3f397c 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -43,7 +43,7 @@ jobs:
+       - name: Configure project
+         run: |
+           mkdir build
+-          cmake -B build --warn-uninitialized -Werror=dev -G Ninja -DLIBICAL_DEVMODE_MEMORY_CONSISTENCY=False -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DLIBICAL_BUILD_TESTING=True -DENABLE_GTK_DOC=True -DICAL_GLIB=True -DGOBJECT_INTROSPECTION=True -DICAL_GLIB_VAPI=True
++          cmake -B build --warn-uninitialized -Werror=dev -G Ninja -DLIBICAL_DEVMODE_MEMORY_CONSISTENCY=False -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DLIBICAL_BUILD_TESTING=True -DENABLE_GTK_DOC=True -DICAL_GLIB=True -DGOBJECT_INTROSPECTION=True -DICAL_GLIB_VAPI=True -DLIBICAL_BUILD_TESTING_BIGFUZZ=True
+       - name: Build project
+         run: cmake --build build
+       - name: Test project
+@@ -67,7 +67,7 @@ jobs:
+           export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+           export XML_CATALOG_FILES=/usr/local/etc/xml/catalog
+           mkdir build
+-          cmake -B build --warn-uninitialized -Werror=dev -G Ninja -DLIBICAL_DEVMODE_MEMORY_CONSISTENCY=True -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DLIBICAL_BUILD_TESTING=True -DENABLE_GTK_DOC=True -DICAL_GLIB=True -DGOBJECT_INTROSPECTION=False -DICAL_GLIB_VAPI=False
++          cmake -B build --warn-uninitialized -Werror=dev -G Ninja -DLIBICAL_DEVMODE_MEMORY_CONSISTENCY=True -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DLIBICAL_BUILD_TESTING=True -DENABLE_GTK_DOC=True -DICAL_GLIB=True -DGOBJECT_INTROSPECTION=False -DICAL_GLIB_VAPI=False -DLIBICAL_BUILD_TESTING_BIGFUZZ=True
+       - name: Build project
+         run: cmake --build build
+       - name: Test project
+diff --git a/src/libical/icalmemory.c b/src/libical/icalmemory.c
+index c00810349..1b76da89b 100644
+--- a/src/libical/icalmemory.c
++++ b/src/libical/icalmemory.c
+@@ -233,7 +233,7 @@ char *icalmemory_tmp_copy(const char *str)
+ {
+     char *b;
+ 
+-    if (!str)
++    if (!str || str[0] == '\0')
+         return NULL;
+ 
+     b = icalmemory_tmp_buffer(strlen(str) + 1);
+diff --git a/src/libical/icalparser.c b/src/libical/icalparser.c
+index c7d73e6e2..49e2fdb2d 100644
+--- a/src/libical/icalparser.c
++++ b/src/libical/icalparser.c
+@@ -823,8 +823,8 @@ icalcomponent *icalparser_add_line(icalparser *parser, char *line)
+ 
+         if (parser->level < 0) {
+             // Encountered an END before any BEGIN, this must be invalid data
+-            icalerror_warn("Encountered END before BEGIN");
+-
++            icalerror_set_error_state(ICAL_MALFORMEDDATA_ERROR,
++                                      icalerror_get_error_state(ICAL_MALFORMEDDATA_ERROR));
+             parser->state = ICALPARSER_ERROR;
+             parser->level = 0;
+             return 0;
+diff --git a/src/libical/icaltypes.c b/src/libical/icaltypes.c
+index 302cab53c..cee0685c2 100644
+--- a/src/libical/icaltypes.c
++++ b/src/libical/icaltypes.c
+@@ -21,7 +21,7 @@
+ #include <pthread.h>
+ static pthread_mutex_t unk_token_mutex = PTHREAD_MUTEX_INITIALIZER;
+ #endif
+-
++#include <ctype.h>
+ static ICAL_GLOBAL_VAR ical_unknown_token_handling unknownTokenHandling = ICAL_TREAT_AS_ERROR;
+ 
+ int icaltriggertype_is_null_trigger(struct icaltriggertype tr)
+@@ -92,7 +92,7 @@ struct icaltriggertype icaltriggertype_from_string(const char *str)
+ 
+ struct icalreqstattype icalreqstattype_from_string(const char *str)
+ {
+-    const char *p1, *p2;
++    const char *s, *p1, *p2;
+     struct icalreqstattype stat;
+     short major = 0, minor = 0;
+ 
+@@ -102,6 +102,16 @@ struct icalreqstattype icalreqstattype_from_string(const char *str)
+     stat.debug = 0;
+     stat.desc = 0;
+ 
++    // Don't allow (fuzzer) garbage chars anywhere in the reqstat string
++    s = str;
++    while (*s && isprint((unsigned char)*s)) {
++        ++s;
++    }
++    if (*s != '\0') {
++        // garbage encountered. return the empty stat
++        return stat;
++    }
++
+     /* Get the status numbers */
+ 
+     sscanf(str, "%hd.%hd", &major, &minor);
+diff --git a/src/libical/pvl.c b/src/libical/pvl.c
+index 125baffd4..4c53f5d41 100644
+--- a/src/libical/pvl.c
++++ b/src/libical/pvl.c
+@@ -266,10 +266,8 @@ void pvl_insert_ordered(pvl_list L, pvl_comparef f, void *d)
+         }
+     }
+ 
+-    /* badness, choke */
+-#if !defined(lint)
+-    icalassert(0);
+-#endif
++    /* badness, just return */
++    return;
+ }
+ 
+ /**
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 28486d3ee..71c81a3b8 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -251,6 +251,7 @@ if(LIBICAL_BUILD_TESTING_BIGFUZZ)
+     56539
+     69341
+     69344
++    69527
+     usban
+   )
+     add_test(NAME fuzz1test${fuzztest} COMMAND icalcomponent_fuzz1 "${PROJECT_SOURCE_DIR}/test-data/fuzz${fuzztest}")
+diff --git a/test-data/fuzz69527 b/test-data/fuzz69527
+new file mode 100644
+index 000000000..e2686cbb5
+--- /dev/null
++++ b/test-data/fuzz69527
+@@ -0,0 +1,131 @@
++BEgIN;
++X;TZID=:0:;
++X;TZID=õ§Ä=:2:;
++X;TZID=:9:;
++X;TZID=:1:;
++X;TZID=:8:;
++X;TZID=:5:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:3:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:5:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:D=:1:;
++X;TZID=:8:;
++X;TZID=:5:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:3:;
++X;TZID=:1:;
++X;TZID=:0:;
++X;TZID=:5:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:9:ÌõX;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:2:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:3:;
++X;TZID=:9:;
++X;TZID=:°:;
++X;TZID=:4:;
++X;TZID=:=:2:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:0:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;
++X;TZID=:1:;
++X;TZID=:8:;
++X;TZID=:5:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:3:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:5:;
++­X;TZID=:o0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;Z
++X;TZID=:2:;
++X;TZID=:3:;
++X;TZID=:9:;
++X;TZID=:8:;
++X;TZID=:5:;
++X;TZID=:1:;
++X;TZID=:2:;
++X;TZID=:3:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:5:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;T
++X;TZID=:1:;
++X;TZID=:3:;
++X;TZID=:1:;
++X;TZID=:0:;
++X;TZID=:5:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;
++X;TZID=:1:;
++X;TZID=:8:;
++X;TZID=:5:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:3:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:5:;
++X;TZID=:0:;
++X;TZID=]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]:9:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:3:;
++X;TZID=:9:;
++X;TZID=:°:;
++X;TZID=:1:;
++X;TZID=:0:;
++X;TZID=:9:;
++X;TZID=:2:;
++X;TZID=:9:;
++X;TZID=:0:;
++X;TZID=:0:;
++XTID
++X;TZID=:9:;
++X;TZID=:;:;
+\ No newline at end of file

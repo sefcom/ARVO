@@ -1,0 +1,111 @@
+From 8ab484c23b9f3533fcd942e95887383786331f06 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Tue, 14 Jan 2020 09:39:47 +1030
+Subject: [PATCH] ubsan: alpha-vms: segv
+
+I thought the fuzzers were really going overboard by defining
+VMS_DEBUG but that wasn't the case.  VMS_DEBUG is defined by
+default.  Let's not do that, and fix the segv as well.
+
+	* vms.h (VMS_DEBUG): Define as 0.
+	* vms-alpha.c (image_write): Move debug output after bounds check.
+	Tidy bounds check.
+	(_bfd_vms_slurp_eihd): Warning fix.
+	(_bfd_vms_slurp_etir): Init variables to avoid bogus warnings.
+---
+ bfd/ChangeLog   |  8 ++++++++
+ bfd/vms-alpha.c | 20 +++++++++++---------
+ bfd/vms.h       |  2 +-
+ 3 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/bfd/ChangeLog b/bfd/ChangeLog
+index 84caf0b04ae..acb545cd03c 100644
+--- a/bfd/ChangeLog
++++ b/bfd/ChangeLog
+@@ -1,3 +1,11 @@
++2020-01-14  Alan Modra  <amodra@gmail.com>
++
++	* vms.h (VMS_DEBUG): Define as 0.
++	* vms-alpha.c (image_write): Move debug output after bounds check.
++	Tidy bounds check.
++	(_bfd_vms_slurp_eihd): Warning fix.
++	(_bfd_vms_slurp_etir): Init variables to avoid bogus warnings.
++
+ 2020-01-13  Alan Modra  <amodra@gmail.com>
+ 
+ 	* vms-alpha.c (_bfd_vms_slurp_egsd): Ensure minimum size even
+diff --git a/bfd/vms-alpha.c b/bfd/vms-alpha.c
+index 32f4e68bbba..586a157cb1b 100644
+--- a/bfd/vms-alpha.c
++++ b/bfd/vms-alpha.c
+@@ -503,6 +503,7 @@ _bfd_vms_slurp_eihd (bfd *abfd, unsigned int *eisd_offset,
+   vms_debug2 ((4, "EIHD size %d imgtype %d symvva 0x%lx eisd %d eihs %d\n",
+ 	       size, imgtype, (unsigned long)symvva,
+ 	       *eisd_offset, *eihs_offset));
++  (void) size;
+ 
+   return TRUE;
+ }
+@@ -1594,18 +1595,16 @@ image_write (bfd *abfd, unsigned char *ptr, unsigned int size)
+ #if VMS_DEBUG
+   _bfd_vms_debug (8, "image_write from (%p, %d) to (%ld)\n", ptr, size,
+ 		  (long)PRIV (image_offset));
+-  _bfd_hexdump (9, ptr, size, 0);
+ #endif
+ 
+   if (PRIV (image_section)->contents != NULL)
+     {
+       asection *sec = PRIV (image_section);
+-      file_ptr off = PRIV (image_offset);
++      size_t off = PRIV (image_offset);
+ 
+       /* Check bounds.  */
+-      if (off > (file_ptr)sec->size
+-	  || size > (file_ptr)sec->size
+-	  || off + size > (file_ptr)sec->size)
++      if (off > sec->size
++	  || size > sec->size - off)
+ 	{
+ 	  bfd_set_error (bfd_error_bad_value);
+ 	  return FALSE;
+@@ -1613,6 +1612,9 @@ image_write (bfd *abfd, unsigned char *ptr, unsigned int size)
+ 
+       memcpy (sec->contents + off, ptr, size);
+     }
++#if VMS_DEBUG
++  _bfd_hexdump (9, ptr, size, 0);
++#endif
+ 
+   PRIV (image_offset) += size;
+   return TRUE;
+@@ -1861,10 +1863,10 @@ _bfd_vms_slurp_etir (bfd *abfd, struct bfd_link_info *info)
+   unsigned char *ptr;
+   unsigned int length;
+   unsigned char *maxptr;
+-  bfd_vma op1;
+-  bfd_vma op2;
+-  unsigned int rel1;
+-  unsigned int rel2;
++  bfd_vma op1 = 0;
++  bfd_vma op2 = 0;
++  unsigned int rel1 = RELC_NONE;
++  unsigned int rel2 = RELC_NONE;
+   struct alpha_vms_link_hash_entry *h;
+ 
+   PRIV (recrd.rec) += ETIR__C_HEADER_SIZE;
+diff --git a/bfd/vms.h b/bfd/vms.h
+index 2a4fb7e3fe2..88cf83e4820 100644
+--- a/bfd/vms.h
++++ b/bfd/vms.h
+@@ -98,7 +98,7 @@ struct evax_private_udata_struct
+ 
+ /* vms-misc.c.  */
+ 
+-#define VMS_DEBUG 1
++#define VMS_DEBUG 0
+ 
+ #if VMS_DEBUG
+ extern void _bfd_vms_debug (int, char *, ...) ATTRIBUTE_PRINTF_2;
+-- 
+GitLab
+

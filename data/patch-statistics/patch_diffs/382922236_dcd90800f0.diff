@@ -1,0 +1,103 @@
+From b0b39cdc3e5cf791ccd7f358b32ff1340a652d78 Mon Sep 17 00:00:00 2001
+From: Dmitry Stogov <dmitry@zend.com>
+Date: Tue, 19 Nov 2024 18:03:54 +0300
+Subject: [PATCH] Backport JIT fix: set valid EX(opline) before calling
+ gc_possible_root() (#16858)
+
+This will finally make the COMMUNTIY build of the PHP 8.1 build green.
+
+See https://github.com/php/php-src/pull/16858#issuecomment-2509010556
+Closes GH-17091
+---
+ ext/opcache/jit/zend_jit_arm64.dasc | 12 ++++++++++++
+ ext/opcache/jit/zend_jit_x86.dasc   | 12 ++++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/ext/opcache/jit/zend_jit_arm64.dasc b/ext/opcache/jit/zend_jit_arm64.dasc
+index 1583706855d41..b9a4fbc82e124 100644
+--- a/ext/opcache/jit/zend_jit_arm64.dasc
++++ b/ext/opcache/jit/zend_jit_arm64.dasc
+@@ -1533,6 +1533,9 @@ static bool logical_immediate_p(uint64_t value, uint32_t reg_size)
+ ||			}
+ |			IF_GC_MAY_NOT_LEAK FCARG1x, >4, Rw(tmp_reg1), Rw(tmp_reg2)
+ |			// gc_possible_root(Z_COUNTED_P(z))
++||			if (opline) {
++|				SET_EX_OPLINE opline, TMP1
++||			}
+ |			EXT_CALL gc_possible_root, Rx(tmp_reg1)
+ ||		}
+ ||		if (cold && ((op_info) & ((MAY_BE_ANY|MAY_BE_UNDEF|MAY_BE_INDIRECT|MAY_BE_GUARD)-(MAY_BE_OBJECT|MAY_BE_RESOURCE))) != 0) {
+@@ -5972,6 +5975,9 @@ static int zend_jit_assign_to_variable(dasm_State    **Dst,
+ 			if (RC_MAY_BE_N(var_info) && (var_info & (MAY_BE_ARRAY|MAY_BE_OBJECT)) != 0) {
+ 				|4:
+ 				|	IF_GC_MAY_NOT_LEAK FCARG1x, >8, TMP1w, TMP2w
++				if (opline) {
++					|	SET_EX_OPLINE opline, REG0
++				}
+ 				|	EXT_CALL gc_possible_root, REG0
+ 				if (in_cold) {
+ 					|	b >8
+@@ -5999,6 +6005,9 @@ static int zend_jit_assign_to_variable(dasm_State    **Dst,
+ 				|	GET_ZVAL_PTR FCARG1x, var_use_addr, TMP1
+ 				|	GC_DELREF FCARG1x, TMP1w
+ 				|	IF_GC_MAY_NOT_LEAK FCARG1x, >5, TMP1w, TMP2w
++				if (opline) {
++					|	SET_EX_OPLINE opline, TMP1
++				}
+ 				|	EXT_CALL gc_possible_root, TMP1
+ 				if (Z_REG(var_use_addr) != ZREG_FP) {
+ 					|	ldr Rx(Z_REG(var_use_addr)), T1 // restore
+@@ -11980,6 +11989,9 @@ static int zend_jit_bind_global(dasm_State **Dst, const zend_op *opline, uint32_
+ 			|3:
+ 			|	// GC_ZVAL_CHECK_POSSIBLE_ROOT(variable_ptr)
+ 			|	IF_GC_MAY_NOT_LEAK FCARG1x, >5, TMP1w, TMP2w
++			if (opline) {
++				|	SET_EX_OPLINE opline, REG0
++			}
+ 			|	EXT_CALL gc_possible_root, REG0
+ 			|	b >5
+ 		}
+diff --git a/ext/opcache/jit/zend_jit_x86.dasc b/ext/opcache/jit/zend_jit_x86.dasc
+index b3989a4ae254d..a1d0a8e098a2a 100644
+--- a/ext/opcache/jit/zend_jit_x86.dasc
++++ b/ext/opcache/jit/zend_jit_x86.dasc
+@@ -1443,6 +1443,9 @@ static size_t tsrm_tls_offset;
+ |1:
+ ||			}
+ |			IF_GC_MAY_NOT_LEAK FCARG1a, >4
++||			if (opline) {
++|				SET_EX_OPLINE opline, r0
++||			}
+ |			// gc_possible_root(Z_COUNTED_P(z))
+ |			EXT_CALL gc_possible_root, r0
+ ||		}
+@@ -6526,6 +6529,9 @@ static int zend_jit_assign_to_variable(dasm_State    **Dst,
+ 			if (RC_MAY_BE_N(var_info) && (var_info & (MAY_BE_ARRAY|MAY_BE_OBJECT)) != 0) {
+ 				|4:
+ 				|	IF_GC_MAY_NOT_LEAK FCARG1a, >8
++				if (opline) {
++					|	SET_EX_OPLINE opline, r0
++				}
+ 				|	EXT_CALL gc_possible_root, r0
+ 				if (in_cold) {
+ 					|	jmp >8
+@@ -6553,6 +6559,9 @@ static int zend_jit_assign_to_variable(dasm_State    **Dst,
+ 				|	GET_ZVAL_PTR FCARG1a, var_use_addr
+ 				|	GC_DELREF FCARG1a
+ 				|	IF_GC_MAY_NOT_LEAK FCARG1a, >5
++				if (opline) {
++					|	SET_EX_OPLINE opline, r0
++				}
+ 				|	EXT_CALL gc_possible_root, r0
+ 				if (Z_REG(var_use_addr) != ZREG_FP) {
+ 					|	mov Ra(Z_REG(var_use_addr)), T1 // restore
+@@ -12742,6 +12751,9 @@ static int zend_jit_bind_global(dasm_State **Dst, const zend_op *opline, uint32_
+ 			|3:
+ 			|	// GC_ZVAL_CHECK_POSSIBLE_ROOT(variable_ptr)
+ 			|	IF_GC_MAY_NOT_LEAK FCARG1a, >5
++			if (opline) {
++				|	SET_EX_OPLINE opline, r0
++			}
+ 			|	EXT_CALL gc_possible_root, r1
+ 			|	jmp >5
+ 		}

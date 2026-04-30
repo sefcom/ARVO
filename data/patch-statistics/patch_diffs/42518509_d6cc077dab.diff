@@ -1,0 +1,94 @@
+From 9bece0d0da44e3f0ab384bb4e40d2a24026aa456 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?kleines=20Filmr=C3=B6llchen?= <filmroellchen@serenityos.org>
+Date: Tue, 27 Jun 2023 20:26:39 +0200
+Subject: [PATCH] LibAudio: Prevent multiple kinds of buffer overruns in FLAC
+ picture load
+
+The fuzzer found one heap buffer overflow here due to confusion between
+u32* and u8* (the given size is for bytes, but we used it for 32-bit
+elements, quadrupling it), and it looks like there's an opportunity for
+several more. This commit modernizes the picture loader by using
+String's built-in stream loader, and also adds several spec-compliance
+checks: The MIME type must be ASCII in a specific range, and the picture
+description must be UTF-8.
+---
+ Userland/Libraries/LibAudio/FlacLoader.cpp | 25 ++++++++++++++++------
+ Userland/Libraries/LibAudio/GenericTypes.h |  6 +++---
+ 2 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/Userland/Libraries/LibAudio/FlacLoader.cpp b/Userland/Libraries/LibAudio/FlacLoader.cpp
+index 151935d349ffae..c2c7dc58ff3a22 100644
+--- a/Userland/Libraries/LibAudio/FlacLoader.cpp
++++ b/Userland/Libraries/LibAudio/FlacLoader.cpp
+@@ -156,20 +156,28 @@ MaybeLoaderError FlacLoaderPlugin::load_picture(FlacRawMetadataBlock& block)
+     FixedMemoryStream memory_stream { block.data.bytes() };
+     BigEndianInputBitStream picture_block_bytes { MaybeOwned<Stream>(memory_stream) };
+ 
+-    PictureData picture {};
++    PictureData picture;
+ 
+     picture.type = static_cast<ID3PictureType>(LOADER_TRY(picture_block_bytes.read_bits(32)));
+ 
+     auto const mime_string_length = LOADER_TRY(picture_block_bytes.read_bits(32));
+-    // Note: We are seeking before reading the value to ensure that we stayed inside buffer's size.
+     auto offset_before_seeking = memory_stream.offset();
+-    LOADER_TRY(memory_stream.seek(mime_string_length, SeekMode::FromCurrentPosition));
+-    picture.mime_string = { block.data.bytes().data() + offset_before_seeking, (size_t)mime_string_length };
++    if (offset_before_seeking + mime_string_length >= block.data.size())
++        return LoaderError { LoaderError::Category::Format, LOADER_TRY(m_stream->tell()), "Picture MIME type exceeds available data" };
++
++    // "The MIME type string, in printable ASCII characters 0x20-0x7E."
++    picture.mime_string = LOADER_TRY(String::from_stream(memory_stream, mime_string_length));
++    for (auto code_point : picture.mime_string.code_points()) {
++        if (code_point < 0x20 || code_point > 0x7E)
++            return LoaderError { LoaderError::Category::Format, LOADER_TRY(m_stream->tell()), "Picture MIME type is not ASCII in range 0x20 - 0x7E" };
++    }
+ 
+     auto const description_string_length = LOADER_TRY(picture_block_bytes.read_bits(32));
+     offset_before_seeking = memory_stream.offset();
+-    LOADER_TRY(memory_stream.seek(description_string_length, SeekMode::FromCurrentPosition));
+-    picture.description_string = Vector<u32> { Span<u32> { reinterpret_cast<u32*>(block.data.bytes().data() + offset_before_seeking), (size_t)description_string_length } };
++    if (offset_before_seeking + description_string_length >= block.data.size())
++        return LoaderError { LoaderError::Category::Format, LOADER_TRY(m_stream->tell()), "Picture description exceeds available data" };
++
++    picture.description_string = LOADER_TRY(String::from_stream(memory_stream, description_string_length));
+ 
+     picture.width = LOADER_TRY(picture_block_bytes.read_bits(32));
+     picture.height = LOADER_TRY(picture_block_bytes.read_bits(32));
+@@ -179,8 +187,11 @@ MaybeLoaderError FlacLoaderPlugin::load_picture(FlacRawMetadataBlock& block)
+ 
+     auto const picture_size = LOADER_TRY(picture_block_bytes.read_bits(32));
+     offset_before_seeking = memory_stream.offset();
++    if (offset_before_seeking + picture_size > block.data.size())
++        return LoaderError { LoaderError::Category::Format, static_cast<size_t>(TRY(m_stream->tell())), "Picture size exceeds available data" };
++
+     LOADER_TRY(memory_stream.seek(picture_size, SeekMode::FromCurrentPosition));
+-    picture.data = Vector<u8> { Span<u8> { block.data.bytes().data() + offset_before_seeking, (size_t)picture_size } };
++    picture.data = Vector<u8> { block.data.bytes().slice(offset_before_seeking, picture_size) };
+ 
+     m_pictures.append(move(picture));
+ 
+diff --git a/Userland/Libraries/LibAudio/GenericTypes.h b/Userland/Libraries/LibAudio/GenericTypes.h
+index f60bc9af4b1479..ba4a8703116858 100644
+--- a/Userland/Libraries/LibAudio/GenericTypes.h
++++ b/Userland/Libraries/LibAudio/GenericTypes.h
+@@ -6,7 +6,7 @@
+ 
+ #pragma once
+ 
+-#include <AK/DeprecatedString.h>
++#include <AK/String.h>
+ #include <AK/Vector.h>
+ 
+ namespace Audio {
+@@ -40,8 +40,8 @@ enum class ID3PictureType : u32 {
+ // Note: This was first implemented for Flac but is compatible with ID3v2
+ struct PictureData {
+     ID3PictureType type {};
+-    DeprecatedString mime_string {};
+-    Vector<u32> description_string {};
++    String mime_string {};
++    String description_string {};
+ 
+     u32 width {};
+     u32 height {};

@@ -1,0 +1,71 @@
+From 91d9610a55409d03b91d5ff0d2022aa1b7b58269 Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 3 Nov 2020 11:48:21 +0000
+Subject: [PATCH] fix out of bounds read in tiffload
+
+libtiff can change the value of some fields while scanning a corrupt
+TIFF file and this could trigger an out of bounds read.
+
+This patch makes tiffload more cautious about rescanning a TIFF
+directory before reading out header fields.
+---
+ ChangeLog                   |  1 +
+ libvips/foreign/tiff2vips.c | 19 ++++++++++++++-----
+ 2 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index fe971a3de3..8bec4e9148 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -2,6 +2,7 @@
+ - relax heic is_a rules [hisham]
+ - fix vips7 webp load [barryspearce]
+ - fix out of bounds exif read in heifload
++- fix out of bounds read in tiffload
+ 
+ 6/9/20 started 8.10.2
+ - update magicksave/load profile handling [kelilevi]
+diff --git a/libvips/foreign/tiff2vips.c b/libvips/foreign/tiff2vips.c
+index cac7139638..be8a8fe0a3 100644
+--- a/libvips/foreign/tiff2vips.c
++++ b/libvips/foreign/tiff2vips.c
+@@ -2680,18 +2680,23 @@ rtiff_header_read_all( Rtiff *rtiff )
+ 		"reading header for page %d ...\n", rtiff->page );
+ #endif /*DEBUG*/
+ 
++	/* -1 means "to the end". 
++	 *
++	 * We must count pages before selecting and reading the header of the 
++	 * first page, since scanning a TIFF can change the value of libtiff's 
++	 * internal header fields in strange ways, especially if the TIFF is 
++	 * corrupt.  
++	 */
++	rtiff->n_pages = rtiff_n_pages( rtiff );
++
+ 	if( rtiff_set_page( rtiff, rtiff->page ) ||
+ 		rtiff_header_read( rtiff, &rtiff->header ) )
+ 		return( -1 ); 
+ 
+-	/* -1 means "to the end".
++	/* If we're to read many pages, verify that they are all identical. 
+ 	 */
+-	rtiff->n_pages = rtiff_n_pages( rtiff );
+ 	if( rtiff->n == -1 )
+ 		rtiff->n = rtiff->n_pages - rtiff->page;
+-
+-	/* If we're to read many pages, verify that they are all identical. 
+-	 */
+ 	if( rtiff->n > 1 ) {
+ 		int i;
+ 
+@@ -2715,6 +2720,10 @@ rtiff_header_read_all( Rtiff *rtiff )
+ 				return( -1 );
+ 			}
+ 		}
++
++		/* Make sure the next set_page() will reread the directory.
++		 */
++		rtiff->current_page = -1;
+ 	}
+ 
+ 	return( 0 );

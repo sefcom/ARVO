@@ -1,0 +1,107 @@
+From 322716256d60e316c9a3b905a387be36d4e47368 Mon Sep 17 00:00:00 2001
+From: Ingo Berg <github_contact@beltoforion.de>
+Date: Thu, 17 Sep 2020 00:21:02 +0200
+Subject: [PATCH] fix for oss fuzz issue 25402
+
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25402
+---
+ include/muParserDef.h         |  4 ++--
+ samples/example1/example1.cpp |  4 ++--
+ src/muParserBase.cpp          | 12 ++++++++++--
+ src/muParserTest.cpp          | 10 ++++++++++
+ src/muParserTokenReader.cpp   |  3 ---
+ 5 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/include/muParserDef.h b/include/muParserDef.h
+index f59dce9..7de46d2 100644
+--- a/include/muParserDef.h
++++ b/include/muParserDef.h
+@@ -416,8 +416,8 @@ namespace mu
+ 
+ 	static const int MaxLenExpression = 5000;
+ 	static const int MaxLenIdentifier = 100;
+-	static const string_type ParserVersion = string_type(_T("2.3.3 (Development Snapshot)"));
+-	static const string_type ParserVersionDate = string_type(_T("20200809"));
++	static const string_type ParserVersion = string_type(_T("2.3.3 (Unstable Development Build!)"));
++	static const string_type ParserVersionDate = string_type(_T("20200917"));
+ } // end of namespace
+ 
+ #if defined(_MSC_VER)
+diff --git a/samples/example1/example1.cpp b/samples/example1/example1.cpp
+index e07b261..30b4dd7 100644
+--- a/samples/example1/example1.cpp
++++ b/samples/example1/example1.cpp
+@@ -380,13 +380,13 @@ static int CheckKeywords(const mu::char_type* a_szLine, mu::Parser& a_Parser)
+ 	}
+ 	else if (sLine == _T("dbg"))
+ 	{
+-		string_type dbg = _T(R"(avg(0>3?4:(""),0^3?4:("")))");
++		string_type dbg = _T("((\"\")), 7");
+ 		a_Parser.SetExpr(dbg);
+ 		mu::console() << dbg;
+ 
+ 		int stackSize;
+ 		double* v = a_Parser.Eval(stackSize);
+-		mu::console() << *v << std::endl;
++		mu::console() << "=" <<  *v << std::endl;
+ 		return 1;
+ 	}
+ 
+diff --git a/src/muParserBase.cpp b/src/muParserBase.cpp
+index a54ba19..795e1c7 100644
+--- a/src/muParserBase.cpp
++++ b/src/muParserBase.cpp
+@@ -1487,8 +1487,16 @@ namespace mu
+ 		if (stVal.size() == 0)
+ 			Error(ecEMPTY_EXPRESSION);
+ 
+-		if (stVal.top().GetType() != tpDBL)
+-			Error(ecSTR_RESULT);
++		// 2020-09-17; fix for https://oss-fuzz.com/testcase-detail/5758791700971520
++		// I don't need the value stack any more. Destructively check if all values in the value 
++		// stack represent floating point values
++		while (stVal.size())
++		{
++			if (stVal.top().GetType() != tpDBL)
++				Error(ecSTR_RESULT);
++
++			stVal.pop();
++		}
+ 
+ 		m_vStackBuffer.resize(m_vRPN.GetMaxStackSize() * s_MaxNumOpenMPThreads);
+ 	}
+diff --git a/src/muParserTest.cpp b/src/muParserTest.cpp
+index 9d39436..e67af60 100644
+--- a/src/muParserTest.cpp
++++ b/src/muParserTest.cpp
+@@ -149,6 +149,16 @@ namespace mu
+ 
+ 			// from oss-fuzz: https://oss-fuzz.com/testcase-detail/5106868061208576
+ 			iStat += ThrowTest(_T(R"("","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",8)"), ecSTR_RESULT);
++			
++			// derived from oss-fuzz: https://oss-fuzz.com/testcase-detail/5758791700971520
++			iStat += ThrowTest(_T("(\"\"), 7"), ecSTR_RESULT);
++			iStat += ThrowTest(_T("((\"\")), 7"), ecSTR_RESULT);
++			//iStat += ThrowTest(_T("(\"\"),(\" \"), 7, (3)"), ecSTR_RESULT);
++			//iStat += ThrowTest(_T("(\"\"),(\"\"), 7, (3)"), ecSTR_RESULT);
++			//iStat += ThrowTest(_T("(\"\"),(\"\"), (3)"), ecSTR_RESULT);
++			//iStat += ThrowTest(_T("(\"\"),(\"\"), 7"), ecSTR_RESULT);
++
++			
+ 			// variations:
+ 			iStat += ThrowTest(_T(R"("","",9)"), ecSTR_RESULT);
+ 
+diff --git a/src/muParserTokenReader.cpp b/src/muParserTokenReader.cpp
+index 9bb4295..f67d852 100644
+--- a/src/muParserTokenReader.cpp
++++ b/src/muParserTokenReader.cpp
+@@ -443,9 +443,6 @@ namespace mu
+ 				case cmDIV:
+ 				case cmPOW:
+ 				case cmASSIGN:
+-					//if (len!=sTok.length())
+-					//  continue;
+-
+ 					// The assignment operator need special treatment
+ 					if (i == cmASSIGN && m_iSynFlags & noASSIGN)
+ 						Error(ecUNEXPECTED_OPERATOR, m_iPos, pOprtDef[i]);

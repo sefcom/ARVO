@@ -1,0 +1,72 @@
+From ab1e3c9309330e8e3562d3e77c90fb1edb971f09 Mon Sep 17 00:00:00 2001
+From: "Philip.Hazel" <Philip.Hazel@gmail.com>
+Date: Wed, 10 May 2017 18:21:03 +0000
+Subject: [PATCH] Refactor to avoid sanitize warnings when accessing the
+ variable size ovector in the backtracking frame. Fixes oss-fuzz issue 1465.
+ Also make -bigstack in RunTest allocate a 64Mb stack for use with clang
+ sanitizing.
+
+---
+ ChangeLog         | 6 ++++++
+ RunTest           | 2 +-
+ src/pcre2_match.c | 8 +++++++-
+ 3 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index b22a58a17..9be4acc24 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -38,6 +38,9 @@ bugs were never in fully released code, but are noted here for the record.
+   
+   (f) Refactor some code in do_callout() to avoid picky compiler warnings about 
+       negative indices. Fixes oss-fuzz issue 1454.
++      
++  (g) Similarly refactor the way the variable length ovector is addressed for
++      similar reasons. Fixes oss-fuzz issue 1465.
+  
+       
+ 2. Now that pcre2_match() no longer uses recursive function calls (see above),
+@@ -160,6 +163,9 @@ tests to improve coverage.
+ 31. If more than one of "push", "pushcopy", or "pushtablescopy" were set in 
+ pcre2test, a crash could occur.
+ 
++32. Make -bigstack in RunTest allocate a 64Mb stack (instead of 16 MB) so that 
++all the tests can run with clang's sanitizing options.
++
+ 
+ 
+ Version 10.23 14-February-2017
+diff --git a/RunTest b/RunTest
+index c15b68ed4..89c4b771a 100755
+--- a/RunTest
++++ b/RunTest
+@@ -321,7 +321,7 @@ fi
+ 
+ $sim ./pcre2test -S 1 /dev/null /dev/null
+ if [ $? -eq 0 -a "$bigstack" != "" ] ; then
+-  setstack="-S 16"
++  setstack="-S 64"
+ else
+   setstack=""
+ fi
+diff --git a/src/pcre2_match.c b/src/pcre2_match.c
+index 41d0fcbde..373ee9e97 100644
+--- a/src/pcre2_match.c
++++ b/src/pcre2_match.c
+@@ -182,9 +182,15 @@ of use and undefined afterwards. */
+ #define Foffset_top        F->offset_top
+ #define Foccu              F->occu
+ #define Fop                F->op
+-#define Fovector           F->ovector
+ #define Freturn_id         F->return_id
+ 
++/* We need a cast for this one because F->ovector is a vector of size 2, at the 
++end of the backtrack frame, but when there are capturing parentheses the space 
++allocated is bigger so we want to be able to address more elements. Without the 
++case, -fsanitize=undefined grumbles at this. */
++
++#define Fovector           ((PCRE2_SIZE *)(F->ovector))
++
+ 
+ #ifdef DEBUG_FRAMES_DISPLAY
+ /*************************************************

@@ -1,0 +1,86 @@
+From 36b8c01b1091ab51720ab6697c83534cfcf2e292 Mon Sep 17 00:00:00 2001
+From: tbeu <tbeu@users.noreply.github.com>
+Date: Sat, 6 Feb 2021 21:44:29 +0100
+Subject: [PATCH] Check success of H5Gget_info
+
+---
+ src/mat.c   | 12 +++++++++---
+ src/mat73.c | 26 +++++++++++++++-----------
+ 2 files changed, 24 insertions(+), 14 deletions(-)
+
+diff --git a/src/mat.c b/src/mat.c
+index 8490cc18..2c035bf8 100644
+--- a/src/mat.c
++++ b/src/mat.c
+@@ -597,10 +597,16 @@ Mat_Open(const char *matname,int mode)
+ 
+         if ( -1 < *(hid_t*)mat->fp ) {
+             H5G_info_t group_info;
++            herr_t herr;
+             memset(&group_info, 0, sizeof(group_info));
+-            H5Gget_info(*(hid_t*)mat->fp, &group_info);
+-            mat->num_datasets = (size_t)group_info.nlinks;
+-            mat->refs_id      = -1;
++            herr = H5Gget_info(*(hid_t*)mat->fp, &group_info);
++            if ( herr < 0 ) {
++                Mat_Close(mat);
++                mat = NULL;
++            } else {
++                mat->num_datasets = (size_t)group_info.nlinks;
++                mat->refs_id = -1;
++            }
+         }
+ #else
+         mat->fp = NULL;
+diff --git a/src/mat73.c b/src/mat73.c
+index edcf21b8..671a8bce 100644
+--- a/src/mat73.c
++++ b/src/mat73.c
+@@ -894,13 +894,13 @@ Mat_H5ReadGroupInfo(mat_t *mat,matvar_t *matvar,hid_t dset_id)
+             return err;
+         }
+     } else {
++        herr_t herr;
+         H5G_info_t group_info;
+         matvar->internal->num_fields = 0;
+         group_info.nlinks = 0;
+-        H5Gget_info(dset_id, &group_info);
+-        if ( group_info.nlinks > 0 ) {
++        herr = H5Gget_info(dset_id, &group_info);
++        if ( herr >= 0 && group_info.nlinks > 0 ) {
+             struct ReadGroupInfoIterData group_data = {0, NULL};
+-            herr_t herr;
+ 
+             /* First iteration to retrieve number of relevant links */
+             herr = H5Literate_by_name(dset_id, matvar->internal->hdf5_name, H5_INDEX_NAME,
+@@ -1375,18 +1375,22 @@ static int
+ Mat_VarWriteRef(hid_t id, matvar_t* matvar, enum matio_compression compression, hid_t *refs_id, hobj_ref_t* ref)
+ {
+     int err;
++    herr_t herr;
+     char obj_name[64];
+     H5G_info_t group_info;
+ 
+     group_info.nlinks = 0;
+-    H5Gget_info(*refs_id, &group_info);
+-    sprintf(obj_name,"%llu", group_info.nlinks);
+-    if ( NULL != matvar )
+-        matvar->compression = compression;
+-    err = Mat_VarWriteNext73(*refs_id, matvar, obj_name, refs_id);
+-    sprintf(obj_name, "/#refs#/%llu", group_info.nlinks);
+-    H5Rcreate(ref, id, obj_name, H5R_OBJECT, -1);
+-
++    herr = H5Gget_info(*refs_id, &group_info);
++    if ( herr < 0) {
++        err = MATIO_E_BAD_ARGUMENT;
++    } else {
++        sprintf(obj_name,"%llu", group_info.nlinks);
++        if ( NULL != matvar )
++            matvar->compression = compression;
++        err = Mat_VarWriteNext73(*refs_id, matvar, obj_name, refs_id);
++        sprintf(obj_name, "/#refs#/%llu", group_info.nlinks);
++        H5Rcreate(ref, id, obj_name, H5R_OBJECT, -1);
++    }
+     return err;
+ }
+ 

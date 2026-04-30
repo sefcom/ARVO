@@ -1,0 +1,3599 @@
+diff --git a/gn/sksl.gni b/gn/sksl.gni
+index 8e2a331..e47593e 100644
+--- a/gn/sksl.gni
++++ b/gn/sksl.gni
+@@ -75,6 +75,7 @@
+   "$_src/sksl/ir/SkSLFunctionDeclaration.h",
+   "$_src/sksl/ir/SkSLFunctionDefinition.h",
+   "$_src/sksl/ir/SkSLFunctionReference.h",
++  "$_src/sksl/ir/SkSLIRNode.cpp",
+   "$_src/sksl/ir/SkSLIRNode.h",
+   "$_src/sksl/ir/SkSLIfStatement.h",
+   "$_src/sksl/ir/SkSLIndexExpression.h",
+diff --git a/src/sksl/SkSLAnalysis.cpp b/src/sksl/SkSLAnalysis.cpp
+index 468db17..0fe64b8 100644
+--- a/src/sksl/SkSLAnalysis.cpp
++++ b/src/sksl/SkSLAnalysis.cpp
+@@ -470,8 +470,8 @@
+ 
+         case Expression::Kind::kBinary: {
+             auto& b = e.template as<BinaryExpression>();
+-            return (b.left() && this->visitExpression(*b.left())) ||
+-                   (b.right() && this->visitExpression(*b.right()));
++            return (b.leftPointer() && this->visitExpression(b.left())) ||
++                   (b.rightPointer() && this->visitExpression(b.right()));
+         }
+         case Expression::Kind::kConstructor: {
+             auto& c = e.template as<Constructor>();
+@@ -572,10 +572,10 @@
+                 return true;
+             }
+             for (const auto& c : sw.cases()) {
+-                if (c->value() && this->visitExpression(*c->value())) {
++                if (c.value() && this->visitExpression(*c.value())) {
+                     return true;
+                 }
+-                for (auto& st : c->statements()) {
++                for (auto& st : c.statements()) {
+                     if (st && this->visitStatement(*st)) {
+                         return true;
+                     }
+@@ -585,8 +585,8 @@
+         }
+         case Statement::Kind::kVarDeclaration: {
+             auto& v = s.template as<VarDeclaration>();
+-            for (const std::unique_ptr<Expression>& size : v.sizes()) {
+-                if (size && this->visitExpression(*size)) {
++            for (int i = 0; i < v.sizeCount(); ++i) {
++                if (v.size(i) && this->visitExpression(*v.size(i))) {
+                     return true;
+                 }
+             }
+diff --git a/src/sksl/SkSLByteCodeGenerator.cpp b/src/sksl/SkSLByteCodeGenerator.cpp
+index f24f0a5..649c9db 100644
+--- a/src/sksl/SkSLByteCodeGenerator.cpp
++++ b/src/sksl/SkSLByteCodeGenerator.cpp
+@@ -680,8 +680,8 @@
+ }
+ 
+ bool ByteCodeGenerator::writeBinaryExpression(const BinaryExpression& b, bool discard) {
+-    const Expression& left = *b.left();
+-    const Expression& right = *b.right();
++    const Expression& left = b.left();
++    const Expression& right = b.right();
+     Token::Kind op = b.getOperator();
+     if (op == Token::Kind::TK_EQ) {
+         std::unique_ptr<LValue> lvalue = this->getLValue(left);
+diff --git a/src/sksl/SkSLCFGGenerator.cpp b/src/sksl/SkSLCFGGenerator.cpp
+index 0b1e493..540490d 100644
+--- a/src/sksl/SkSLCFGGenerator.cpp
++++ b/src/sksl/SkSLCFGGenerator.cpp
+@@ -181,13 +181,13 @@
+         case Expression::Kind::kBinary: {
+             BinaryExpression& b = expr->as<BinaryExpression>();
+             if (b.getOperator() == Token::Kind::TK_EQ) {
+-                if (!this->tryRemoveLValueBefore(iter, b.left().get())) {
++                if (!this->tryRemoveLValueBefore(iter, &b.left())) {
+                     return false;
+                 }
+-            } else if (!this->tryRemoveExpressionBefore(iter, b.left().get())) {
++            } else if (!this->tryRemoveExpressionBefore(iter, &b.left())) {
+                 return false;
+             }
+-            if (!this->tryRemoveExpressionBefore(iter, b.right().get())) {
++            if (!this->tryRemoveExpressionBefore(iter, &b.right())) {
+                 return false;
+             }
+             SkASSERT((*iter)->expression()->get() == expr);
+@@ -281,12 +281,12 @@
+     switch ((*expr)->kind()) {
+         case Expression::Kind::kBinary: {
+             BinaryExpression& b = expr->get()->as<BinaryExpression>();
+-            if (!this->tryInsertExpression(iter, &b.right())) {
++            if (!this->tryInsertExpression(iter, &b.rightPointer())) {
+                 return false;
+             }
+ 
+             ++(*iter);
+-            if (!this->tryInsertExpression(iter, &b.left())) {
++            if (!this->tryInsertExpression(iter, &b.leftPointer())) {
+                 return false;
+             }
+             ++(*iter);
+@@ -341,10 +341,10 @@
+                     // this isn't as precise as it could be -- we don't bother to track that if we
+                     // early exit from a logical and/or, we know which branch of an 'if' we're going
+                     // to hit -- but it won't make much difference in practice.
+-                    this->addExpression(cfg, &b.left(), constantPropagate);
++                    this->addExpression(cfg, &b.leftPointer(), constantPropagate);
+                     BlockId start = cfg.fCurrent;
+                     cfg.newBlock();
+-                    this->addExpression(cfg, &b.right(), constantPropagate);
++                    this->addExpression(cfg, &b.rightPointer(), constantPropagate);
+                     cfg.newBlock();
+                     cfg.addExit(start, cfg.fCurrent);
+                     cfg.currentBlock().fNodes.push_back(
+@@ -352,16 +352,16 @@
+                     break;
+                 }
+                 case Token::Kind::TK_EQ: {
+-                    this->addExpression(cfg, &b.right(), constantPropagate);
+-                    this->addLValue(cfg, &b.left());
++                    this->addExpression(cfg, &b.rightPointer(), constantPropagate);
++                    this->addLValue(cfg, &b.leftPointer());
+                     cfg.currentBlock().fNodes.push_back(
+                             BasicBlock::MakeExpression(e, constantPropagate));
+                     break;
+                 }
+                 default:
+-                    this->addExpression(cfg, &b.left(),
++                    this->addExpression(cfg, &b.leftPointer(),
+                                         !Compiler::IsAssignment(b.getOperator()));
+-                    this->addExpression(cfg, &b.right(), constantPropagate);
++                    this->addExpression(cfg, &b.rightPointer(), constantPropagate);
+                     cfg.currentBlock().fNodes.push_back(
+                             BasicBlock::MakeExpression(e, constantPropagate));
+             }
+@@ -634,18 +634,18 @@
+             for (auto& c : ss.cases()) {
+                 cfg.newBlock();
+                 cfg.addExit(start, cfg.fCurrent);
+-                if (c->value()) {
++                if (c.value()) {
+                     // technically this should go in the start block, but it doesn't actually matter
+                     // because it must be constant. Not worth running two loops for.
+-                    this->addExpression(cfg, &c->value(), /*constantPropagate=*/true);
++                    this->addExpression(cfg, &c.value(), /*constantPropagate=*/true);
+                 }
+-                for (auto& caseStatement : c->statements()) {
++                for (auto& caseStatement : c.statements()) {
+                     this->addStatement(cfg, &caseStatement);
+                 }
+             }
+             cfg.addExit(cfg.fCurrent, switchExit);
+             // note that unlike GLSL, our grammar requires the default case to be last
+-            if (ss.cases().empty() || ss.cases().back()->value()) {
++            if (ss.cases().empty() || ss.cases().back().value()) {
+                 // switch does not have a default clause, mark that it can skip straight to the end
+                 cfg.addExit(start, switchExit);
+             }
+diff --git a/src/sksl/SkSLCPPCodeGenerator.cpp b/src/sksl/SkSLCPPCodeGenerator.cpp
+index f122a5c..d13870c 100644
+--- a/src/sksl/SkSLCPPCodeGenerator.cpp
++++ b/src/sksl/SkSLCPPCodeGenerator.cpp
+@@ -70,8 +70,8 @@
+ 
+ void CPPCodeGenerator::writeBinaryExpression(const BinaryExpression& b,
+                                              Precedence parentPrecedence) {
+-    const Expression& left = *b.left();
+-    const Expression& right = *b.right();
++    const Expression& left = b.left();
++    const Expression& right = b.right();
+     Token::Kind op = b.getOperator();
+     if (op == Token::Kind::TK_PERCENT) {
+         // need to use "%%" instead of "%" b/c the code will be inside of a printf
+diff --git a/src/sksl/SkSLCompiler.cpp b/src/sksl/SkSLCompiler.cpp
+index de0e5b5..331b086 100644
+--- a/src/sksl/SkSLCompiler.cpp
++++ b/src/sksl/SkSLCompiler.cpp
+@@ -454,10 +454,10 @@
+             case Expression::Kind::kBinary: {
+                 BinaryExpression* b = &expr->as<BinaryExpression>();
+                 if (b->getOperator() == Token::Kind::TK_EQ) {
+-                    this->addDefinition(b->left().get(), &b->right(), definitions);
++                    this->addDefinition(&b->left(), &b->rightPointer(), definitions);
+                 } else if (Compiler::IsAssignment(b->getOperator())) {
+                     this->addDefinition(
+-                                  b->left().get(),
++                                  &b->left(),
+                                   (std::unique_ptr<Expression>*) &fContext->fDefined_Expression,
+                                   definitions);
+ 
+@@ -619,7 +619,7 @@
+     if (!Compiler::IsAssignment(b.getOperator())) {
+         return false;
+     }
+-    return is_dead(*b.left(), usage);
++    return is_dead(b.left(), usage);
+ }
+ 
+ void Compiler::computeDataFlow(CFG* cfg) {
+@@ -711,8 +711,8 @@
+     optimizationContext->fUpdated = true;
+     std::unique_ptr<Expression>* target = (*iter)->expression();
+     BinaryExpression& bin = (*target)->as<BinaryExpression>();
+-    Expression& left = *bin.left();
+-    std::unique_ptr<Expression>& rightPointer = bin.right();
++    Expression& left = bin.left();
++    std::unique_ptr<Expression>& rightPointer = bin.rightPointer();
+     SkASSERT(!left.hasSideEffects());
+     bool result;
+     if (bin.getOperator() == Token::Kind::TK_EQ) {
+@@ -750,8 +750,8 @@
+     optimizationContext->fUpdated = true;
+     std::unique_ptr<Expression>* target = (*iter)->expression();
+     BinaryExpression& bin = (*target)->as<BinaryExpression>();
+-    std::unique_ptr<Expression>& leftPointer = bin.left();
+-    Expression& right = *bin.right();
++    std::unique_ptr<Expression>& leftPointer = bin.leftPointer();
++    Expression& right = bin.right();
+     SkASSERT(!right.hasSideEffects());
+     // Remove references within RHS.
+     optimizationContext->fUsage->remove(&right);
+@@ -818,8 +818,8 @@
+                            Compiler::OptimizationContext* optimizationContext) {
+     BinaryExpression& bin = (*(*iter)->expression())->as<BinaryExpression>();
+     // Remove references within RHS. Vectorization of LHS doesn't change reference counts.
+-    optimizationContext->fUsage->remove(bin.right().get());
+-    vectorize(b, iter, bin.right()->type(), &bin.left(), optimizationContext);
++    optimizationContext->fUsage->remove(bin.rightPointer().get());
++    vectorize(b, iter, bin.right().type(), &bin.leftPointer(), optimizationContext);
+ }
+ 
+ /**
+@@ -831,8 +831,8 @@
+                             Compiler::OptimizationContext* optimizationContext) {
+     BinaryExpression& bin = (*(*iter)->expression())->as<BinaryExpression>();
+     // Remove references within LHS. Vectorization of RHS doesn't change reference counts.
+-    optimizationContext->fUsage->remove(bin.left().get());
+-    vectorize(b, iter, bin.left()->type(), &bin.right(), optimizationContext);
++    optimizationContext->fUsage->remove(bin.leftPointer().get());
++    vectorize(b, iter, bin.left().type(), &bin.rightPointer(), optimizationContext);
+ }
+ 
+ // Mark that an expression which we were writing to is no longer being written to
+@@ -915,8 +915,8 @@
+                 delete_left(&b, iter, optimizationContext);
+                 break;
+             }
+-            Expression& left = *bin->left();
+-            Expression& right = *bin->right();
++            Expression& left = bin->left();
++            Expression& right = bin->right();
+             const Type& leftType = left.type();
+             const Type& rightType = right.type();
+             // collapse useless expressions like x * 1 or x + 0
+@@ -1221,7 +1221,7 @@
+     // of action. First, find the switch-case we are interested in.
+     auto iter = switchStatement->cases().begin();
+     for (; iter != switchStatement->cases().end(); ++iter) {
+-        if (iter->get() == caseToCapture) {
++        if (&*iter == caseToCapture) {
+             break;
+         }
+     }
+@@ -1232,7 +1232,7 @@
+     auto startIter = iter;
+     Statement* unconditionalBreakStmt = nullptr;
+     for (; iter != switchStatement->cases().end(); ++iter) {
+-        for (std::unique_ptr<Statement>& stmt : (*iter)->statements()) {
++        for (std::unique_ptr<Statement>& stmt : iter->statements()) {
+             if (contains_conditional_break(*stmt)) {
+                 // We can't reduce switch-cases to a block when they have conditional breaks.
+                 return nullptr;
+@@ -1257,7 +1257,7 @@
+ 
+     // We can move over most of the statements as-is.
+     while (startIter != iter) {
+-        for (std::unique_ptr<Statement>& stmt : (*startIter)->statements()) {
++        for (std::unique_ptr<Statement>& stmt : startIter->statements()) {
+             caseStmts.push_back(std::move(stmt));
+         }
+         ++startIter;
+@@ -1266,7 +1266,7 @@
+     // If we found an unconditional break at the end, we need to move what we can while avoiding
+     // that break.
+     if (unconditionalBreakStmt != nullptr) {
+-        for (std::unique_ptr<Statement>& stmt : (*startIter)->statements()) {
++        for (std::unique_ptr<Statement>& stmt : startIter->statements()) {
+             if (stmt.get() == unconditionalBreakStmt) {
+                 move_all_but_break(stmt, &caseStmts);
+                 unconditionalBreakStmt = nullptr;
+@@ -1353,15 +1353,15 @@
+                 // switch is constant, replace it with the case that matches
+                 bool found = false;
+                 SwitchCase* defaultCase = nullptr;
+-                for (const std::unique_ptr<SwitchCase>& c : s.cases()) {
+-                    if (!c->value()) {
+-                        defaultCase = c.get();
++                for (SwitchCase& c : s.cases()) {
++                    if (!c.value()) {
++                        defaultCase = &c;
+                         continue;
+                     }
+                     int64_t caseValue;
+-                    SkAssertResult(fIRGenerator->getConstantInt(*c->value(), &caseValue));
++                    SkAssertResult(fIRGenerator->getConstantInt(*c.value(), &caseValue));
+                     if (caseValue == switchValue) {
+-                        std::unique_ptr<Statement> newBlock = block_for_case(&s, c.get());
++                        std::unique_ptr<Statement> newBlock = block_for_case(&s, &c);
+                         if (newBlock) {
+                             (*iter)->setStatement(std::move(newBlock), usage);
+                             found = true;
+diff --git a/src/sksl/SkSLDehydrator.cpp b/src/sksl/SkSLDehydrator.cpp
+index 728429e..663b57b 100644
+--- a/src/sksl/SkSLDehydrator.cpp
++++ b/src/sksl/SkSLDehydrator.cpp
+@@ -267,9 +267,9 @@
+             case Expression::Kind::kBinary: {
+                 const BinaryExpression& b = e->as<BinaryExpression>();
+                 this->writeCommand(Rehydrator::kBinary_Command);
+-                this->write(b.left().get());
++                this->write(&b.left());
+                 this->writeU8((int) b.getOperator());
+-                this->write(b.right().get());
++                this->write(&b.right());
+                 this->write(b.type());
+                 break;
+             }
+@@ -469,11 +469,11 @@
+                 this->writeU8(ss.isStatic());
+                 AutoDehydratorSymbolTable symbols(this, ss.symbols());
+                 this->write(ss.value().get());
+-                this->writeU8(ss.cases().size());
+-                for (const std::unique_ptr<SwitchCase>& sc : ss.cases()) {
+-                    this->write(sc->value().get());
+-                    this->writeU8(sc->statements().size());
+-                    for (const std::unique_ptr<Statement>& stmt : sc->statements()) {
++                this->writeU8(ss.cases().count());
++                for (const SwitchCase& sc : ss.cases()) {
++                    this->write(sc.value().get());
++                    this->writeU8(sc.statements().size());
++                    for (const std::unique_ptr<Statement>& stmt : sc.statements()) {
+                         this->write(stmt.get());
+                     }
+                 }
+@@ -487,9 +487,9 @@
+                 this->writeCommand(Rehydrator::kVarDeclaration_Command);
+                 this->writeU16(this->symbolId(&v.var()));
+                 this->write(v.baseType());
+-                this->writeU8(v.sizes().count());
+-                for (const std::unique_ptr<Expression>& size : v.sizes()) {
+-                    this->write(size.get());
++                this->writeU8(v.sizeCount());
++                for (int i = 0; i < v.sizeCount(); ++i) {
++                    this->write(v.size(i).get());
+                 }
+                 this->write(v.value().get());
+                 break;
+diff --git a/src/sksl/SkSLExternalValue.h b/src/sksl/SkSLExternalValue.h
+index 4e9be24..aac27ca 100644
+--- a/src/sksl/SkSLExternalValue.h
++++ b/src/sksl/SkSLExternalValue.h
+@@ -20,7 +20,8 @@
+     static constexpr Kind kSymbolKind = Kind::kExternal;
+ 
+     ExternalValue(const char* name, const Type& type)
+-        : INHERITED(-1, kSymbolKind, name, &type) {}
++        : INHERITED(-1, kSymbolKind, name)
++        , fType(type) {}
+ 
+     virtual bool canRead() const {
+         return false;
+@@ -34,6 +35,13 @@
+         return false;
+     }
+ 
++    /**
++     * Returns the type for purposes of read and write operations.
++     */
++    const Type& type() const override {
++        return fType;
++    }
++
+     virtual int callParameterCount() const {
+         return -1;
+     }
+@@ -50,7 +58,7 @@
+      * Returns the return type resulting from a call operation.
+      */
+     virtual const Type& callReturnType() const {
+-        return this->type();
++        return fType;
+     }
+ 
+     /**
+@@ -110,6 +118,8 @@
+ 
+ private:
+     using INHERITED = Symbol;
++
++    const Type& fType;
+ };
+ 
+ }  // namespace SkSL
+diff --git a/src/sksl/SkSLGLSLCodeGenerator.cpp b/src/sksl/SkSLGLSLCodeGenerator.cpp
+index 3e0e9bd..f6d4d61 100644
+--- a/src/sksl/SkSLGLSLCodeGenerator.cpp
++++ b/src/sksl/SkSLGLSLCodeGenerator.cpp
+@@ -908,8 +908,8 @@
+ 
+ void GLSLCodeGenerator::writeBinaryExpression(const BinaryExpression& b,
+                                               Precedence parentPrecedence) {
+-    const Expression& left = *b.left();
+-    const Expression& right = *b.right();
++    const Expression& left = b.left();
++    const Expression& right = b.right();
+     Token::Kind op = b.getOperator();
+     if (fProgram.fSettings.fCaps->unfoldShortCircuitAsTernary() &&
+             (op == Token::Kind::TK_LOGICALAND || op == Token::Kind::TK_LOGICALOR)) {
+@@ -952,10 +952,10 @@
+     // Transform:
+     // a && b  =>   a ? b : false
+     // a || b  =>   a ? true : b
+-    this->writeExpression(*b.left(), kTernary_Precedence);
++    this->writeExpression(b.left(), kTernary_Precedence);
+     this->write(" ? ");
+     if (b.getOperator() == Token::Kind::TK_LOGICALAND) {
+-        this->writeExpression(*b.right(), kTernary_Precedence);
++        this->writeExpression(b.right(), kTernary_Precedence);
+     } else {
+         BoolLiteral boolTrue(fContext, -1, true);
+         this->writeBoolLiteral(boolTrue);
+@@ -965,7 +965,7 @@
+         BoolLiteral boolFalse(fContext, -1, false);
+         this->writeBoolLiteral(boolFalse);
+     } else {
+-        this->writeExpression(*b.right(), kTernary_Precedence);
++        this->writeExpression(b.right(), kTernary_Precedence);
+     }
+     if (kTernary_Precedence >= parentPrecedence) {
+         this->write(")");
+@@ -1251,10 +1251,10 @@
+     this->writeType(var.baseType());
+     this->write(" ");
+     this->write(var.var().name());
+-    for (const std::unique_ptr<Expression>& size : var.sizes()) {
++    for (int i = 0; i < var.sizeCount(); ++i) {
+         this->write("[");
+-        if (size) {
+-            this->writeExpression(*size, kTopLevel_Precedence);
++        if (var.size(i)) {
++            this->writeExpression(*var.size(i), kTopLevel_Precedence);
+         }
+         this->write("]");
+     }
+@@ -1448,16 +1448,16 @@
+     this->writeExpression(*s.value(), kTopLevel_Precedence);
+     this->writeLine(") {");
+     fIndentation++;
+-    for (const std::unique_ptr<SwitchCase>& c : s.cases()) {
+-        if (c->value()) {
++    for (const SwitchCase& c : s.cases()) {
++        if (c.value()) {
+             this->write("case ");
+-            this->writeExpression(*c->value(), kTopLevel_Precedence);
++            this->writeExpression(*c.value(), kTopLevel_Precedence);
+             this->writeLine(":");
+         } else {
+             this->writeLine("default:");
+         }
+         fIndentation++;
+-        for (const auto& stmt : c->statements()) {
++        for (const auto& stmt : c.statements()) {
+             this->writeStatement(*stmt);
+             this->writeLine();
+         }
+diff --git a/src/sksl/SkSLIRGenerator.h b/src/sksl/SkSLIRGenerator.h
+index 38e254a..3964773 100644
+--- a/src/sksl/SkSLIRGenerator.h
++++ b/src/sksl/SkSLIRGenerator.h
+@@ -33,7 +33,6 @@
+ 
+ namespace SkSL {
+ 
+-class ExternalValue;
+ class FunctionCall;
+ struct ParsedModule;
+ struct Swizzle;
+diff --git a/src/sksl/SkSLInliner.cpp b/src/sksl/SkSLInliner.cpp
+index 6f80c20..3b013b6 100644
+--- a/src/sksl/SkSLInliner.cpp
++++ b/src/sksl/SkSLInliner.cpp
+@@ -355,9 +355,9 @@
+         case Expression::Kind::kBinary: {
+             const BinaryExpression& b = expression.as<BinaryExpression>();
+             return std::make_unique<BinaryExpression>(offset,
+-                                                      expr(b.left()),
++                                                      expr(b.leftPointer()),
+                                                       b.getOperator(),
+-                                                      expr(b.right()),
++                                                      expr(b.rightPointer()),
+                                                       &b.type());
+         }
+         case Expression::Kind::kBoolLiteral:
+@@ -535,10 +535,10 @@
+         case Statement::Kind::kSwitch: {
+             const SwitchStatement& ss = statement.as<SwitchStatement>();
+             std::vector<std::unique_ptr<SwitchCase>> cases;
+-            cases.reserve(ss.cases().size());
+-            for (const std::unique_ptr<SwitchCase>& sc : ss.cases()) {
+-                cases.push_back(std::make_unique<SwitchCase>(offset, expr(sc->value()),
+-                                                             stmts(sc->statements())));
++            cases.reserve(ss.cases().count());
++            for (const SwitchCase& sc : ss.cases()) {
++                cases.push_back(std::make_unique<SwitchCase>(offset, expr(sc.value()),
++                                                             stmts(sc.statements())));
+             }
+             return std::make_unique<SwitchStatement>(offset, ss.isStatic(), expr(ss.value()),
+                                                      std::move(cases),
+@@ -547,9 +547,9 @@
+         case Statement::Kind::kVarDeclaration: {
+             const VarDeclaration& decl = statement.as<VarDeclaration>();
+             ExpressionArray sizes;
+-            sizes.reserve_back(decl.sizes().count());
+-            for (const std::unique_ptr<Expression>& size : decl.sizes()) {
+-                sizes.push_back(expr(size));
++            sizes.reserve_back(decl.sizeCount());
++            for (int i = 0; i < decl.sizeCount(); ++i) {
++                sizes.push_back(expr(decl.size(i)));
+             }
+             std::unique_ptr<Expression> initialValue = expr(decl.value());
+             const Variable& old = decl.var();
+@@ -940,9 +940,9 @@
+                 }
+ 
+                 this->visitExpression(&switchStmt.value());
+-                for (const std::unique_ptr<SwitchCase>& switchCase : switchStmt.cases()) {
++                for (SwitchCase& switchCase : switchStmt.cases()) {
+                     // The switch-case's fValue cannot be a FunctionCall; skip it.
+-                    for (std::unique_ptr<Statement>& caseBlock : switchCase->statements()) {
++                    for (std::unique_ptr<Statement>& caseBlock : switchCase.statements()) {
+                         this->visitStatement(&caseBlock);
+                     }
+                 }
+@@ -999,7 +999,7 @@
+ 
+             case Expression::Kind::kBinary: {
+                 BinaryExpression& binaryExpr = (*expr)->as<BinaryExpression>();
+-                this->visitExpression(&binaryExpr.left());
++                this->visitExpression(&binaryExpr.leftPointer());
+ 
+                 // Logical-and and logical-or binary expressions do not inline the right side,
+                 // because that would invalidate short-circuiting. That is, when evaluating
+@@ -1013,7 +1013,7 @@
+                 bool shortCircuitable = (op == Token::Kind::TK_LOGICALAND ||
+                                          op == Token::Kind::TK_LOGICALOR);
+                 if (!shortCircuitable) {
+-                    this->visitExpression(&binaryExpr.right());
++                    this->visitExpression(&binaryExpr.rightPointer());
+                 }
+                 break;
+             }
+diff --git a/src/sksl/SkSLMetalCodeGenerator.cpp b/src/sksl/SkSLMetalCodeGenerator.cpp
+index 22a9cab..c8ef96a 100644
+--- a/src/sksl/SkSLMetalCodeGenerator.cpp
++++ b/src/sksl/SkSLMetalCodeGenerator.cpp
+@@ -823,8 +823,8 @@
+ 
+ void MetalCodeGenerator::writeBinaryExpression(const BinaryExpression& b,
+                                                Precedence parentPrecedence) {
+-    const Expression& left = *b.left();
+-    const Expression& right = *b.right();
++    const Expression& left = b.left();
++    const Expression& right = b.right();
+     const Type& leftType = left.type();
+     const Type& rightType = right.type();
+     Token::Kind op = b.getOperator();
+@@ -1236,10 +1236,10 @@
+     this->writeType(var.baseType());
+     this->write(" ");
+     this->writeName(var.var().name());
+-    for (const std::unique_ptr<Expression>& size : var.sizes()) {
++    for (int i = 0; i < var.sizeCount(); ++i) {
+         this->write("[");
+-        if (size) {
+-            this->writeExpression(*size, kTopLevel_Precedence);
++        if (var.size(i)) {
++            this->writeExpression(*var.size(i), kTopLevel_Precedence);
+         }
+         this->write("]");
+     }
+@@ -1368,16 +1368,16 @@
+     this->writeExpression(*s.value(), kTopLevel_Precedence);
+     this->writeLine(") {");
+     fIndentation++;
+-    for (const std::unique_ptr<SwitchCase>& c : s.cases()) {
+-        if (c->value()) {
++    for (const SwitchCase& c : s.cases()) {
++        if (c.value()) {
+             this->write("case ");
+-            this->writeExpression(*c->value(), kTopLevel_Precedence);
++            this->writeExpression(*c.value(), kTopLevel_Precedence);
+             this->writeLine(":");
+         } else {
+             this->writeLine("default:");
+         }
+         fIndentation++;
+-        for (const auto& stmt : c->statements()) {
++        for (const auto& stmt : c.statements()) {
+             this->writeStatement(*stmt);
+             this->writeLine();
+         }
+@@ -1713,8 +1713,8 @@
+             return this->requirements(e->as<Swizzle>().base().get());
+         case Expression::Kind::kBinary: {
+             const BinaryExpression& bin = e->as<BinaryExpression>();
+-            return this->requirements(bin.left().get()) |
+-                   this->requirements(bin.right().get());
++            return this->requirements(&bin.left()) |
++                   this->requirements(&bin.right());
+         }
+         case Expression::Kind::kIndex: {
+             const IndexExpression& idx = e->as<IndexExpression>();
+@@ -1802,8 +1802,8 @@
+         case Statement::Kind::kSwitch: {
+             const SwitchStatement& sw = s->as<SwitchStatement>();
+             Requirements result = this->requirements(sw.value().get());
+-            for (const std::unique_ptr<SwitchCase>& sc : sw.cases()) {
+-                for (const auto& st : sc->statements()) {
++            for (const SwitchCase& sc : sw.cases()) {
++                for (const auto& st : sc.statements()) {
+                     result |= this->requirements(st.get());
+                 }
+             }
+diff --git a/src/sksl/SkSLSPIRVCodeGenerator.cpp b/src/sksl/SkSLSPIRVCodeGenerator.cpp
+index 52d647b..5e5ddb6 100644
+--- a/src/sksl/SkSLSPIRVCodeGenerator.cpp
++++ b/src/sksl/SkSLSPIRVCodeGenerator.cpp
+@@ -2317,8 +2317,8 @@
+ }
+ 
+ SpvId SPIRVCodeGenerator::writeBinaryExpression(const BinaryExpression& b, OutputStream& out) {
+-    const Expression& left = *b.left();
+-    const Expression& right = *b.right();
++    const Expression& left = b.left();
++    const Expression& right = b.right();
+     Token::Kind op = b.getOperator();
+     // handle cases where we don't necessarily evaluate both LHS and RHS
+     switch (op) {
+@@ -2357,14 +2357,14 @@
+     SkASSERT(a.getOperator() == Token::Kind::TK_LOGICALAND);
+     BoolLiteral falseLiteral(fContext, -1, false);
+     SpvId falseConstant = this->writeBoolLiteral(falseLiteral);
+-    SpvId lhs = this->writeExpression(*a.left(), out);
++    SpvId lhs = this->writeExpression(a.left(), out);
+     SpvId rhsLabel = this->nextId();
+     SpvId end = this->nextId();
+     SpvId lhsBlock = fCurrentBlock;
+     this->writeInstruction(SpvOpSelectionMerge, end, SpvSelectionControlMaskNone, out);
+     this->writeInstruction(SpvOpBranchConditional, lhs, rhsLabel, end, out);
+     this->writeLabel(rhsLabel, out);
+-    SpvId rhs = this->writeExpression(*a.right(), out);
++    SpvId rhs = this->writeExpression(a.right(), out);
+     SpvId rhsBlock = fCurrentBlock;
+     this->writeInstruction(SpvOpBranch, end, out);
+     this->writeLabel(end, out);
+@@ -2378,14 +2378,14 @@
+     SkASSERT(o.getOperator() == Token::Kind::TK_LOGICALOR);
+     BoolLiteral trueLiteral(fContext, -1, true);
+     SpvId trueConstant = this->writeBoolLiteral(trueLiteral);
+-    SpvId lhs = this->writeExpression(*o.left(), out);
++    SpvId lhs = this->writeExpression(o.left(), out);
+     SpvId rhsLabel = this->nextId();
+     SpvId end = this->nextId();
+     SpvId lhsBlock = fCurrentBlock;
+     this->writeInstruction(SpvOpSelectionMerge, end, SpvSelectionControlMaskNone, out);
+     this->writeInstruction(SpvOpBranchConditional, lhs, end, rhsLabel, out);
+     this->writeLabel(rhsLabel, out);
+-    SpvId rhs = this->writeExpression(*o.right(), out);
++    SpvId rhs = this->writeExpression(o.right(), out);
+     SpvId rhsBlock = fCurrentBlock;
+     this->writeInstruction(SpvOpBranch, end, out);
+     this->writeLabel(end, out);
+@@ -3055,11 +3055,11 @@
+     SpvId defaultLabel = end;
+     fBreakTarget.push(end);
+     int size = 3;
+-    auto& cases = s.cases();
+-    for (const std::unique_ptr<SwitchCase>& c : cases) {
++    auto cases = s.cases();
++    for (const SwitchCase& c : cases) {
+         SpvId label = this->nextId();
+         labels.push_back(label);
+-        if (c->value()) {
++        if (c.value()) {
+             size += 2;
+         } else {
+             defaultLabel = label;
+@@ -3070,16 +3070,16 @@
+     this->writeOpCode(SpvOpSwitch, size, out);
+     this->writeWord(value, out);
+     this->writeWord(defaultLabel, out);
+-    for (size_t i = 0; i < cases.size(); ++i) {
+-        if (!cases[i]->value()) {
++    for (int i = 0; i < cases.count(); ++i) {
++        if (!cases[i].value()) {
+             continue;
+         }
+-        this->writeWord(cases[i]->value()->as<IntLiteral>().value(), out);
++        this->writeWord(cases[i].value()->as<IntLiteral>().value(), out);
+         this->writeWord(labels[i], out);
+     }
+-    for (size_t i = 0; i < cases.size(); ++i) {
++    for (int i = 0; i < cases.count(); ++i) {
+         this->writeLabel(labels[i], out);
+-        for (const auto& stmt : cases[i]->statements()) {
++        for (const auto& stmt : cases[i].statements()) {
+             this->writeStatement(*stmt, out);
+         }
+         if (fCurrentBlock) {
+diff --git a/src/sksl/ir/SkSLBinaryExpression.h b/src/sksl/ir/SkSLBinaryExpression.h
+index bf59cf9..c393fdd 100644
+--- a/src/sksl/ir/SkSLBinaryExpression.h
++++ b/src/sksl/ir/SkSLBinaryExpression.h
+@@ -52,71 +52,79 @@
+ 
+     BinaryExpression(int offset, std::unique_ptr<Expression> left, Token::Kind op,
+                      std::unique_ptr<Expression> right, const Type* type)
+-    : INHERITED(offset, kExpressionKind, type)
+-    , fLeft(std::move(left))
+-    , fOperator(op)
+-    , fRight(std::move(right)) {
++    : INHERITED(offset, kExpressionKind, TypeTokenData{type, op}) {
++        fExpressionChildren.reserve_back(2);
++        fExpressionChildren.push_back(std::move(left));
++        fExpressionChildren.push_back(std::move(right));
+         // If we are assigning to a VariableReference, ensure that it is set to Write or ReadWrite
+-        SkASSERT(!Compiler::IsAssignment(op) || check_ref(*this->left()));
++        SkASSERT(!Compiler::IsAssignment(op) || check_ref(this->left()));
+     }
+ 
+-    std::unique_ptr<Expression>& left() {
+-        return fLeft;
++    const Type& type() const override {
++        return *this->typeTokenData().fType;
+     }
+ 
+-    const std::unique_ptr<Expression>& left() const {
+-        return fLeft;
++    Expression& left() const {
++        return this->expressionChild(0);
+     }
+ 
+-    std::unique_ptr<Expression>& right() {
+-        return fRight;
++    std::unique_ptr<Expression>& leftPointer() {
++        return this->expressionPointer(0);
+     }
+ 
+-    const std::unique_ptr<Expression>& right() const {
+-        return fRight;
++    const std::unique_ptr<Expression>& leftPointer() const {
++        return this->expressionPointer(0);
++    }
++
++    Expression& right() const {
++        return this->expressionChild(1);
++    }
++
++    std::unique_ptr<Expression>& rightPointer() {
++        return this->expressionPointer(1);
++    }
++
++    const std::unique_ptr<Expression>& rightPointer() const {
++        return this->expressionPointer(1);
+     }
+ 
+     Token::Kind getOperator() const {
+-        return fOperator;
++        return this->typeTokenData().fToken;
+     }
+ 
+     bool isConstantOrUniform() const override {
+-        return this->left()->isConstantOrUniform() && this->right()->isConstantOrUniform();
++        return this->left().isConstantOrUniform() && this->right().isConstantOrUniform();
+     }
+ 
+     std::unique_ptr<Expression> constantPropagate(const IRGenerator& irGenerator,
+                                                   const DefinitionMap& definitions) override {
+-        return irGenerator.constantFold(*this->left(),
++        return irGenerator.constantFold(this->left(),
+                                         this->getOperator(),
+-                                        *this->right());
++                                        this->right());
+     }
+ 
+     bool hasProperty(Property property) const override {
+         if (property == Property::kSideEffects && Compiler::IsAssignment(this->getOperator())) {
+             return true;
+         }
+-        return this->left()->hasProperty(property) || this->right()->hasProperty(property);
++        return this->left().hasProperty(property) || this->right().hasProperty(property);
+     }
+ 
+     std::unique_ptr<Expression> clone() const override {
+         return std::unique_ptr<Expression>(new BinaryExpression(fOffset,
+-                                                                this->left()->clone(),
++                                                                this->left().clone(),
+                                                                 this->getOperator(),
+-                                                                this->right()->clone(),
++                                                                this->right().clone(),
+                                                                 &this->type()));
+     }
+ 
+     String description() const override {
+-        return "(" + this->left()->description() + " " +
+-               Compiler::OperatorName(this->getOperator()) + " " + this->right()->description() +
++        return "(" + this->left().description() + " " +
++               Compiler::OperatorName(this->getOperator()) + " " + this->right().description() +
+                ")";
+     }
+ 
+ private:
+-    std::unique_ptr<Expression> fLeft;
+-    Token::Kind fOperator;
+-    std::unique_ptr<Expression> fRight;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLBlock.h b/src/sksl/ir/SkSLBlock.h
+index b916a5b..faefd7e 100644
+--- a/src/sksl/ir/SkSLBlock.h
++++ b/src/sksl/ir/SkSLBlock.h
+@@ -22,29 +22,27 @@
+ 
+     Block(int offset, StatementArray statements,
+           const std::shared_ptr<SymbolTable> symbols = nullptr, bool isScope = true)
+-    : INHERITED(offset, kStatementKind)
+-    , fChildren(std::move(statements))
+-    , fSymbolTable(std::move(symbols))
+-    , fIsScope(isScope) {}
++    : INHERITED(offset, kStatementKind, BlockData{std::move(symbols), isScope},
++                std::move(statements)) {}
+ 
+     const StatementArray& children() const {
+-        return fChildren;
++        return fStatementChildren;
+     }
+ 
+     StatementArray& children() {
+-        return fChildren;
++        return fStatementChildren;
+     }
+ 
+     bool isScope() const {
+-        return fIsScope;
++        return this->blockData().fIsScope;
+     }
+ 
+     void setIsScope(bool isScope) {
+-        fIsScope = isScope;
++        this->blockData().fIsScope = isScope;
+     }
+ 
+     std::shared_ptr<SymbolTable> symbolTable() const {
+-        return fSymbolTable;
++        return this->blockData().fSymbolTable;
+     }
+ 
+     bool isEmpty() const override {
+@@ -78,13 +76,6 @@
+     }
+ 
+ private:
+-    StatementArray fChildren;
+-    std::shared_ptr<SymbolTable> fSymbolTable;
+-    // if isScope is false, this is just a group of statements rather than an actual
+-    // language-level block. This allows us to pass around multiple statements as if they were a
+-    // single unit, with no semantic impact.
+-    bool fIsScope;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLBoolLiteral.h b/src/sksl/ir/SkSLBoolLiteral.h
+index 38c51c7..0bb660c 100644
+--- a/src/sksl/ir/SkSLBoolLiteral.h
++++ b/src/sksl/ir/SkSLBoolLiteral.h
+@@ -21,11 +21,14 @@
+     static constexpr Kind kExpressionKind = Kind::kBoolLiteral;
+ 
+     BoolLiteral(const Context& context, int offset, bool value)
+-        : INHERITED(offset, kExpressionKind, context.fBool_Type.get())
+-        , fValue(value) {}
++    : INHERITED(offset, BoolLiteralData{context.fBool_Type.get(), value}) {}
++
++    const Type& type() const override {
++        return *this->boolLiteralData().fType;
++    }
+ 
+     bool value() const {
+-        return fValue;
++        return this->boolLiteralData().fValue;
+     }
+ 
+     String description() const override {
+@@ -51,10 +54,7 @@
+ 
+ private:
+     BoolLiteral(int offset, bool value, const Type* type)
+-        : INHERITED(offset, kExpressionKind, type)
+-        , fValue(value) {}
+-
+-    bool fValue;
++    : INHERITED(offset, BoolLiteralData{type, value}) {}
+ 
+     using INHERITED = Expression;
+ };
+diff --git a/src/sksl/ir/SkSLConstructor.h b/src/sksl/ir/SkSLConstructor.h
+index 25240b7..103e4d6 100644
+--- a/src/sksl/ir/SkSLConstructor.h
++++ b/src/sksl/ir/SkSLConstructor.h
+@@ -31,15 +31,16 @@
+     static constexpr Kind kExpressionKind = Kind::kConstructor;
+ 
+     Constructor(int offset, const Type* type, ExpressionArray arguments)
+-        : INHERITED(offset, kExpressionKind, type)
+-        , fArguments(std::move(arguments)) {}
++            : INHERITED(offset, kExpressionKind, type) {
++        fExpressionChildren = std::move(arguments);
++    }
+ 
+     ExpressionArray& arguments() {
+-        return fArguments;
++        return fExpressionChildren;
+     }
+ 
+     const ExpressionArray& arguments() const {
+-        return fArguments;
++        return fExpressionChildren;
+     }
+ 
+     std::unique_ptr<Expression> constantPropagate(const IRGenerator& irGenerator,
+@@ -113,8 +114,6 @@
+     SKSL_FLOAT getMatComponent(int col, int row) const override;
+ 
+ private:
+-    ExpressionArray fArguments;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLDoStatement.h b/src/sksl/ir/SkSLDoStatement.h
+index 231abba..39636d7 100644
+--- a/src/sksl/ir/SkSLDoStatement.h
++++ b/src/sksl/ir/SkSLDoStatement.h
+@@ -22,24 +22,25 @@
+ 
+     DoStatement(int offset, std::unique_ptr<Statement> statement,
+                 std::unique_ptr<Expression> test)
+-        : INHERITED(offset, kStatementKind)
+-        , fStatement(std::move(statement))
+-        , fTest(std::move(test)) {}
++    : INHERITED(offset, kStatementKind) {
++        fStatementChildren.push_back(std::move(statement));
++        fExpressionChildren.push_back(std::move(test));
++    }
+ 
+     std::unique_ptr<Statement>& statement() {
+-        return fStatement;
++        return fStatementChildren[0];
+     }
+ 
+     const std::unique_ptr<Statement>& statement() const {
+-        return fStatement;
++        return fStatementChildren[0];
+     }
+ 
+     std::unique_ptr<Expression>& test() {
+-        return fTest;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& test() const {
+-        return fTest;
++        return fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+@@ -53,9 +54,6 @@
+     }
+ 
+ private:
+-    std::unique_ptr<Statement> fStatement;
+-    std::unique_ptr<Expression> fTest;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLExpression.h b/src/sksl/ir/SkSLExpression.h
+index 6a69e2f..a0614b1 100644
+--- a/src/sksl/ir/SkSLExpression.h
++++ b/src/sksl/ir/SkSLExpression.h
+@@ -58,18 +58,63 @@
+         kContainsRTAdjust
+     };
+ 
+-    Expression(int offset, Kind kind, const Type* type)
+-        : INHERITED(offset, (int) kind)
+-        , fType(type) {
++    Expression(int offset, const BoolLiteralData& data)
++        : INHERITED(offset, (int) Kind::kBoolLiteral, data) {
++    }
++
++    Expression(int offset, Kind kind, const ExternalValueData& data)
++        : INHERITED(offset, (int) kind, data) {
+         SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
+     }
+ 
++    Expression(int offset, const FieldAccessData& data)
++        : INHERITED(offset, (int) Kind::kFieldAccess, data) {}
++
++    Expression(int offset, const FloatLiteralData& data)
++        : INHERITED(offset, (int) Kind::kFloatLiteral, data) {}
++
++    Expression(int offset, const FunctionCallData& data)
++        : INHERITED(offset, (int) Kind::kFunctionCall, data) {}
++
++    Expression(int offset, const FunctionReferenceData& data)
++        : INHERITED(offset, (int) Kind::kFunctionReference, data) {}
++
++    Expression(int offset, const IntLiteralData& data)
++        : INHERITED(offset, (int) Kind::kIntLiteral, data) {
++    }
++
++    Expression(int offset, const SettingData& data)
++        : INHERITED(offset, (int) Kind::kSetting, data) {
++    }
++
++    Expression(int offset, const SwizzleData& data)
++        : INHERITED(offset, (int) Kind::kSwizzle, data) {
++    }
++
++    Expression(int offset, Kind kind, const Type* type)
++        : INHERITED(offset, (int) kind, type) {
++        SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
++    }
++
++    Expression(int offset, const TypeReferenceData& data)
++        : INHERITED(offset, (int) Kind::kTypeReference, data) {
++    }
++
++    Expression(int offset, Kind kind, const TypeTokenData& data)
++        : INHERITED(offset, (int) kind, data) {
++        SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
++    }
++
++    Expression(int offset, const VariableReferenceData& data)
++        : INHERITED(offset, (int) Kind::kVariableReference, data) {
++    }
++
+     Kind kind() const {
+         return (Kind) fKind;
+     }
+ 
+     virtual const Type& type() const {
+-        return *fType;
++        return *this->typeData();
+     }
+ 
+     /**
+@@ -195,8 +240,6 @@
+     virtual std::unique_ptr<Expression> clone() const = 0;
+ 
+ private:
+-    const Type* fType;
+-
+     using INHERITED = IRNode;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLExpressionStatement.h b/src/sksl/ir/SkSLExpressionStatement.h
+index b14964f..8b98ccb 100644
+--- a/src/sksl/ir/SkSLExpressionStatement.h
++++ b/src/sksl/ir/SkSLExpressionStatement.h
+@@ -21,15 +21,16 @@
+     static constexpr Kind kStatementKind = Kind::kExpression;
+ 
+     ExpressionStatement(std::unique_ptr<Expression> expression)
+-        : INHERITED(expression->fOffset, kStatementKind)
+-        , fExpression(std::move(expression)) {}
++    : INHERITED(expression->fOffset, kStatementKind) {
++        fExpressionChildren.push_back(std::move(expression));
++    }
+ 
+     const std::unique_ptr<Expression>& expression() const {
+-        return fExpression;
++        return fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Expression>& expression() {
+-        return fExpression;
++        return fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+@@ -41,8 +42,6 @@
+     }
+ 
+ private:
+-    std::unique_ptr<Expression> fExpression;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLExtension.h b/src/sksl/ir/SkSLExtension.h
+index d0293d2..f06b421 100644
+--- a/src/sksl/ir/SkSLExtension.h
++++ b/src/sksl/ir/SkSLExtension.h
+@@ -20,11 +20,10 @@
+     static constexpr Kind kProgramElementKind = Kind::kExtension;
+ 
+     Extension(int offset, String name)
+-        : INHERITED(offset, kProgramElementKind)
+-        , fName(std::move(name)) {}
++    : INHERITED(offset, kProgramElementKind, name) {}
+ 
+     const String& name() const {
+-        return fName;
++        return this->stringData();
+     }
+ 
+     std::unique_ptr<ProgramElement> clone() const override {
+@@ -36,8 +35,6 @@
+     }
+ 
+ private:
+-    String fName;
+-
+     using INHERITED = ProgramElement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLExternalFunctionCall.h b/src/sksl/ir/SkSLExternalFunctionCall.h
+index 05eede2..bb54ae5 100644
+--- a/src/sksl/ir/SkSLExternalFunctionCall.h
++++ b/src/sksl/ir/SkSLExternalFunctionCall.h
+@@ -23,20 +23,24 @@
+     static constexpr Kind kExpressionKind = Kind::kExternalFunctionCall;
+ 
+     ExternalFunctionCall(int offset, const ExternalValue* function, ExpressionArray arguments)
+-        : INHERITED(offset, kExpressionKind, &function->callReturnType())
+-        , fFunction(*function)
+-        , fArguments(std::move(arguments)) {}
++    : INHERITED(offset, kExpressionKind, ExternalValueData{&function->callReturnType(), function}) {
++        fExpressionChildren = std::move(arguments);
++    }
++
++    const Type& type() const override {
++        return *this->externalValueData().fType;
++    }
+ 
+     ExpressionArray& arguments() {
+-        return fArguments;
++        return fExpressionChildren;
+     }
+ 
+     const ExpressionArray& arguments() const {
+-        return fArguments;
++        return fExpressionChildren;
+     }
+ 
+     const ExternalValue& function() const {
+-        return fFunction;
++        return *this->externalValueData().fValue;
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -73,10 +77,6 @@
+         return result;
+     }
+ 
+-private:
+-    const ExternalValue& fFunction;
+-    ExpressionArray fArguments;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLExternalValueReference.h b/src/sksl/ir/SkSLExternalValueReference.h
+index 5c42c6a..ace35ff 100644
+--- a/src/sksl/ir/SkSLExternalValueReference.h
++++ b/src/sksl/ir/SkSLExternalValueReference.h
+@@ -21,11 +21,14 @@
+     static constexpr Kind kExpressionKind = Kind::kExternalValue;
+ 
+     ExternalValueReference(int offset, const ExternalValue* ev)
+-        : INHERITED(offset, kExpressionKind, &ev->type())
+-        , fValue(*ev) {}
++    : INHERITED(offset, kExpressionKind, ExternalValueData{&ev->type(), ev}) {}
++
++    const Type& type() const override {
++        return *this->externalValueData().fType;
++    }
+ 
+     const ExternalValue& value() const {
+-        return fValue;
++        return *this->externalValueData().fValue;
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -41,8 +44,6 @@
+     }
+ 
+ private:
+-    const ExternalValue& fValue;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLFieldAccess.h b/src/sksl/ir/SkSLFieldAccess.h
+index 3291c11..f1dde07 100644
+--- a/src/sksl/ir/SkSLFieldAccess.h
++++ b/src/sksl/ir/SkSLFieldAccess.h
+@@ -31,25 +31,29 @@
+ 
+     FieldAccess(std::unique_ptr<Expression> base, int fieldIndex,
+                 OwnerKind ownerKind = OwnerKind::kDefault)
+-    : INHERITED(base->fOffset, kExpressionKind, base->type().fields()[fieldIndex].fType)
+-    , fFieldIndex(fieldIndex)
+-    , fOwnerKind(ownerKind)
+-    , fBase(std::move(base)) {}
++    : INHERITED(base->fOffset, FieldAccessData{base->type().fields()[fieldIndex].fType,
++                                               fieldIndex, ownerKind}) {
++        fExpressionChildren.push_back(std::move(base));
++    }
++
++    const Type& type() const override {
++        return *this->fieldAccessData().fType;
++    }
+ 
+     std::unique_ptr<Expression>& base() {
+-        return fBase;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& base() const {
+-        return fBase;
++        return fExpressionChildren[0];
+     }
+ 
+     int fieldIndex() const {
+-        return fFieldIndex;
++        return this->fieldAccessData().fFieldIndex;
+     }
+ 
+     OwnerKind ownerKind() const {
+-        return fOwnerKind;
++        return this->fieldAccessData().fOwnerKind;
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -68,10 +72,6 @@
+     }
+ 
+ private:
+-    int fFieldIndex;
+-    FieldAccessOwnerKind fOwnerKind;
+-    std::unique_ptr<Expression> fBase;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLFloatLiteral.h b/src/sksl/ir/SkSLFloatLiteral.h
+index 87329b1..81f85ef 100644
+--- a/src/sksl/ir/SkSLFloatLiteral.h
++++ b/src/sksl/ir/SkSLFloatLiteral.h
+@@ -21,15 +21,17 @@
+     static constexpr Kind kExpressionKind = Kind::kFloatLiteral;
+ 
+     FloatLiteral(const Context& context, int offset, float value)
+-        : INHERITED(offset, kExpressionKind, context.fFloatLiteral_Type.get())
+-        , fValue(value) {}
++    : INHERITED(offset, FloatLiteralData{context.fFloatLiteral_Type.get(), value}) {}
+ 
+     FloatLiteral(int offset, float value, const Type* type)
+-        : INHERITED(offset, kExpressionKind, type)
+-        , fValue(value) {}
++    : INHERITED(offset, FloatLiteralData{type, value}) {}
++
++    const Type& type() const override {
++        return *this->floatLiteralData().fType;
++    }
+ 
+     float value() const {
+-        return fValue;
++        return this->floatLiteralData().fValue;
+     }
+ 
+     String description() const override {
+@@ -64,8 +66,6 @@
+     }
+ 
+ private:
+-    float fValue;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLForStatement.h b/src/sksl/ir/SkSLForStatement.h
+index 8aaafec4..8afd092 100644
+--- a/src/sksl/ir/SkSLForStatement.h
++++ b/src/sksl/ir/SkSLForStatement.h
+@@ -24,47 +24,49 @@
+     ForStatement(int offset, std::unique_ptr<Statement> initializer,
+                  std::unique_ptr<Expression> test, std::unique_ptr<Expression> next,
+                  std::unique_ptr<Statement> statement, std::shared_ptr<SymbolTable> symbols)
+-    : INHERITED(offset, kStatementKind)
+-    , fSymbolTable(std::move(symbols))
+-    , fInitializer(std::move(initializer))
+-    , fTest(std::move(test))
+-    , fNext(std::move(next))
+-    , fStatement(std::move(statement)) {}
++    : INHERITED(offset, ForStatementData{std::move(symbols)}) {
++        fStatementChildren.reserve_back(2);
++        fStatementChildren.push_back(std::move(initializer));
++        fStatementChildren.push_back(std::move(statement));
++        fExpressionChildren.reserve_back(2);
++        fExpressionChildren.push_back(std::move(test));
++        fExpressionChildren.push_back(std::move(next));
++    }
+ 
+     std::unique_ptr<Statement>& initializer() {
+-        return fInitializer;
++        return fStatementChildren[0];
+     }
+ 
+     const std::unique_ptr<Statement>& initializer() const {
+-        return fInitializer;
++        return fStatementChildren[0];
+     }
+ 
+     std::unique_ptr<Expression>& test() {
+-        return fTest;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& test() const {
+-        return fTest;
++        return fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Expression>& next() {
+-        return fNext;
++        return fExpressionChildren[1];
+     }
+ 
+     const std::unique_ptr<Expression>& next() const {
+-        return fNext;
++        return fExpressionChildren[1];
+     }
+ 
+     std::unique_ptr<Statement>& statement() {
+-        return fStatement;
++        return fStatementChildren[1];
+     }
+ 
+     const std::unique_ptr<Statement>& statement() const {
+-        return fStatement;
++        return fStatementChildren[1];
+     }
+ 
+-    const std::shared_ptr<SymbolTable>& symbols() const {
+-        return fSymbolTable;
++    std::shared_ptr<SymbolTable> symbols() const {
++        return this->forStatementData().fSymbolTable;
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+@@ -97,12 +99,6 @@
+     }
+ 
+ private:
+-    std::shared_ptr<SymbolTable> fSymbolTable;
+-    std::unique_ptr<Statement> fInitializer;
+-    std::unique_ptr<Expression> fTest;
+-    std::unique_ptr<Expression> fNext;
+-    std::unique_ptr<Statement> fStatement;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLFunctionCall.h b/src/sksl/ir/SkSLFunctionCall.h
+index 08ece8f..f8d83aa 100644
+--- a/src/sksl/ir/SkSLFunctionCall.h
++++ b/src/sksl/ir/SkSLFunctionCall.h
+@@ -23,22 +23,26 @@
+ 
+     FunctionCall(int offset, const Type* type, const FunctionDeclaration* function,
+                  ExpressionArray arguments)
+-        : INHERITED(offset, kExpressionKind, type)
+-        , fFunction(*function)
+-        , fArguments(std::move(arguments)) {}
++    : INHERITED(offset, FunctionCallData{type, function}) {
++        fExpressionChildren = std::move(arguments);
++    }
+ 
+     ~FunctionCall() override {}
+ 
++    const Type& type() const override {
++        return *this->functionCallData().fType;
++    }
++
+     const FunctionDeclaration& function() const {
+-        return fFunction;
++        return *this->functionCallData().fFunction;
+     }
+ 
+     ExpressionArray& arguments() {
+-        return fArguments;
++        return fExpressionChildren;
+     }
+ 
+     const ExpressionArray& arguments() const {
+-        return fArguments;
++        return fExpressionChildren;
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -77,9 +81,6 @@
+     }
+ 
+ private:
+-    const FunctionDeclaration& fFunction;
+-    ExpressionArray fArguments;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLFunctionDefinition.h b/src/sksl/ir/SkSLFunctionDefinition.h
+index 419d5cf..2638e36 100644
+--- a/src/sksl/ir/SkSLFunctionDefinition.h
++++ b/src/sksl/ir/SkSLFunctionDefinition.h
+@@ -30,9 +30,10 @@
+         : INHERITED(offset, kProgramElementKind)
+         , fDeclaration(declaration)
+         , fBuiltin(builtin)
+-        , fBody(std::move(body))
+         , fReferencedIntrinsics(std::move(referencedIntrinsics))
+-        , fSource(nullptr) {}
++        , fSource(nullptr) {
++        fStatementChildren.push_back(std::move(body));
++    }
+ 
+     const FunctionDeclaration& declaration() const {
+         return *fDeclaration;
+@@ -43,11 +44,11 @@
+     }
+ 
+     std::unique_ptr<Statement>& body() {
+-        return fBody;
++        return this->fStatementChildren[0];
+     }
+ 
+     const std::unique_ptr<Statement>& body() const {
+-        return fBody;
++        return this->fStatementChildren[0];
+     }
+ 
+     const std::unordered_set<const FunctionDeclaration*>& referencedIntrinsics() const {
+@@ -75,7 +76,6 @@
+ private:
+     const FunctionDeclaration* fDeclaration;
+     bool fBuiltin;
+-    std::unique_ptr<Statement> fBody;
+     // We track intrinsic functions we reference so that we can ensure that all of them end up
+     // copied into the final output.
+     std::unordered_set<const FunctionDeclaration*> fReferencedIntrinsics;
+diff --git a/src/sksl/ir/SkSLFunctionReference.h b/src/sksl/ir/SkSLFunctionReference.h
+index c9f7c1b..e26c517 100644
+--- a/src/sksl/ir/SkSLFunctionReference.h
++++ b/src/sksl/ir/SkSLFunctionReference.h
+@@ -24,11 +24,14 @@
+ 
+     FunctionReference(const Context& context, int offset,
+                       std::vector<const FunctionDeclaration*> functions)
+-        : INHERITED(offset, kExpressionKind, context.fInvalid_Type.get())
+-        , fFunctions(std::move(functions)) {}
++    : INHERITED(offset, FunctionReferenceData{context.fInvalid_Type.get(), std::move(functions)}) {}
++
++    const Type& type() const override {
++        return *this->functionReferenceData().fType;
++    }
+ 
+     const std::vector<const FunctionDeclaration*>& functions() const {
+-        return fFunctions;
++        return this->functionReferenceData().fFunctions;
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -47,10 +50,7 @@
+ private:
+     FunctionReference(int offset, std::vector<const FunctionDeclaration*> functions,
+                       const Type* type)
+-        : INHERITED(offset, kExpressionKind, type)
+-        , fFunctions(std::move(functions)) {}
+-
+-    std::vector<const FunctionDeclaration*> fFunctions;
++    : INHERITED(offset, FunctionReferenceData{type, std::move(functions)}) {}
+ 
+     using INHERITED = Expression;
+ };
+diff --git a/src/sksl/ir/SkSLIRNode.cpp b/src/sksl/ir/SkSLIRNode.cpp
+new file mode 100644
+index 0000000..9b1817d
+--- /dev/null
++++ b/src/sksl/ir/SkSLIRNode.cpp
+@@ -0,0 +1,137 @@
++/*
++ * Copyright 2020 Google LLC.
++ *
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file.
++ */
++
++#include "src/sksl/ir/SkSLIRNode.h"
++
++#include "src/sksl/ir/SkSLExpression.h"
++
++namespace SkSL {
++
++IRNode::IRNode(int offset, int kind, const BlockData& data, StatementArray stmts)
++: fOffset(offset)
++, fKind(kind)
++, fData(data)
++, fStatementChildren(std::move(stmts)) {}
++
++IRNode::IRNode(int offset, int kind, const BoolLiteralData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const ExternalValueData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const FieldAccessData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const FloatLiteralData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const ForStatementData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const FunctionCallData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const FunctionReferenceData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const IfStatementData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const InlineMarkerData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const IntLiteralData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const ModifiersDeclarationData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const SettingData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const String& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const SwitchStatementData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const SwizzleData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const SymbolData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const SymbolAliasData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const Type* data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const TypeReferenceData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const TypeTokenData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const UnresolvedFunctionData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const VarDeclarationData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::IRNode(int offset, int kind, const VariableReferenceData& data)
++: fOffset(offset)
++, fKind(kind)
++, fData(data) {}
++
++IRNode::~IRNode() {}
++
++} // namespace SkSL
+diff --git a/src/sksl/ir/SkSLIRNode.h b/src/sksl/ir/SkSLIRNode.h
+index 1883eb1..c94bcd5 100644
+--- a/src/sksl/ir/SkSLIRNode.h
++++ b/src/sksl/ir/SkSLIRNode.h
+@@ -23,6 +23,7 @@
+ namespace SkSL {
+ 
+ class Expression;
++class ExternalValue;
+ class FunctionDeclaration;
+ class FunctionDefinition;
+ class Statement;
+@@ -31,6 +32,7 @@
+ class Type;
+ class Variable;
+ class VariableReference;
++enum class FieldAccessOwnerKind : int8_t;
+ enum class VariableRefKind : int8_t;
+ enum class VariableStorage : int8_t;
+ 
+@@ -43,7 +45,19 @@
+  */
+ class IRNode {
+ public:
+-    virtual ~IRNode() {}
++    virtual ~IRNode();
++
++    IRNode& operator=(const IRNode& other) {
++        // Need to have a copy assignment operator because Type requires it, but can't use the
++        // default version until we finish migrating away from std::unique_ptr children. For now,
++        // just assert that there are no children (we could theoretically clone them, but we never
++        // actually copy nodes containing children).
++        SkASSERT(other.fExpressionChildren.empty());
++        fKind = other.fKind;
++        fOffset = other.fOffset;
++        fData = other.fData;
++        return *this;
++    }
+ 
+     virtual String description() const = 0;
+ 
+@@ -61,11 +75,716 @@
+     }
+ 
+ protected:
+-    IRNode(int offset, int kind)
+-        : fOffset(offset)
+-        , fKind(kind) {}
++    struct BlockData {
++        std::shared_ptr<SymbolTable> fSymbolTable;
++        // if isScope is false, this is just a group of statements rather than an actual
++        // language-level block. This allows us to pass around multiple statements as if they were a
++        // single unit, with no semantic impact.
++        bool fIsScope;
++    };
++
++    struct BoolLiteralData {
++        const Type* fType;
++        bool fValue;
++    };
++
++    struct ExternalValueData {
++        const Type* fType;
++        const ExternalValue* fValue;
++    };
++
++    struct FieldAccessData {
++        const Type* fType;
++        int fFieldIndex;
++        FieldAccessOwnerKind fOwnerKind;
++    };
++
++    struct FloatLiteralData {
++        const Type* fType;
++        float fValue;
++    };
++
++    struct ForStatementData {
++        std::shared_ptr<SymbolTable> fSymbolTable;
++    };
++
++    struct FunctionCallData {
++        const Type* fType;
++        const FunctionDeclaration* fFunction;
++    };
++
++    struct FunctionReferenceData {
++        const Type* fType;
++        std::vector<const FunctionDeclaration*> fFunctions;
++     };
++
++    struct IfStatementData {
++        bool fIsStatic;
++    };
++
++    struct IntLiteralData {
++        const Type* fType;
++        int64_t fValue;
++    };
++
++    struct InlineMarkerData {
++        const FunctionDeclaration* fFunction;
++    };
++
++    struct ModifiersDeclarationData {
++        ModifiersPool::Handle fModifiersHandle;
++    };
++
++    struct SettingData {
++        String fName;
++        const Type* fType;
++    };
++
++    struct SwitchStatementData {
++        bool fIsStatic;
++        std::shared_ptr<SymbolTable> fSymbols;
++    };
++
++    struct SwizzleData {
++        const Type* fType;
++        std::vector<int> fComponents;
++    };
++
++    struct SymbolData {
++        StringFragment fName;
++        const Type* fType;
++    };
++
++    struct SymbolAliasData {
++        StringFragment fName;
++        const Symbol* fOrigSymbol;
++    };
++
++    struct TypeReferenceData {
++        const Type* fType;
++        const Type* fValue;
++     };
++
++    struct TypeTokenData {
++        const Type* fType;
++        Token::Kind fToken;
++    };
++
++    struct UnresolvedFunctionData {
++        // FIXME move this into the child vector after killing fExpressionChildren /
++        // fStatementChildren
++        std::vector<const FunctionDeclaration*> fFunctions;
++    };
++
++    struct VarDeclarationData {
++        const Type* fBaseType;
++        const Variable* fVar;
++    };
++
++    struct VariableReferenceData {
++        const Variable* fVariable;
++        VariableRefKind fRefKind;
++    };
++
++    struct NodeData {
++        enum class Kind {
++            kBlock,
++            kBoolLiteral,
++            kExternalValue,
++            kFieldAccess,
++            kFloatLiteral,
++            kForStatement,
++            kFunctionCall,
++            kFunctionReference,
++            kIfStatement,
++            kInlineMarker,
++            kIntLiteral,
++            kModifiersDeclaration,
++            kSetting,
++            kString,
++            kSwitchStatement,
++            kSwizzle,
++            kSymbol,
++            kSymbolAlias,
++            kType,
++            kTypeReference,
++            kTypeToken,
++            kUnresolvedFunction,
++            kVarDeclaration,
++            kVariableReference,
++        } fKind = Kind::kType;
++        // it doesn't really matter what kind we default to, as long as it's a POD type
++
++        union Contents {
++            BlockData fBlock;
++            BoolLiteralData fBoolLiteral;
++            ExternalValueData fExternalValue;
++            FieldAccessData fFieldAccess;
++            FloatLiteralData fFloatLiteral;
++            ForStatementData fForStatement;
++            FunctionCallData fFunctionCall;
++            FunctionReferenceData fFunctionReference;
++            IfStatementData fIfStatement;
++            InlineMarkerData fInlineMarker;
++            IntLiteralData fIntLiteral;
++            ModifiersDeclarationData fModifiersDeclaration;
++            SettingData fSetting;
++            String fString;
++            SwitchStatementData fSwitchStatement;
++            SwizzleData fSwizzle;
++            SymbolData fSymbol;
++            SymbolAliasData fSymbolAlias;
++            const Type* fType;
++            TypeReferenceData fTypeReference;
++            TypeTokenData fTypeToken;
++            UnresolvedFunctionData fUnresolvedFunction;
++            VarDeclarationData fVarDeclaration;
++            VariableReferenceData fVariableReference;
++
++            Contents() {}
++
++            ~Contents() {}
++        } fContents;
++
++        NodeData(const BlockData& data)
++            : fKind(Kind::kBlock) {
++            *(new(&fContents) BlockData) = data;
++        }
++
++        NodeData(const BoolLiteralData& data)
++            : fKind(Kind::kBoolLiteral) {
++            *(new(&fContents) BoolLiteralData) = data;
++        }
++
++        NodeData(const ExternalValueData& data)
++            : fKind(Kind::kExternalValue) {
++            *(new(&fContents) ExternalValueData) = data;
++        }
++
++        NodeData(const FieldAccessData& data)
++            : fKind(Kind::kFieldAccess) {
++            *(new(&fContents) FieldAccessData) = data;
++        }
++
++        NodeData(const FloatLiteralData& data)
++            : fKind(Kind::kFloatLiteral) {
++            *(new(&fContents) FloatLiteralData) = data;
++        }
++
++        NodeData(const ForStatementData& data)
++            : fKind(Kind::kForStatement) {
++            *(new(&fContents) ForStatementData) = data;
++        }
++
++        NodeData(const FunctionCallData& data)
++            : fKind(Kind::kFunctionCall) {
++            *(new(&fContents) FunctionCallData) = data;
++        }
++
++        NodeData(const FunctionReferenceData& data)
++            : fKind(Kind::kFunctionReference) {
++            *(new(&fContents) FunctionReferenceData) = data;
++        }
++
++        NodeData(IfStatementData data)
++            : fKind(Kind::kIfStatement) {
++            *(new(&fContents) IfStatementData) = data;
++        }
++
++        NodeData(InlineMarkerData data)
++            : fKind(Kind::kInlineMarker) {
++            *(new(&fContents) InlineMarkerData) = data;
++        }
++
++        NodeData(IntLiteralData data)
++            : fKind(Kind::kIntLiteral) {
++            *(new(&fContents) IntLiteralData) = data;
++        }
++
++        NodeData(ModifiersDeclarationData data)
++            : fKind(Kind::kModifiersDeclaration) {
++            *(new(&fContents) ModifiersDeclarationData) = data;
++        }
++
++        NodeData(const SettingData& data)
++            : fKind(Kind::kSetting) {
++            *(new(&fContents) SettingData) = data;
++        }
++
++        NodeData(const String& data)
++            : fKind(Kind::kString) {
++            *(new(&fContents) String) = data;
++        }
++
++        NodeData(const SwitchStatementData& data)
++            : fKind(Kind::kSwitchStatement) {
++            *(new(&fContents) SwitchStatementData) = data;
++        }
++
++        NodeData(const SwizzleData& data)
++            : fKind(Kind::kSwizzle) {
++            *(new(&fContents) SwizzleData) = data;
++        }
++
++        NodeData(const SymbolData& data)
++            : fKind(Kind::kSymbol) {
++            *(new(&fContents) SymbolData) = data;
++        }
++
++        NodeData(const SymbolAliasData& data)
++            : fKind(Kind::kSymbolAlias) {
++            *(new(&fContents) SymbolAliasData) = data;
++        }
++
++        NodeData(const Type* data)
++            : fKind(Kind::kType) {
++            *(new(&fContents) const Type*) = data;
++        }
++
++        NodeData(const TypeReferenceData& data)
++            : fKind(Kind::kTypeReference) {
++            *(new(&fContents) TypeReferenceData) = data;
++        }
++
++        NodeData(const TypeTokenData& data)
++            : fKind(Kind::kTypeToken) {
++            *(new(&fContents) TypeTokenData) = data;
++        }
++
++        NodeData(const UnresolvedFunctionData& data)
++            : fKind(Kind::kUnresolvedFunction) {
++            *(new(&fContents) UnresolvedFunctionData) = data;
++        }
++
++        NodeData(const VarDeclarationData& data)
++            : fKind(Kind::kVarDeclaration) {
++            *(new(&fContents) VarDeclarationData) = data;
++        }
++
++        NodeData(const VariableReferenceData& data)
++            : fKind(Kind::kVariableReference) {
++            *(new(&fContents) VariableReferenceData) = data;
++        }
++
++        NodeData(const NodeData& other) {
++            *this = other;
++        }
++
++        NodeData& operator=(const NodeData& other) {
++            this->cleanup();
++            fKind = other.fKind;
++            switch (fKind) {
++                case Kind::kBlock:
++                    *(new(&fContents) BlockData) = other.fContents.fBlock;
++                    break;
++                case Kind::kBoolLiteral:
++                    *(new(&fContents) BoolLiteralData) = other.fContents.fBoolLiteral;
++                    break;
++                case Kind::kExternalValue:
++                    *(new(&fContents) ExternalValueData) = other.fContents.fExternalValue;
++                    break;
++                case Kind::kFieldAccess:
++                    *(new(&fContents) FieldAccessData) = other.fContents.fFieldAccess;
++                    break;
++                case Kind::kFloatLiteral:
++                    *(new(&fContents) FloatLiteralData) = other.fContents.fFloatLiteral;
++                    break;
++                case Kind::kForStatement:
++                    *(new(&fContents) ForStatementData) = other.fContents.fForStatement;
++                    break;
++                case Kind::kFunctionCall:
++                    *(new(&fContents) FunctionCallData) = other.fContents.fFunctionCall;
++                    break;
++                case Kind::kFunctionReference:
++                    *(new(&fContents) FunctionReferenceData) = other.fContents.fFunctionReference;
++                    break;
++                case Kind::kIfStatement:
++                    *(new(&fContents) IfStatementData) = other.fContents.fIfStatement;
++                    break;
++                case Kind::kInlineMarker:
++                    *(new(&fContents) InlineMarkerData) = other.fContents.fInlineMarker;
++                    break;
++                case Kind::kIntLiteral:
++                    *(new(&fContents) IntLiteralData) = other.fContents.fIntLiteral;
++                    break;
++                case Kind::kModifiersDeclaration:
++                    *(new(&fContents) ModifiersDeclarationData) =
++                                                              other.fContents.fModifiersDeclaration;
++                    break;
++                case Kind::kSetting:
++                    *(new(&fContents) SettingData) = other.fContents.fSetting;
++                    break;
++                case Kind::kString:
++                    *(new(&fContents) String) = other.fContents.fString;
++                    break;
++                case Kind::kSwitchStatement:
++                    *(new(&fContents) SwitchStatementData) = other.fContents.fSwitchStatement;
++                    break;
++                case Kind::kSwizzle:
++                    *(new(&fContents) SwizzleData) = other.fContents.fSwizzle;
++                    break;
++                case Kind::kSymbol:
++                    *(new(&fContents) SymbolData) = other.fContents.fSymbol;
++                    break;
++                case Kind::kSymbolAlias:
++                    *(new(&fContents) SymbolAliasData) = other.fContents.fSymbolAlias;
++                    break;
++                case Kind::kType:
++                    *(new(&fContents) const Type*) = other.fContents.fType;
++                    break;
++                case Kind::kTypeReference:
++                    *(new(&fContents) TypeReferenceData) = other.fContents.fTypeReference;
++                    break;
++                case Kind::kTypeToken:
++                    *(new(&fContents) TypeTokenData) = other.fContents.fTypeToken;
++                    break;
++                case Kind::kUnresolvedFunction:
++                    *(new(&fContents) UnresolvedFunctionData) = other.fContents.fUnresolvedFunction;
++                    break;
++                case Kind::kVarDeclaration:
++                    *(new(&fContents) VarDeclarationData) = other.fContents.fVarDeclaration;
++                    break;
++                case Kind::kVariableReference:
++                    *(new(&fContents) VariableReferenceData) = other.fContents.fVariableReference;
++                    break;
++            }
++            return *this;
++        }
++
++        ~NodeData() {
++            this->cleanup();
++        }
++
++    private:
++        void cleanup() {
++            switch (fKind) {
++                case Kind::kBlock:
++                    fContents.fBlock.~BlockData();
++                    break;
++                case Kind::kBoolLiteral:
++                    fContents.fBoolLiteral.~BoolLiteralData();
++                    break;
++                case Kind::kExternalValue:
++                    fContents.fExternalValue.~ExternalValueData();
++                    break;
++                case Kind::kFieldAccess:
++                    fContents.fFieldAccess.~FieldAccessData();
++                    break;
++                case Kind::kFloatLiteral:
++                    fContents.fFloatLiteral.~FloatLiteralData();
++                    break;
++                case Kind::kForStatement:
++                    fContents.fForStatement.~ForStatementData();
++                    break;
++                case Kind::kFunctionCall:
++                    fContents.fFunctionCall.~FunctionCallData();
++                    break;
++                case Kind::kFunctionReference:
++                    fContents.fFunctionReference.~FunctionReferenceData();
++                    break;
++                case Kind::kIfStatement:
++                    fContents.fIfStatement.~IfStatementData();
++                    break;
++                case Kind::kInlineMarker:
++                    fContents.fInlineMarker.~InlineMarkerData();
++                    break;
++                case Kind::kIntLiteral:
++                    fContents.fIntLiteral.~IntLiteralData();
++                    break;
++                case Kind::kModifiersDeclaration:
++                    fContents.fModifiersDeclaration.~ModifiersDeclarationData();
++                    break;
++                case Kind::kSetting:
++                    fContents.fSetting.~SettingData();
++                    break;
++                case Kind::kString:
++                    fContents.fString.~String();
++                    break;
++                case Kind::kSwitchStatement:
++                    fContents.fSwitchStatement.~SwitchStatementData();
++                    break;
++                case Kind::kSwizzle:
++                    fContents.fSwizzle.~SwizzleData();
++                    break;
++                case Kind::kSymbol:
++                    fContents.fSymbol.~SymbolData();
++                    break;
++                case Kind::kSymbolAlias:
++                    fContents.fSymbolAlias.~SymbolAliasData();
++                    break;
++                case Kind::kType:
++                    break;
++                case Kind::kTypeReference:
++                    fContents.fTypeReference.~TypeReferenceData();
++                    break;
++                case Kind::kTypeToken:
++                    fContents.fTypeToken.~TypeTokenData();
++                    break;
++                case Kind::kUnresolvedFunction:
++                    fContents.fUnresolvedFunction.~UnresolvedFunctionData();
++                    break;
++                case Kind::kVarDeclaration:
++                    fContents.fVarDeclaration.~VarDeclarationData();
++                    break;
++                case Kind::kVariableReference:
++                    fContents.fVariableReference.~VariableReferenceData();
++                    break;
++            }
++        }
++    };
++
++    IRNode(int offset, int kind, const BlockData& data, StatementArray stmts);
++
++    IRNode(int offset, int kind, const BoolLiteralData& data);
++
++    IRNode(int offset, int kind, const ExternalValueData& data);
++
++    IRNode(int offset, int kind, const FieldAccessData& data);
++
++    IRNode(int offset, int kind, const FloatLiteralData& data);
++
++    IRNode(int offset, int kind, const ForStatementData& data);
++
++    IRNode(int offset, int kind, const FunctionCallData& data);
++
++    IRNode(int offset, int kind, const FunctionReferenceData& data);
++
++    IRNode(int offset, int kind, const IfStatementData& data);
++
++    IRNode(int offset, int kind, const InlineMarkerData& data);
++
++    IRNode(int offset, int kind, const IntLiteralData& data);
++
++    IRNode(int offset, int kind, const ModifiersDeclarationData& data);
++
++    IRNode(int offset, int kind, const SettingData& data);
++
++    IRNode(int offset, int kind, const String& data);
++
++    IRNode(int offset, int kind, const SwitchStatementData& data);
++
++    IRNode(int offset, int kind, const SwizzleData& data);
++
++    IRNode(int offset, int kind, const SymbolData& data);
++
++    IRNode(int offset, int kind, const SymbolAliasData& data);
++
++    IRNode(int offset, int kind, const Type* data = nullptr);
++
++    IRNode(int offset, int kind, const TypeReferenceData& data);
++
++    IRNode(int offset, int kind, const TypeTokenData& data);
++
++    IRNode(int offset, int kind, const UnresolvedFunctionData& data);
++
++    IRNode(int offset, int kind, const VarDeclarationData& data);
++
++    IRNode(int offset, int kind, const VariableReferenceData& data);
++
++    Expression& expressionChild(int index) const {
++        SkASSERT(index >= 0 && index < (int) fExpressionChildren.size());
++        return *fExpressionChildren[index];
++    }
++
++    std::unique_ptr<Expression>& expressionPointer(int index) {
++        SkASSERT(index >= 0 && index < (int) fExpressionChildren.size());
++        return fExpressionChildren[index];
++    }
++
++    const std::unique_ptr<Expression>& expressionPointer(int index) const {
++        SkASSERT(index >= 0 && index < (int) fExpressionChildren.size());
++        return fExpressionChildren[index];
++    }
++
++    int expressionChildCount() const {
++        return fExpressionChildren.size();
++    }
++
++
++    Statement& statementChild(int index) const {
++        SkASSERT(index >= 0 && index < (int) fStatementChildren.size());
++        return *fStatementChildren[index];
++    }
++
++    std::unique_ptr<Statement>& statementPointer(int index) {
++        SkASSERT(index >= 0 && index < (int) fStatementChildren.size());
++        return fStatementChildren[index];
++    }
++
++    const std::unique_ptr<Statement>& statementPointer(int index) const {
++        SkASSERT(index >= 0 && index < (int) fStatementChildren.size());
++        return fStatementChildren[index];
++    }
++
++    int statementChildCount() const {
++        return fStatementChildren.size();
++    }
++
++    BlockData& blockData() {
++        SkASSERT(fData.fKind == NodeData::Kind::kBlock);
++        return fData.fContents.fBlock;
++    }
++
++    const BlockData& blockData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kBlock);
++        return fData.fContents.fBlock;
++    }
++
++    const BoolLiteralData& boolLiteralData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kBoolLiteral);
++        return fData.fContents.fBoolLiteral;
++    }
++
++    const ExternalValueData& externalValueData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kExternalValue);
++        return fData.fContents.fExternalValue;
++    }
++
++    const FieldAccessData& fieldAccessData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kFieldAccess);
++        return fData.fContents.fFieldAccess;
++    }
++
++    const FloatLiteralData& floatLiteralData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kFloatLiteral);
++        return fData.fContents.fFloatLiteral;
++    }
++
++    const ForStatementData& forStatementData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kForStatement);
++        return fData.fContents.fForStatement;
++    }
++
++    const FunctionCallData& functionCallData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kFunctionCall);
++        return fData.fContents.fFunctionCall;
++    }
++
++    const FunctionReferenceData& functionReferenceData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kFunctionReference);
++        return fData.fContents.fFunctionReference;
++    }
++
++    const IfStatementData& ifStatementData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kIfStatement);
++        return fData.fContents.fIfStatement;
++    }
++
++    const InlineMarkerData& inlineMarkerData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kInlineMarker);
++        return fData.fContents.fInlineMarker;
++    }
++
++    const IntLiteralData& intLiteralData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kIntLiteral);
++        return fData.fContents.fIntLiteral;
++    }
++
++    const ModifiersDeclarationData& modifiersDeclarationData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kModifiersDeclaration);
++        return fData.fContents.fModifiersDeclaration;
++    }
++
++    const SettingData& settingData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kSetting);
++        return fData.fContents.fSetting;
++    }
++
++    const String& stringData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kString);
++        return fData.fContents.fString;
++    }
++
++    SwitchStatementData& switchStatementData() {
++        SkASSERT(fData.fKind == NodeData::Kind::kSwitchStatement);
++        return fData.fContents.fSwitchStatement;
++    }
++
++    const SwitchStatementData& switchStatementData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kSwitchStatement);
++        return fData.fContents.fSwitchStatement;
++    }
++
++    SwizzleData& swizzleData() {
++        SkASSERT(fData.fKind == NodeData::Kind::kSwizzle);
++        return fData.fContents.fSwizzle;
++    }
++
++    const SwizzleData& swizzleData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kSwizzle);
++        return fData.fContents.fSwizzle;
++    }
++
++    SymbolData& symbolData() {
++        SkASSERT(fData.fKind == NodeData::Kind::kSymbol);
++        return fData.fContents.fSymbol;
++    }
++
++    const SymbolData& symbolData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kSymbol);
++        return fData.fContents.fSymbol;
++    }
++
++    const SymbolAliasData& symbolAliasData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kSymbolAlias);
++        return fData.fContents.fSymbolAlias;
++    }
++
++    const Type* typeData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kType);
++        return fData.fContents.fType;
++    }
++
++    const TypeReferenceData& typeReferenceData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kTypeReference);
++        return fData.fContents.fTypeReference;
++    }
++
++    const TypeTokenData& typeTokenData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kTypeToken);
++        return fData.fContents.fTypeToken;
++    }
++
++    const UnresolvedFunctionData& unresolvedFunctionData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kUnresolvedFunction);
++        return fData.fContents.fUnresolvedFunction;
++    }
++
++    VarDeclarationData& varDeclarationData() {
++        SkASSERT(fData.fKind == NodeData::Kind::kVarDeclaration);
++        return fData.fContents.fVarDeclaration;
++    }
++
++    const VarDeclarationData& varDeclarationData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kVarDeclaration);
++        return fData.fContents.fVarDeclaration;
++    }
++
++    VariableReferenceData& variableReferenceData() {
++        SkASSERT(fData.fKind == NodeData::Kind::kVariableReference);
++        return fData.fContents.fVariableReference;
++    }
++
++    const VariableReferenceData& variableReferenceData() const {
++        SkASSERT(fData.fKind == NodeData::Kind::kVariableReference);
++        return fData.fContents.fVariableReference;
++    }
+ 
+     int fKind;
++
++    NodeData fData;
++
++    // Needing two separate vectors is a temporary issue. Ideally, we'd just be able to use a single
++    // vector of nodes, but there are various spots where we take pointers to std::unique_ptr<>,
++    // and it isn't safe to pun std::unique_ptr<IRNode> to std::unique_ptr<Statement / Expression>.
++    // And we can't update the call sites to expect std::unique_ptr<IRNode> while there are still
++    // old-style nodes around.
++    // When the transition is finished, we'll be able to drop the unique_ptrs and just handle
++    // <IRNode> directly.
++    ExpressionArray fExpressionChildren;
++    // it's important to keep the statement array defined after (and thus destroyed before) fData,
++    // because destroying statements can modify reference counts in a SymbolTable contained in fData
++    StatementArray fStatementChildren;
+ };
+ 
+ }  // namespace SkSL
+diff --git a/src/sksl/ir/SkSLIfStatement.h b/src/sksl/ir/SkSLIfStatement.h
+index 56aaab9..15145ed 100644
+--- a/src/sksl/ir/SkSLIfStatement.h
++++ b/src/sksl/ir/SkSLIfStatement.h
+@@ -16,44 +16,44 @@
+ /**
+  * An 'if' statement.
+  */
+-class IfStatement final : public Statement {
+-public:
++struct IfStatement final : public Statement {
+     static constexpr Kind kStatementKind = Kind::kIf;
+ 
+     IfStatement(int offset, bool isStatic, std::unique_ptr<Expression> test,
+                 std::unique_ptr<Statement> ifTrue, std::unique_ptr<Statement> ifFalse)
+-        : INHERITED(offset, kStatementKind)
+-        , fTest(std::move(test))
+-        , fIfTrue(std::move(ifTrue))
+-        , fIfFalse(std::move(ifFalse))
+-        , fIsStatic(isStatic) {}
++    : INHERITED(offset, IfStatementData{isStatic}) {
++        fExpressionChildren.push_back(std::move(test));
++        fStatementChildren.reserve_back(2);
++        fStatementChildren.push_back(std::move(ifTrue));
++        fStatementChildren.push_back(std::move(ifFalse));
++    }
+ 
+     bool isStatic() const {
+-        return fIsStatic;
++        return this->ifStatementData().fIsStatic;
+     }
+ 
+     std::unique_ptr<Expression>& test() {
+-        return fTest;
++        return this->fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& test() const {
+-        return fTest;
++        return this->fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Statement>& ifTrue() {
+-        return fIfTrue;
++        return this->fStatementChildren[0];
+     }
+ 
+     const std::unique_ptr<Statement>& ifTrue() const {
+-        return fIfTrue;
++        return this->fStatementChildren[0];
+     }
+ 
+     std::unique_ptr<Statement>& ifFalse() {
+-        return fIfFalse;
++        return this->fStatementChildren[1];
+     }
+ 
+     const std::unique_ptr<Statement>& ifFalse() const {
+-        return fIfFalse;
++        return this->fStatementChildren[1];
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+@@ -76,12 +76,6 @@
+         return result;
+     }
+ 
+-private:
+-    std::unique_ptr<Expression> fTest;
+-    std::unique_ptr<Statement> fIfTrue;
+-    std::unique_ptr<Statement> fIfFalse;
+-    bool fIsStatic;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLIndexExpression.h b/src/sksl/ir/SkSLIndexExpression.h
+index 4151173..0816975 100644
+--- a/src/sksl/ir/SkSLIndexExpression.h
++++ b/src/sksl/ir/SkSLIndexExpression.h
+@@ -46,24 +46,27 @@
+ 
+     IndexExpression(const Context& context, std::unique_ptr<Expression> base,
+                     std::unique_ptr<Expression> index)
+-        : INHERITED(base->fOffset, kExpressionKind, &index_type(context, base->type()))
+-        , fBase(std::move(base))
+-        , fIndex(std::move(index)) {}
++    : INHERITED(base->fOffset, kExpressionKind, &index_type(context, base->type())) {
++        SkASSERT(index->type() == *context.fInt_Type || index->type() == *context.fUInt_Type);
++        fExpressionChildren.reserve_back(2);
++        fExpressionChildren.push_back(std::move(base));
++        fExpressionChildren.push_back(std::move(index));
++    }
+ 
+     std::unique_ptr<Expression>& base() {
+-        return fBase;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& base() const {
+-        return fBase;
++        return fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Expression>& index() {
+-        return fIndex;
++        return fExpressionChildren[1];
+     }
+ 
+     const std::unique_ptr<Expression>& index() const {
+-        return fIndex;
++        return fExpressionChildren[1];
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -85,13 +88,11 @@
+ private:
+     IndexExpression(std::unique_ptr<Expression> base, std::unique_ptr<Expression> index,
+                     const Type* type)
+-        : INHERITED(base->fOffset, Kind::kIndex, type)
+-        , fBase(std::move(base))
+-        , fIndex(std::move(index)) {}
+-
+-
+-    std::unique_ptr<Expression> fBase;
+-    std::unique_ptr<Expression> fIndex;
++    : INHERITED(base->fOffset, Kind::kIndex, type) {
++        fExpressionChildren.reserve_back(2);
++        fExpressionChildren.push_back(std::move(base));
++        fExpressionChildren.push_back(std::move(index));
++    }
+ };
+ 
+ }  // namespace SkSL
+diff --git a/src/sksl/ir/SkSLInlineMarker.h b/src/sksl/ir/SkSLInlineMarker.h
+index 45f4680..bce27d7 100644
+--- a/src/sksl/ir/SkSLInlineMarker.h
++++ b/src/sksl/ir/SkSLInlineMarker.h
+@@ -23,11 +23,10 @@
+     static constexpr Kind kStatementKind = Kind::kInlineMarker;
+ 
+     InlineMarker(const FunctionDeclaration* function)
+-            : INHERITED(-1, kStatementKind)
+-            , fFunction(*function) {}
++            : INHERITED(-1, InlineMarkerData{function}) {}
+ 
+     const FunctionDeclaration& function() const {
+-        return fFunction;
++        return *this->inlineMarkerData().fFunction;
+     }
+ 
+     bool isEmpty() const override {
+@@ -43,8 +42,6 @@
+     }
+ 
+ private:
+-    const FunctionDeclaration& fFunction;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLIntLiteral.h b/src/sksl/ir/SkSLIntLiteral.h
+index 74d4591..9554e96 100644
+--- a/src/sksl/ir/SkSLIntLiteral.h
++++ b/src/sksl/ir/SkSLIntLiteral.h
+@@ -23,15 +23,17 @@
+     // FIXME: we will need to revisit this if/when we add full support for both signed and unsigned
+     // 64-bit integers, but for right now an int64_t will hold every value we care about
+     IntLiteral(const Context& context, int offset, int64_t value)
+-        : INHERITED(offset, kExpressionKind, context.fInt_Type.get())
+-        , fValue(value) {}
++    : INHERITED(offset, IntLiteralData{context.fInt_Type.get(), value}) {}
+ 
+     IntLiteral(int offset, int64_t value, const Type* type = nullptr)
+-        : INHERITED(offset, kExpressionKind, type)
+-        , fValue(value) {}
++    : INHERITED(offset, IntLiteralData{type, value}) {}
++
++    const Type& type() const override {
++        return *this->intLiteralData().fType;
++    }
+ 
+     int64_t value() const {
+-        return fValue;
++        return this->intLiteralData().fValue;
+     }
+ 
+     String description() const override {
+@@ -67,8 +69,6 @@
+     }
+ 
+ private:
+-    int64_t fValue;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLInterfaceBlock.h b/src/sksl/ir/SkSLInterfaceBlock.h
+index 6353d7f..60b4ff7 100644
+--- a/src/sksl/ir/SkSLInterfaceBlock.h
++++ b/src/sksl/ir/SkSLInterfaceBlock.h
+@@ -34,8 +34,9 @@
+     , fVariable(var)
+     , fTypeName(std::move(typeName))
+     , fInstanceName(std::move(instanceName))
+-    , fSizes(std::move(sizes))
+-    , fTypeOwner(std::move(typeOwner)) {}
++    , fTypeOwner(std::move(typeOwner)) {
++        fExpressionChildren.move_back_n(sizes.size(), sizes.data());
++    }
+ 
+     const Variable& variable() const {
+         return *fVariable;
+@@ -58,11 +59,11 @@
+     }
+ 
+     ExpressionArray& sizes() {
+-        return fSizes;
++        return fExpressionChildren;
+     }
+ 
+     const ExpressionArray& sizes() const {
+-        return fSizes;
++        return fExpressionChildren;
+     }
+ 
+     std::unique_ptr<ProgramElement> clone() const override {
+@@ -103,7 +104,6 @@
+     const Variable* fVariable;
+     String fTypeName;
+     String fInstanceName;
+-    ExpressionArray fSizes;
+     std::shared_ptr<SymbolTable> fTypeOwner;
+ 
+     using INHERITED = ProgramElement;
+diff --git a/src/sksl/ir/SkSLModifiersDeclaration.h b/src/sksl/ir/SkSLModifiersDeclaration.h
+index 25433ff..a9ef296 100644
+--- a/src/sksl/ir/SkSLModifiersDeclaration.h
++++ b/src/sksl/ir/SkSLModifiersDeclaration.h
+@@ -23,15 +23,14 @@
+     static constexpr Kind kProgramElementKind = Kind::kModifiers;
+ 
+     ModifiersDeclaration(ModifiersPool::Handle modifiers)
+-        : INHERITED(-1, kProgramElementKind)
+-        , fModifiersHandle(modifiers) {}
++    : INHERITED(-1, ModifiersDeclarationData{modifiers}) {}
+ 
+     const Modifiers& modifiers() const {
+-        return *fModifiersHandle;
++        return *this->modifiersDeclarationData().fModifiersHandle;
+     }
+ 
+     const ModifiersPool::Handle& modifiersHandle() const {
+-        return fModifiersHandle;
++        return this->modifiersDeclarationData().fModifiersHandle;
+     }
+ 
+     std::unique_ptr<ProgramElement> clone() const override {
+@@ -43,8 +42,6 @@
+     }
+ 
+ private:
+-    ModifiersPool::Handle fModifiersHandle;
+-
+     using INHERITED = ProgramElement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLPostfixExpression.h b/src/sksl/ir/SkSLPostfixExpression.h
+index 6b61f75..a9b7fbf 100644
+--- a/src/sksl/ir/SkSLPostfixExpression.h
++++ b/src/sksl/ir/SkSLPostfixExpression.h
+@@ -22,20 +22,24 @@
+     static constexpr Kind kExpressionKind = Kind::kPostfix;
+ 
+     PostfixExpression(std::unique_ptr<Expression> operand, Token::Kind op)
+-        : INHERITED(operand->fOffset, kExpressionKind, &operand->type())
+-        , fOperand(std::move(operand))
+-        , fOperator(op) {}
++    : INHERITED(operand->fOffset, kExpressionKind, TypeTokenData{&operand->type(), op}) {
++        fExpressionChildren.push_back(std::move(operand));
++    }
++
++    const Type& type() const override {
++        return *this->typeTokenData().fType;
++    }
+ 
+     Token::Kind getOperator() const {
+-        return fOperator;
++        return this->typeTokenData().fToken;
+     }
+ 
+     std::unique_ptr<Expression>& operand() {
+-        return fOperand;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& operand() const {
+-        return fOperand;
++        return fExpressionChildren[0];
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -55,9 +59,6 @@
+     }
+ 
+ private:
+-    std::unique_ptr<Expression> fOperand;
+-    Token::Kind fOperator;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLPrefixExpression.h b/src/sksl/ir/SkSLPrefixExpression.h
+index 11d64ee..2db1c94 100644
+--- a/src/sksl/ir/SkSLPrefixExpression.h
++++ b/src/sksl/ir/SkSLPrefixExpression.h
+@@ -24,20 +24,24 @@
+     static constexpr Kind kExpressionKind = Kind::kPrefix;
+ 
+     PrefixExpression(Token::Kind op, std::unique_ptr<Expression> operand)
+-        : INHERITED(operand->fOffset, kExpressionKind, &operand->type())
+-        , fOperator(op)
+-        , fOperand(std::move(operand)) {}
++    : INHERITED(operand->fOffset, kExpressionKind, TypeTokenData{&operand->type(), op}) {
++        fExpressionChildren.push_back(std::move(operand));
++    }
++
++    const Type& type() const override {
++        return *this->typeTokenData().fType;
++    }
+ 
+     Token::Kind getOperator() const {
+-        return fOperator;
++        return this->typeTokenData().fToken;
+     }
+ 
+     std::unique_ptr<Expression>& operand() {
+-        return fOperand;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& operand() const {
+-        return fOperand;
++        return fExpressionChildren[0];
+     }
+ 
+     bool isCompileTimeConstant() const override {
+@@ -91,9 +95,6 @@
+     }
+ 
+ private:
+-    Token::Kind fOperator;
+-    std::unique_ptr<Expression> fOperand;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLProgramElement.h b/src/sksl/ir/SkSLProgramElement.h
+index e14415a..27997a2 100644
+--- a/src/sksl/ir/SkSLProgramElement.h
++++ b/src/sksl/ir/SkSLProgramElement.h
+@@ -33,7 +33,15 @@
+     };
+ 
+     ProgramElement(int offset, Kind kind)
+-        : INHERITED(offset, (int) kind) {
++    : INHERITED(offset, (int) kind) {
++        SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
++    }
++
++    ProgramElement(int offset, const ModifiersDeclarationData& data)
++    : INHERITED(offset, (int) Kind::kModifiers, data) {}
++
++    ProgramElement(int offset, Kind kind, const String& data)
++    : INHERITED(offset, (int) kind, data) {
+         SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
+     }
+ 
+diff --git a/src/sksl/ir/SkSLReturnStatement.h b/src/sksl/ir/SkSLReturnStatement.h
+index d44f049..9b40e51 100644
+--- a/src/sksl/ir/SkSLReturnStatement.h
++++ b/src/sksl/ir/SkSLReturnStatement.h
+@@ -21,18 +21,21 @@
+     static constexpr Kind kStatementKind = Kind::kReturn;
+ 
+     ReturnStatement(int offset)
+-        : INHERITED(offset, kStatementKind) {}
++    : INHERITED(offset, kStatementKind) {
++        fExpressionChildren.push_back(nullptr);
++    }
+ 
+     ReturnStatement(std::unique_ptr<Expression> expression)
+-        : INHERITED(expression->fOffset, kStatementKind)
+-        , fExpression(std::move(expression)) {}
++    : INHERITED(expression->fOffset, kStatementKind) {
++        fExpressionChildren.push_back(std::move(expression));
++    }
+ 
+     std::unique_ptr<Expression>& expression() {
+-        return fExpression;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& expression() const {
+-        return fExpression;
++        return fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+@@ -51,8 +54,6 @@
+     }
+ 
+ private:
+-    std::unique_ptr<Expression> fExpression;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLSetting.h b/src/sksl/ir/SkSLSetting.h
+index f4bcee5..76f0af0 100644
+--- a/src/sksl/ir/SkSLSetting.h
++++ b/src/sksl/ir/SkSLSetting.h
+@@ -22,8 +22,7 @@
+     static constexpr Kind kExpressionKind = Kind::kSetting;
+ 
+     Setting(int offset, String name, const Type* type)
+-        : INHERITED(offset, kExpressionKind, type)
+-        , fName(std::move(name)) {}
++    : INHERITED(offset, SettingData{std::move(name), type}) {}
+ 
+     std::unique_ptr<Expression> constantPropagate(const IRGenerator& irGenerator,
+                                                   const DefinitionMap& definitions) override;
+@@ -33,7 +32,11 @@
+     }
+ 
+     const String& name() const {
+-        return fName;
++        return this->settingData().fName;
++    }
++
++    const Type& type() const override {
++        return *this->settingData().fType;
+     }
+ 
+     String description() const override {
+@@ -49,8 +52,6 @@
+     }
+ 
+ private:
+-    String fName;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLStatement.h b/src/sksl/ir/SkSLStatement.h
+index 6ffb4e5..b4d26a1 100644
+--- a/src/sksl/ir/SkSLStatement.h
++++ b/src/sksl/ir/SkSLStatement.h
+@@ -44,6 +44,26 @@
+         SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
+     }
+ 
++    Statement(int offset, Kind kind, BlockData data, StatementArray stmts)
++    : INHERITED(offset, (int) kind, data, std::move(stmts)) {
++        SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
++    }
++
++    Statement(int offset, const ForStatementData& data)
++    : INHERITED(offset, (int) Kind::kFor, data) {}
++
++    Statement(int offset, const IfStatementData& data)
++    : INHERITED(offset, (int) Kind::kIf, data) {}
++
++    Statement(int offset, const InlineMarkerData& data)
++    : INHERITED(offset, (int) Kind::kInlineMarker, data) {}
++
++    Statement(int offset, const SwitchStatementData& data)
++    : INHERITED(offset, (int) Kind::kSwitch, data) {}
++
++    Statement(int offset, const VarDeclarationData& data)
++    : INHERITED(offset, (int) Kind::kVarDeclaration, data) {}
++
+     Kind kind() const {
+         return (Kind) fKind;
+     }
+diff --git a/src/sksl/ir/SkSLSwitchCase.h b/src/sksl/ir/SkSLSwitchCase.h
+index 3d5ac70..841af52 100644
+--- a/src/sksl/ir/SkSLSwitchCase.h
++++ b/src/sksl/ir/SkSLSwitchCase.h
+@@ -22,24 +22,25 @@
+ 
+     // null value implies "default" case
+     SwitchCase(int offset, std::unique_ptr<Expression> value, StatementArray statements)
+-        : INHERITED(offset, kStatementKind)
+-        , fValue(std::move(value))
+-        , fStatements(std::move(statements)) {}
++            : INHERITED(offset, kStatementKind) {
++        fExpressionChildren.push_back(std::move(value));
++        fStatementChildren = std::move(statements);
++    }
+ 
+     std::unique_ptr<Expression>& value() {
+-        return fValue;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& value() const {
+-        return fValue;
++        return fExpressionChildren[0];
+     }
+ 
+     StatementArray& statements() {
+-        return fStatements;
++        return fStatementChildren;
+     }
+ 
+     const StatementArray& statements() const {
+-        return fStatements;
++        return fStatementChildren;
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+@@ -67,9 +68,6 @@
+     }
+ 
+ private:
+-    std::unique_ptr<Expression> fValue;
+-    StatementArray fStatements;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLSwitchStatement.h b/src/sksl/ir/SkSLSwitchStatement.h
+index 916a8d5..0ca17dd 100644
+--- a/src/sksl/ir/SkSLSwitchStatement.h
++++ b/src/sksl/ir/SkSLSwitchStatement.h
+@@ -23,43 +23,49 @@
+ public:
+     static constexpr Kind kStatementKind = Kind::kSwitch;
+ 
++    using CaseArray = NodeArrayWrapper<SwitchCase, Statement>;
++
++    using ConstCaseArray = ConstNodeArrayWrapper<SwitchCase, Statement>;
++
+     SwitchStatement(int offset, bool isStatic, std::unique_ptr<Expression> value,
+                     std::vector<std::unique_ptr<SwitchCase>> cases,
+                     const std::shared_ptr<SymbolTable> symbols)
+-        : INHERITED(offset, kStatementKind)
+-        , fIsStatic(isStatic)
+-        , fValue(std::move(value))
+-        , fCases(std::move(cases))
+-        , fSymbols(std::move(symbols)) {}
++    : INHERITED(offset, SwitchStatementData{isStatic, std::move(symbols)}) {
++        fExpressionChildren.push_back(std::move(value));
++        fStatementChildren.reserve_back(cases.size());
++        for (std::unique_ptr<SwitchCase>& c : cases) {
++            fStatementChildren.push_back(std::move(c));
++        }
++    }
+ 
+     std::unique_ptr<Expression>& value() {
+-        return fValue;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& value() const {
+-        return fValue;
++        return fExpressionChildren[0];
+     }
+ 
+-    std::vector<std::unique_ptr<SwitchCase>>& cases() {
+-        return fCases;
++    CaseArray cases() {
++        return CaseArray(&fStatementChildren);
+     }
+ 
+-    const std::vector<std::unique_ptr<SwitchCase>>& cases() const {
+-        return fCases;
++    ConstCaseArray cases() const {
++        return ConstCaseArray(&fStatementChildren);
+     }
+ 
+     bool isStatic() const {
+-        return fIsStatic;
++        return this->switchStatementData().fIsStatic;
+     }
+ 
+     const std::shared_ptr<SymbolTable>& symbols() const {
+-        return fSymbols;
++        return this->switchStatementData().fSymbols;
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+         std::vector<std::unique_ptr<SwitchCase>> cloned;
+-        for (const std::unique_ptr<SwitchCase>& sc : this->cases()) {
+-            cloned.emplace_back(&sc->clone().release()->as<SwitchCase>());
++        for (const std::unique_ptr<Statement>& s : fStatementChildren) {
++            cloned.emplace_back((SwitchCase*) s->as<SwitchCase>().clone().release());
+         }
+         return std::unique_ptr<Statement>(new SwitchStatement(
+                                                       fOffset,
+@@ -76,18 +82,13 @@
+         }
+         result += String::printf("switch (%s) {\n", this->value()->description().c_str());
+         for (const auto& c : this->cases()) {
+-            result += c->description();
++            result += c.description();
+         }
+         result += "}";
+         return result;
+     }
+ 
+ private:
+-    bool fIsStatic;
+-    std::unique_ptr<Expression> fValue;
+-    std::vector<std::unique_ptr<SwitchCase>> fCases;
+-    std::shared_ptr<SymbolTable> fSymbols;
+-
+     using INHERITED = Statement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLSwizzle.h b/src/sksl/ir/SkSLSwizzle.h
+index 30ac5a5..aea1e7a 100644
+--- a/src/sksl/ir/SkSLSwizzle.h
++++ b/src/sksl/ir/SkSLSwizzle.h
+@@ -23,23 +23,25 @@
+     static constexpr Kind kExpressionKind = Kind::kSwizzle;
+ 
+     Swizzle(const Context& context, std::unique_ptr<Expression> base, std::vector<int> components)
+-            : INHERITED(base->fOffset, kExpressionKind,
+-                        &base->type().componentType().toCompound(context, components.size(), 1))
+-            , fBase(std::move(base))
+-            , fComponents(std::move(components)) {
++            : INHERITED(base->fOffset, swizzle_data(context, *base, std::move(components))) {
+         SkASSERT(this->components().size() >= 1 && this->components().size() <= 4);
++        fExpressionChildren.push_back(std::move(base));
++    }
++
++    const Type& type() const override {
++        return *this->swizzleData().fType;
+     }
+ 
+     std::unique_ptr<Expression>& base() {
+-        return fBase;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& base() const {
+-        return fBase;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::vector<int>& components() const {
+-        return fComponents;
++        return this->swizzleData().fComponents;
+     }
+ 
+     std::unique_ptr<Expression> constantPropagate(const IRGenerator& irGenerator,
+@@ -84,14 +86,18 @@
+ 
+ private:
+     Swizzle(const Type* type, std::unique_ptr<Expression> base, std::vector<int> components)
+-        : INHERITED(base->fOffset, kExpressionKind, type)
+-        , fBase(std::move(base))
+-        , fComponents(std::move(components)) {
++    : INHERITED(base->fOffset, SwizzleData{type, std::move(components)}) {
+         SkASSERT(this->components().size() >= 1 && this->components().size() <= 4);
++        fExpressionChildren.push_back(std::move(base));
+     }
+ 
+-    std::unique_ptr<Expression> fBase;
+-    std::vector<int> fComponents;
++    static SwizzleData swizzle_data(const Context& context, Expression& base,
++                                    std::vector<int> components) {
++        SwizzleData result;
++        result.fType = &base.type().componentType().toCompound(context, components.size(), 1);
++        result.fComponents = std::move(components);
++        return result;
++    }
+ 
+     using INHERITED = Expression;
+ };
+diff --git a/src/sksl/ir/SkSLSymbol.h b/src/sksl/ir/SkSLSymbol.h
+index ebf885a..8ca599b 100644
+--- a/src/sksl/ir/SkSLSymbol.h
++++ b/src/sksl/ir/SkSLSymbol.h
+@@ -32,27 +32,30 @@
+     };
+ 
+     Symbol(int offset, Kind kind, StringFragment name, const Type* type = nullptr)
+-        : INHERITED(offset, (int) kind)
+-        , fName(name)
+-        , fType(type) {
++    : INHERITED(offset, (int) kind, SymbolData{name, type}) {
+         SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
+     }
+ 
++    Symbol(int offset, const SymbolAliasData& data)
++    : INHERITED(offset, (int) Kind::kSymbolAlias, data) {}
++
++    Symbol(int offset, const UnresolvedFunctionData& data)
++    : INHERITED(offset, (int) Kind::kUnresolvedFunction, data) {}
++
+     Symbol& operator=(const Symbol&) = default;
+ 
+     ~Symbol() override {}
+ 
+-    const Type& type() const {
+-        SkASSERT(fType);
+-        return *fType;
++    virtual const Type& type() const {
++        return *this->symbolData().fType;
+     }
+ 
+     Kind kind() const {
+         return (Kind) fKind;
+     }
+ 
+-    StringFragment name() const {
+-        return fName;
++    virtual StringFragment name() const {
++        return this->symbolData().fName;
+     }
+ 
+     /**
+@@ -80,12 +83,7 @@
+     }
+ 
+ private:
+-    StringFragment fName;
+-    const Type* fType;
+-
+     using INHERITED = IRNode;
+-
+-    friend class Type;
+ };
+ 
+ }  // namespace SkSL
+diff --git a/src/sksl/ir/SkSLSymbolAlias.h b/src/sksl/ir/SkSLSymbolAlias.h
+index 310856a..6651d39 100644
+--- a/src/sksl/ir/SkSLSymbolAlias.h
++++ b/src/sksl/ir/SkSLSymbolAlias.h
+@@ -20,11 +20,14 @@
+     static constexpr Kind kSymbolKind = Kind::kSymbolAlias;
+ 
+     SymbolAlias(int offset, StringFragment name, const Symbol* origSymbol)
+-        : INHERITED(offset, kSymbolKind, name)
+-        , fOrigSymbol(origSymbol) {}
++    : INHERITED(offset, SymbolAliasData{name, origSymbol}) {}
++
++    StringFragment name() const override {
++        return this->symbolAliasData().fName;
++    }
+ 
+     const Symbol* origSymbol() const {
+-        return fOrigSymbol;
++        return this->symbolAliasData().fOrigSymbol;
+     }
+ 
+     String description() const override {
+@@ -32,8 +35,6 @@
+     }
+ 
+ private:
+-    const Symbol* fOrigSymbol;
+-
+     using INHERITED = Symbol;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLTernaryExpression.h b/src/sksl/ir/SkSLTernaryExpression.h
+index 25006cf..ab73c4f 100644
+--- a/src/sksl/ir/SkSLTernaryExpression.h
++++ b/src/sksl/ir/SkSLTernaryExpression.h
+@@ -22,35 +22,36 @@
+ 
+     TernaryExpression(int offset, std::unique_ptr<Expression> test,
+                       std::unique_ptr<Expression> ifTrue, std::unique_ptr<Expression> ifFalse)
+-        : INHERITED(offset, kExpressionKind, &ifTrue->type())
+-        , fTest(std::move(test))
+-        , fIfTrue(std::move(ifTrue))
+-        , fIfFalse(std::move(ifFalse)) {
+-        SkASSERT(this->ifTrue()->type() == this->ifFalse()->type());
++    : INHERITED(offset, kExpressionKind, &ifTrue->type()) {
++        SkASSERT(ifTrue->type() == ifFalse->type());
++        fExpressionChildren.reserve_back(3);
++        fExpressionChildren.push_back(std::move(test));
++        fExpressionChildren.push_back(std::move(ifTrue));
++        fExpressionChildren.push_back(std::move(ifFalse));
+     }
+ 
+     std::unique_ptr<Expression>& test() {
+-        return fTest;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& test() const {
+-        return fTest;
++        return fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Expression>& ifTrue() {
+-        return fIfTrue;
++        return fExpressionChildren[1];
+     }
+ 
+     const std::unique_ptr<Expression>& ifTrue() const {
+-        return fIfTrue;
++        return fExpressionChildren[1];
+     }
+ 
+     std::unique_ptr<Expression>& ifFalse() {
+-        return fIfFalse;
++        return fExpressionChildren[2];
+     }
+ 
+     const std::unique_ptr<Expression>& ifFalse() const {
+-        return fIfFalse;
++        return fExpressionChildren[2];
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -75,10 +76,6 @@
+     }
+ 
+ private:
+-    std::unique_ptr<Expression> fTest;
+-    std::unique_ptr<Expression> fIfTrue;
+-    std::unique_ptr<Expression> fIfFalse;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLType.h b/src/sksl/ir/SkSLType.h
+index 59b7ef0..0ba682f 100644
+--- a/src/sksl/ir/SkSLType.h
++++ b/src/sksl/ir/SkSLType.h
+@@ -116,7 +116,7 @@
+     , fNameString(std::move(name))
+     , fTypeKind(kind)
+     , fNumberKind(NumberKind::kNonnumeric) {
+-        fName = StringFragment(fNameString.c_str(), fNameString.length());
++        this->symbolData().fName = StringFragment(fNameString.c_str(), fNameString.length());
+     }
+ 
+     // Create a generic type which maps to the listed types.
+@@ -133,7 +133,7 @@
+     , fTypeKind(TypeKind::kStruct)
+     , fNumberKind(NumberKind::kNonnumeric)
+     , fFields(std::move(fields)) {
+-        fName = StringFragment(fNameString.c_str(), fNameString.length());
++        this->symbolData().fName = StringFragment(fNameString.c_str(), fNameString.length());
+     }
+ 
+     // Create a scalar type.
+@@ -169,7 +169,7 @@
+     , fColumns(1)
+     , fRows(1)
+     , fDimensions(SpvDim1D) {
+-        fName = StringFragment(fNameString.c_str(), fNameString.length());
++        this->symbolData().fName = StringFragment(fNameString.c_str(), fNameString.length());
+     }
+ 
+     // Create a vector type.
+@@ -189,7 +189,7 @@
+     , fRows(1)
+     , fDimensions(SpvDim1D) {
+         SkASSERT(fColumns > 0 || (fTypeKind == TypeKind::kArray && fColumns == kUnsizedArray));
+-        fName = StringFragment(fNameString.c_str(), fNameString.length());
++        this->symbolData().fName = StringFragment(fNameString.c_str(), fNameString.length());
+     }
+ 
+     // Create a matrix type.
+diff --git a/src/sksl/ir/SkSLTypeReference.h b/src/sksl/ir/SkSLTypeReference.h
+index 9fc5bae..5d37621 100644
+--- a/src/sksl/ir/SkSLTypeReference.h
++++ b/src/sksl/ir/SkSLTypeReference.h
+@@ -22,11 +22,14 @@
+     static constexpr Kind kExpressionKind = Kind::kTypeReference;
+ 
+     TypeReference(const Context& context, int offset, const Type* value)
+-        : INHERITED(offset, kExpressionKind, context.fInvalid_Type.get())
+-        , fValue(*value) {}
++    : INHERITED(offset, TypeReferenceData{context.fInvalid_Type.get(), value}) {}
++
++    const Type& type() const override {
++        return *this->typeReferenceData().fType;
++    }
+ 
+     const Type& value() const {
+-        return fValue;
++        return *this->typeReferenceData().fValue;
+     }
+ 
+     bool hasProperty(Property property) const override {
+@@ -44,10 +47,7 @@
+ 
+ private:
+     TypeReference(int offset, const Type* value, const Type* type)
+-        : INHERITED(offset, kExpressionKind, type)
+-        , fValue(*value) {}
+-
+-    const Type& fValue;
++    : INHERITED(offset, TypeReferenceData{type, value}) {}
+ 
+     using INHERITED = Expression;
+ };
+diff --git a/src/sksl/ir/SkSLUnresolvedFunction.h b/src/sksl/ir/SkSLUnresolvedFunction.h
+index f1aad74..a4d44d7 100644
+--- a/src/sksl/ir/SkSLUnresolvedFunction.h
++++ b/src/sksl/ir/SkSLUnresolvedFunction.h
+@@ -20,8 +20,7 @@
+     static constexpr Kind kSymbolKind = Kind::kUnresolvedFunction;
+ 
+     UnresolvedFunction(std::vector<const FunctionDeclaration*> funcs)
+-    : INHERITED(-1, kSymbolKind, funcs[0]->name())
+-    , fFunctions(std::move(funcs)) {
++    : INHERITED(-1, UnresolvedFunctionData{std::move(funcs)}) {
+ #ifdef SK_DEBUG
+         SkASSERT(!this->functions().empty());
+         for (auto func : this->functions()) {
+@@ -30,8 +29,12 @@
+ #endif
+     }
+ 
++    StringFragment name() const override {
++        return this->functions()[0]->name();
++    }
++
+     const std::vector<const FunctionDeclaration*>& functions() const {
+-        return fFunctions;
++        return this->unresolvedFunctionData().fFunctions;
+     }
+ 
+     String description() const override {
+@@ -39,8 +42,6 @@
+     }
+ 
+ private:
+-    std::vector<const FunctionDeclaration*> fFunctions;
+-
+     using INHERITED = Symbol;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLVarDeclarations.h b/src/sksl/ir/SkSLVarDeclarations.h
+index c82dd5f..0ba7dc2 100644
+--- a/src/sksl/ir/SkSLVarDeclarations.h
++++ b/src/sksl/ir/SkSLVarDeclarations.h
+@@ -28,42 +28,47 @@
+                    const Type* baseType,
+                    ExpressionArray sizes,
+                    std::unique_ptr<Expression> value)
+-            : INHERITED(var->fOffset, kStatementKind)
+-            , fVar(var)
+-            , fBaseType(*baseType)
+-            , fSizes(std::move(sizes))
+-            , fValue(std::move(value)) {}
++            : INHERITED(var->fOffset, VarDeclarationData{baseType, var}) {
++        fExpressionChildren.reserve_back(sizes.size() + 1);
++        fExpressionChildren.move_back_n(sizes.size(), sizes.data());
++        fExpressionChildren.push_back(std::move(value));
++    }
+ 
+     const Type& baseType() const {
+-        return fBaseType;
++        return *this->varDeclarationData().fBaseType;
+     }
+ 
+     const Variable& var() const {
+-        return *fVar;
++        return *this->varDeclarationData().fVar;
+     }
+ 
+     void setVar(const Variable* var) {
+-        fVar = var;
++        this->varDeclarationData().fVar = var;
+     }
+ 
+-    const ExpressionArray& sizes() const {
+-        return fSizes;
++    int sizeCount() const {
++        return fExpressionChildren.size() - 1;
++    }
++
++    const std::unique_ptr<Expression>& size(int index) const {
++        SkASSERT(index >= 0 && index < this->sizeCount());
++        return fExpressionChildren[index];
+     }
+ 
+     std::unique_ptr<Expression>& value() {
+-        return fValue;
++        return fExpressionChildren.back();
+     }
+ 
+     const std::unique_ptr<Expression>& value() const {
+-        return fValue;
++        return fExpressionChildren.back();
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+         ExpressionArray sizesClone;
+-        sizesClone.reserve_back(this->sizes().count());
+-        for (const std::unique_ptr<Expression>& size : this->sizes()) {
+-            if (size) {
+-                sizesClone.push_back(size->clone());
++        sizesClone.reserve_back(this->sizeCount());
++        for (int i = 0; i < this->sizeCount(); ++i) {
++            if (this->size(i)) {
++                sizesClone.push_back(this->size(i)->clone());
+             } else {
+                 sizesClone.push_back(nullptr);
+             }
+@@ -77,9 +82,9 @@
+     String description() const override {
+         String result = this->var().modifiers().description() + this->baseType().description() +
+                         " " + this->var().name();
+-        for (const std::unique_ptr<Expression>& size : this->sizes()) {
+-            if (size) {
+-                result += "[" + size->description() + "]";
++        for (int i = 0; i < this->sizeCount(); ++i) {
++            if (this->size(i)) {
++                result += "[" + this->size(i)->description() + "]";
+             } else {
+                 result += "[]";
+             }
+@@ -91,12 +96,6 @@
+         return result;
+     }
+ 
+-private:
+-    const Variable* fVar;
+-    const Type& fBaseType;
+-    ExpressionArray fSizes;
+-    std::unique_ptr<Expression> fValue;
+-
+     using INHERITED = Statement;
+ };
+ 
+@@ -109,17 +108,17 @@
+     static constexpr Kind kProgramElementKind = Kind::kGlobalVar;
+ 
+     GlobalVarDeclaration(int offset, std::unique_ptr<Statement> decl)
+-            : INHERITED(offset, kProgramElementKind)
+-            , fDeclaration(std::move(decl)) {
+-        SkASSERT(this->declaration()->is<VarDeclaration>());
++            : INHERITED(offset, kProgramElementKind) {
++        SkASSERT(decl->is<VarDeclaration>());
++        fStatementChildren.push_back(std::move(decl));
+     }
+ 
+     std::unique_ptr<Statement>& declaration() {
+-        return fDeclaration;
++        return fStatementChildren[0];
+     }
+ 
+     const std::unique_ptr<Statement>& declaration() const {
+-        return fDeclaration;
++        return fStatementChildren[0];
+     }
+ 
+     std::unique_ptr<ProgramElement> clone() const override {
+@@ -131,8 +130,6 @@
+     }
+ 
+ private:
+-    std::unique_ptr<Statement> fDeclaration;
+-
+     using INHERITED = ProgramElement;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLVariableReference.cpp b/src/sksl/ir/SkSLVariableReference.cpp
+index 8e7686a..b9610f0 100644
+--- a/src/sksl/ir/SkSLVariableReference.cpp
++++ b/src/sksl/ir/SkSLVariableReference.cpp
+@@ -15,12 +15,14 @@
+ namespace SkSL {
+ 
+ VariableReference::VariableReference(int offset, const Variable* variable, RefKind refKind)
+-    : INHERITED(offset, kExpressionKind, &variable->type())
+-    , fVariable(variable)
+-    , fRefKind(refKind) {
++        : INHERITED(offset, VariableReferenceData{variable, refKind}) {
+     SkASSERT(this->variable());
+ }
+ 
++const Type& VariableReference::type() const {
++    return this->variableReferenceData().fVariable->type();
++}
++
+ bool VariableReference::hasProperty(Property property) const {
+     switch (property) {
+         case Property::kSideEffects:      return false;
+@@ -40,11 +42,11 @@
+ }
+ 
+ void VariableReference::setRefKind(RefKind refKind) {
+-    fRefKind = refKind;
++    this->variableReferenceData().fRefKind = refKind;
+ }
+ 
+ void VariableReference::setVariable(const Variable* variable) {
+-    fVariable = variable;
++    this->variableReferenceData().fVariable = variable;
+ }
+ 
+ std::unique_ptr<Expression> VariableReference::constantPropagate(const IRGenerator& irGenerator,
+diff --git a/src/sksl/ir/SkSLVariableReference.h b/src/sksl/ir/SkSLVariableReference.h
+index 87a180b2..48b13a4 100644
+--- a/src/sksl/ir/SkSLVariableReference.h
++++ b/src/sksl/ir/SkSLVariableReference.h
+@@ -42,12 +42,14 @@
+     VariableReference(const VariableReference&) = delete;
+     VariableReference& operator=(const VariableReference&) = delete;
+ 
++    const Type& type() const override;
++
+     const Variable* variable() const {
+-        return fVariable;
++        return this->variableReferenceData().fVariable;
+     }
+ 
+     RefKind refKind() const {
+-        return fRefKind;
++        return (RefKind) this->variableReferenceData().fRefKind;
+     }
+ 
+     void setRefKind(RefKind refKind);
+@@ -68,9 +70,6 @@
+                                                   const DefinitionMap& definitions) override;
+ 
+ private:
+-    const Variable* fVariable;
+-    VariableRefKind fRefKind;
+-
+     using INHERITED = Expression;
+ };
+ 
+diff --git a/src/sksl/ir/SkSLWhileStatement.h b/src/sksl/ir/SkSLWhileStatement.h
+index 7fd1bf4..59146db 100644
+--- a/src/sksl/ir/SkSLWhileStatement.h
++++ b/src/sksl/ir/SkSLWhileStatement.h
+@@ -21,24 +21,25 @@
+ 
+     WhileStatement(int offset, std::unique_ptr<Expression> test,
+                    std::unique_ptr<Statement> statement)
+-        : INHERITED(offset, kStatementKind)
+-        , fTest(std::move(test))
+-        , fStatement(std::move(statement)) {}
++    : INHERITED(offset, kStatementKind) {
++        fExpressionChildren.push_back(std::move(test));
++        fStatementChildren.push_back(std::move(statement));
++    }
+ 
+     std::unique_ptr<Expression>& test() {
+-        return fTest;
++        return fExpressionChildren[0];
+     }
+ 
+     const std::unique_ptr<Expression>& test() const {
+-        return fTest;
++        return fExpressionChildren[0];
+     }
+ 
+     std::unique_ptr<Statement>& statement() {
+-        return fStatement;
++        return fStatementChildren[0];
+     }
+ 
+     const std::unique_ptr<Statement>& statement() const {
+-        return fStatement;
++        return fStatementChildren[0];
+     }
+ 
+     std::unique_ptr<Statement> clone() const override {
+@@ -50,10 +51,6 @@
+         return "while (" + this->test()->description() + ") " + this->statement()->description();
+     }
+ 
+-private:
+-    std::unique_ptr<Expression> fTest;
+-    std::unique_ptr<Statement> fStatement;
+-
+     using INHERITED = Statement;
+ };
+ 

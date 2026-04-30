@@ -1,0 +1,153 @@
+From 1b551741b86b4482cf368444ce6c78063ab9d0f3 Mon Sep 17 00:00:00 2001
+From: cpq <valenok@gmail.com>
+Date: Fri, 11 Dec 2020 09:35:50 +0000
+Subject: [PATCH] Fix mg_url_decode fuzz
+
+---
+ mongoose.c       |  9 +++++----
+ src/http.c       |  7 ++++---
+ src/mqtt.c       |  2 +-
+ test/fuzz.c      |  2 ++
+ test/unit_test.c | 16 ++++++++++++++--
+ 5 files changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/mongoose.c b/mongoose.c
+index dd15b18e84..7969013480 100644
+--- a/mongoose.c
++++ b/mongoose.c
+@@ -433,9 +433,10 @@ int mg_http_get_var(const struct mg_str *buf, const char *name, char *dst,
+ int mg_url_decode(const char *src, size_t src_len, char *dst, size_t dst_len,
+                   int is_form_url_encoded) {
+   size_t i, j;
+-  for (i = j = 0; i < src_len && j < dst_len - 1; i++, j++) {
++  for (i = j = 0; i < src_len && j + 1 < dst_len; i++, j++) {
+     if (src[i] == '%') {
+-      if (i < src_len - 2 && isxdigit(*(const unsigned char *) (src + i + 1)) &&
++      // Use `i + 2 < src_len`, not `i < src_len - 2`, note small src_len
++      if (i + 2 < src_len && isxdigit(*(const unsigned char *) (src + i + 1)) &&
+           isxdigit(*(const unsigned char *) (src + i + 2))) {
+         mg_unhex(src + i + 1, 2, (uint8_t *) &dst[j]);
+         i += 2;
+@@ -448,7 +449,7 @@ int mg_url_decode(const char *src, size_t src_len, char *dst, size_t dst_len,
+       dst[j] = src[i];
+     }
+   }
+-  dst[j] = '\0';  // Null-terminate the destination
++  if (j < dst_len) dst[j] = '\0';  // Null-terminate the destination
+   return i >= src_len ? (int) j : -1;
+ }
+ 
+@@ -1735,7 +1736,7 @@ static int parse(const uint8_t *in, size_t inlen, struct mqtt_message *m) {
+     len += (lc & 0x7f) << 7 * len_len;
+     len_len++;
+     if (!(lc & 0x80)) break;
+-    if (len_len > 4) return MQTT_MALFORMED;
++    if (len_len >= 4) return MQTT_MALFORMED;
+   }
+ 
+   end = p + len;
+diff --git a/src/http.c b/src/http.c
+index 95acaeb6ef..eb232e3ea3 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -73,9 +73,10 @@ int mg_http_get_var(const struct mg_str *buf, const char *name, char *dst,
+ int mg_url_decode(const char *src, size_t src_len, char *dst, size_t dst_len,
+                   int is_form_url_encoded) {
+   size_t i, j;
+-  for (i = j = 0; i < src_len && j < dst_len - 1; i++, j++) {
++  for (i = j = 0; i < src_len && j + 1 < dst_len; i++, j++) {
+     if (src[i] == '%') {
+-      if (i < src_len - 2 && isxdigit(*(const unsigned char *) (src + i + 1)) &&
++      // Use `i + 2 < src_len`, not `i < src_len - 2`, note small src_len
++      if (i + 2 < src_len && isxdigit(*(const unsigned char *) (src + i + 1)) &&
+           isxdigit(*(const unsigned char *) (src + i + 2))) {
+         mg_unhex(src + i + 1, 2, (uint8_t *) &dst[j]);
+         i += 2;
+@@ -88,7 +89,7 @@ int mg_url_decode(const char *src, size_t src_len, char *dst, size_t dst_len,
+       dst[j] = src[i];
+     }
+   }
+-  dst[j] = '\0';  // Null-terminate the destination
++  if (j < dst_len) dst[j] = '\0';  // Null-terminate the destination
+   return i >= src_len ? (int) j : -1;
+ }
+ 
+diff --git a/src/mqtt.c b/src/mqtt.c
+index 4167a97c27..93abc77c5a 100644
+--- a/src/mqtt.c
++++ b/src/mqtt.c
+@@ -150,7 +150,7 @@ static int parse(const uint8_t *in, size_t inlen, struct mqtt_message *m) {
+     len += (lc & 0x7f) << 7 * len_len;
+     len_len++;
+     if (!(lc & 0x80)) break;
+-    if (len_len > 4) return MQTT_MALFORMED;
++    if (len_len >= 4) return MQTT_MALFORMED;
+   }
+ 
+   end = p + len;
+diff --git a/test/fuzz.c b/test/fuzz.c
+index bb6919e9b7..c8dd931632 100644
+--- a/test/fuzz.c
++++ b/test/fuzz.c
+@@ -11,6 +11,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+   struct mg_str body = mg_str_n((const char *) data, size);
+   char tmp[256];
+   mg_http_get_var(&body, "key", tmp, sizeof(tmp));
++  mg_url_decode((char *) data, size, tmp, sizeof(tmp), 1);
++  mg_url_decode((char *) data, size, tmp, 1, 1);
+ 
+   struct mg_mqtt_message mm;
+   mg_mqtt_parse(data, size, &mm);
+diff --git a/test/unit_test.c b/test/unit_test.c
+index 1ba942d940..ad1a0b7fbe 100644
+--- a/test/unit_test.c
++++ b/test/unit_test.c
+@@ -92,6 +92,8 @@ static void test_http_get_var(void) {
+   body = mg_str("key=broken%2x");
+   ASSERT(mg_http_get_var(&body, "key", buf, sizeof(buf)) == -3);
+   ASSERT(mg_http_get_var(&body, "inexistent", buf, sizeof(buf)) == -4);
++  body = mg_str("key=%");
++  ASSERT(mg_http_get_var(&body, "key", buf, sizeof(buf)) == -3);
+ }
+ 
+ static int vcmp(struct mg_str s1, const char *s2) {
+@@ -270,6 +272,12 @@ static void test_mqtt(void) {
+   int i;
+   mg_mgr_init(&mgr);
+ 
++  {
++    uint8_t bad[] = " \xff\xff\xff\xff ";
++    struct mg_mqtt_message mm;
++    mg_mqtt_parse(bad, sizeof(bad), &mm);
++  }
++
+   // Connect with empty client ID
+   c = mg_mqtt_connect(&mgr, url, NULL, mqtt_cb, buf);
+   for (i = 0; i < 100 && buf[0] == 0; i++) mg_mgr_poll(&mgr, 10);
+@@ -859,12 +867,17 @@ static void test_util(void) {
+   ASSERT(mg_file_write("data.txt", "%s", "hi") == 2);
+   ASSERT(strcmp(mg_ntoa(0x100007f, buf, sizeof(buf)), "127.0.0.1") == 0);
+   ASSERT(strcmp(mg_hex("abc", 3, buf), "616263") == 0);
++  {
++    char bad[] = {'a', '=', '%'};
++    ASSERT(mg_url_decode(bad, sizeof(bad), buf, sizeof(buf), 0) < 0);
++  }
+ }
+ 
+ int main(void) {
+   mg_log_set("3");
+-  test_str();
+   test_util();
++  test_mqtt();
++  test_str();
+   test_timer();
+   test_http_range();
+   test_url();
+@@ -875,7 +888,6 @@ int main(void) {
+   test_http_get_var();
+   test_tls();
+   test_ws();
+-  test_mqtt();
+   test_http_parse();
+   test_http_server();
+   test_http_client();

@@ -1,0 +1,280 @@
+From 53fe93430e1e37d3796d99086af9f3a97c0a9ba5 Mon Sep 17 00:00:00 2001
+From: Eric Blankenhorn <eric@wolfssl.com>
+Date: Mon, 15 May 2023 08:40:53 -0500
+Subject: [PATCH] Update EBSNET port
+
+---
+ examples/configs/README.md              |  1 +
+ examples/configs/include.am             |  1 +
+ examples/configs/user_settings_EBSnet.h | 56 ++++++++++++++++++++++
+ wolfcrypt/src/random.c                  | 15 ++++++
+ wolfcrypt/src/wc_port.c                 | 62 ++++++++++++++++++++++++-
+ wolfssl/test.h                          |  2 +-
+ wolfssl/wolfcrypt/settings.h            |  8 +++-
+ wolfssl/wolfcrypt/wc_port.h             |  8 +++-
+ 8 files changed, 148 insertions(+), 5 deletions(-)
+ create mode 100644 examples/configs/user_settings_EBSnet.h
+
+diff --git a/examples/configs/README.md b/examples/configs/README.md
+index e2ae4b037c2..8ed282cc72a 100644
+--- a/examples/configs/README.md
++++ b/examples/configs/README.md
+@@ -12,6 +12,7 @@ Example wolfSSL configuration file templates for use when autoconf is not availa
+ * `user_settings_fipsv5.h`: The FIPS v5 (ready) 140-3 build options. Equivalent to `./configure --enable-fips=v5-dev`.
+ * `user_settings_stm32.h`: Example configuration file generated from the wolfSSL STM32 Cube pack.
+ * `user_settings_wolftpm.h`: Minimum options for building wolfTPM. See comment at top for ./configure used to generate.
++*.`user_settings_EBSnet.h`: Example configuration file for use with EBSnet ports.
+ 
+ ## Usage
+ 
+diff --git a/examples/configs/include.am b/examples/configs/include.am
+index d59776102ea..781fbcbcab6 100644
+--- a/examples/configs/include.am
++++ b/examples/configs/include.am
+@@ -10,3 +10,4 @@ EXTRA_DIST += examples/configs/user_settings_fipsv2.h
+ EXTRA_DIST += examples/configs/user_settings_fipsv5.h
+ EXTRA_DIST += examples/configs/user_settings_stm32.h
+ EXTRA_DIST += examples/configs/user_settings_wolftpm.h
++EXTRA_DIST += examples/configs/user_settings_EBSnet.h
+diff --git a/examples/configs/user_settings_EBSnet.h b/examples/configs/user_settings_EBSnet.h
+new file mode 100644
+index 00000000000..3d1486998b5
+--- /dev/null
++++ b/examples/configs/user_settings_EBSnet.h
+@@ -0,0 +1,56 @@
++/* user_settings_EBSnet.h
++ *
++ * Copyright (C) 2006-2023 wolfSSL Inc.
++ *
++ * This file is part of wolfSSL.
++ *
++ * wolfSSL is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * wolfSSL is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
++ */
++
++/* Example wolfSSL user settings for use with EBSnet ports.
++ * This file is included with wolfssl/wolfcrypt/settings.h when WOLFSSL_USER_SETTINGS is defined.
++ */
++
++#ifndef WOLFSSL_USER_SETTINGS_H
++#define WOLFSSL_USER_SETTINGS_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define OPENSSL_EXTRA_X509_SMALL
++
++#define USE_FAST_MATH
++#define TFM_TIMING_RESISTANT
++#define WC_RSA_BLINDING
++#define ECC_TIMING_RESISTANT
++
++#define HAVE_ECC
++#define HAVE_CURVE25519
++#define HAVE_AESGCM
++#define WOLFSSL_SHA384
++
++#define NO_DSA
++#define NO_RC4
++#define NO_MD4
++#define NO_MD5
++#define NO_DES3
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* WOLFSSL_USER_SETTINGS_H */
++
+diff --git a/wolfcrypt/src/random.c b/wolfcrypt/src/random.c
+index c54e8ce5829..d15b2927c90 100644
+--- a/wolfcrypt/src/random.c
++++ b/wolfcrypt/src/random.c
+@@ -2627,6 +2627,8 @@ int wc_GenerateSeed(OS_Seed* os, byte* output, word32 sz)
+ #elif defined(HAVE_RTP_SYS) || defined(EBSNET)
+ 
+ #include "rtprand.h"   /* rtp_rand () */
++
++#if (defined(HAVE_RTP_SYS) || (defined(RTPLATFORM) && (RTPLATFORM != 0)))
+ #include "rtptime.h"   /* rtp_get_system_msec() */
+ 
+ int wc_GenerateSeed(OS_Seed* os, byte* output, word32 sz)
+@@ -2640,6 +2642,19 @@ int wc_GenerateSeed(OS_Seed* os, byte* output, word32 sz)
+ 
+     return 0;
+ }
++#else
++int wc_GenerateSeed(OS_Seed* os, byte* output, word32 sz)
++{
++    word32 i;
++    KS_SEED(ks_get_ticks());
++
++    for (i = 0; i < sz; i++ ) {
++        output[i] = KS_RANDOM() % 256;
++    }
++
++    return 0;
++}
++#endif /* defined(HAVE_RTP_SYS) || (defined(RTPLATFORM) && (RTPLATFORM != 0)) */
+ 
+ #elif (defined(WOLFSSL_ATMEL) || defined(WOLFSSL_ATECC_RNG)) && \
+       !defined(WOLFSSL_PIC32MZ_RNG)
+diff --git a/wolfcrypt/src/wc_port.c b/wolfcrypt/src/wc_port.c
+index b6b8c1fde29..9f81eb82cb7 100644
+--- a/wolfcrypt/src/wc_port.c
++++ b/wolfcrypt/src/wc_port.c
+@@ -2031,7 +2031,7 @@ int wolfSSL_CryptHwMutexUnLock(void)
+     }
+ 
+ #elif defined(EBSNET)
+-
++    #if (defined(RTPLATFORM) && (RTPLATFORM != 0))
+     int wc_InitMutex(wolfSSL_Mutex* m)
+     {
+         if (rtp_sig_mutex_alloc(m, "wolfSSL Mutex") == -1)
+@@ -2072,6 +2072,66 @@ int wolfSSL_CryptHwMutexUnLock(void)
+ 
+         return(retval);
+     }
++    #else
++    static int rtip_semaphore_build(wolfSSL_Mutex *m)
++    {
++        KS_SEMAPHORE_BUILD(m)
++        return(RTP_TRUE);
++    }
++
++    int wc_InitMutex(wolfSSL_Mutex* m)
++    {
++        if (rtip_semaphore_build(m) == RTP_FALSE)
++            return BAD_MUTEX_E;
++        else
++            return 0;
++    }
++
++    int wc_FreeMutex(wolfSSL_Mutex* m)
++    {
++        KS_SEMAPHORE_FREE(*m);
++        return 0;
++    }
++
++    int wc_LockMutex(wolfSSL_Mutex* m)
++    {
++        if (KS_SEMAPHORE_GET(*m))
++            return 0;
++        else
++            return BAD_MUTEX_E;
++    }
++
++    int wc_UnLockMutex(wolfSSL_Mutex* m)
++    {
++        KS_SEMAPHORE_GIVE(*m);
++        return 0;
++    }
++    #endif
++    int ebsnet_fseek(int a, long b, int c)
++    {
++        int retval;
++
++        retval = (int)vf_lseek(a, b, c);
++        if (retval > 0)
++            retval = 0;
++        else
++            retval =  -1;
++
++        return(retval);
++    }
++
++    int strcasecmp(const char *s1, const char *s2)
++    {
++        while (rtp_tolower(*s1) == rtp_tolower(*s2)) {
++            if (*s1 == '\0' || *s2 == '\0')
++                break;
++            s1++;
++            s2++;
++        }
++
++        return rtp_tolower(*(unsigned char *) s1) -
++               rtp_tolower(*(unsigned char *) s2);
++    }
+ 
+ #elif defined(FREESCALE_MQX) || defined(FREESCALE_KSDK_MQX)
+ 
+diff --git a/wolfssl/test.h b/wolfssl/test.h
+index fff636302cd..bc057ab3b70 100644
+--- a/wolfssl/test.h
++++ b/wolfssl/test.h
+@@ -2313,7 +2313,7 @@ static WC_INLINE void tcp_accept(SOCKET_T* sockfd, SOCKET_T* clientfd,
+ 
+ static WC_INLINE void tcp_set_nonblocking(SOCKET_T* sockfd)
+ {
+-    #ifdef USE_WINDOWS_API
++    #if defined(USE_WINDOWS_API) || defined(EBSNET)
+         unsigned long blocking = 1;
+         int ret = ioctlsocket(*sockfd, FIONBIO, &blocking);
+         if (ret == SOCKET_ERROR)
+diff --git a/wolfssl/wolfcrypt/settings.h b/wolfssl/wolfcrypt/settings.h
+index 47e3b7363af..0234a377fca 100644
+--- a/wolfssl/wolfcrypt/settings.h
++++ b/wolfssl/wolfcrypt/settings.h
+@@ -918,7 +918,7 @@ extern void uITRON4_free(void *p) ;
+         #define SINGLE_THREADED
+     #endif
+ 
+-    #if (RTPLATFORM)
++    #if (defined(RTPLATFORM) && (RTPLATFORM != 0))
+         #if (!RTP_LITTLE_ENDIAN)
+             #define BIG_ENDIAN_ORDER
+         #endif
+@@ -937,9 +937,13 @@ extern void uITRON4_free(void *p) ;
+         #endif
+     #endif
+ 
++    #if (WINMSP3)
++        #define strtok_r strtok_s
++    #endif
++
+     #define XMALLOC(s, h, type) ((void *)rtp_malloc((s), SSL_PRO_MALLOC))
+     #define XFREE(p, h, type) (rtp_free(p))
+-    #define XREALLOC(p, n, h, t) (rtp_realloc((p), (n)))
++    #define XREALLOC(p, n, h, t) (rtp_realloc((p), (n), (t)))
+ 
+     #if (WINMSP3)
+         #define XSTRNCASECMP(s1,s2,n)  _strnicmp((s1),(s2),(n))
+diff --git a/wolfssl/wolfcrypt/wc_port.h b/wolfssl/wolfcrypt/wc_port.h
+index 7b45284188c..b1b1ee330bd 100644
+--- a/wolfssl/wolfcrypt/wc_port.h
++++ b/wolfssl/wolfcrypt/wc_port.h
+@@ -244,7 +244,11 @@
+     #elif defined(MICRIUM)
+         typedef OS_MUTEX wolfSSL_Mutex;
+     #elif defined(EBSNET)
+-        typedef RTP_MUTEX wolfSSL_Mutex;
++        #if (defined(RTPLATFORM) && (RTPLATFORM != 0))
++            typedef RTP_MUTEX wolfSSL_Mutex;
++        #else
++            typedef KS_RTIPSEM wolfSSL_Mutex;
++        #endif
+     #elif defined(FREESCALE_MQX) || defined(FREESCALE_KSDK_MQX)
+         typedef MUTEX_STRUCT wolfSSL_Mutex;
+     #elif defined(FREESCALE_FREE_RTOS)
+@@ -474,6 +478,8 @@ WOLFSSL_ABI WOLFSSL_API int wolfCrypt_Cleanup(void);
+     #define XSEEK_END                VSEEK_END
+     #define XBADFILE                 -1
+     #define XFGETS(b,s,f)            -2 /* Not ported yet */
++    #define XSNPRINTF rtp_snprintf
++    #define XFPRINTF fprintf
+ 
+ #elif defined(LSR_FS)
+     #include <fs.h>

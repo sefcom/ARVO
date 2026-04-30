@@ -1,0 +1,65 @@
+From fd77cb891899dd5f4f69145d76a28f73abe9a11c Mon Sep 17 00:00:00 2001
+From: elms <jeff@wolfssl.com>
+Date: Thu, 2 Sep 2021 19:48:01 -0700
+Subject: [PATCH] fix `wc_AesKeyWrap_ex` and `wc_AesKeyUnWrap_ex` bound checks
+ (#4369)
+
+RFC3394 in must be at least 2 64-bit blocks and output is one block longer.
+On Unwrapping the input must then be a minimum of 3 64-bit blocks
+---
+ tests/api.c         | 4 ++++
+ wolfcrypt/src/aes.c | 7 +++----
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/tests/api.c b/tests/api.c
+index 65363d5faf1..c6b0f5b7379 100644
+--- a/tests/api.c
++++ b/tests/api.c
+@@ -39596,11 +39596,15 @@ static void test_wolfSSL_AES_cbc_encrypt(void)
+     byte wrapIV[KEYWRAP_BLOCK_SIZE] = { 0 };
+     printf(testingFmt, "wolfSSL_AES_wrap_key() 256-bit NULL iv");
+     AssertIntEQ(wolfSSL_AES_set_encrypt_key(key256, sizeof(key256)*8, &aes), 0);
++    AssertIntEQ(wolfSSL_AES_wrap_key(&aes, NULL, wrapCipher, key256,
++            15), WOLFSSL_FAILURE);
+     AssertIntEQ(wolfSSL_AES_wrap_key(&aes, NULL, wrapCipher, key256,
+             sizeof(key256)), sizeof(wrapCipher));
+     printf(resultFmt, "passed");
+     printf(testingFmt, "wolfSSL_AES_unwrap_key() 256-bit NULL iv");
+     AssertIntEQ(wolfSSL_AES_set_decrypt_key(key256, sizeof(key256)*8, &aes), 0);
++    AssertIntEQ(wolfSSL_AES_unwrap_key(&aes, NULL, wrapPlain, wrapCipher,
++            23), WOLFSSL_FAILURE);
+     AssertIntEQ(wolfSSL_AES_unwrap_key(&aes, NULL, wrapPlain, wrapCipher,
+             sizeof(wrapCipher)), sizeof(wrapPlain));
+     AssertIntEQ(XMEMCMP(wrapPlain, key256, sizeof(key256)), 0);
+diff --git a/wolfcrypt/src/aes.c b/wolfcrypt/src/aes.c
+index cc84a50f538..ce094fbeae0 100644
+--- a/wolfcrypt/src/aes.c
++++ b/wolfcrypt/src/aes.c
+@@ -10807,8 +10807,8 @@ int wc_AesKeyWrap_ex(Aes *aes, const byte* in, word32 inSz, byte* out,
+     byte t[KEYWRAP_BLOCK_SIZE];
+     byte tmp[AES_BLOCK_SIZE];
+ 
+-    /* n must be at least 2, output size is n + 8 bytes */
+-    if (aes == NULL || in  == NULL || inSz < 2 ||
++    /* n must be at least 2 64-bit blocks, output size is (n + 1) 8 bytes (64-bit) */
++    if (aes == NULL || in  == NULL || inSz < 2*KEYWRAP_BLOCK_SIZE ||
+         out == NULL || outSz < (inSz + KEYWRAP_BLOCK_SIZE))
+         return BAD_FUNC_ARG;
+ 
+@@ -10862,7 +10862,6 @@ int wc_AesKeyWrap(const byte* key, word32 keySz, const byte* in, word32 inSz,
+ #endif
+     int ret;
+ 
+-    /* n must be at least 2, output size is n + 8 bytes */
+     if (key == NULL)
+         return BAD_FUNC_ARG;
+ 
+@@ -10910,7 +10909,7 @@ int wc_AesKeyUnWrap_ex(Aes *aes, const byte* in, word32 inSz, byte* out,
+         0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6
+     };
+ 
+-    if (aes == NULL || in == NULL || inSz < 3 ||
++    if (aes == NULL || in == NULL || inSz < 3 * KEYWRAP_BLOCK_SIZE ||
+         out == NULL || outSz < (inSz - KEYWRAP_BLOCK_SIZE))
+         return BAD_FUNC_ARG;
+ 

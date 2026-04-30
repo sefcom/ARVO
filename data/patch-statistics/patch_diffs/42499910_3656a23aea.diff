@@ -1,0 +1,105 @@
+From 187be72eb8f736681d1c31f5d42b6de85e1a53bd Mon Sep 17 00:00:00 2001
+From: Christian Mazakas <christian.mazakas@gmail.com>
+Date: Fri, 14 Feb 2025 15:22:30 -0800
+Subject: [PATCH] fix cve issue 42506269
+
+---
+ .github/workflows/ci.yml                      |  1 +
+ include/boost/regex/v5/basic_regex_parser.hpp |  9 +++++++-
+ include/boost/regex/v5/regbase.hpp            |  2 ++
+ test/Jamfile.v2                               |  1 +
+ test/issue244.cpp                             | 21 +++++++++++++++++++
+ 5 files changed, 33 insertions(+), 1 deletion(-)
+ create mode 100644 test/issue244.cpp
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 84ab6bbc2..ca46c5d58 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -10,6 +10,7 @@ on:
+       - master
+       - develop
+       - feature/**
++      - cve-*
+   pull_request:
+   release:
+     types: [published, created, edited]
+diff --git a/include/boost/regex/v5/basic_regex_parser.hpp b/include/boost/regex/v5/basic_regex_parser.hpp
+index f3f3a27ea..a83e5345e 100644
+--- a/include/boost/regex/v5/basic_regex_parser.hpp
++++ b/include/boost/regex/v5/basic_regex_parser.hpp
+@@ -997,7 +997,7 @@ bool basic_regex_parser<charT, traits>::parse_repeat(std::size_t low, std::size_
+       if((m_position != m_end)
+          && (0 == (this->flags() & regbase::main_option_type)) 
+          && (this->m_traits.syntax_type(*m_position) == regex_constants::syntax_plus))
+-      {
++      { 
+          possessive = true;
+          ++m_position;
+       }
+@@ -1114,6 +1114,13 @@ bool basic_regex_parser<charT, traits>::parse_repeat(std::size_t low, std::size_
+                   else
+                      contin = false;
+                   break;
++               case regex_constants::syntax_hash:
++                  if (this->flags() & regex_constants::mod_x) {
++                     while((m_position != m_end) && !is_separator(*m_position++)){}
++                     contin = true;
++                     break;
++                  }
++                  BOOST_REGEX_FALLTHROUGH;
+                default:
+                   contin = false;
+                }
+diff --git a/include/boost/regex/v5/regbase.hpp b/include/boost/regex/v5/regbase.hpp
+index b9c32b40f..42fda89a4 100644
+--- a/include/boost/regex/v5/regbase.hpp
++++ b/include/boost/regex/v5/regbase.hpp
+@@ -19,6 +19,8 @@
+ #ifndef BOOST_REGEX_V5_REGBASE_HPP
+ #define BOOST_REGEX_V5_REGBASE_HPP
+ 
++#include <boost/regex/config.hpp>
++
+ namespace boost{
+ //
+ // class regbase
+diff --git a/test/Jamfile.v2 b/test/Jamfile.v2
+index 3732c9990..28cbbb086 100644
+--- a/test/Jamfile.v2
++++ b/test/Jamfile.v2
+@@ -137,6 +137,7 @@ compile test_windows_defs_4.cpp ;
+ run issue153.cpp : : : "<toolset>msvc:<linkflags>-STACK:2097152" ;
+ run issue227.cpp ;
+ run issue232.cpp ;
++run issue244.cpp ;
+ run lookbehind_recursion_stress_test.cpp ;
+ run regex_replace_overflow.cpp ;
+ 
+diff --git a/test/issue244.cpp b/test/issue244.cpp
+new file mode 100644
+index 000000000..1b8cf13da
+--- /dev/null
++++ b/test/issue244.cpp
+@@ -0,0 +1,21 @@
++#include <boost/regex.hpp>
++
++#include <string>
++
++#include "test_macros.hpp"
++
++int main()
++{
++   char const strdata1[] = "\x00t\x03.z%(?x:]*+\x0c#\\x0c\x0c\x0c+\x0c#\\x0c\x0c\x0c\x11\x0c\x0c\xff\xff\xfd*\xff\xff\xff\xff\xff\xff\xff\xff|\xff\xff\xfd*\xff\xff)*\x01\x03\x00\x00\x00\x03\xff\xff\xff\x00\x00\xff\xff\xff";
++   char const strdata2[] = "(?x:]*+#comment\n+)*";
++   
++   std::string str1(strdata1, strdata1 + sizeof(strdata1) - 1);
++   std::string str2(strdata2, strdata2 + sizeof(strdata2) - 1);
++
++   boost::match_results<std::string::const_iterator> what;
++   
++   BOOST_TEST_THROWS((boost::regex(str1)), boost::regex_error);
++   BOOST_TEST_THROWS((boost::regex(str2)), boost::regex_error);
++
++   return boost::report_errors();
++}

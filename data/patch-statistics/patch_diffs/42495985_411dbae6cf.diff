@@ -1,0 +1,103 @@
+From 718e03e5f297564b828730dfc012fa3f6fbf576b Mon Sep 17 00:00:00 2001
+From: Andreas Rheinhardt <andreas.rheinhardt@outlook.com>
+Date: Tue, 20 Apr 2021 18:18:36 +0200
+Subject: [PATCH] avcodec/jpeglsdec: Don't presume the context to contain a
+ JLSState
+
+Before 9b3c46a081a9f01559082bf7a154fc6be1e06c18 every call to
+ff_jpegls_decode_picture() allocated and freed a JLSState. This commit
+instead put said structure into the context of the JPEG-LS decoder to
+avoid said allocation. But said function can also be called from other
+MJPEG-based decoders and their contexts doesn't contain said structure,
+leading to segfaults. This commit fixes this: The JLSState is now
+allocated on the first call to ff_jpegls_decode_picture() and stored in
+the context.
+
+Found-by: Michael Niedermayer <michael@niedermayer.cc>
+Reviewed-by: Michael Niedermayer <michael@niedermayer.cc>
+Signed-off-by: Andreas Rheinhardt <andreas.rheinhardt@outlook.com>
+---
+ libavcodec/jpeglsdec.c | 15 ++++++++-------
+ libavcodec/mjpegdec.c  |  1 +
+ libavcodec/mjpegdec.h  |  3 +++
+ 3 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/libavcodec/jpeglsdec.c b/libavcodec/jpeglsdec.c
+index 92df81600b..e17de09e9f 100644
+--- a/libavcodec/jpeglsdec.c
++++ b/libavcodec/jpeglsdec.c
+@@ -45,11 +45,6 @@
+  */
+ //#define JLS_BROKEN
+ 
+-typedef struct JpegLSDecodeContext {
+-    MJpegDecodeContext mjpeg;
+-    JLSState state;
+-} JpegLSDecodeContext;
+-
+ /**
+  * Decode LSE block with initialization parameters
+  */
+@@ -355,10 +350,16 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
+ {
+     int i, t = 0;
+     uint8_t *zero, *last, *cur;
+-    JLSState *const state = &((JpegLSDecodeContext*)s)->state;
++    JLSState *state = s->jls_state;
+     int off = 0, stride = 1, width, shift, ret = 0;
+     int decoded_height = 0;
+ 
++    if (!state) {
++        state = av_malloc(sizeof(*state));
++        if (!state)
++            return AVERROR(ENOMEM);
++        s->jls_state = state;
++    }
+     zero = av_mallocz(s->picture_ptr->linesize[0]);
+     if (!zero)
+         return AVERROR(ENOMEM);
+@@ -548,7 +549,7 @@ AVCodec ff_jpegls_decoder = {
+     .long_name      = NULL_IF_CONFIG_SMALL("JPEG-LS"),
+     .type           = AVMEDIA_TYPE_VIDEO,
+     .id             = AV_CODEC_ID_JPEGLS,
+-    .priv_data_size = sizeof(JpegLSDecodeContext),
++    .priv_data_size = sizeof(MJpegDecodeContext),
+     .init           = ff_mjpeg_decode_init,
+     .close          = ff_mjpeg_decode_end,
+     .receive_frame  = ff_mjpeg_receive_frame,
+diff --git a/libavcodec/mjpegdec.c b/libavcodec/mjpegdec.c
+index f3d9e99aab..7c7cc20af8 100644
+--- a/libavcodec/mjpegdec.c
++++ b/libavcodec/mjpegdec.c
+@@ -2916,6 +2916,7 @@ av_cold int ff_mjpeg_decode_end(AVCodecContext *avctx)
+     reset_icc_profile(s);
+ 
+     av_freep(&s->hwaccel_picture_private);
++    av_freep(&s->jls_state);
+ 
+     return 0;
+ }
+diff --git a/libavcodec/mjpegdec.h b/libavcodec/mjpegdec.h
+index 0d69d9101b..2400a179f1 100644
+--- a/libavcodec/mjpegdec.h
++++ b/libavcodec/mjpegdec.h
+@@ -49,6 +49,8 @@ typedef struct ICCEntry {
+     int    length;
+ } ICCEntry;
+ 
++struct JLSState;
++
+ typedef struct MJpegDecodeContext {
+     AVClass *class;
+     AVCodecContext *avctx;
+@@ -163,6 +165,7 @@ typedef struct MJpegDecodeContext {
+     enum AVPixelFormat hwaccel_sw_pix_fmt;
+     enum AVPixelFormat hwaccel_pix_fmt;
+     void *hwaccel_picture_private;
++    struct JLSState *jls_state;
+ } MJpegDecodeContext;
+ 
+ int ff_mjpeg_build_vlc(VLC *vlc, const uint8_t *bits_table,
+-- 
+2.25.1
+

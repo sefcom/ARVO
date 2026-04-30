@@ -1,0 +1,87 @@
+From ac0d7ccb7e6ee1a9b67f07822dad66617d5ff75b Mon Sep 17 00:00:00 2001
+From: Nardi Ivan <nardi.ivan@gmail.com>
+Date: Mon, 22 Aug 2022 17:00:40 +0200
+Subject: [PATCH] HTTP, SoftEther, Florensia: fix some memory corruptions
+
+```
+==12308==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x60600068f4b4 at pc 0x5603d2b56098 bp 0x7ffc967bd3b0 sp 0x7ffc967bd3a8
+READ of size 2 at 0x60600068f4b4 thread T0
+    #0 0x5603d2b56097 in ndpi_search_florensia /home/ivan/svnrepos/nDPI/src/lib/protocols/florensia.c:93:40
+    #1 0x5603d2a2e835 in check_ndpi_detection_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:5414:6
+    #2 0x5603d2a2f247 in check_ndpi_tcp_flow_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:5462:12
+    #3 0x5603d2a2eee7 in ndpi_check_flow_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:5481:12
+    #4 0x5603d2a3ffb5 in ndpi_detection_process_packet /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:6308:15
+    #5 0x5603d2955f4c in packet_processing /home/ivan/svnrepos/nDPI/example/reader_util.c:1612:31
+    #6 0x5603d294ee64 in ndpi_workflow_process_packet /home/ivan/svnrepos/nDPI/example/reader_util.c:2182:10
+    #7 0x5603d290aa50 in LLVMFuzzerTestOneInput /home/ivan/svnrepos/nDPI/fuzz/fuzz_ndpi_reader.c:107:7
+    #8 0x5603d290ab8b in main /home/ivan/svnrepos/nDPI/fuzz/fuzz_ndpi_reader.c:179:17
+    #9 0x7f972cdc9082 in __libc_start_main /build/glibc-SzIz7B/glibc-2.31/csu/../csu/libc-start.c:308:16
+    #10 0x5603d28494fd in _start (/home/ivan/svnrepos/nDPI/fuzz/fuzz_ndpi_reader_with_main+0x4be4fd) (BuildId: e81373a75c70e248ba9ae985fcb4134e7113121a)
+```
+```
+==14164==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x60d0000000c1 at pc 0x561608bada2c bp 0x7ffc40d38ed0 sp 0x7ffc40d38690
+READ of size 10 at 0x60d0000000c1 thread T0
+    #0 0x561608bada2b in __interceptor_strncpy (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet_with_main+0x4e9a2b) (BuildId: 2e4fd67f1aeb93c491a04ae424331669c993ee9b)
+    #1 0x561608e66f2a in dissect_softether_host_fqdn /home/ivan/svnrepos/nDPI/src/lib/protocols/softether.c:226:2
+    #2 0x561608e64e88 in ndpi_search_softether /home/ivan/svnrepos/nDPI/src/lib/protocols/softether.c:316:8
+    #3 0x561608ca7475 in check_ndpi_detection_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:5414:6
+    #4 0x561608ca823b in check_ndpi_udp_flow_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:5450:10
+    #5 0x561608ca7bdc in ndpi_check_flow_func /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:5483:12
+    #6 0x561608cb8bf5 in ndpi_detection_process_packet /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:6308:15
+    #7 0x561608bff84e in LLVMFuzzerTestOneInput /home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet.c:29:5
+    #8 0x561608bff9c7 in main /home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet.c:101:17
+    #9 0x7fc50662d082 in __libc_start_main /build/glibc-SzIz7B/glibc-2.31/csu/../csu/libc-start.c:308:16
+    #10 0x561608b3e42d in _start (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet_with_main+0x47a42d) (BuildId: 2e4fd67f1aeb93c491a04ae424331669c993ee9b)
+```
+
+Found by oss-fuzzer.
+See: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=50105
+See: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=50110
+See: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=50268
+---
+ src/lib/protocols/florensia.c | 3 ++-
+ src/lib/protocols/http.c      | 3 ++-
+ src/lib/protocols/softether.c | 2 +-
+ 3 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/lib/protocols/florensia.c b/src/lib/protocols/florensia.c
+index 95a6d99d5c6..8617f3741dd 100644
+--- a/src/lib/protocols/florensia.c
++++ b/src/lib/protocols/florensia.c
+@@ -90,7 +90,8 @@ void ndpi_search_florensia(struct ndpi_detection_module_struct *ndpi_struct, str
+ 	ndpi_florensia_add_connection(ndpi_struct, flow);
+ 	return;
+       }
+-      if (flow->packet_counter < 10 && get_l16(packet->payload, 0) == packet->payload_packet_len) {
++      if (flow->packet_counter < 10 && packet->payload_packet_len >=2 &&
++	  get_l16(packet->payload, 0) == packet->payload_packet_len) {
+ 	NDPI_LOG_DBG2(ndpi_struct, "maybe florensia\n");
+ 	return;
+       }
+diff --git a/src/lib/protocols/http.c b/src/lib/protocols/http.c
+index a562aa03eeb..6fe6cab33d5 100644
+--- a/src/lib/protocols/http.c
++++ b/src/lib/protocols/http.c
+@@ -855,7 +855,8 @@ static void check_content_type_and_change_protocol(struct ndpi_detection_module_
+       /* Matching on Content-Type.
+           OCSP:  application/ocsp-request, application/ocsp-response
+        */
+-      if(strncmp((const char *)packet->content_line.ptr, "application/ocsp-", 17) == 0) {
++      if(packet->content_line.len > 17 &&
++         strncmp((const char *)packet->content_line.ptr, "application/ocsp-", 17) == 0) {
+         NDPI_LOG_DBG2(ndpi_struct, "Found OCSP\n");
+         ndpi_set_detected_protocol(ndpi_struct, flow, NDPI_PROTOCOL_OCSP, NDPI_PROTOCOL_HTTP, NDPI_CONFIDENCE_DPI);
+       }
+diff --git a/src/lib/protocols/softether.c b/src/lib/protocols/softether.c
+index d5dce55f9f1..ea59a9a99c0 100644
+--- a/src/lib/protocols/softether.c
++++ b/src/lib/protocols/softether.c
+@@ -97,7 +97,7 @@ static size_t dissect_softether_type(enum softether_value_type t,
+ 
+       v->value.ptr.raw = payload + 4;
+       u_int32_t siz = ntohl(get_u_int32_t(payload, 0));
+-      if(siz == 0 || (u_int64_t)payload_len < (u_int64_t)siz + 3)
++      if(siz == 0 || (u_int64_t)payload_len < (u_int64_t)siz + sizeof(siz))
+ 	return 0;
+ 
+       if(t == VALUE_DATA)

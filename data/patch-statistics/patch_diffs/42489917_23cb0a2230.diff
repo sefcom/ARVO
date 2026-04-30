@@ -1,0 +1,64 @@
+From 345fcccb33795600b9c159908c606c5027a4ce19 Mon Sep 17 00:00:00 2001
+From: Zhengyang Liu <liuz@cs.utah.edu>
+Date: Thu, 26 Nov 2020 00:10:36 -0700
+Subject: [PATCH] Fix use-of-uninitialized-value in rG75f50e15bf8f
+
+Differential Revision: https://reviews.llvm.org/D71126
+---
+ llvm/lib/IR/Constants.cpp                        | 10 +++++++++-
+ llvm/lib/IR/LLVMContextImpl.cpp                  |  1 +
+ llvm/lib/Transforms/Utils/FunctionComparator.cpp |  1 +
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/IR/Constants.cpp b/llvm/lib/IR/Constants.cpp
+index f731021492bf3..764d32e39b05c 100644
+--- a/llvm/lib/IR/Constants.cpp
++++ b/llvm/lib/IR/Constants.cpp
+@@ -519,6 +519,9 @@ void llvm::deleteConstant(Constant *C) {
+   case Constant::UndefValueVal:
+     delete static_cast<UndefValue *>(C);
+     break;
++  case Constant::PoisonValueVal:
++    delete static_cast<PoisonValue *>(C);
++    break;
+   case Constant::ConstantExprVal:
+     if (isa<UnaryConstantExpr>(C))
+       delete static_cast<UnaryConstantExpr *>(C);
+@@ -1722,7 +1725,12 @@ UndefValue *UndefValue::get(Type *Ty) {
+ /// Remove the constant from the constant table.
+ void UndefValue::destroyConstantImpl() {
+   // Free the constant and any dangling references to it.
+-  getContext().pImpl->UVConstants.erase(getType());
++  if (getValueID() == UndefValueVal) {
++    getContext().pImpl->UVConstants.erase(getType());
++  } else if (getValueID() == PoisonValueVal) {
++    getContext().pImpl->PVConstants.erase(getType());
++  }
++  llvm_unreachable("Not a undef or a poison!");
+ }
+ 
+ PoisonValue *PoisonValue::get(Type *Ty) {
+diff --git a/llvm/lib/IR/LLVMContextImpl.cpp b/llvm/lib/IR/LLVMContextImpl.cpp
+index c4f0a0ac85491..875c61cda4230 100644
+--- a/llvm/lib/IR/LLVMContextImpl.cpp
++++ b/llvm/lib/IR/LLVMContextImpl.cpp
+@@ -97,6 +97,7 @@ LLVMContextImpl::~LLVMContextImpl() {
+   CAZConstants.clear();
+   CPNConstants.clear();
+   UVConstants.clear();
++  PVConstants.clear();
+   IntConstants.clear();
+   FPConstants.clear();
+   CDSConstants.clear();
+diff --git a/llvm/lib/Transforms/Utils/FunctionComparator.cpp b/llvm/lib/Transforms/Utils/FunctionComparator.cpp
+index f25c4e5d6e99b..2696557a719fa 100644
+--- a/llvm/lib/Transforms/Utils/FunctionComparator.cpp
++++ b/llvm/lib/Transforms/Utils/FunctionComparator.cpp
+@@ -291,6 +291,7 @@ int FunctionComparator::cmpConstants(const Constant *L,
+ 
+   switch (L->getValueID()) {
+   case Value::UndefValueVal:
++  case Value::PoisonValueVal:
+   case Value::ConstantTokenNoneVal:
+     return TypesRes;
+   case Value::ConstantIntVal: {

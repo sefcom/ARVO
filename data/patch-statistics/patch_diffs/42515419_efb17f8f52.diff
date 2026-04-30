@@ -1,0 +1,169 @@
+From 760a6c54f96e708c4b6c5812b562b35cefe62eef Mon Sep 17 00:00:00 2001
+From: Kevin Backhouse <kevinbackhouse@github.com>
+Date: Sun, 4 Sep 2022 20:17:09 +0100
+Subject: [PATCH 1/3] Regression test for
+ https://github.com/Exiv2/exiv2/issues/2345
+
+---
+ test/data/issue_2345_poc.mp4                       | Bin 0 -> 80 bytes
+ tests/bugfixes/github/test_issue_2345.py           |  13 +++++++++++++
+ tests/regression_tests/test_regression_allfiles.py |   1 +
+ 3 files changed, 14 insertions(+)
+ create mode 100644 test/data/issue_2345_poc.mp4
+ create mode 100644 tests/bugfixes/github/test_issue_2345.py
+
+diff --git a/test/data/issue_2345_poc.mp4 b/test/data/issue_2345_poc.mp4
+new file mode 100644
+index 0000000000000000000000000000000000000000..d79efcf6acd7c736b4676b517284c6e9bff707bf
+GIT binary patch
+literal 80
+ecmZQzVBk$FsVpc?DN|5jU|>)vEy_`#0000p;0#d!
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/bugfixes/github/test_issue_2345.py b/tests/bugfixes/github/test_issue_2345.py
+new file mode 100644
+index 0000000000..6bb7713f65
+--- /dev/null
++++ b/tests/bugfixes/github/test_issue_2345.py
+@@ -0,0 +1,13 @@
++# -*- coding: utf-8 -*-
++
++from system_tests import CaseMeta, check_no_ASAN_UBSAN_errors
++
++class issue_2345_QuickTimeVideo_tagDecoder_buffer_overflow(metaclass=CaseMeta):
++    url      = "https://github.com/Exiv2/exiv2/issues/2345"
++    filename = "$data_path/issue_2345_poc.mp4"
++    commands = ["$exiv2 -q -pa $filename"]
++    retval   = [1]
++    stderr   = ["""$exiv2_exception_message $filename:
++$kerCorruptedMetadata
++"""]
++    compare_stdout = check_no_ASAN_UBSAN_errors
+diff --git a/tests/regression_tests/test_regression_allfiles.py b/tests/regression_tests/test_regression_allfiles.py
+index f0736bd820..8ac9288efa 100644
+--- a/tests/regression_tests/test_regression_allfiles.py
++++ b/tests/regression_tests/test_regression_allfiles.py
+@@ -59,6 +59,7 @@ def get_valid_files(data_dir):
+         # non-zero return code files, most of them are security POC so we don't
+         # really need to worry about them here
+         "issue_2340_poc.mp4",
++        "issue_2345_poc.mp4",
+         "2018-01-09-exiv2-crash-001.tiff",
+         "cve_2017_1000126_stack-oob-read.webp",
+         "exiv2-bug1247.jpg",
+
+From d3651fdbd352cbaf259f89abf7557da343339378 Mon Sep 17 00:00:00 2001
+From: Kevin Backhouse <kevinbackhouse@github.com>
+Date: Mon, 5 Sep 2022 17:33:43 +0100
+Subject: [PATCH 2/3] Credit to OSS-Fuzz:
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=50901 Resize buf to
+ avoid buffer overflow.
+
+---
+ src/quicktimevideo.cpp | 30 +++++++++++++++++++++---------
+ 1 file changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/src/quicktimevideo.cpp b/src/quicktimevideo.cpp
+index 5362ea1f4d..31cb25e0ee 100644
+--- a/src/quicktimevideo.cpp
++++ b/src/quicktimevideo.cpp
+@@ -568,10 +568,16 @@ void QuickTimeVideo::decodeBlock(std::string const& entered_from) {
+   enforce(size - hdrsize <= std::numeric_limits<size_t>::max(), Exiv2::ErrorCode::kerCorruptedMetadata);
+ 
+   // std::cerr<<"Tag=>"<<buf.data()<<"     size=>"<<size-hdrsize << std::endl;
+-  tagDecoder(buf, static_cast<size_t>(size - hdrsize));
++  const size_t newsize = static_cast<size_t>(size - hdrsize);
++  if (newsize > buf.size()) {
++    buf.resize(newsize);
++  }
++  tagDecoder(buf, newsize);
+ }  // QuickTimeVideo::decodeBlock
+ 
+ void QuickTimeVideo::tagDecoder(Exiv2::DataBuf& buf, size_t size) {
++  assert(buf.size() > 4);
++
+   if (ignoreList(buf))
+     discard(size);
+ 
+@@ -620,24 +626,30 @@ void QuickTimeVideo::tagDecoder(Exiv2::DataBuf& buf, size_t size) {
+     keysTagDecoder(size);
+ 
+   else if (equalsQTimeTag(buf, "url ")) {
+-    io_->readOrThrow(buf.data(), size);
++    Exiv2::DataBuf url(size+1);
++    io_->readOrThrow(url.data(), size);
++    url.write_uint8(size, 0);
+     if (currentStream_ == Video)
+-      xmpData_["Xmp.video.URL"] = Exiv2::toString(buf.data());
++      xmpData_["Xmp.video.URL"] = Exiv2::toString(url.data());
+     else if (currentStream_ == Audio)
+-      xmpData_["Xmp.audio.URL"] = Exiv2::toString(buf.data());
++      xmpData_["Xmp.audio.URL"] = Exiv2::toString(url.data());
+   }
+ 
+   else if (equalsQTimeTag(buf, "urn ")) {
+-    io_->readOrThrow(buf.data(), size);
++    Exiv2::DataBuf urn(size+1);
++    io_->readOrThrow(urn.data(), size);
++    urn.write_uint8(size, 0);
+     if (currentStream_ == Video)
+-      xmpData_["Xmp.video.URN"] = Exiv2::toString(buf.data());
++      xmpData_["Xmp.video.URN"] = Exiv2::toString(urn.data());
+     else if (currentStream_ == Audio)
+-      xmpData_["Xmp.audio.URN"] = Exiv2::toString(buf.data());
++      xmpData_["Xmp.audio.URN"] = Exiv2::toString(urn.data());
+   }
+ 
+   else if (equalsQTimeTag(buf, "dcom")) {
+-    io_->readOrThrow(buf.data(), size);
+-    xmpData_["Xmp.video.Compressor"] = Exiv2::toString(buf.data());
++    Exiv2::DataBuf dcom(size+1);
++    io_->readOrThrow(dcom.data(), size);
++    dcom.write_uint8(size, 0);
++    xmpData_["Xmp.video.Compressor"] = Exiv2::toString(dcom.data());
+   }
+ 
+   else if (equalsQTimeTag(buf, "smhd")) {
+
+From 344764a7de898e28b41fbcbac358566013ec63ad Mon Sep 17 00:00:00 2001
+From: Kevin Backhouse <kevinbackhouse@github.com>
+Date: Mon, 5 Sep 2022 17:53:46 +0100
+Subject: [PATCH 3/3] Fix clang-format error.
+
+---
+ src/quicktimevideo.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/quicktimevideo.cpp b/src/quicktimevideo.cpp
+index 31cb25e0ee..2d8b9c0ef5 100644
+--- a/src/quicktimevideo.cpp
++++ b/src/quicktimevideo.cpp
+@@ -626,7 +626,7 @@ void QuickTimeVideo::tagDecoder(Exiv2::DataBuf& buf, size_t size) {
+     keysTagDecoder(size);
+ 
+   else if (equalsQTimeTag(buf, "url ")) {
+-    Exiv2::DataBuf url(size+1);
++    Exiv2::DataBuf url(size + 1);
+     io_->readOrThrow(url.data(), size);
+     url.write_uint8(size, 0);
+     if (currentStream_ == Video)
+@@ -636,7 +636,7 @@ void QuickTimeVideo::tagDecoder(Exiv2::DataBuf& buf, size_t size) {
+   }
+ 
+   else if (equalsQTimeTag(buf, "urn ")) {
+-    Exiv2::DataBuf urn(size+1);
++    Exiv2::DataBuf urn(size + 1);
+     io_->readOrThrow(urn.data(), size);
+     urn.write_uint8(size, 0);
+     if (currentStream_ == Video)
+@@ -646,7 +646,7 @@ void QuickTimeVideo::tagDecoder(Exiv2::DataBuf& buf, size_t size) {
+   }
+ 
+   else if (equalsQTimeTag(buf, "dcom")) {
+-    Exiv2::DataBuf dcom(size+1);
++    Exiv2::DataBuf dcom(size + 1);
+     io_->readOrThrow(dcom.data(), size);
+     dcom.write_uint8(size, 0);
+     xmpData_["Xmp.video.Compressor"] = Exiv2::toString(dcom.data());

@@ -1,0 +1,126 @@
+From 3d05b96181b259593047f592df4df33a3658e472 Mon Sep 17 00:00:00 2001
+From: Garret Rieger <grieger@google.com>
+Date: Mon, 13 Mar 2023 21:34:26 +0000
+Subject: [PATCH] [subset] track which glyphs have allocated memory so we can
+ clean up correctly.
+
+Fixes https://oss-fuzz.com/testcase-detail/5388270411579392
+---
+ src/OT/glyf/CompositeGlyph.hh                    |   5 ++++-
+ src/OT/glyf/SubsetGlyph.hh                       |  13 ++++++++++---
+ src/OT/glyf/glyf.hh                              |   6 ++----
+ ...e-minimized-hb-subset-fuzzer-5388270411579392 | Bin 0 -> 4844 bytes
+ 4 files changed, 16 insertions(+), 8 deletions(-)
+ create mode 100644 test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5388270411579392
+
+diff --git a/src/OT/glyf/CompositeGlyph.hh b/src/OT/glyf/CompositeGlyph.hh
+index edf8cd8797d..ad9ce82fb79 100644
+--- a/src/OT/glyf/CompositeGlyph.hh
++++ b/src/OT/glyf/CompositeGlyph.hh
+@@ -330,7 +330,10 @@ struct CompositeGlyph
+     for (const auto &component : it)
+     {
+       /* last 4 points in deltas are phantom points and should not be included */
+-      if (i >= deltas.length - 4) return false;
++      if (i >= deltas.length - 4) {
++        free (o);
++        return false;
++      }
+ 
+       unsigned comp_len = component.get_size ();
+       if (component.is_anchored ())
+diff --git a/src/OT/glyf/SubsetGlyph.hh b/src/OT/glyf/SubsetGlyph.hh
+index 795925bba52..a38a57a7cef 100644
+--- a/src/OT/glyf/SubsetGlyph.hh
++++ b/src/OT/glyf/SubsetGlyph.hh
+@@ -18,6 +18,7 @@ struct SubsetGlyph
+   Glyph source_glyph;
+   hb_bytes_t dest_start;  /* region of source_glyph to copy first */
+   hb_bytes_t dest_end;    /* region of source_glyph to copy second */
++  bool allocated;
+ 
+   bool serialize (hb_serialize_context_t *c,
+ 		  bool use_short_loca,
+@@ -60,12 +61,18 @@ struct SubsetGlyph
+   bool compile_bytes_with_deltas (const hb_subset_plan_t *plan,
+                                   hb_font_t *font,
+                                   const glyf_accelerator_t &glyf)
+-  { return source_glyph.compile_bytes_with_deltas (plan, font, glyf, dest_start, dest_end); }
++  {
++    allocated = source_glyph.compile_bytes_with_deltas (plan, font, glyf, dest_start, dest_end);
++    return allocated;
++  }
+ 
+   void free_compiled_bytes ()
+   {
+-    dest_start.fini ();
+-    dest_end.fini ();
++    if (likely (allocated)) {
++      allocated = false;
++      dest_start.fini ();
++      dest_end.fini ();
++    }
+   }
+ 
+   void drop_hints_bytes ()
+diff --git a/src/OT/glyf/glyf.hh b/src/OT/glyf/glyf.hh
+index bc5608d4fc4..6e9f420bd65 100644
+--- a/src/OT/glyf/glyf.hh
++++ b/src/OT/glyf/glyf.hh
+@@ -424,7 +424,6 @@ glyf::_populate_subset_glyphs (const hb_subset_plan_t   *plan,
+   unsigned num_glyphs = plan->num_output_glyphs ();
+   if (!glyphs.resize (num_glyphs)) return false;
+ 
+-  unsigned idx = 0;
+   for (auto p : plan->glyph_map->iter ())
+   {
+     unsigned new_gid = p.second;
+@@ -452,11 +451,10 @@ glyf::_populate_subset_glyphs (const hb_subset_plan_t   *plan,
+       if (unlikely (!subset_glyph.compile_bytes_with_deltas (plan, font, glyf)))
+       {
+         // when pinned at default, only bounds are updated, thus no need to free
+-        if (!plan->pinned_at_default && idx > 0)
+-          _free_compiled_subset_glyphs (glyphs, idx - 1);
++        if (!plan->pinned_at_default)
++          _free_compiled_subset_glyphs (glyphs, new_gid);
+         return false;
+       }
+-      idx++;
+     }
+   }
+   return true;
+diff --git a/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5388270411579392 b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5388270411579392
+new file mode 100644
+index 0000000000000000000000000000000000000000..d39baddcc173191550b0695c6ffd3e54718e9ecc
+GIT binary patch
+literal 4844
+zcmeHKZETZO6n@^f@7s>GY_-gVua0e5W}TbNM&=}Z?4x5-n{9DJ4d__YF`BW`GOG^w
+zL5+!m@WTLMKi~(!KXVd7NK6(3k%SlnCdT*?qKP_zfC?eT1qbW4>vL~6JA`Cp!Gt9{
+z&HXs{+;iS@&OPVcTWA1W><r{qH~3$~3e5{xD!AHS-BsCG@2}quA;eDcc0%}S)*zcZ
+zp%s&!Q`^|k)N{6HADNxRGub5kLHc(bJq=Auy>Gqq?(cv;K)ki7xw5(E<K3r8-%Gq8
+z7!E|?z(LYI#LL^?40IhnyXPFg-%EV!rp|5cAKL3(K*oHEe}5C{%j#bF46wZlSWksE
+z2HNIbyUeXRag>F);J9FRQ2q(x1)*@PyS2j-C;b5N=Q|_8K=D$~8>ElW$f9tdJBq{l
+zT;hJxbGHP-8}l5i&HyI)wZ3TN^_b|#Q=E57I+U+Cn*f6=8Z6N05^uTpnet`Ndb1$t
+zi5o~GMMn;-+}y?{_ga#S;uEZ&5TV9L$1y1_ja)!haz%`u{;0;U@w-iRzLzzAi9gtS
+zM^6HF>+Sf+5&JQ@atA!3R?<<(pYB`ZZ-%Qg5Zi(bwTr3(;_Sa1N43p*hTfs~>4TPX
+z%Sp?ivDP?lt~L)@t=6s9E4Cur4%_GQc$Hq#f-GsV8W}Sj4P_fpEd;Sj2Fsaoos?#a
+zJyl0G{Iwx-#Z6djUvmd8oQjXA@%qT_+wsvo_G31Q+te30F{60e{04KdU+xma3XdYf
+zaUWYm(#)0cb4<2=an9_A$yTJsy<!+;xW&d$G6u8{V8Sr73>g&%lcRnLUcFz+H)WTE
+zNuKORT~%`~Do}}P>2Gb!)~na&BB_(H%j_mgt~yca(R#KFIAv~7pvF_zX^%w=(I<0=
+zrxUkxw}bS##50IzerX{GAkWK1eBO9`$Vibs)fo$h;*nCNZceW0^uGZ|)k`%pX72*I
+z;X1~|h!_)NW0_?0T%`;T%vxq|SDgyAC$|13bDCSzON%BMosy;_pNMQfiR<itVSj!K
+zNO4a!lXl$&p2w){llWEnNW*?6x9%*Bik-oYTVjjL?y2U2l$2?)uOq({tXZ@)Ag#7(
+zZPjx34jIM^v0PEo>4ZXJ+vzNM#QExIIn~p7JlR~$XPYVRlHq4#gX2?KNwjz}lhawJ
+zilJ?mRU%E+9&Lcpp&SzohNE1Ao`E=8VOHqO32mMtI=O=fsjiIyh8XC?y6-Eh8!P=k
+z`@E}(d$0y2zS^2>Y^z`<Yr9zYvZa@Ou^(85Z=Y!Y^JWgOiPFaWOqO{~CRJ-?Oo<hb
+zXLXl^@*=TGO7n9jtOnw$PU<bp8xMSpZ-I5_;xSmV(wJ|HF6FQK_QsHY?Tew-CH7MH
+z3+^R$ue&c{EV3_3L=v`yJCXNXwcCEY?P#E7VOe2EVsT535caCbYb~8Qp|T<%gitsz
+zT5D}`p`+xY5Epw~``^3OAkO2mHtbX|KRKu#82<6fe?g|$)vt0fNUQY2f%V=IxBb?>
+zAu+gw3(V$%mAs*f)%?zGJkjo4Okocyd1%(99@hcegjvdns{|@8VS37s>v>;>a_>w@
+zof)6|v$akYtr=76QU!YIYAn+TygCU6sx<jRu=3K9BIM=77e1olU{KQYg|#ahYA4+(
+zpQbGBDQM$VRedgNC~)YC|KX^)DJ_$;1$;UUOJ(_h`g^?cDr{O00mV6EN|Dl5cGI$T
+xwh*Wwe+UY}>`UjKFP#VVzL`xE`E<VDzfzN)*{Q1s{O3C5e}n(~>HDDK;U9`<+Y<l)
+
+literal 0
+HcmV?d00001
+

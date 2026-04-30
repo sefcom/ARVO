@@ -1,0 +1,112 @@
+From 570b0ed6d5368f4653bf019c60fa277ed7e983bf Mon Sep 17 00:00:00 2001
+From: Claudiu Zissulescu <claziss@gmail.com>
+Date: Tue, 14 Jul 2020 14:51:15 +0300
+Subject: [PATCH] arc: Detect usage of illegal double register pairs
+
+ARC can use odd-even double register pairs in some selected
+instructions. Although the GNU assembler doesn't allow even-odd
+registers to be used, there may be cases when the disassembler is
+presented with such situation.  This patch add a test and detects such
+cases.
+
+opcodes/
+2020-07-14  Claudiu Zissulescu  <claziss@gmail.com>
+
+	* arc-dis.c (print_insn_arc): Detect and emit a warning when a
+	faulty double register pair is detected.
+
+binutils/
+2020-07-14  Claudiu Zissulescu  <claziss@gmail.com>
+
+	* testsuite/binutils-all/arc/double_regs.s: New test.
+	* testsuite/binutils-all/arc/objdump.exp: Add the above test.
+
+Signed-off-by: Claudiu Zissulescu <claziss@gmail.com>
+---
+ binutils/ChangeLog                                |  5 +++++
+ binutils/testsuite/binutils-all/arc/double_regs.s |  3 +++
+ binutils/testsuite/binutils-all/arc/objdump.exp   |  3 +++
+ opcodes/ChangeLog                                 |  5 +++++
+ opcodes/arc-dis.c                                 | 14 +++++++++++---
+ 5 files changed, 27 insertions(+), 3 deletions(-)
+ create mode 100644 binutils/testsuite/binutils-all/arc/double_regs.s
+
+diff --git a/binutils/ChangeLog b/binutils/ChangeLog
+index 7219f85b49b..708be22cfd7 100644
+--- a/binutils/ChangeLog
++++ b/binutils/ChangeLog
+@@ -1,3 +1,8 @@
++2020-07-14  Claudiu Zissulescu  <claziss@gmail.com>
++
++	* testsuite/binutils-all/arc/double_regs.s: New test.
++	* testsuite/binutils-all/arc/objdump.exp: Add the above test.
++
+ 2020-07-13  Nick Clifton  <nickc@redhat.com>
+ 
+ 	* po/fr.po: Updated French translation.
+diff --git a/binutils/testsuite/binutils-all/arc/double_regs.s b/binutils/testsuite/binutils-all/arc/double_regs.s
+new file mode 100644
+index 00000000000..5d3aa86ec68
+--- /dev/null
++++ b/binutils/testsuite/binutils-all/arc/double_regs.s
+@@ -0,0 +1,3 @@
++	.cpu HS
++	.text
++	.byte 0x9e,0x2f,0x20,0x75
+diff --git a/binutils/testsuite/binutils-all/arc/objdump.exp b/binutils/testsuite/binutils-all/arc/objdump.exp
+index 18f0bb74a18..542a3367697 100644
+--- a/binutils/testsuite/binutils-all/arc/objdump.exp
++++ b/binutils/testsuite/binutils-all/arc/objdump.exp
+@@ -72,6 +72,9 @@ proc check_assembly { testname objfile expected { disas_flags "" } } {
+ # disassembler has had to guess as the instruction class in use).
+ set want "Warning: disassembly.*vmac2hnfr\[ \t\]*r0,r2,r4.*dmulh12.f\[ \t\]*r0,r2,r4.*dmulh11.f"
+ check_assembly "Warning test" [do_objfile dsp.s] $want
++set warn_double_reg "Warning: illegal use of double register pair."
++check_assembly "Warning faulty double regs" [do_objfile double_regs.s] \
++    $warn_double_reg
+ 
+ set double_store_hs_expected {std\s*r0r1,\[r3\]}
+ set objfile [do_objfile double_store.s]
+diff --git a/opcodes/ChangeLog b/opcodes/ChangeLog
+index 3a38bb2853f..f57188494e2 100644
+--- a/opcodes/ChangeLog
++++ b/opcodes/ChangeLog
+@@ -1,3 +1,8 @@
++2020-07-14  Claudiu Zissulescu  <claziss@gmail.com>
++
++	* arc-dis.c (print_insn_arc): Detect and emit a warning when a
++	faulty double register pair is detected.
++
+ 2020-07-14  Jan Beulich  <jbeulich@suse.com>
+ 
+ 	* i386-dis.c (OP_D): Print dr<N> instead of db<N> in Intel mode.
+diff --git a/opcodes/arc-dis.c b/opcodes/arc-dis.c
+index bf3194071c9..27852e8f03b 100644
+--- a/opcodes/arc-dis.c
++++ b/opcodes/arc-dis.c
+@@ -1269,11 +1269,19 @@ print_insn_arc (bfd_vma memaddr,
+ 	  if (!rname)
+ 	    rname = regnames[value];
+ 	  (*info->fprintf_func) (info->stream, "%s", rname);
++
++	  /* Check if we have a double register to print.  */
+ 	  if (operand->flags & ARC_OPERAND_TRUNCATE)
+ 	    {
+-	      rname = arcExtMap_coreRegName (value + 1);
+-	      if (!rname)
+-		rname = regnames[value + 1];
++	      if ((value & 0x01) == 0)
++		{
++		  rname = arcExtMap_coreRegName (value + 1);
++		  if (!rname)
++		    rname = regnames[value + 1];
++		}
++	      else
++		rname = _("\nWarning: illegal use of double register "
++			  "pair.\n");
+ 	      (*info->fprintf_func) (info->stream, "%s", rname);
+ 	    }
+ 	  if (value == 63)
+-- 
+GitLab
+

@@ -1,0 +1,53 @@
+From 034a5c02488cf7f0048e130177fc71c9e626e135 Mon Sep 17 00:00:00 2001
+From: Stefan Berger <stefanb@linux.vnet.ibm.com>
+Date: Fri, 23 Jul 2021 13:29:00 -0400
+Subject: [PATCH] tpm2: NVMarshal: Handle index orderly RAM without 0-sized
+ terminating node
+
+The NVRAM entries in s_indexOrderlyRam array do not need to contain a
+0-sized terminating node. Instead, the entries may fill up this 512
+byte array so that no NV_RAM_HEADER structure fits anymore. The fact
+that no more NV_RAM_HEADER structure fits is also an indicator for the
+last entry. We need to account for this in the code marshalling and
+unmarshalling the entries so that we stop marshalling the entries
+then and similarly stop unmarshalling.
+
+Signed-off-by: Stefan Berger <stefanb@linux.ibm.com>
+---
+ src/tpm2/NVMarshal.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/tpm2/NVMarshal.c b/src/tpm2/NVMarshal.c
+index 8e0ec0b4d..e3db9d644 100644
+--- a/src/tpm2/NVMarshal.c
++++ b/src/tpm2/NVMarshal.c
+@@ -4269,6 +4269,12 @@ INDEX_ORDERLY_RAM_Marshal(void *array, size_t array_size,
+                                      datasize, buffer, size);
+         }
+         offset += nrh.size;
++        if (offset + sizeof(NV_RAM_HEADER) > array_size) {
++            /* nothing will fit anymore and there won't be a 0-sized
++             * terminating node (@1).
++             */
++            break;
++        }
+     }
+ 
+     written += BLOCK_SKIP_WRITE_PUSH(TRUE, buffer, size);
+@@ -4311,6 +4317,16 @@ INDEX_ORDERLY_RAM_Unmarshal(void *array, size_t array_size,
+          */
+         nrhp = array + offset;
+ 
++        if (offset + sizeof(NV_RAM_HEADER) > sourceside_size) {
++            /* this case can occur with the previous entry filling up the
++             * space; in this case there will not be a 0-sized terminating
++             * node (see @1 above). We clear the rest of our space.
++             */
++            if (array_size > offset)
++                memset(nrhp, 0, array_size - offset);
++            break;
++        }
++
+         /* write the NVRAM header;
+            nrh->size holds the complete size including data;
+            nrh->size = 0 indicates the end */

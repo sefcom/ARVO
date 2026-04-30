@@ -1,0 +1,88 @@
+From 509cc68bf575fd34f03b7066138901c4b97b8979 Mon Sep 17 00:00:00 2001
+From: Mike Pall <mike>
+Date: Mon, 28 Aug 2023 21:00:37 +0200
+Subject: [PATCH] Fix predict_next() in parser (again).
+
+Reported by Sergey Bronnikov.
+
+(cherry picked from commit 309fb42b871b6414f53e0e0e708bce0b0d62daff)
+
+The following Lua snippet triggers out-of-boundary access to a stack:
+
+```
+a, b, c = 1, 2, 3
+local d
+for _ in nil do end
+```
+
+During the execution of this snippet with LuaJIT instrumented by ASAN,
+it leads to a heap-based buffer overflow.
+
+In function `predict_next()` variable `exprpc` looks forward and expects
+extra bytecodes on the stack. However, `KPRI` is merged to `KNIL` and
+there is no new bytecode to add, so `exprpc == fs->bclim`, and it leads
+to out-of-boundary access. Issue has been fixed by an early return when
+`pc >= fs->bclim`.
+
+Sergey Bronnikov:
+* added the description and the test for the problem
+
+Part of tarantool/tarantool#8825
+
+Reviewed-by: Sergey Kaplun <skaplun@tarantool.org>
+Reviewed-by: Maxim Kokryashkin <m.kokryashkin@tarantool.org>
+Signed-off-by: Igor Munkin <imun@tarantool.org>
+---
+ src/lj_parse.c                                |  4 ++-
+ ...ncorrect-pc-value-in-predict-next.test.lua | 25 +++++++++++++++++++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+ create mode 100644 test/tarantool-tests/lj-1054-fix-incorrect-pc-value-in-predict-next.test.lua
+
+diff --git a/src/lj_parse.c b/src/lj_parse.c
+index 420b95cb4d..5a4ab7c834 100644
+--- a/src/lj_parse.c
++++ b/src/lj_parse.c
+@@ -2527,9 +2527,11 @@ static void parse_for_num(LexState *ls, GCstr *varname, BCLine line)
+ */
+ static int predict_next(LexState *ls, FuncState *fs, BCPos pc)
+ {
+-  BCIns ins = fs->bcbase[pc].ins;
++  BCIns ins;
+   GCstr *name;
+   cTValue *o;
++  if (pc >= fs->bclim) return 0;
++  ins = fs->bcbase[pc].ins;
+   switch (bc_op(ins)) {
+   case BC_MOV:
+     if (bc_d(ins) >= fs->nactvar) return 0;
+diff --git a/test/tarantool-tests/lj-1054-fix-incorrect-pc-value-in-predict-next.test.lua b/test/tarantool-tests/lj-1054-fix-incorrect-pc-value-in-predict-next.test.lua
+new file mode 100644
+index 0000000000..23c3ae756c
+--- /dev/null
++++ b/test/tarantool-tests/lj-1054-fix-incorrect-pc-value-in-predict-next.test.lua
+@@ -0,0 +1,25 @@
++local tap = require('tap')
++local test = tap.test('lj-1054-fix-incorrect-pc-value-in-predict_next')
++test:plan(3)
++
++-- The test demonstrates a problem with out-of-boundary
++-- access to a stack. The problem can be easily observed
++-- on execution of the sample by LuaJIT instrumented by ASAN,
++-- where the sanitizer reports a heap-based buffer overflow.
++-- See also https://github.com/LuaJIT/LuaJIT/issues/1054.
++
++local res_f = loadstring([[
++a, b, c = 1, 2, 3
++local d
++for _ in nil do end
++]])
++
++test:ok(res_f, 'chunk loaded successfully')
++
++local res, err = pcall(res_f)
++
++-- Check consistency with PUC Rio Lua 5.1 behaviour.
++test:ok(not res, 'loaded function is failed (expected)')
++test:like(err, 'attempt to call a nil value', 'correct error message')
++
++test:done(true)

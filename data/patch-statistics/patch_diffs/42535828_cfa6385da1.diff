@@ -1,0 +1,93 @@
+From 0ae8579b85f9b0cd3f287082ad6e194bdb025d88 Mon Sep 17 00:00:00 2001
+From: Carl Meyer <carl@oddbird.net>
+Date: Sun, 9 Jun 2024 22:23:30 -0400
+Subject: [PATCH] gh-119666: fix multiple class-scope comprehensions
+ referencing __class__ (#120295)
+
+---
+ Lib/test/test_listcomps.py                    | 25 +++++++++++++++++++
+ ...-06-09-19-13-38.gh-issue-119666.S0G4rZ.rst |  1 +
+ Python/symtable.c                             | 23 ++++++++---------
+ 3 files changed, 36 insertions(+), 13 deletions(-)
+ create mode 100644 Misc/NEWS.d/next/Core and Builtins/2024-06-09-19-13-38.gh-issue-119666.S0G4rZ.rst
+
+diff --git a/Lib/test/test_listcomps.py b/Lib/test/test_listcomps.py
+index ec2aac81682db8..58b076e9ea5d8a 100644
+--- a/Lib/test/test_listcomps.py
++++ b/Lib/test/test_listcomps.py
+@@ -168,6 +168,31 @@ def test_references___class__(self):
+         """
+         self._check_in_scopes(code, raises=NameError)
+ 
++    def test_references___class___defined(self):
++        code = """
++            __class__ = 2
++            res = [__class__ for x in [1]]
++        """
++        self._check_in_scopes(
++                code, outputs={"res": [2]}, scopes=["module", "function"])
++        self._check_in_scopes(code, raises=NameError, scopes=["class"])
++
++    def test_references___class___enclosing(self):
++        code = """
++            __class__ = 2
++            class C:
++                res = [__class__ for x in [1]]
++            res = C.res
++        """
++        self._check_in_scopes(code, raises=NameError)
++
++    def test_super_and_class_cell_in_sibling_comps(self):
++        code = """
++            [super for _ in [1]]
++            [__class__ for _ in [1]]
++        """
++        self._check_in_scopes(code, raises=NameError)
++
+     def test_inner_cell_shadows_outer(self):
+         code = """
+             items = [(lambda: i) for i in range(5)]
+diff --git a/Misc/NEWS.d/next/Core and Builtins/2024-06-09-19-13-38.gh-issue-119666.S0G4rZ.rst b/Misc/NEWS.d/next/Core and Builtins/2024-06-09-19-13-38.gh-issue-119666.S0G4rZ.rst
+new file mode 100644
+index 00000000000000..09c1f553c48702
+--- /dev/null
++++ b/Misc/NEWS.d/next/Core and Builtins/2024-06-09-19-13-38.gh-issue-119666.S0G4rZ.rst	
+@@ -0,0 +1 @@
++Fix a compiler crash in the case where two comprehensions in class scope both reference ``__class__``.
+diff --git a/Python/symtable.c b/Python/symtable.c
+index 0ee8ca36cf8df0..7e452cdb13badf 100644
+--- a/Python/symtable.c
++++ b/Python/symtable.c
+@@ -781,22 +781,19 @@ inline_comprehension(PySTEntryObject *ste, PySTEntryObject *comp,
+         if (existing == NULL && PyErr_Occurred()) {
+             return 0;
+         }
++        // __class__ is never allowed to be free through a class scope (see
++        // drop_class_free)
++        if (scope == FREE && ste->ste_type == ClassBlock &&
++                _PyUnicode_EqualToASCIIString(k, "__class__")) {
++            scope = GLOBAL_IMPLICIT;
++            if (PySet_Discard(comp_free, k) < 0) {
++                return 0;
++            }
++            remove_dunder_class = 1;
++        }
+         if (!existing) {
+             // name does not exist in scope, copy from comprehension
+             assert(scope != FREE || PySet_Contains(comp_free, k) == 1);
+-            if (scope == FREE && ste->ste_type == ClassBlock &&
+-                _PyUnicode_EqualToASCIIString(k, "__class__")) {
+-                // if __class__ is unbound in the enclosing class scope and free
+-                // in the comprehension scope, it needs special handling; just
+-                // letting it be marked as free in class scope will break due to
+-                // drop_class_free
+-                scope = GLOBAL_IMPLICIT;
+-                only_flags &= ~DEF_FREE;
+-                if (PySet_Discard(comp_free, k) < 0) {
+-                    return 0;
+-                }
+-                remove_dunder_class = 1;
+-            }
+             PyObject *v_flags = PyLong_FromLong(only_flags);
+             if (v_flags == NULL) {
+                 return 0;

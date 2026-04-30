@@ -1,0 +1,124 @@
+diff --git a/decoder/ih264d_bitstrm.h b/decoder/ih264d_bitstrm.h
+index 49cd5e7..8bb06fb 100644
+--- a/decoder/ih264d_bitstrm.h
++++ b/decoder/ih264d_bitstrm.h
+@@ -57,7 +57,7 @@
+ {
+     UWORD32 u4_ofst; /* Offset in the buffer for the current bit */
+     UWORD32 *pu4_buffer; /* Bitstream Buffer  */
+-    UWORD32 u4_max_ofst; /* Position of the last bit read in the current buffer */
++    UWORD32 u4_max_ofst; /* points to first bit beyond the buffer */
+     void * pv_codec_handle; /* For Error Handling */
+ } dec_bit_stream_t;
+ 
+@@ -88,10 +88,13 @@
+  **************************************************************************
+  */
+ 
+-#define MORE_RBSP_DATA(ps_bitstrm) \
+-  (ps_bitstrm->u4_ofst < ps_bitstrm->u4_max_ofst)
++
+ #define EXCEED_OFFSET(ps_bitstrm) \
+   (ps_bitstrm->u4_ofst > ps_bitstrm->u4_max_ofst)
++#define CHECK_BITS_SUFFICIENT(ps_bitstrm, bits_to_read) \
++  (ps_bitstrm->u4_ofst + bits_to_read <= ps_bitstrm->u4_max_ofst)
++#define MORE_RBSP_DATA(ps_bitstrm) \
++    CHECK_BITS_SUFFICIENT(ps_bitstrm, 1)
+ 
+ void GoToByteBoundary(dec_bit_stream_t * ps_bitstrm);
+ UWORD8 ih264d_check_byte_aligned(dec_bit_stream_t * ps_bitstrm);
+diff --git a/decoder/ih264d_cabac.c b/decoder/ih264d_cabac.c
+index 38028ae..ef1fafc 100644
+--- a/decoder/ih264d_cabac.c
++++ b/decoder/ih264d_cabac.c
+@@ -69,7 +69,7 @@
+              32);
+     FLUSHBITS(ps_bitstrm->u4_ofst, 9)
+ 
+-    if(ps_bitstrm->u4_ofst > ps_bitstrm->u4_max_ofst)
++    if(EXCEED_OFFSET(ps_bitstrm))
+         return ERROR_EOB_FLUSHBITS_T;
+ 
+     ps_cab_env->u4_code_int_val_ofst = u4_code_int_val_ofst;
+diff --git a/decoder/ih264d_parse_headers.c b/decoder/ih264d_parse_headers.c
+index f286e29..9220707 100644
+--- a/decoder/ih264d_parse_headers.c
++++ b/decoder/ih264d_parse_headers.c
+@@ -463,7 +463,7 @@
+ 
+     /* In case bitstream read has exceeded the filled size, then
+        return an error */
+-    if(ps_bitstrm->u4_ofst > ps_bitstrm->u4_max_ofst + 8)
++    if(EXCEED_OFFSET(ps_bitstrm))
+     {
+         return ERROR_INV_SPS_PPS_T;
+     }
+@@ -1093,7 +1093,7 @@
+ 
+     /* In case bitstream read has exceeded the filled size, then
+      return an error */
+-    if (ps_bitstrm->u4_ofst > ps_bitstrm->u4_max_ofst)
++    if (EXCEED_OFFSET(ps_bitstrm))
+     {
+         return ERROR_INV_SPS_PPS_T;
+     }
+diff --git a/decoder/ih264d_sei.c b/decoder/ih264d_sei.c
+index 4375671..ac4d056 100644
+--- a/decoder/ih264d_sei.c
++++ b/decoder/ih264d_sei.c
+@@ -759,8 +759,12 @@
+     {
+         ui4_payload_type = 0;
+ 
++        if(!CHECK_BITS_SUFFICIENT(ps_bitstrm, 8))
++        {
++            return ERROR_EOB_GETBITS_T;
++        }
+         u4_bits = ih264d_get_bits_h264(ps_bitstrm, 8);
+-        while(0xff == u4_bits && !EXCEED_OFFSET(ps_bitstrm))
++        while(0xff == u4_bits && CHECK_BITS_SUFFICIENT(ps_bitstrm, 8))
+         {
+             u4_bits = ih264d_get_bits_h264(ps_bitstrm, 8);
+             ui4_payload_type += 255;
+@@ -768,14 +772,22 @@
+         ui4_payload_type += u4_bits;
+ 
+         ui4_payload_size = 0;
++        if(!CHECK_BITS_SUFFICIENT(ps_bitstrm, 8))
++        {
++            return ERROR_EOB_GETBITS_T;
++        }
+         u4_bits = ih264d_get_bits_h264(ps_bitstrm, 8);
+-        while(0xff == u4_bits && !EXCEED_OFFSET(ps_bitstrm))
++        while(0xff == u4_bits && CHECK_BITS_SUFFICIENT(ps_bitstrm, 8))
+         {
+             u4_bits = ih264d_get_bits_h264(ps_bitstrm, 8);
+             ui4_payload_size += 255;
+         }
+         ui4_payload_size += u4_bits;
+ 
++        if(!CHECK_BITS_SUFFICIENT(ps_bitstrm, (ui4_payload_size << 3)))
++        {
++            return ERROR_EOB_GETBITS_T;
++        }
+         i4_status = ih264d_parse_sei_payload(ps_bitstrm, ui4_payload_type,
+                                              ui4_payload_size, ps_dec);
+         if(i4_status != OK)
+@@ -789,7 +801,7 @@
+                 H264_DEC_DEBUG_PRINT("\nError in parsing SEI message");
+             }
+             while(0 == ih264d_check_byte_aligned(ps_bitstrm)
+-                            && !EXCEED_OFFSET(ps_bitstrm))
++                            && CHECK_BITS_SUFFICIENT(ps_bitstrm, 1))
+             {
+                 u4_bits = ih264d_get_bit_h264(ps_bitstrm);
+                 if(u4_bits)
+@@ -799,7 +811,7 @@
+             }
+         }
+     }
+-    while(ps_bitstrm->u4_ofst < ps_bitstrm->u4_max_ofst);
++    while(MORE_RBSP_DATA(ps_bitstrm));
+     return (i4_status);
+ }
+ 

@@ -1,0 +1,90 @@
+From 8be8bf1fdff6181453a2c5e946618186b8b64c54 Mon Sep 17 00:00:00 2001
+From: Jonathan Hui <jonhui@google.com>
+Date: Fri, 20 Sep 2019 14:39:49 +0800
+Subject: [PATCH] [meshcop] improve HandleCommissioningGet implementation
+ (#4194)
+
+- Fix insufficient length checks.
+- Avoid using a large stack buffer.
+---
+ src/core/thread/network_data_leader_ftd.cpp | 35 ++++++++-------------
+ src/core/thread/network_data_leader_ftd.hpp |  5 ++-
+ 2 files changed, 15 insertions(+), 25 deletions(-)
+
+diff --git a/src/core/thread/network_data_leader_ftd.cpp b/src/core/thread/network_data_leader_ftd.cpp
+index 7a862d54681..7f40382748f 100644
+--- a/src/core/thread/network_data_leader_ftd.cpp
++++ b/src/core/thread/network_data_leader_ftd.cpp
+@@ -286,32 +286,19 @@ void Leader::HandleCommissioningGet(void *aContext, otMessage *aMessage, const o
+ 
+ void Leader::HandleCommissioningGet(Coap::Message &aMessage, const Ip6::MessageInfo &aMessageInfo)
+ {
+-    MeshCoP::Tlv tlv;
+-    uint16_t     offset = aMessage.GetOffset();
+-    uint8_t      tlvs[NetworkData::kMaxSize];
+-    uint8_t      length = 0;
++    uint16_t length = 0;
++    uint16_t offset;
+ 
+-    while (offset < aMessage.GetLength())
+-    {
+-        aMessage.Read(offset, sizeof(tlv), &tlv);
+-
+-        if (tlv.GetType() == MeshCoP::Tlv::kGet)
+-        {
+-            length = tlv.GetLength();
+-            aMessage.Read(offset + sizeof(MeshCoP::Tlv), length, tlvs);
+-            break;
+-        }
++    SuccessOrExit(Tlv::GetValueOffset(aMessage, MeshCoP::Tlv::kGet, offset, length));
++    aMessage.SetOffset(offset);
+ 
+-        offset += sizeof(tlv) + tlv.GetLength();
+-    }
+-
+-    SendCommissioningGetResponse(aMessage, aMessageInfo, tlvs, length);
++exit:
++    SendCommissioningGetResponse(aMessage, length, aMessageInfo);
+ }
+ 
+ void Leader::SendCommissioningGetResponse(const Coap::Message &   aRequest,
+-                                          const Ip6::MessageInfo &aMessageInfo,
+-                                          const uint8_t *         aTlvs,
+-                                          uint8_t                 aLength)
++                                          uint16_t                aLength,
++                                          const Ip6::MessageInfo &aMessageInfo)
+ {
+     otError        error = OT_ERROR_NONE;
+     Coap::Message *message;
+@@ -345,10 +332,14 @@ void Leader::SendCommissioningGetResponse(const Coap::Message &   aRequest,
+     {
+         for (index = 0; index < aLength; index++)
+         {
++            uint8_t type;
++
++            aRequest.Read(aRequest.GetOffset() + index, sizeof(type), &type);
++
+             for (MeshCoP::Tlv *cur                                          = reinterpret_cast<MeshCoP::Tlv *>(data);
+                  cur < reinterpret_cast<MeshCoP::Tlv *>(data + length); cur = cur->GetNext())
+             {
+-                if (cur->GetType() == aTlvs[index])
++                if (cur->GetType() == type)
+                 {
+                     SuccessOrExit(error = message->AppendTlv(*cur));
+                     break;
+diff --git a/src/core/thread/network_data_leader_ftd.hpp b/src/core/thread/network_data_leader_ftd.hpp
+index 72998b078e9..dab990aa50a 100644
+--- a/src/core/thread/network_data_leader_ftd.hpp
++++ b/src/core/thread/network_data_leader_ftd.hpp
+@@ -225,9 +225,8 @@ class Leader : public LeaderBase
+     void        HandleCommissioningGet(Coap::Message &aMessage, const Ip6::MessageInfo &aMessageInfo);
+ 
+     void SendCommissioningGetResponse(const Coap::Message &   aRequest,
+-                                      const Ip6::MessageInfo &aMessageInfo,
+-                                      const uint8_t *         aTlvs,
+-                                      uint8_t                 aLength);
++                                      uint16_t                aLength,
++                                      const Ip6::MessageInfo &aMessageInfo);
+     void SendCommissioningSetResponse(const Coap::Message &    aRequest,
+                                       const Ip6::MessageInfo & aMessageInfo,
+                                       MeshCoP::StateTlv::State aState);

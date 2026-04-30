@@ -1,0 +1,43 @@
+From cb23c3efd22d34db279ceb39cc312473761db5ed Mon Sep 17 00:00:00 2001
+From: Patrick Steinhardt <ps@pks.im>
+Date: Wed, 21 Nov 2018 10:54:29 +0100
+Subject: [PATCH] commit: fix out-of-bound reads when parsing truncated author
+ fields
+
+While commit objects usually should have only one author field, our commit
+parser actually handles the case where a commit has multiple author fields
+because some tools that exist in the wild actually write them. Detection of
+those additional author fields is done by using a simple `git__prefixcmp`,
+checking whether the current line starts with the string "author ". In case
+where we are handed a non-NUL-terminated string that ends directly after the
+space, though, we may have an out-of-bounds read of one byte when trying to
+compare the expected final NUL byte.
+
+Fix the issue by using `git__prefixncmp` instead of `git_prefixcmp`.
+Unfortunately, a test cannot be easily written to catch this case. While we
+could test the last error message and verify that it didn't in fact fail parsing
+a signature (because that would indicate that it has in fact tried to parse the
+additional "author " field, which it shouldn't be able to detect in the first
+place), this doesn't work as the next line needs to be the "committer" field,
+which would error out with the same error message even if we hadn't done an
+out-of-bounds read.
+
+As objects read from the object database are always NUL terminated, this issue
+cannot be triggered in normal code and thus it's not security critical.
+---
+ src/commit.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/commit.c b/src/commit.c
+index bda5a8b424c..a26368ce09c 100644
+--- a/src/commit.c
++++ b/src/commit.c
+@@ -420,7 +420,7 @@ int git_commit__parse_raw(void *_commit, const char *data, size_t size)
+ 		return -1;
+ 
+ 	/* Some tools create multiple author fields, ignore the extra ones */
+-	while ((size_t)(buffer_end - buffer) >= strlen("author ") && !git__prefixcmp(buffer, "author ")) {
++	while (!git__prefixncmp(buffer, buffer_end - buffer, "author ")) {
+ 		if (git_signature__parse(&dummy_sig, &buffer, buffer_end, "author ", '\n') < 0)
+ 			return -1;
+ 

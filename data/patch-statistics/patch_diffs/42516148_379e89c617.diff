@@ -1,0 +1,158 @@
+From b8900bfc21cb3df44a3d17df4acb2a533dfd36a3 Mon Sep 17 00:00:00 2001
+From: Hal Murray <hmurray@megapathdsl.net>
+Date: Thu, 22 Dec 2022 17:44:05 -0800
+Subject: [PATCH] Fix for gliitches found by Google's oss-fuzz
+
+---
+ include/nts.h           |  4 ++++
+ ntpd/nts.c              |  4 ----
+ ntpd/nts_client.c       |  5 ++++-
+ ntpd/nts_extens.c       |  9 +++++++--
+ ntpd/nts_server.c       |  5 ++++-
+ tests/ntpd/nts_client.c | 12 ++++++++----
+ 6 files changed, 27 insertions(+), 12 deletions(-)
+
+diff --git a/include/nts.h b/include/nts.h
+index d01c48d15..41b03ed81 100644
+--- a/include/nts.h
++++ b/include/nts.h
+@@ -65,6 +65,10 @@ bool nts_ke_setup_send(struct BufCtl_t *buf, int aead,
+  */
+ 
+ 
++/* 2 byte type, 2 byte length */
++#define NTS_KE_HDR_LNG 4
++#define NTS_KE_U16_LNG 2
++
+ /* xxx_append_record_foo makes whole record with one foo */
+ /* append_foo appends foo to existing partial record */
+ void ke_append_record_null(BufCtl* buf, uint16_t type);
+diff --git a/ntpd/nts.c b/ntpd/nts.c
+index 107d08ca7..c42dbbb7e 100644
+--- a/ntpd/nts.c
++++ b/ntpd/nts.c
+@@ -296,10 +296,6 @@ void nts_log_ssl_error(void) {
+ 
+ /* NB: KE length is body length, Extension length includes header. */
+ 
+-/* 2 byte type, 2 byte length */
+-#define NTS_KE_HDR_LNG 4
+-#define NTS_KE_U16_LNG 2
+-
+ /* Troubles with signed/unsigned compares when using sizeof() */
+ 
+ void ke_append_record_null(BufCtl* buf, uint16_t type) {
+diff --git a/ntpd/nts_client.c b/ntpd/nts_client.c
+index c76d48598..0f174caa2 100644
+--- a/ntpd/nts_client.c
++++ b/ntpd/nts_client.c
+@@ -616,7 +616,7 @@ bool nts_client_process_response_core(uint8_t *buff, int transferred, struct pee
+ 
+ 	buf.next = buff;
+ 	buf.left = transferred;
+-	while (buf.left > 0) {
++	while (buf.left >= NTS_KE_HDR_LNG) {
+ 		uint16_t type, data, port;
+ 		bool critical = false;
+ 		int length, keylength;
+@@ -729,6 +729,9 @@ bool nts_client_process_response_core(uint8_t *buff, int transferred, struct pee
+ 		} /* case */
+ 	}   /* while */
+ 
++	if (buf.left > 0)
++		return false;
++
+ 	if (NO_AEAD == peer->nts_state.aead) {
+ 		msyslog(LOG_ERR, "NTSc: No AEAD algorithim.");
+ 		return false;
+diff --git a/ntpd/nts_extens.c b/ntpd/nts_extens.c
+index b893c7a68..553b61b25 100644
+--- a/ntpd/nts_extens.c
++++ b/ntpd/nts_extens.c
+@@ -142,7 +142,7 @@ bool extens_server_recv(struct ntspacket_t *ntspacket, uint8_t *pkt, int lng) {
+ 	ntspacket->uidlen = 0;
+ 	ntspacket->needed = 0;
+ 
+-	while (buf.left > 0) {
++	while (buf.left >= NTS_KE_HDR_LNG) {
+ 		uint16_t type;
+ 		bool critical = false;
+ 		int length, adlength;
+@@ -259,6 +259,9 @@ bool extens_server_recv(struct ntspacket_t *ntspacket, uint8_t *pkt, int lng) {
+ 	if (!sawAEEF) {
+ 		return false;
+ 	}
++	if (buf.left > 0)
++		return false;
++
+ 	//  printf("ESRx: %d, %d, %d\n",
+ 	//      lng-LEN_PKT_NOMAC, ntspacket->needed, ntspacket->keylen);
+ 	ntspacket->valid = true;
+@@ -361,7 +364,7 @@ bool extens_client_recv(struct peer *peer, uint8_t *pkt, int lng) {
+ 	buf.next = pkt+LEN_PKT_NOMAC;
+ 	buf.left = lng-LEN_PKT_NOMAC;
+ 
+-	while (buf.left > 0) {
++	while (buf.left >= NTS_KE_HDR_LNG) {
+ 		uint16_t type;
+ 		bool critical = false;
+ 		int length, adlength, noncelen;
+@@ -442,6 +445,8 @@ bool extens_client_recv(struct peer *peer, uint8_t *pkt, int lng) {
+ 	if (!sawAEEF) {
+ 		return false;
+ 	}
++	if (buf.left > 0)
++		return false;
+ 	nts_client_recv_good++;
+ 	nts_client_recv_bad--;
+ 	return true;
+diff --git a/ntpd/nts_server.c b/ntpd/nts_server.c
+index d6081db5a..c1d1f073e 100644
+--- a/ntpd/nts_server.c
++++ b/ntpd/nts_server.c
+@@ -491,7 +491,7 @@ bool create_listener6(int port) {
+ }
+ 
+ bool nts_ke_process_receive(struct BufCtl_t *buf, int *aead) {
+-	while (buf->left > 0) {
++	while (buf->left >= NTS_KE_HDR_LNG) {
+ 		uint16_t type, data;
+ 		int length;
+ 		bool critical = false;
+@@ -554,6 +554,9 @@ bool nts_ke_process_receive(struct BufCtl_t *buf, int *aead) {
+ 		} /* case */
+ 	}   /* while */
+ 
++	if (buf->left > 0)
++		return false;
++
+ 	return true;
+ 
+ }
+diff --git a/tests/ntpd/nts_client.c b/tests/ntpd/nts_client.c
+index d870b5535..da899e573 100644
+--- a/tests/ntpd/nts_client.c
++++ b/tests/ntpd/nts_client.c
+@@ -117,11 +117,15 @@ TEST(nts_client, nts_client_process_response_core) {
+ 	/* ===== Test: all correct ===== */
+ 	/* data */
+ 	uint8_t buf0[] = {
+-		0x80, nts_next_protocol_negotiation, 0, 2, 0, nts_protocol_NTP,
+-		0x80, nts_algorithm_negotiation, 0, 2, 0, AEAD_AES_SIV_CMAC_256,
+-		0x80, nts_new_cookie, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8,
++		0x80, nts_next_protocol_negotiation, 0, 2,
++			0, nts_protocol_NTP,
++		0x80, nts_algorithm_negotiation, 0, 2,
++			0, AEAD_AES_SIV_CMAC_256,
++		0x80, nts_new_cookie, 0, 8,
++			1, 2, 3, 4, 5, 6, 7, 8,
+ 		/* server_negotiation skipped due to getaddrinfo() containment breach */
+-		0x80, nts_port_negotiation, 0, 2, 0, 3,
++		0x80, nts_port_negotiation, 0, 2,
++			0, 123,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+-- 
+GitLab
+

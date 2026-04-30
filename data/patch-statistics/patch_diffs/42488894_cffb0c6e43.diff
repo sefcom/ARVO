@@ -1,0 +1,204 @@
+From c697520826d5f3e7089609c887913290f6fa55c0 Mon Sep 17 00:00:00 2001
+From: David Garske <david@wolfssl.com>
+Date: Fri, 16 Oct 2020 15:14:02 -0700
+Subject: [PATCH] Disable ECC key sizes < 224 bits by default. Added
+ `--enable-eccweakcurves` or `ECC_WEAK_CURVES` to enable smaller key sizes.
+ Currently this option is automatically enabled if `WOLFSSL_MIN_ECC_BITS` is
+ less than 224-bits.
+
+---
+ configure.ac                 | 14 ++++++++++++++
+ src/internal.c               |  8 ++++----
+ src/tls.c                    | 12 ++++++------
+ wolfcrypt/src/ecc.c          |  9 +++++----
+ wolfssl/wolfcrypt/ecc.h      |  2 +-
+ wolfssl/wolfcrypt/settings.h |  7 +++++++
+ 6 files changed, 37 insertions(+), 15 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index e832a8768ee..2131ed083a4 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1880,6 +1880,19 @@ then
+ fi
+ 
+ 
++# ECC Weak Key Sizes (224-bit equiv to RSA 2048 - by default disable < 224 bit ECC)
++AC_ARG_ENABLE([eccweakcurves],
++    [AS_HELP_STRING([--enable-eccweakcurves],[Enable ECC curves less than 224 bit (default: disabled)])],
++    [ ENABLED_ECCWEAKCURVES=$enableval ],
++    [ ENABLED_ECCWEAKCURVES=no ]
++    )
++
++if test "$ENABLED_ECCWEAKCURVES" = "yes"
++then
++    AM_CFLAGS="$AM_CFLAGS -DECC_WEAK_CURVES"
++fi
++
++
+ # Compressed Key
+ AC_ARG_ENABLE([compkey],
+     [AS_HELP_STRING([--enable-compkey],[Enable compressed keys support (default: disabled)])],
+@@ -6042,6 +6055,7 @@ echo "   * DH:                         $ENABLED_DH"
+ echo "   * DH Default Parameters:      $ENABLED_DHDEFAULTPARAMS"
+ echo "   * ECC:                        $ENABLED_ECC"
+ echo "   * ECC Custom Curves           $ENABLED_ECCCUSTCURVES"
++echo "   * ECC Weak Curves             $ENABLED_ECCWEAKCURVES"
+ echo "   * CURVE25519:                 $ENABLED_CURVE25519"
+ echo "   * ED25519:                    $ENABLED_ED25519"
+ echo "   * CURVE448:                   $ENABLED_CURVE448"
+diff --git a/src/internal.c b/src/internal.c
+index 45826033640..04a52c94faf 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -21114,7 +21114,7 @@ int DecodePrivateKey(WOLFSSL *ssl, word16* length)
+         int ret = ECC_CURVE_ERROR;
+ 
+         switch (tlsCurveId) {
+-    #if defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)
++    #if (defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+         #ifndef NO_ECC_SECP
+             case WOLFSSL_ECC_SECP160R1: return ECC_SECP160R1_OID;
+         #endif /* !NO_ECC_SECP */
+@@ -21125,7 +21125,7 @@ int DecodePrivateKey(WOLFSSL *ssl, word16* length)
+             case WOLFSSL_ECC_SECP160K1: return ECC_SECP160K1_OID;
+         #endif /* HAVE_ECC_KOBLITZ */
+     #endif
+-    #if defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)
++    #if (defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+         #ifndef NO_ECC_SECP
+             case WOLFSSL_ECC_SECP192R1: return ECC_SECP192R1_OID;
+         #endif /* !NO_ECC_SECP */
+@@ -24763,7 +24763,7 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+     /* returns the WOLFSSL_* version of the curve from the OID sum */
+     word16 GetCurveByOID(int oidSum) {
+         switch(oidSum) {
+-    #if defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)
++    #if (defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+         #ifndef NO_ECC_SECP
+             case ECC_SECP160R1_OID:
+                 return WOLFSSL_ECC_SECP160R1;
+@@ -24777,7 +24777,7 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+                 return WOLFSSL_ECC_SECP160K1;
+         #endif /* HAVE_ECC_KOBLITZ */
+     #endif
+-    #if defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)
++    #if (defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+         #ifndef NO_ECC_SECP
+             case ECC_SECP192R1_OID:
+                 return WOLFSSL_ECC_SECP192R1;
+diff --git a/src/tls.c b/src/tls.c
+index 811d280bc19..5b0647ef27d 100644
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -4340,7 +4340,7 @@ int TLSX_ValidateSupportedCurves(WOLFSSL* ssl, byte first, byte second) {
+         /* find supported curve */
+         switch (curve->name) {
+ #ifdef HAVE_ECC
+-    #if defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)
++    #if (defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+         #ifndef NO_ECC_SECP
+             case WOLFSSL_ECC_SECP160R1:
+                 pkOid = oid = ECC_SECP160R1_OID;
+@@ -4359,8 +4359,8 @@ int TLSX_ValidateSupportedCurves(WOLFSSL* ssl, byte first, byte second) {
+                 octets = 20;
+                 break;
+         #endif /* HAVE_ECC_KOBLITZ */
+-    #endif
+-    #if defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)
++        #endif
++    #if (defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+         #ifndef NO_ECC_SECP
+             case WOLFSSL_ECC_SECP192R1:
+                 pkOid = oid = ECC_SECP192R1_OID;
+@@ -9926,7 +9926,7 @@ static int TLSX_PopulateSupportedGroups(WOLFSSL* ssl, TLSX** extensions)
+         #endif
+ 
+     #ifndef HAVE_FIPS
+-        #if defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)
++        #if (defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+             #ifndef NO_ECC_SECP
+                 ret = TLSX_UseSupportedCurve(extensions,
+                                               WOLFSSL_ECC_SECP192R1, ssl->heap);
+@@ -9938,7 +9938,7 @@ static int TLSX_PopulateSupportedGroups(WOLFSSL* ssl, TLSX** extensions)
+                 if (ret != WOLFSSL_SUCCESS) return ret;
+             #endif
+         #endif
+-        #if defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)
++        #if (defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+             #ifndef NO_ECC_SECP
+                 ret = TLSX_UseSupportedCurve(extensions,
+                                               WOLFSSL_ECC_SECP160R1, ssl->heap);
+@@ -9958,7 +9958,7 @@ static int TLSX_PopulateSupportedGroups(WOLFSSL* ssl, TLSX** extensions)
+     #endif /* HAVE_FIPS */
+ #endif /* HAVE_ECC && HAVE_SUPPORTED_CURVES */
+ 
+-                /* Add FFDHE supported groups. */
++            /* Add FFDHE supported groups. */
+         #ifdef HAVE_FFDHE_8192
+             if (8192/8 >= ssl->options.minDhKeySz &&
+                                             8192/8 <= ssl->options.maxDhKeySz) {
+diff --git a/wolfcrypt/src/ecc.c b/wolfcrypt/src/ecc.c
+index 7cac4b1c237..f794043de1e 100644
+--- a/wolfcrypt/src/ecc.c
++++ b/wolfcrypt/src/ecc.c
+@@ -75,6 +75,7 @@ ECC Curve Types:
+ ECC Curve Sizes:
+  * ECC_USER_CURVES: Allows custom combination of key sizes below
+  * HAVE_ALL_CURVES: Enable all key sizes (on unless ECC_USER_CURVES is defined)
++ * ECC_WEAK_CURVES: Enable support for weak keys < 224 bits
+  * HAVE_ECC112: 112 bit key
+  * HAVE_ECC128: 128 bit key
+  * HAVE_ECC160: 160 bit key
+@@ -179,16 +180,16 @@ enum {
+ */
+ 
+ /* 256-bit curve on by default whether user curves or not */
+-#if defined(HAVE_ECC112) || defined(HAVE_ALL_CURVES)
++#if (defined(HAVE_ECC112) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+     #define ECC112
+ #endif
+-#if defined(HAVE_ECC128) || defined(HAVE_ALL_CURVES)
++#if (defined(HAVE_ECC128) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+     #define ECC128
+ #endif
+-#if defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)
++#if (defined(HAVE_ECC160) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+     #define ECC160
+ #endif
+-#if defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)
++#if (defined(HAVE_ECC192) || defined(HAVE_ALL_CURVES)) && defined(ECC_WEAK_CURVES)
+     #define ECC192
+ #endif
+ #if defined(HAVE_ECC224) || defined(HAVE_ALL_CURVES)
+diff --git a/wolfssl/wolfcrypt/ecc.h b/wolfssl/wolfcrypt/ecc.h
+index 3c7458931e1..ec1587d6646 100644
+--- a/wolfssl/wolfcrypt/ecc.h
++++ b/wolfssl/wolfcrypt/ecc.h
+@@ -93,7 +93,7 @@
+     #define MAX_ECC_BITS    256
+ #elif defined(HAVE_ECC239)
+     #define MAX_ECC_BITS    239
+-#elif defined(HAVE_ECC224)
++#elif defined(HAVE_ECC224) && !defined(ECC_WEAK_CURVES)
+     #define MAX_ECC_BITS    224
+ #elif defined(HAVE_ECC192)
+     #define MAX_ECC_BITS    192
+diff --git a/wolfssl/wolfcrypt/settings.h b/wolfssl/wolfcrypt/settings.h
+index ad6204f2c26..c3f2858833d 100644
+--- a/wolfssl/wolfcrypt/settings.h
++++ b/wolfssl/wolfcrypt/settings.h
+@@ -1749,6 +1749,13 @@ extern void uITRON4_free(void *p) ;
+         #define HAVE_ALL_CURVES
+     #endif
+ #endif
++#ifndef ECC_WEAK_CURVES
++    /* if building TLS to enable < 224 then allow weak curves */
++    /* Note: ECC 224-bit is equiv to RSA 2048 bit */
++    #if defined(WOLFSSL_MIN_ECC_BITS) && WOLFSSL_MIN_ECC_BITS < 224
++        #define ECC_WEAK_CURVES
++    #endif
++#endif
+ 
+ /* ECC Configs */
+ #ifdef HAVE_ECC

@@ -1,0 +1,305 @@
+From c5203079596f4614bcf7b4e653b4bb8810e64a3e Mon Sep 17 00:00:00 2001
+From: Chen Huitao <h980501427@163.com>
+Date: Tue, 25 Feb 2020 11:36:06 +0800
+Subject: [PATCH] fix some oss-fuzz (#1206)
+
+* fix oss-fuzz 18138.
+
+* fix oss-fuzz 20079.
+
+* fix oss-fuzz 20209.
+
+* fix oss-fuzz 20210.
+
+* fix oss-fuzz 20262.
+
+* rollback.
+
+* rollback.
+
+* fix oss-fuzz 20079.
+
+* fix oss-fuzz 20179.
+
+* fix oss-fuzz 20195.
+
+* fix oss-fuzz 20206.
+
+* fix oss-fuzz 20207.
+
+* fix oss-fuzz 20265.
+---
+ qemu/cpu-exec.c               |  3 +++
+ qemu/fpu/softfloat.c          |  2 +-
+ qemu/target-arm/internals.h   | 12 ++++++------
+ qemu/target-arm/neon_helper.c |  2 +-
+ qemu/target-arm/translate.c   |  2 +-
+ qemu/target-i386/ops_sse.h    |  2 +-
+ qemu/target-mips/translate.c  | 12 ++++++------
+ qemu/target-sparc/helper.c    |  2 +-
+ qemu/tcg/optimize.c           |  3 +++
+ qemu/tcg/tcg.c                | 10 +++++++++-
+ qemu/translate-all.c          | 10 +++++++++-
+ 11 files changed, 41 insertions(+), 19 deletions(-)
+
+diff --git a/qemu/cpu-exec.c b/qemu/cpu-exec.c
+index 62975085b2..99b3d9381b 100644
+--- a/qemu/cpu-exec.c
++++ b/qemu/cpu-exec.c
+@@ -395,6 +395,9 @@ static TranslationBlock *tb_find_slow(CPUArchState *env, target_ulong pc,
+ not_found:
+     /* if no translated code available, then translate it now */
+     tb = tb_gen_code(cpu, pc, cs_base, (int)flags, 0);   // qq
++    if (tb == NULL) {
++        return NULL;
++    }
+ 
+ found:
+     /* Move the last found TB to the head of the list */
+diff --git a/qemu/fpu/softfloat.c b/qemu/fpu/softfloat.c
+index c9b1785b05..d409e78f9a 100644
+--- a/qemu/fpu/softfloat.c
++++ b/qemu/fpu/softfloat.c
+@@ -4655,7 +4655,7 @@ int32 floatx80_to_int32_round_to_zero( floatx80 a STATUS_PARAM )
+     savedASig = aSig;
+     aSig >>= shiftCount;
+     z = (int32_t)aSig;
+-    if ( aSign ) z = - z;
++    if ( aSign && (z != 0x80000000) ) z = - z;
+     if ( ( z < 0 ) ^ aSign ) {
+  invalid:
+         float_raise( float_flag_invalid STATUS_VAR);
+diff --git a/qemu/target-arm/internals.h b/qemu/target-arm/internals.h
+index 8b639ae431..c1ad7574e1 100644
+--- a/qemu/target-arm/internals.h
++++ b/qemu/target-arm/internals.h
+@@ -250,12 +250,12 @@ static inline uint32_t syn_aa32_smc(void)
+ 
+ static inline uint32_t syn_aa64_bkpt(uint32_t imm16)
+ {
+-    return (EC_AA64_BKPT << ARM_EL_EC_SHIFT) | ARM_EL_IL | (imm16 & 0xffff);
++    return (((unsigned int)EC_AA64_BKPT) << ARM_EL_EC_SHIFT) | ARM_EL_IL | (imm16 & 0xffff);
+ }
+ 
+ static inline uint32_t syn_aa32_bkpt(uint32_t imm16, bool is_thumb)
+ {
+-    return (EC_AA32_BKPT << ARM_EL_EC_SHIFT) | (imm16 & 0xffff)
++    return (((unsigned int)EC_AA32_BKPT) << ARM_EL_EC_SHIFT) | (imm16 & 0xffff)
+         | (is_thumb ? 0 : ARM_EL_IL);
+ }
+ 
+@@ -324,25 +324,25 @@ static inline uint32_t syn_insn_abort(int same_el, int ea, int s1ptw, int fsc)
+ static inline uint32_t syn_data_abort(int same_el, int ea, int cm, int s1ptw,
+                                       int wnr, int fsc)
+ {
+-    return (EC_DATAABORT << ARM_EL_EC_SHIFT) | (same_el << ARM_EL_EC_SHIFT)
++    return (((unsigned int) EC_DATAABORT) << ARM_EL_EC_SHIFT) | (same_el << ARM_EL_EC_SHIFT)
+         | (ea << 9) | (cm << 8) | (s1ptw << 7) | (wnr << 6) | fsc;
+ }
+ 
+ static inline uint32_t syn_swstep(int same_el, int isv, int ex)
+ {
+-    return (EC_SOFTWARESTEP << ARM_EL_EC_SHIFT) | (same_el << ARM_EL_EC_SHIFT)
++    return (((unsigned int)EC_SOFTWARESTEP) << ARM_EL_EC_SHIFT) | (same_el << ARM_EL_EC_SHIFT)
+         | (isv << 24) | (ex << 6) | 0x22;
+ }
+ 
+ static inline uint32_t syn_watchpoint(int same_el, int cm, int wnr)
+ {
+-    return (EC_WATCHPOINT << ARM_EL_EC_SHIFT) | (same_el << ARM_EL_EC_SHIFT)
++    return (((unsigned int)EC_WATCHPOINT) << ARM_EL_EC_SHIFT) | (same_el << ARM_EL_EC_SHIFT)
+         | (cm << 8) | (wnr << 6) | 0x22;
+ }
+ 
+ static inline uint32_t syn_breakpoint(int same_el)
+ {
+-    return (EC_BREAKPOINT << ARM_EL_EC_SHIFT) | (same_el << ARM_EL_EC_SHIFT)
++    return (((unsigned int) EC_BREAKPOINT) << ARM_EL_EC_SHIFT) | (same_el << ARM_EL_EC_SHIFT)
+         | ARM_EL_IL | 0x22;
+ }
+ 
+diff --git a/qemu/target-arm/neon_helper.c b/qemu/target-arm/neon_helper.c
+index 1426decd2f..a1f4af7a1e 100644
+--- a/qemu/target-arm/neon_helper.c
++++ b/qemu/target-arm/neon_helper.c
+@@ -1064,7 +1064,7 @@ uint64_t HELPER(neon_qrshl_u64)(CPUARMState *env, uint64_t val, uint64_t shiftop
+     } else if (tmp < 0) { \
+         dest = (src1 + (1 << (-1 - tmp))) >> -tmp; \
+     } else { \
+-        dest = src1 << tmp; \
++        dest = ((uint64_t)src1) << tmp; \
+         if ((dest >> tmp) != src1) { \
+             SET_QC(); \
+             dest = (uint32_t)(1 << (sizeof(src1) * 8 - 1)); \
+diff --git a/qemu/target-arm/translate.c b/qemu/target-arm/translate.c
+index 31f0327a23..b48007102a 100644
+--- a/qemu/target-arm/translate.c
++++ b/qemu/target-arm/translate.c
+@@ -7857,7 +7857,7 @@ static void disas_arm_insn(DisasContext *s, unsigned int insn)  // qq
+             /* Sign-extend the 24-bit offset */
+             offset = ((int32_t)(insn << 8)) >> 8;
+             /* offset * 4 + bit24 * 2 + (thumb bit) */
+-            val += (offset << 2) | ((insn >> 23) & 2) | 1;
++            val += (((uint32_t)offset) << 2) | ((insn >> 23) & 2) | 1;
+             /* pipeline offset */
+             val += 4;
+             /* protected by ARCH(5); above, near the start of uncond block */
+diff --git a/qemu/target-i386/ops_sse.h b/qemu/target-i386/ops_sse.h
+index f142f335d5..e8c01f8593 100644
+--- a/qemu/target-i386/ops_sse.h
++++ b/qemu/target-i386/ops_sse.h
+@@ -1417,7 +1417,7 @@ void glue(helper_phaddd, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
+ {
+     d->L(0) = (int32_t)d->L(0) + (int32_t)d->L(1);
+     XMM_ONLY(d->L(1) = (int32_t)d->L(2) + (int32_t)d->L(3));
+-    d->L((1 << SHIFT) + 0) = (uint32_t)((int32_t)s->L(0) + (int32_t)s->L(1));
++    d->L((1 << SHIFT) + 0) = (uint32_t)((int32_t)s->L(0) + (uint32_t)s->L(1));
+     XMM_ONLY(d->L(3) = (int32_t)s->L(2) + (int32_t)s->L(3));
+ }
+ 
+diff --git a/qemu/target-mips/translate.c b/qemu/target-mips/translate.c
+index e91b330c80..ad8e30939f 100644
+--- a/qemu/target-mips/translate.c
++++ b/qemu/target-mips/translate.c
+@@ -11161,11 +11161,11 @@ static int decode_extended_mips16_opc (CPUMIPSState *env, DisasContext *ctx)
+         /* No delay slot, so just process as a normal instruction */
+         break;
+     case M16_OPC_BEQZ:
+-        gen_compute_branch(ctx, OPC_BEQ, 4, rx, 0, offset << 1, 0);
++        gen_compute_branch(ctx, OPC_BEQ, 4, rx, 0, (uint16_t)offset << 1, 0);
+         /* No delay slot, so just process as a normal instruction */
+         break;
+     case M16_OPC_BNEQZ:
+-        gen_compute_branch(ctx, OPC_BNE, 4, rx, 0, offset << 1, 0);
++        gen_compute_branch(ctx, OPC_BNE, 4, rx, 0, (uint16_t)offset << 1, 0);
+         /* No delay slot, so just process as a normal instruction */
+         break;
+     case M16_OPC_SHIFT:
+@@ -11223,10 +11223,10 @@ static int decode_extended_mips16_opc (CPUMIPSState *env, DisasContext *ctx)
+     case M16_OPC_I8:
+         switch (funct) {
+         case I8_BTEQZ:
+-            gen_compute_branch(ctx, OPC_BEQ, 4, 24, 0, offset << 1, 0);
++            gen_compute_branch(ctx, OPC_BEQ, 4, 24, 0, (uint16_t)offset << 1, 0);
+             break;
+         case I8_BTNEZ:
+-            gen_compute_branch(ctx, OPC_BNE, 4, 24, 0, offset << 1, 0);
++            gen_compute_branch(ctx, OPC_BNE, 4, 24, 0, (uint16_t)offset << 1, 0);
+             break;
+         case I8_SWRASP:
+             gen_st(ctx, OPC_SW, 31, 29, imm);
+@@ -18865,7 +18865,7 @@ static void decode_opc (CPUMIPSState *env, DisasContext *ctx, bool *insn_need_pa
+             if (ctx->insn_flags & ISA_MIPS32R6) {
+                 /* OPC_BC1EQZ */
+                 gen_compute_branch1_r6(ctx, MASK_CP1(ctx->opcode),
+-                                rt, imm << 2);
++                                rt, ((uint16_t)imm) << 2);
+             } else {
+                 /* OPC_BC1ANY2 */
+                 check_cop1x(ctx);
+@@ -18878,7 +18878,7 @@ static void decode_opc (CPUMIPSState *env, DisasContext *ctx, bool *insn_need_pa
+             check_cp1_enabled(ctx);
+             check_insn(ctx, ISA_MIPS32R6);
+             gen_compute_branch1_r6(ctx, MASK_CP1(ctx->opcode),
+-                            rt, imm << 2);
++                            rt, ((uint16_t)imm) << 2);
+             break;
+         case OPC_BC1ANY4:
+             check_cp1_enabled(ctx);
+diff --git a/qemu/target-sparc/helper.c b/qemu/target-sparc/helper.c
+index e4ae5d40c6..602a81949d 100644
+--- a/qemu/target-sparc/helper.c
++++ b/qemu/target-sparc/helper.c
+@@ -76,7 +76,7 @@ static target_ulong helper_udiv_common(CPUSPARCState *env, target_ulong a,
+     uint64_t x0;
+     uint32_t x1;
+ 
+-    x0 = (a & 0xffffffff) | ((int64_t) (env->y) << 32);
++    x0 = (a & 0xffffffff) | ((uint64_t) (env->y) << 32);
+     x1 = (b & 0xffffffff);
+ 
+     if (x1 == 0) {
+diff --git a/qemu/tcg/optimize.c b/qemu/tcg/optimize.c
+index 3316b76c71..cb9626decb 100644
+--- a/qemu/tcg/optimize.c
++++ b/qemu/tcg/optimize.c
+@@ -571,6 +571,9 @@ static TCGArg *tcg_constant_folding(TCGContext *s, uint16_t *tcg_opc_ptr,
+ 
+         /* Do copy propagation */
+         for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
++            if (args[i] >= TCG_MAX_TEMPS) {
++                return NULL;
++            }
+             if (temps[args[i]].state == TCG_TEMP_COPY) {
+                 args[i] = find_better_copy(s, args[i]);
+             }
+diff --git a/qemu/tcg/tcg.c b/qemu/tcg/tcg.c
+index fd0b287189..4d33212968 100644
+--- a/qemu/tcg/tcg.c
++++ b/qemu/tcg/tcg.c
+@@ -2546,6 +2546,10 @@ static inline int tcg_gen_code_common(TCGContext *s,
+ #ifdef USE_TCG_OPTIMIZATIONS
+     s->gen_opparam_ptr =
+         tcg_optimize(s, s->gen_opc_ptr, s->gen_opparam_buf, s->tcg_op_defs);
++    if (s->gen_opparam_ptr == NULL) {
++        tcg_out_tb_finalize(s);
++        return -2;
++    }
+ #endif
+ 
+ #ifdef CONFIG_PROFILER
+@@ -2654,6 +2658,7 @@ static inline int tcg_gen_code_common(TCGContext *s,
+ 
+ int tcg_gen_code(TCGContext *s, tcg_insn_unit *gen_code_buf)    // qq
+ {
++    int ret;
+ #ifdef CONFIG_PROFILER
+     {
+         int n;
+@@ -2670,7 +2675,10 @@ int tcg_gen_code(TCGContext *s, tcg_insn_unit *gen_code_buf)    // qq
+ 
+     //printf("====== before gen code\n");
+     //tcg_dump_ops(s);
+-    tcg_gen_code_common(s, gen_code_buf, -1);   // qq
++    ret = tcg_gen_code_common(s, gen_code_buf, -1);   // qq
++    if (ret == -2) {
++        return -1;
++    }
+ 
+     //printf("====== after gen code\n");
+     //tcg_dump_ops(s);
+diff --git a/qemu/translate-all.c b/qemu/translate-all.c
+index ed4beb1e59..2deddd1ec5 100644
+--- a/qemu/translate-all.c
++++ b/qemu/translate-all.c
+@@ -239,6 +239,9 @@ static int cpu_gen_code(CPUArchState *env, TranslationBlock *tb, int *gen_code_s
+     s->code_time -= profile_getclock();
+ #endif
+     gen_code_size = tcg_gen_code(s, gen_code_buf);
++    if (gen_code_size == -1) {
++        return -1;
++    }
+     //printf(">>> code size = %u: ", gen_code_size);
+     //int i;
+     //for (i = 0; i < gen_code_size; i++) {
+@@ -1130,6 +1133,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+     TranslationBlock *tb;
+     tb_page_addr_t phys_pc, phys_page2;
+     int code_gen_size;
++    int ret;
+ 
+     phys_pc = get_page_addr_code(env, pc);
+     tb = tb_alloc(env->uc, pc);
+@@ -1145,7 +1149,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+     tb->cs_base = cs_base;
+     tb->flags = flags;
+     tb->cflags = cflags;
+-    cpu_gen_code(env, tb, &code_gen_size);  // qq
++    ret = cpu_gen_code(env, tb, &code_gen_size);  // qq
++    if (ret == -1) {
++        tb_free(env->uc, tb);
++        return NULL;
++    }
+     tcg_ctx->code_gen_ptr = (void *)(((uintptr_t)tcg_ctx->code_gen_ptr +
+             code_gen_size + CODE_GEN_ALIGN - 1) & ~(CODE_GEN_ALIGN - 1));
+ 

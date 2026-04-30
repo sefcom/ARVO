@@ -1,0 +1,43 @@
+From f5905a62c7fc1922d0b49e9399d56e8cfee69516 Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Sat, 6 Apr 2024 20:23:06 +0200
+Subject: [PATCH] Fix invalid memory access (#2374)
+
+The bug is triggered when `pe_offset == (u_int32_t)-1`
+
+```
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==23719==ERROR: AddressSanitizer: SEGV on unknown address 0x5081000002b3 (pc 0x55c69274ac72 bp 0x7ffffffc8e70 sp 0x7ffffffc8cc0 T0)
+==23719==The signal is caused by a READ memory access.
+    #0 0x55c69274ac72 in ndpi_search_portable_executable /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:8191:7
+    #1 0x55c69271606b in ndpi_internal_detection_process_packet /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:8596:5
+    #2 0x55c69270f58f in ndpi_detection_process_packet /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:8629:22
+    #3 0x55c6926a07e7 in LLVMFuzzerTestOneInput /home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet.c:24:5
+    #4 0x55c6925a79b6 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet+0x64e9b6) (BuildId: ec46c60ec7e03ebfb3d825bd6308d0a8d6e9803b)
+    #5 0x55c692590d48 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet+0x637d48) (BuildId: ec46c60ec7e03ebfb3d825bd6308d0a8d6e9803b)
+    #6 0x55c69259685a in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet+0x63d85a) (BuildId: ec46c60ec7e03ebfb3d825bd6308d0a8d6e9803b)
+    #7 0x55c6925c0e02 in main (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet+0x667e02) (BuildId: ec46c60ec7e03ebfb3d825bd6308d0a8d6e9803b)
+    #8 0x7f8e99793082 in __libc_start_main /build/glibc-wuryBv/glibc-2.31/csu/../csu/libc-start.c:308:16
+    #9 0x55c69258baed in _start (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet+0x632aed) (BuildId: ec46c60ec7e03ebfb3d825bd6308d0a8d6e9803b)
+```
+
+Found by oss-fuzzer
+See: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=67881
+---
+ src/lib/ndpi_main.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/lib/ndpi_main.c b/src/lib/ndpi_main.c
+index ad4638a640f..e0150fe6cbf 100644
+--- a/src/lib/ndpi_main.c
++++ b/src/lib/ndpi_main.c
+@@ -8210,7 +8210,7 @@ static void ndpi_search_portable_executable(struct ndpi_detection_module_struct
+   }
+ 
+   uint32_t const pe_offset = le32toh(get_u_int32_t(packet->payload, 0x3C));
+-  if (packet->payload_packet_len <= pe_offset + 4 ||
++  if ((u_int32_t)(packet->payload_packet_len - 4) <= pe_offset ||
+       be32toh(get_u_int32_t(packet->payload, pe_offset)) != pe_signature)
+   {
+     return;

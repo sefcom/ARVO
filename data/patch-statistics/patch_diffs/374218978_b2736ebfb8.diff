@@ -1,0 +1,765 @@
+From 24f9d8df0b8ddabc217ec4e7856a678e09f52773 Mon Sep 17 00:00:00 2001
+From: Zoltan Herczeg <zherczeg7@gmail.com>
+Date: Thu, 31 Oct 2024 08:29:49 +0100
+Subject: [PATCH] Move character lists data before the byte code in a pattern
+ (#540)
+
+This ensures aligned data store even when the range is repeated.
+Furthermore character lists are stored once regerdless of repeats.
+
+Co-authored-by: Zoltan Herczeg <hzmester@freemail.hu>
+---
+ src/pcre2_auto_possess.c  |   7 ++-
+ src/pcre2_compile.c       |  34 +++++++++++--
+ src/pcre2_compile.h       |   3 ++
+ src/pcre2_compile_class.c | 101 +++++++++++++++++---------------------
+ src/pcre2_dfa_match.c     |  11 +++--
+ src/pcre2_internal.h      |  15 ++----
+ src/pcre2_intmodedep.h    |   6 ++-
+ src/pcre2_jit_compile.c   |   7 +--
+ src/pcre2_match.c         |  22 ++++++---
+ src/pcre2_printint.c      |  18 +++----
+ src/pcre2_study.c         |  12 ++---
+ src/pcre2_xclass.c        |  14 ++++--
+ testdata/testinput5       |   3 ++
+ testdata/testoutput5      |  36 ++++++++++++++
+ 14 files changed, 180 insertions(+), 109 deletions(-)
+
+diff --git a/src/pcre2_auto_possess.c b/src/pcre2_auto_possess.c
+index 74d2e8f29..540f5ea9d 100644
+--- a/src/pcre2_auto_possess.c
++++ b/src/pcre2_auto_possess.c
+@@ -1115,7 +1115,8 @@ for(;;)
+ #ifdef SUPPORT_WIDE_CHARS
+       case OP_XCLASS:
+       if (PRIV(xclass)(chr, (list_ptr == list ? code : base_end) -
+-          list_ptr[2] + LINK_SIZE, utf)) return FALSE;
++          list_ptr[2] + LINK_SIZE, (const uint8_t*)cb->start_code, utf))
++        return FALSE;
+       break;
+ #endif
+ 
+@@ -1124,7 +1125,9 @@ for(;;)
+       case OP_ECLASS:
+       if (PRIV(eclass)(chr,
+           (list_ptr == list ? code : base_end) - list_ptr[2] + LINK_SIZE,
+-          (list_ptr == list ? code : base_end) - list_ptr[3], utf)) return FALSE;
++          (list_ptr == list ? code : base_end) - list_ptr[3],
++          (const uint8_t*)cb->start_code, utf))
++        return FALSE;
+       break;
+ 
+       default:
+diff --git a/src/pcre2_compile.c b/src/pcre2_compile.c
+index 46b910e44..2493c871e 100644
+--- a/src/pcre2_compile.c
++++ b/src/pcre2_compile.c
+@@ -5919,7 +5919,6 @@ for (;; pptr++)
+     zerofirstcuflags = firstcuflags;
+     zeroreqcu = reqcu;
+     zeroreqcuflags = reqcuflags;
+-
+     break;  /* End of class processing */
+ 
+ 
+@@ -9810,6 +9809,7 @@ cb.workspace_size = COMPILE_WORK_SIZE;
+ #ifdef SUPPORT_WIDE_CHARS
+ cb.cranges = NULL;
+ cb.next_cranges = NULL;
++cb.char_lists_size = 0;
+ #endif
+ 
+ /* Maximum back reference and backref bitmap. The bitmap records up to 31 back
+@@ -10200,7 +10200,13 @@ if (errorcode != 0) goto HAD_CB_ERROR;  /* Offset is in cb.erroroffset */
+ 
+ /* This should be caught in compile_regex(), but just in case... */
+ 
++#if defined SUPPORT_WIDE_CHARS
++PCRE2_ASSERT((cb.char_lists_size & 0x3) == 0);
++if (length > MAX_PATTERN_SIZE ||
++    MAX_PATTERN_SIZE - length < (cb.char_lists_size / sizeof(PCRE2_UCHAR)))
++#else
+ if (length > MAX_PATTERN_SIZE)
++#endif
+   {
+   errorcode = ERR20;
+   goto HAD_CB_ERROR;
+@@ -10211,8 +10217,22 @@ block for storing the compiled pattern and names table. Integer overflow should
+ no longer be possible because nowadays we limit the maximum value of
+ cb.names_found and cb.name_entry_size. */
+ 
+-re_blocksize = CU2BYTES(length +
+-  (PCRE2_SIZE)cb.names_found * (PCRE2_SIZE)cb.name_entry_size);
++re_blocksize =
++  CU2BYTES((PCRE2_SIZE)cb.names_found * (PCRE2_SIZE)cb.name_entry_size);
++
++#if defined SUPPORT_WIDE_CHARS
++if (cb.char_lists_size != 0)
++  {
++#if PCRE2_CODE_UNIT_WIDTH != 32
++  /* Align to 32 bit first. This ensures the
++  allocated area will also be 32 bit aligned. */
++  re_blocksize = (PCRE2_SIZE)CLIST_ALIGN_TO(re_blocksize, sizeof(uint32_t));
++#endif
++  re_blocksize += cb.char_lists_size;
++  }
++#endif
++
++re_blocksize += CU2BYTES(length);
+ 
+ if (re_blocksize > ccontext->max_pattern_compiled_length)
+   {
+@@ -10241,6 +10261,7 @@ re->tables = tables;
+ re->executable_jit = NULL;
+ memset(re->start_bitmap, 0, 32 * sizeof(uint8_t));
+ re->blocksize = re_blocksize;
++re->code_start = re_blocksize - CU2BYTES(length);
+ re->magic_number = MAGIC_NUMBER;
+ re->compile_options = options;
+ re->overall_options = cb.external_options;
+@@ -10264,8 +10285,7 @@ re->optimization_flags = optim_flags;
+ /* The basic block is immediately followed by the name table, and the compiled
+ code follows after that. */
+ 
+-codestart = (PCRE2_UCHAR *)((uint8_t *)re + sizeof(pcre2_real_code)) +
+-  re->name_entry_size * re->name_count;
++codestart = (PCRE2_UCHAR *)((uint8_t *)re + re->code_start);
+ 
+ /* Update the compile data block for the actual compile. The starting points of
+ the name/number translation table and of the code are passed around in the
+@@ -10280,6 +10300,10 @@ cb.start_code = codestart;
+ cb.req_varyopt = 0;
+ cb.had_accept = FALSE;
+ cb.had_pruneorskip = FALSE;
++#ifdef SUPPORT_WIDE_CHARS
++cb.char_lists_size = 0;
++#endif
++
+ 
+ /* If any named groups were found, create the name/number table from the list
+ created in the pre-pass. */
+diff --git a/src/pcre2_compile.h b/src/pcre2_compile.h
+index f860f66e2..08d148063 100644
+--- a/src/pcre2_compile.h
++++ b/src/pcre2_compile.h
+@@ -206,6 +206,9 @@ therefore no need for it to have a length entry, so use a high value. */
+ #define SELECT_VALUE8(value8, value) (value)
+ #endif
+ 
++/* Macro for aligning data. */
++#define CLIST_ALIGN_TO(base, align) \
++  ((base + ((size_t)(align) - 1)) & ~((size_t)(align) - 1))
+ 
+ /* Macros for the definitions below, to prevent name collisions. */
+ 
+diff --git a/src/pcre2_compile_class.c b/src/pcre2_compile_class.c
+index a3e73a7fd..427e35763 100644
+--- a/src/pcre2_compile_class.c
++++ b/src/pcre2_compile_class.c
+@@ -1703,47 +1703,38 @@ if ((xclass_props & XCLASS_REQUIRED) != 0)
+ 
+   if ((xclass_props & XCLASS_HAS_CHAR_LISTS) != 0)
+     {
+-    /* Char lists size is an even number,
+-    because all items are 16 or 32 bit values. */
++    /* Char lists size is an even number, because all items are 16 or 32
++    bit values. The character list data is always aligned to 32 bits. */
+     size_t char_lists_size = cranges->char_lists_size;
+-    PCRE2_ASSERT((char_lists_size & 0x1) == 0);
++    PCRE2_ASSERT((char_lists_size & 0x1) == 0 &&
++                 (cb->char_lists_size & 0x3) == 0);
+ 
+     if (lengthptr != NULL)
+       {
+-      /* At this point, we don't know the precise location
+-      so the maximum alignment is added to the length. */
++      char_lists_size = CLIST_ALIGN_TO(char_lists_size, sizeof(uint32_t));
++
+ #if PCRE2_CODE_UNIT_WIDTH == 8
+-      *lengthptr += 2 /* sizeof(type) in PCRE2_UCHARs */ +
+-         3 /* maximum alignment. */;
+-#elif PCRE2_CODE_UNIT_WIDTH == 16
+-      *lengthptr += 1 /* sizeof(type) in PCRE2_UCHARs */ +
+-         1 /* maximum alignment. */;
+-      char_lists_size >>= 1;
++      *lengthptr += 2 + LINK_SIZE;
+ #else
+-      *lengthptr += 1 /* sizeof(type) in PCRE2_UCHARs */;
+-      /* Padding, when the size is not divisible by 4. */
+-      if ((char_lists_size & 0x2) != 0)
+-        char_lists_size += 2;
+-      char_lists_size >>= 2;
++      *lengthptr += 1 + LINK_SIZE;
+ #endif
+ 
+-      if (INT_MAX - *lengthptr < char_lists_size)
+-        {
+-        *errorcodeptr = ERR20;   /* Integer overflow */
+-        return FALSE;
+-        }
++      cb->char_lists_size += char_lists_size;
+ 
+-      *lengthptr += char_lists_size;
++      char_lists_size /= sizeof(PCRE2_UCHAR);
+ 
+-      if (*lengthptr > MAX_PATTERN_SIZE)
++      /* Storage space for character lists is included
++      in the maximum pattern size. */
++      if (*lengthptr > MAX_PATTERN_SIZE ||
++          MAX_PATTERN_SIZE - *lengthptr < char_lists_size)
+         {
+         *errorcodeptr = ERR20;   /* Pattern is too large */
+-        return FALSE;
++        return 0;
+         }
+       }
+     else
+       {
+-      uint8_t *char_buffer = (uint8_t*)code;
++      uint8_t *data;
+ 
+       PCRE2_ASSERT(cranges->char_lists_types <= XCL_TYPE_MASK);
+ #if PCRE2_CODE_UNIT_WIDTH == 8
+@@ -1751,46 +1742,44 @@ if ((xclass_props & XCLASS_REQUIRED) != 0)
+       code[0] = (uint8_t)(XCL_LIST |
+         (cranges->char_lists_types >> 8));
+       code[1] = (uint8_t)cranges->char_lists_types;
+-      char_buffer += 2;
++      code += 2;
++#else
++      *code++ = (PCRE2_UCHAR)(XCL_LIST | cranges->char_lists_types);
++#endif
+ 
+-      /* Compute alignment. */
+-      if (((uintptr_t)char_buffer & 0x1) != 0)
+-        {
+-        code[0] |= 1u << (XCL_ALIGNMENT_SHIFT - 8);
+-        char_buffer += 1;
+-        }
++      /* Character lists are stored in backwards direction from
++      byte code start. The non-dfa/dfa matchers can access these
++      lists using the byte code start stored in match blocks.
++      Each list is aligned to 32 bit with an optional unused
++      16 bit value at the beginning of the character list. */
+ 
+-      if (((uintptr_t)char_buffer & 0x2) != (char_lists_size & 0x2))
+-        {
+-        code[0] |= 2u << (XCL_ALIGNMENT_SHIFT - 8);
+-        char_buffer += 2;
+-        }
+-#elif PCRE2_CODE_UNIT_WIDTH == 16
+-      code[0] = (PCRE2_UCHAR)(XCL_LIST | cranges->char_lists_types);
+-      char_buffer += 2;
++      cb->char_lists_size += char_lists_size;
++      data = (uint8_t*)cb->start_code - cb->char_lists_size;
+ 
+-      /* Compute alignment. */
+-      if (((uintptr_t)char_buffer & 0x2) != (char_lists_size & 0x2))
+-        {
+-        code[0] |= 2u << XCL_ALIGNMENT_SHIFT;
+-        char_buffer += 2;
+-        }
+-#else
+-      code[0] = (PCRE2_UCHAR)(XCL_LIST | cranges->char_lists_types);
+-      char_buffer += 4;
++      memcpy(data, (uint8_t*)(cranges + 1) + cranges->char_lists_start,
++        char_lists_size);
++
++      /* Since character lists total size is less than MAX_PATTERN_SIZE,
++      their starting offset fits into a value which size is LINK_SIZE. */
++
++      char_lists_size = cb->char_lists_size;
++      PUT(code, 0, (uint32_t)(char_lists_size >> 1));
++      code += LINK_SIZE;
+ 
+-      /* Padding. */
++#if defined PCRE2_DEBUG || defined SUPPORT_VALGRIND
+       if ((char_lists_size & 0x2) != 0)
+         {
+-        code[0] |= 2u << XCL_ALIGNMENT_SHIFT;
+-        char_buffer += 2;
++        /* In debug the unused 16 bit value is set
++        to a fixed value and marked unused. */
++        ((uint16_t*)data)[-1] = 0x5555;
++#ifdef SUPPORT_VALGRIND
++        VALGRIND_MAKE_MEM_NOACCESS(data - 2, 2);
++#endif
+         }
+ #endif
+-      memcpy(char_buffer,
+-        (uint8_t*)(cranges + 1) + cranges->char_lists_start,
+-        char_lists_size);
+ 
+-      code = (PCRE2_UCHAR*)(char_buffer + char_lists_size);
++      cb->char_lists_size =
++        CLIST_ALIGN_TO(char_lists_size, sizeof(uint32_t));
+ 
+       cb->cx->memctl.free(cranges, cb->cx->memctl.memory_data);
+       }
+diff --git a/src/pcre2_dfa_match.c b/src/pcre2_dfa_match.c
+index 11b2aa670..a674bb7a8 100644
+--- a/src/pcre2_dfa_match.c
++++ b/src/pcre2_dfa_match.c
+@@ -2682,7 +2682,9 @@ for (;;)
+         if (codevalue == OP_XCLASS)
+          {
+          ecode = code + GET(code, 1);
+-         if (clen > 0) isinclass = PRIV(xclass)(c, code + 1 + LINK_SIZE, utf);
++         if (clen > 0)
++           isinclass = PRIV(xclass)(c, code + 1 + LINK_SIZE,
++             (const uint8_t*)mb->start_code, utf);
+          }
+ 
+         /* A nested set-based class has internal opcodes for performing
+@@ -2691,7 +2693,9 @@ for (;;)
+         else if (codevalue == OP_ECLASS)
+          {
+          ecode = code + GET(code, 1);
+-         if (clen > 0) isinclass = PRIV(eclass)(c, code + 1 + LINK_SIZE, ecode, utf);
++         if (clen > 0)
++           isinclass = PRIV(eclass)(c, code + 1 + LINK_SIZE, ecode,
++             (const uint8_t*)mb->start_code, utf);
+          }
+ 
+         /* For a simple class, there is always just a 32-byte table, and we
+@@ -3536,8 +3540,7 @@ if (mb->match_limit_depth > re->limit_depth)
+ if (mb->heap_limit > re->limit_heap)
+   mb->heap_limit = re->limit_heap;
+ 
+-mb->start_code = (PCRE2_SPTR)((const uint8_t *)re + sizeof(pcre2_real_code)) +
+-  re->name_count * re->name_entry_size;
++mb->start_code = (PCRE2_SPTR)((const uint8_t *)re + re->code_start);
+ mb->tables = re->tables;
+ mb->start_subject = subject;
+ mb->end_subject = end_subject;
+diff --git a/src/pcre2_internal.h b/src/pcre2_internal.h
+index f1fcc5efb..55d950425 100644
+--- a/src/pcre2_internal.h
++++ b/src/pcre2_internal.h
+@@ -1358,9 +1358,8 @@ contain characters with values greater than 255. */
+ #define XCL_NOTPROP  4     /* Unicode inverted property (ditto) */
+ /* This value represents the beginning of character lists. The value
+ is 16 bit long, and stored as a high and low byte pair in 8 bit mode.
+-The lower 12 bit contains information about character lists (see later)
+-and next two bits contains the alignment (padding) data. */
+-#define XCL_LIST     (sizeof(PCRE2_UCHAR) == 1 ? 0x40 : 0x4000)
++The lower 12 bit contains information about character lists (see later). */
++#define XCL_LIST     (sizeof(PCRE2_UCHAR) == 1 ? 0x10 : 0x1000)
+ 
+ /* When a character class contains many characters/ranges,
+ they are stored in character lists. There are four character
+@@ -1423,11 +1422,6 @@ represents that the item count is stored at the begining of the
+ character list. The item count has the same width as the items
+ in the character list (e.g. 16 bit for Low16 and High16 lists). */
+ #define XCL_ITEM_COUNT_MASK 0x3
+-/* Shift and mask for getting alignment data. The items of a character
+-list are always naturally aligned. Adding this value to the byte position
+-of the XCL_LIST header ensures the required alignment of the items. */
+-#define XCL_ALIGNMENT_SHIFT 12
+-#define XCL_ALIGNMENT_MASK 0x3
+ /* Shift and flag for constructing character list items. The XCL_CHAR_END
+ is set, when the item is not the beginning of a range. The XCL_CHAR_SHIFT
+ can be used to encode / decode the character value stored in an item. */
+@@ -2199,8 +2193,9 @@ extern int          _pcre2_study(pcre2_real_code *);
+ extern int          _pcre2_valid_utf(PCRE2_SPTR, PCRE2_SIZE, PCRE2_SIZE *);
+ extern BOOL         _pcre2_was_newline(PCRE2_SPTR, uint32_t, PCRE2_SPTR,
+                       uint32_t *, BOOL);
+-extern BOOL         _pcre2_xclass(uint32_t, PCRE2_SPTR, BOOL);
+-extern BOOL         _pcre2_eclass(uint32_t, PCRE2_SPTR, PCRE2_SPTR, BOOL);
++extern BOOL         _pcre2_xclass(uint32_t, PCRE2_SPTR, const uint8_t *, BOOL);
++extern BOOL         _pcre2_eclass(uint32_t, PCRE2_SPTR, PCRE2_SPTR,
++                      const uint8_t *, BOOL);
+ 
+ /* This function is needed only when memmove() is not available. */
+ 
+diff --git a/src/pcre2_intmodedep.h b/src/pcre2_intmodedep.h
+index 25f1d49ff..598060c9b 100644
+--- a/src/pcre2_intmodedep.h
++++ b/src/pcre2_intmodedep.h
+@@ -631,6 +631,7 @@ typedef struct pcre2_real_code {
+   void    *executable_jit;        /* Pointer to JIT code */
+   uint8_t  start_bitmap[32];      /* Bitmap for starting code unit < 256 */
+   CODE_BLOCKSIZE_TYPE blocksize;  /* Total (bytes) that was malloc-ed */
++  CODE_BLOCKSIZE_TYPE code_start; /* Byte code start offset */
+   uint32_t magic_number;          /* Paranoid and endianness check */
+   uint32_t compile_options;       /* Options passed to pcre2_compile() */
+   uint32_t overall_options;       /* Options after processing the pattern */
+@@ -786,8 +787,9 @@ typedef struct compile_block {
+   BOOL had_recurse;                /* Had a pattern recursion or subroutine call */
+   BOOL dupnames;                   /* Duplicate names exist */
+ #ifdef SUPPORT_WIDE_CHARS
+-  class_ranges* cranges;           /* First class range. */
+-  class_ranges* next_cranges;      /* Next class range. */
++  class_ranges *cranges;           /* First class range. */
++  class_ranges *next_cranges;      /* Next class range. */
++  size_t char_lists_size;          /* Current size of character lists */
+ #endif
+ } compile_block;
+ 
+diff --git a/src/pcre2_jit_compile.c b/src/pcre2_jit_compile.c
+index 45d41ff2d..8ccab761d 100644
+--- a/src/pcre2_jit_compile.c
++++ b/src/pcre2_jit_compile.c
+@@ -7778,8 +7778,7 @@ cc++;
+ #endif  /* CODE_UNIT_WIDTH */
+ 
+ /* Align characters. */
+-next_char = (const uint8_t*)cc;
+-next_char += (type >> XCL_ALIGNMENT_SHIFT) & XCL_ALIGNMENT_MASK;
++next_char = (const uint8_t*)common->start - (GET(cc, 0) << 1);
+ type &= XCL_TYPE_MASK;
+ 
+ /* Estimate size. */
+@@ -7851,6 +7850,7 @@ while (type > 0)
+   if (item_count == XCL_ITEM_COUNT_MASK)
+     {
+     READ_FROM_CHAR_LIST(item_count);
++    SLJIT_ASSERT(item_count >= XCL_ITEM_COUNT_MASK);
+     }
+ 
+   while (item_count > 0)
+@@ -7918,6 +7918,7 @@ while (type > 0)
+   }
+ 
+ SLJIT_ASSERT(range_count > 0 && range_count <= (est_range_count << 1));
++SLJIT_ASSERT(next_char <= (const uint8_t*)common->start);
+ ranges->range_count = range_count;
+ }
+ 
+@@ -14702,7 +14703,7 @@ memset(&rootbacktrack, 0, sizeof(backtrack_common));
+ memset(common, 0, sizeof(compiler_common));
+ common->re = re;
+ common->name_table = (PCRE2_SPTR)((uint8_t *)re + sizeof(pcre2_real_code));
+-rootbacktrack.cc = common->name_table + re->name_count * re->name_entry_size;
++rootbacktrack.cc = (PCRE2_SPTR)((uint8_t *)re + re->code_start);
+ 
+ #ifdef SUPPORT_UNICODE
+ common->invalid_utf = (mode & PCRE2_JIT_INVALID_UTF) != 0;
+diff --git a/src/pcre2_match.c b/src/pcre2_match.c
+index a44ce688a..ee45d0c89 100644
+--- a/src/pcre2_match.c
++++ b/src/pcre2_match.c
+@@ -2241,7 +2241,9 @@ fprintf(stderr, "++ %2ld op=%3d %s\n", Fecode - mb->start_code, *Fecode,
+           RRETURN(MATCH_NOMATCH);
+           }
+         GETCHARINCTEST(fc, Feptr);
+-        if (!PRIV(xclass)(fc, Lxclass_data, utf)) RRETURN(MATCH_NOMATCH);
++        if (!PRIV(xclass)(fc, Lxclass_data,
++            (const uint8_t*)mb->start_code, utf))
++          RRETURN(MATCH_NOMATCH);
+         }
+ 
+       /* If Lmax == Lmin we can just continue with the main loop. */
+@@ -2264,7 +2266,9 @@ fprintf(stderr, "++ %2ld op=%3d %s\n", Fecode - mb->start_code, *Fecode,
+             RRETURN(MATCH_NOMATCH);
+             }
+           GETCHARINCTEST(fc, Feptr);
+-          if (!PRIV(xclass)(fc, Lxclass_data, utf)) RRETURN(MATCH_NOMATCH);
++          if (!PRIV(xclass)(fc, Lxclass_data,
++              (const uint8_t*)mb->start_code, utf))
++            RRETURN(MATCH_NOMATCH);
+           }
+         PCRE2_UNREACHABLE(); /* Control never reaches here */
+         }
+@@ -2287,7 +2291,8 @@ fprintf(stderr, "++ %2ld op=%3d %s\n", Fecode - mb->start_code, *Fecode,
+ #else
+           fc = *Feptr;
+ #endif
+-          if (!PRIV(xclass)(fc, Lxclass_data, utf)) break;
++          if (!PRIV(xclass)(fc, Lxclass_data,
++              (const uint8_t*)mb->start_code, utf)) break;
+           Feptr += len;
+           }
+ 
+@@ -2380,7 +2385,8 @@ fprintf(stderr, "++ %2ld op=%3d %s\n", Fecode - mb->start_code, *Fecode,
+           RRETURN(MATCH_NOMATCH);
+           }
+         GETCHARINCTEST(fc, Feptr);
+-        if (!PRIV(eclass)(fc, Leclass_data, Leclass_data + Leclass_len, utf))
++        if (!PRIV(eclass)(fc, Leclass_data, Leclass_data + Leclass_len,
++                          (const uint8_t*)mb->start_code, utf))
+           RRETURN(MATCH_NOMATCH);
+         }
+ 
+@@ -2404,7 +2410,8 @@ fprintf(stderr, "++ %2ld op=%3d %s\n", Fecode - mb->start_code, *Fecode,
+             RRETURN(MATCH_NOMATCH);
+             }
+           GETCHARINCTEST(fc, Feptr);
+-          if (!PRIV(eclass)(fc, Leclass_data, Leclass_data + Leclass_len, utf))
++          if (!PRIV(eclass)(fc, Leclass_data, Leclass_data + Leclass_len,
++                            (const uint8_t*)mb->start_code, utf))
+             RRETURN(MATCH_NOMATCH);
+           }
+         PCRE2_UNREACHABLE(); /* Control never reaches here */
+@@ -2428,7 +2435,8 @@ fprintf(stderr, "++ %2ld op=%3d %s\n", Fecode - mb->start_code, *Fecode,
+ #else
+           fc = *Feptr;
+ #endif
+-          if (!PRIV(eclass)(fc, Leclass_data, Leclass_data + Leclass_len, utf))
++          if (!PRIV(eclass)(fc, Leclass_data, Leclass_data + Leclass_len,
++                            (const uint8_t*)mb->start_code, utf))
+             break;
+           Feptr += len;
+           }
+@@ -7311,7 +7319,7 @@ given name, for condition testing. The code follows the name table. */
+ mb->name_table = (PCRE2_SPTR)((const uint8_t *)re + sizeof(pcre2_real_code));
+ mb->name_count = re->name_count;
+ mb->name_entry_size = re->name_entry_size;
+-mb->start_code = mb->name_table + re->name_count * re->name_entry_size;
++mb->start_code = (PCRE2_SPTR)((const uint8_t *)re + re->code_start);
+ 
+ /* Process the \R and newline settings. */
+ 
+diff --git a/src/pcre2_printint.c b/src/pcre2_printint.c
+index 9e61cfc95..a1df310c7 100644
+--- a/src/pcre2_printint.c
++++ b/src/pcre2_printint.c
+@@ -334,7 +334,7 @@ Returns:       end of the character list
+ */
+ 
+ static PCRE2_SPTR
+-print_char_list(FILE *f, PCRE2_SPTR code)
++print_char_list(FILE *f, PCRE2_SPTR code, const uint8_t *char_lists_end)
+ {
+ uint32_t type, list_ind;
+ uint32_t char_list_add = XCL_CHAR_LIST_LOW_16_ADD;
+@@ -350,8 +350,7 @@ code++;
+ #endif  /* CODE_UNIT_WIDTH */
+ 
+ /* Align characters. */
+-next_char = (const uint8_t*)code;
+-next_char += (type >> XCL_ALIGNMENT_SHIFT) & XCL_ALIGNMENT_MASK;
++next_char = char_lists_end - (GET(code, 0) << 1);
+ type &= XCL_TYPE_MASK;
+ list_ind = 0;
+ 
+@@ -438,7 +437,7 @@ while (type > 0)
+   else char_list_add = XCL_CHAR_LIST_HIGH_32_ADD;
+   }
+ 
+-return (PCRE2_SPTR)next_char;
++return code + LINK_SIZE;
+ }
+ 
+ 
+@@ -461,7 +460,8 @@ Returns:       nothing
+ */
+ 
+ static void
+-print_class(FILE *f, PCRE2_SPTR code, BOOL utf, const char *before, const char *after)
++print_class(FILE *f, PCRE2_SPTR code, const uint8_t *char_lists_end, BOOL utf,
++  const char *before, const char *after)
+ {
+ BOOL printmap, invertmap;
+ PCRE2_SPTR ccode;
+@@ -532,7 +532,7 @@ if (*code == OP_XCLASS)
+     const char *notch = "";
+     if (ch >= XCL_LIST)
+       {
+-      ccode = print_char_list(f, ccode - 1);
++      ccode = print_char_list(f, ccode - 1, char_lists_end);
+       break;
+       }
+     switch(ch)
+@@ -609,7 +609,7 @@ uint32_t nesize = re->name_entry_size;
+ BOOL utf = (re->overall_options & PCRE2_UTF) != 0;
+ 
+ nametable = (PCRE2_SPTR)((uint8_t *)re + sizeof(pcre2_real_code));
+-code = codestart = nametable + re->name_count * re->name_entry_size;
++code = codestart = (PCRE2_SPTR)((uint8_t *)re + re->code_start);
+ 
+ for(;;)
+   {
+@@ -984,7 +984,7 @@ for(;;)
+         case OP_CLASS:
+         case OP_NCLASS:
+         case OP_XCLASS:
+-        print_class(f, ccode, utf, "      cls:", "\n");
++        print_class(f, ccode, (uint8_t*)codestart, utf, "      cls:", "\n");
+         if (*ccode == OP_XCLASS)
+           ccode += GET(ccode, 1);
+         else
+@@ -1012,7 +1012,7 @@ for(;;)
+     case OP_CLASS:
+     case OP_NCLASS:
+     case OP_XCLASS:
+-    print_class(f, code, utf, "    ", "");
++    print_class(f, code, (uint8_t*)codestart, utf, "    ", "");
+     if (*code == OP_XCLASS)
+       extra = GET(code, 1);
+     ccode = code + OP_lengths[*code] + extra;
+diff --git a/src/pcre2_study.c b/src/pcre2_study.c
+index 637c168da..b10304e65 100644
+--- a/src/pcre2_study.c
++++ b/src/pcre2_study.c
+@@ -937,7 +937,8 @@ the starting bits accordingly.
+ Returns:         nothing
+ */
+ static void
+-study_char_list(PCRE2_SPTR code, uint8_t *start_bitmap)
++study_char_list(PCRE2_SPTR code, uint8_t *start_bitmap,
++  const uint8_t *char_lists_end)
+ {
+ uint32_t type, list_ind;
+ uint32_t char_list_add = XCL_CHAR_LIST_LOW_16_ADD;
+@@ -951,8 +952,7 @@ type = (uint32_t)(code[0] << 8) | code[1];
+ code += 2;
+ 
+ /* Align characters. */
+-next_char = (const uint8_t*)code;
+-next_char += (type >> XCL_ALIGNMENT_SHIFT) & XCL_ALIGNMENT_MASK;
++next_char = char_lists_end - (GET(code, 0) << 1);
+ type &= XCL_TYPE_MASK;
+ list_ind = 0;
+ 
+@@ -1755,7 +1755,8 @@ do
+ 
+         if (*p >= XCL_LIST)
+           {
+-          study_char_list(p, re->start_bitmap);
++          study_char_list(p, re->start_bitmap,
++            ((const uint8_t *)re + re->code_start));
+           goto HANDLE_CLASSMAP;
+           }
+ 
+@@ -1920,8 +1921,7 @@ BOOL ucp = (re->overall_options & PCRE2_UCP) != 0;
+ 
+ /* Find start of compiled code */
+ 
+-code = (PCRE2_UCHAR *)((uint8_t *)re + sizeof(pcre2_real_code)) +
+-  re->name_entry_size * re->name_count;
++code = (PCRE2_UCHAR *)((uint8_t *)re + re->code_start);
+ 
+ /* For a pattern that has a first code unit, or a multiline pattern that
+ matches only at "line start", there is no point in seeking a list of starting
+diff --git a/src/pcre2_xclass.c b/src/pcre2_xclass.c
+index 34692e044..1d16bddea 100644
+--- a/src/pcre2_xclass.c
++++ b/src/pcre2_xclass.c
+@@ -66,7 +66,7 @@ Returns:      TRUE if character matches, else FALSE
+ */
+ 
+ BOOL
+-PRIV(xclass)(uint32_t c, PCRE2_SPTR data, BOOL utf)
++PRIV(xclass)(uint32_t c, PCRE2_SPTR data, const uint8_t *char_lists_end, BOOL utf)
+ {
+ /* Update PRIV(update_classbits) when this function is changed. */
+ PCRE2_UCHAR t;
+@@ -320,8 +320,7 @@ data++;
+ #endif  /* CODE_UNIT_WIDTH */
+ 
+ /* Align characters. */
+-next_char = (const uint8_t*)data;
+-next_char += (type >> XCL_ALIGNMENT_SHIFT) & XCL_ALIGNMENT_MASK;
++next_char = char_lists_end - (GET(data, 0) << 1);
+ type &= XCL_TYPE_MASK;
+ 
+ /* Alignment check. */
+@@ -333,6 +332,7 @@ if (c >= XCL_CHAR_LIST_HIGH_16_START)
+   if (max_index == XCL_ITEM_COUNT_MASK)
+     {
+     max_index = *(const uint16_t*)next_char;
++    PCRE2_ASSERT(max_index >= XCL_ITEM_COUNT_MASK);
+     next_char += 2;
+     }
+ 
+@@ -349,6 +349,7 @@ if (c < XCL_CHAR_LIST_LOW_32_START)
+   if (max_index == XCL_ITEM_COUNT_MASK)
+     {
+     max_index = *(const uint16_t*)next_char;
++    PCRE2_ASSERT(max_index >= XCL_ITEM_COUNT_MASK);
+     next_char += 2;
+     }
+ 
+@@ -382,6 +383,7 @@ max_index = type & XCL_ITEM_COUNT_MASK;
+ if (max_index == XCL_ITEM_COUNT_MASK)
+   {
+   max_index = *(const uint16_t*)next_char;
++  PCRE2_ASSERT(max_index >= XCL_ITEM_COUNT_MASK);
+   next_char += 2;
+   }
+ 
+@@ -399,6 +401,7 @@ if (c >= XCL_CHAR_LIST_HIGH_32_START)
+   if (max_index == XCL_ITEM_COUNT_MASK)
+     {
+     max_index = *(const uint32_t*)next_char;
++    PCRE2_ASSERT(max_index >= XCL_ITEM_COUNT_MASK);
+     next_char += 4;
+     }
+ 
+@@ -460,7 +463,8 @@ Returns:      TRUE if character matches, else FALSE
+ */
+ 
+ BOOL
+-PRIV(eclass)(uint32_t c, PCRE2_SPTR data_start, PCRE2_SPTR data_end, BOOL utf)
++PRIV(eclass)(uint32_t c, PCRE2_SPTR data_start, PCRE2_SPTR data_end,
++  const uint8_t *char_lists_end, BOOL utf)
+ {
+ PCRE2_SPTR ptr = data_start;
+ uint32_t stack = 0;
+@@ -507,7 +511,7 @@ while (ptr < data_end)
+ #ifdef SUPPORT_WIDE_CHARS
+     case OP_XCLASS:
+       {
+-      uint32_t matched = PRIV(xclass)(c, ptr + 1 + LINK_SIZE, utf);
++      uint32_t matched = PRIV(xclass)(c, ptr + 1 + LINK_SIZE, char_lists_end, utf);
+ 
+       ptr += GET(ptr, 1);
+       stack = (stack << 1) | matched;
+diff --git a/testdata/testinput5 b/testdata/testinput5
+index 967565843..494371b54 100644
+--- a/testdata/testinput5
++++ b/testdata/testinput5
+@@ -3186,4 +3186,7 @@
+ 
+ # --------------
+ 
++/^([\h\x{9000}\x{9002}\x{9004}][\v\x{9000}\x{9002}\x{9004}\x{9006}\x{9008}][\h\v\x{9000}],){4}$/B,utf
++  \x09\x0a\x0d,\x{1680}\x{2028}\x{1680},\x{180e}\x{2029}\x{180e},\x{9000}\x{9000}\x{9000},
++
+ # End of testinput5
+diff --git a/testdata/testoutput5 b/testdata/testoutput5
+index d760173e9..37b4ae712 100644
+--- a/testdata/testoutput5
++++ b/testdata/testoutput5
+@@ -7157,4 +7157,40 @@ No match
+ 
+ # --------------
+ 
++/^([\h\x{9000}\x{9002}\x{9004}][\v\x{9000}\x{9002}\x{9004}\x{9006}\x{9008}][\h\v\x{9000}],){4}$/B,utf
++------------------------------------------------------------------
++        Bra
++        ^
++        CBra 1
++        [\x09 \xa0\x{1680}\x{180e}\x{2000}-\x{200a}\x{202f}\x{205f}\x{3000}\x{9000}\x{9002}\x{9004}]
++        [\x0a-\x0d\x85\x{2028}-\x{2029}\x{9000}\x{9002}\x{9004}\x{9006}\x{9008}]
++        [\x09-\x0d \x85\xa0\x{1680}\x{180e}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}\x{9000}]
++        ,
++        Ket
++        CBra 1
++        [\x09 \xa0\x{1680}\x{180e}\x{2000}-\x{200a}\x{202f}\x{205f}\x{3000}\x{9000}\x{9002}\x{9004}]
++        [\x0a-\x0d\x85\x{2028}-\x{2029}\x{9000}\x{9002}\x{9004}\x{9006}\x{9008}]
++        [\x09-\x0d \x85\xa0\x{1680}\x{180e}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}\x{9000}]
++        ,
++        Ket
++        CBra 1
++        [\x09 \xa0\x{1680}\x{180e}\x{2000}-\x{200a}\x{202f}\x{205f}\x{3000}\x{9000}\x{9002}\x{9004}]
++        [\x0a-\x0d\x85\x{2028}-\x{2029}\x{9000}\x{9002}\x{9004}\x{9006}\x{9008}]
++        [\x09-\x0d \x85\xa0\x{1680}\x{180e}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}\x{9000}]
++        ,
++        Ket
++        CBra 1
++        [\x09 \xa0\x{1680}\x{180e}\x{2000}-\x{200a}\x{202f}\x{205f}\x{3000}\x{9000}\x{9002}\x{9004}]
++        [\x0a-\x0d\x85\x{2028}-\x{2029}\x{9000}\x{9002}\x{9004}\x{9006}\x{9008}]
++        [\x09-\x0d \x85\xa0\x{1680}\x{180e}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}\x{9000}]
++        ,
++        Ket
++        $
++        Ket
++        End
++------------------------------------------------------------------
++  \x09\x0a\x0d,\x{1680}\x{2028}\x{1680},\x{180e}\x{2029}\x{180e},\x{9000}\x{9000}\x{9000},
++ 0: \x{09}\x{0a}\x{0d},\x{1680}\x{2028}\x{1680},\x{180e}\x{2029}\x{180e},\x{9000}\x{9000}\x{9000},
++ 1: \x{9000}\x{9000}\x{9000},
++
+ # End of testinput5

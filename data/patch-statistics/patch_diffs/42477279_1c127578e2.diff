@@ -1,0 +1,116 @@
+From d80ce4bf15936d7d6c35159b0eb3fe3207b8b89a Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Tue, 13 Aug 2019 11:21:01 +0100
+Subject: [PATCH 1/2] fix a problem with shrinkv tail processing
+
+Tail processing in shrinkv had an implicit assumption of round-down, but of
+course we round to nearest. Thanks angelmixu.
+
+see https://github.com/libvips/libvips/issues/1396
+---
+ ChangeLog                  | 1 +
+ libvips/resample/shrinkv.c | 4 ++--
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index 46b42970e2..02cf7e4cf0 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -7,6 +7,7 @@
+ - fix build with GM
+ - add locks for pdfium load
+ - fix build with MSVC 
++- fix a problem with shinkv tail processing [angelmixu]
+ 
+ 24/5/19 started 8.8.1
+ - improve realpath() use on older libc
+diff --git a/libvips/resample/shrinkv.c b/libvips/resample/shrinkv.c
+index 0dfac96b6e..19925c3256 100644
+--- a/libvips/resample/shrinkv.c
++++ b/libvips/resample/shrinkv.c
+@@ -329,12 +329,12 @@ vips_shrinkv_gen( VipsRegion *or, void *vseq,
+ 		r->top + r->height >= or->im->Ysize ) {
+ 		/* First unused scanline. resample->in->Ysize because we want
+ 		 * the height before the embed.
++		 *
++		 * Because we round to nearest, unused can be negative.
+ 		 */
+ 		int first = or->im->Ysize * shrink->vshrink;
+ 		int unused = resample->in->Ysize - first;
+ 
+-		g_assert( unused >= 0 );
+-
+ 		for( y = 0; y < unused; y++ ) { 
+ 			VipsRect s;
+ 
+
+From b5e8e99746ff1798ca54464c197b9c4c55db38ae Mon Sep 17 00:00:00 2001
+From: John Cupitt <jcupitt@gmail.com>
+Date: Wed, 21 Aug 2019 17:17:54 +0100
+Subject: [PATCH 2/2] fix a read-one-byte-beyond issue in jpeg load
+
+libvips could harmlessly read beyond the end of a string with a crafted jpg
+file
+---
+ ChangeLog                   | 1 +
+ libvips/foreign/jpeg2vips.c | 7 +++++--
+ libvips/iofuncs/header.c    | 7 +++++--
+ 3 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/ChangeLog b/ChangeLog
+index 02cf7e4cf0..4284872769 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -8,6 +8,7 @@
+ - add locks for pdfium load
+ - fix build with MSVC 
+ - fix a problem with shinkv tail processing [angelmixu]
++- fix a read one byte beyond buffer bug in jpegload
+ 
+ 24/5/19 started 8.8.1
+ - improve realpath() use on older libc
+diff --git a/libvips/foreign/jpeg2vips.c b/libvips/foreign/jpeg2vips.c
+index 8240b16484..1060bc9ef0 100644
+--- a/libvips/foreign/jpeg2vips.c
++++ b/libvips/foreign/jpeg2vips.c
+@@ -338,13 +338,16 @@ attach_xmp_blob( VipsImage *im, void *data, int data_length )
+ 	char *p = (char *) data;
+ 	int i;
+ 
+-	if( !vips_isprefix( "http", p ) ) 
++	if( data_length < 4 ||
++		!vips_isprefix( "http", p ) ) 
+ 		return( 0 );
+ 
+ 	/* Search for a null char within the first few characters. 80
+ 	 * should be plenty for a basic URL.
++	 *
++	 * -2 for the extra null.
+ 	 */
+-	for( i = 0; i < 80; i++ )
++	for( i = 0; i < VIPS_MIN( 80, data_length - 2 ); i++ )
+ 		if( !p[i] ) 
+ 			break;
+ 	if( p[i] )
+diff --git a/libvips/iofuncs/header.c b/libvips/iofuncs/header.c
+index 2af3752da1..62df5e9b6e 100644
+--- a/libvips/iofuncs/header.c
++++ b/libvips/iofuncs/header.c
+@@ -1451,12 +1451,15 @@ vips_image_set_blob_copy( VipsImage *image,
+ {
+ 	void *data_copy;
+ 
++	/* Cap at 100mb for sanity.
++	 */
+ 	if( !data ||
+-		length == 0 )
++		length == 0 ||
++		length > 100 * 1024 * 1024 )
+ 		return;
+ 
+ 	/* We add an extra, secret null byte at the end, just in case this blob 
+-	 * is read as a C string. The libtiff reader (for example) attaches
++	 * is read as a C string. The libtiff reader attaches
+ 	 * XMP XML as a blob, for example.
+ 	 */
+ 	if( !(data_copy = vips_malloc( NULL, length + 1 )) ) 

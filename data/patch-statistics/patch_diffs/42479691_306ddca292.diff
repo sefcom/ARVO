@@ -1,0 +1,78 @@
+From 6d7f3976f33b0d4fbbece60d6b7d549b13107674 Mon Sep 17 00:00:00 2001
+From: Luca Deri <deri@ntop.org>
+Date: Mon, 9 Dec 2019 18:02:48 +0100
+Subject: [PATCH] Code cleanup
+
+---
+ src/lib/protocols/dns.c  |  5 ++++-
+ src/lib/protocols/stun.c | 10 +++++++---
+ src/lib/protocols/tls.c  | 17 ++++++++++-------
+ 3 files changed, 21 insertions(+), 11 deletions(-)
+
+diff --git a/src/lib/protocols/dns.c b/src/lib/protocols/dns.c
+index 3fbb399156f..6ef1b951738 100644
+--- a/src/lib/protocols/dns.c
++++ b/src/lib/protocols/dns.c
+@@ -279,8 +279,11 @@ static void ndpi_search_dns(struct ndpi_detection_module_struct *ndpi_struct, st
+       if(j && j < max_len) flow->host_server_name[j++] = '.';
+ 
+       while(j < max_len && cl != 0) {
++	u_int32_t shift;
++	
+ 	c = flow->packet.payload[off++];
+-	flow->host_server_name[j++] = tolower((dns_validchar[c >> 5] & (1 << (c & 0x1f))) ? c : '_');
++	shift = 1 << (c & 0x1f);
++	flow->host_server_name[j++] = tolower((dns_validchar[c >> 5] & shift) ? c : '_');
+ 	cl--;
+       }
+     }
+diff --git a/src/lib/protocols/stun.c b/src/lib/protocols/stun.c
+index e95965f6b9a..d5114204fc5 100644
+--- a/src/lib/protocols/stun.c
++++ b/src/lib/protocols/stun.c
+@@ -350,9 +350,13 @@ static ndpi_int_stun_t ndpi_int_check_stun(struct ndpi_detection_module_struct *
+ 
+             memset(flow->host_server_name, 0, sizeof(flow->host_server_name));
+ 
+-            for(j=0; j<i; j++)
+-              flow->host_server_name[j] = payload[k++];
+-
++            for(j=0; j<i; j++) {
++	      if((k+i) < payload_length)
++		flow->host_server_name[j] = payload[k++];
++	      else
++		break;
++	    }
++	    
+ #ifdef DEBUG_STUN
+             printf("==> [%s]\n", flow->host_server_name);
+ #endif
+diff --git a/src/lib/protocols/tls.c b/src/lib/protocols/tls.c
+index fb9ad4c454a..f46686bb9ca 100644
+--- a/src/lib/protocols/tls.c
++++ b/src/lib/protocols/tls.c
+@@ -593,14 +593,17 @@ int getTLScertificate(struct ndpi_detection_module_struct *ndpi_struct,
+ 
+ 		      len = (packet->payload[offset+extension_offset+3] << 8) + packet->payload[offset+extension_offset+4];
+ 		      len = (u_int)ndpi_min(len, buffer_len-1);
+-		      strncpy(buffer, (char*)&packet->payload[offset+extension_offset+5], len);
+-		      buffer[len] = '\0';
+ 
+-		      stripCertificateTrailer(buffer, buffer_len);
+-
+-		      if(!ndpi_struct->disable_metadata_export) {
+-			snprintf(flow->protos.stun_ssl.ssl.client_certificate,
+-				 sizeof(flow->protos.stun_ssl.ssl.client_certificate), "%s", buffer);
++		      if((offset+extension_offset+5+len) < packet->payload_packet_len) {
++			strncpy(buffer, (char*)&packet->payload[offset+extension_offset+5], len);
++			buffer[len] = '\0';
++			
++			stripCertificateTrailer(buffer, buffer_len);
++			
++			if(!ndpi_struct->disable_metadata_export) {
++			  snprintf(flow->protos.stun_ssl.ssl.client_certificate,
++				   sizeof(flow->protos.stun_ssl.ssl.client_certificate), "%s", buffer);
++			}
+ 		      }
+ 		    } else if(extension_id == 10 /* supported groups */) {
+ 		      u_int16_t s_offset = offset+extension_offset + 2;

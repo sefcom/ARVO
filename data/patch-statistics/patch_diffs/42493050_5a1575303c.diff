@@ -1,0 +1,1890 @@
+From 5a222cc79dc67ce01477da3a3ee10edf1076c655 Mon Sep 17 00:00:00 2001
+From: Aleix Alcacer <aleixalcacer@gmail.com>
+Date: Fri, 5 Feb 2021 13:38:32 +0100
+Subject: [PATCH] Implemented multiple variable-length metalayers
+
+---
+ .gitignore                   |   2 +
+ CMakeLists.txt               |   4 +
+ README_CFRAME_FORMAT.rst     |  54 ++--
+ RELEASE_NOTES.md             |   4 +-
+ blosc/blosc2.h               |  75 +++--
+ blosc/frame.c                | 551 ++++++++++++++++++++++++-----------
+ blosc/frame.h                |   5 +-
+ blosc/schunk.c               | 204 +++++++++----
+ examples/CMakeLists.txt      |   2 +-
+ examples/frame_simple.c      |  35 ++-
+ examples/frame_umetalayers.c |  95 ++++++
+ examples/sframe_simple.c     |   3 +
+ tests/test_copy.c            |   5 +-
+ tests/test_empty_schunk.c    |  10 +-
+ tests/test_frame.c           |  27 +-
+ tests/test_schunk.c          |  17 +-
+ tests/test_sframe.c          |  31 +-
+ 17 files changed, 804 insertions(+), 320 deletions(-)
+ create mode 100644 examples/frame_umetalayers.c
+
+diff --git a/.gitignore b/.gitignore
+index 1596d0164..2a1181beb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,4 @@
+ bench/bench
+ build/
++.idea
++cmake-build-*
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bfce61e51..7930e5b12 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -121,6 +121,10 @@ option(PREFER_EXTERNAL_ZSTD
+ 
+ set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+ 
++if (ENABLE_ASAN)
++    message(STATUS "Enabling ASAN")
++    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Os -fno-omit-frame-pointer -fsanitize=address")
++endif()
+ 
+ if(NOT DEACTIVATE_LZ4)
+     if(PREFER_EXTERNAL_LZ4)
+diff --git a/README_CFRAME_FORMAT.rst b/README_CFRAME_FORMAT.rst
+index 68adc8cd1..6ff245158 100644
+--- a/README_CFRAME_FORMAT.rst
++++ b/README_CFRAME_FORMAT.rst
+@@ -75,15 +75,19 @@ At the end of the header *metalayers* are stored which contain meta-information
+ frame. It is up to the user to store whatever data they want with the only (strong) suggestion that they be stored
+ using the msgpack format. Here is the format for the *metalayers*::
+ 
+-  |-52|-53|-54|-55|-56|-----------------------
+-  | 93| cd| idx   | de| map_of_metalayers
+-  |---|---------------|-----------------------
+-    ^   ^    ^      ^
+-    |   |    |      |
+-    |   |    |      +--[msgpack] map of name/offset pairs
+-    |   |    +--size of the map
+-    |   +--[msgpack] uint16
+-    +-- [msgpack] fixarray with 3 elements
++    |-52|-53|-54|-55|-56|-57|-58|====================|---|---|---|================|
++    | 93| cd| idx   | de| size  | meta keys/values   | dc|  idy  | meta content   |
++    |---|---|-------|---|---|---|====================|---|-------|================|
++     ^   ^      ^     ^     ^             ^            ^     ^            ^
++     |   |      |     |     |             |            |     |            +-- [msgpack] bin32
++     |   |      |     |     |             |            |     +-- number of elements in the array
++     |   |      |     |     |             |            +-- [msgpack] array16
++     |   |      |     |     |             +-- [msgpack] fixstr/int32
++     |   |      |     |     +-- number of elements in the map
++     |   |      |     +-- [msgpack] map of name/offset pairs
++     |   |      +-- size of metalayers
++     |   +-- [msgpack] uint16
++     +-- [msgpack] fixarray with 3 elements
+ 
+ :header_size:
+     (``int32``) Size of the header of the frame (including metalayers).
+@@ -171,7 +175,7 @@ using the msgpack format. Here is the format for the *metalayers*::
+ :map of metalayers:
+     This is a *msgpack-formattted* map for the different metalayers.  The keys will be a string (0xa0 + namelen) for
+     the names of the metalayers, followed by an int32 (0xd2) for the *offset* of the value of this metalayer.  The
+-    actual value will be encoded as a bin32 (0xc6) value later in frame.
++    actual value will be encoded as a bin32 (0xc6) value later in header.
+ 
+ Chunks
+ ------
+@@ -229,27 +233,23 @@ Trailer
+ The trailer for the frame is encoded via `msgpack <https://msgpack.org>`_ and contains a user meta data chunk and
+ a fingerprint.::
+ 
+-    |-0-|-1-|-2-|-3-|-4-|-5-|-6-|====================|---|---------------|---|---|=================|
+-    | 9X| aX| c6| usermeta_len  |   usermeta_chunk   | ce| trailer_len   | d8|fpt| fingerprint     |
+-    |---|---|---|---------------|====================|---|---------------|---|---|=================|
+-      ^   ^   ^       ^                                ^       ^           ^   ^
+-      |   |   |       |                                |       |           |   +-- fingerprint type
+-      |   |   |       |                                |       |           +--[msgpack] fixext 16
+-      |   |   |       |                                |       +-- trailer length (network endian)
+-      |   |   |       |                                +--[msgpack] uint32 for trailer length
+-      |   |   |       +--[msgpack] usermeta length (network endian)
++    |-0-|-1-|================|---|---------------|---|---|---------------|
++    | 9X| aX| vlmetalayers   | ce| trailer_len   | d8|fpt| fingerprint   |
++    |---|---|================|---|---------------|---|---|---------------|
++      ^   ^   ^    ^           ^       ^           ^   ^
++      |   |   |    |           |       |           |   +-- fingerprint type
++      |   |   |    |           |       |           +--[msgpack] fixext 16
++      |   |   |    |           |       +-- trailer length (network endian)
++      |   |   |    |           +--[msgpack] uint32 for trailer length
++      |   |   |    +--Variable-length metalayers (See header metalayers)
+       |   |   +---[msgpack] bin32 for usermeta
+       |   +------[msgpack] int8 for trailer version
+       +---[msgpack] fixarray with X=4 elements
+ 
+-The *usermeta* chunk which stores the user meta data can change in size during the lifetime of the frame.
+-This is an important feature and the reason why the *usermeta* is stored in the trailer and not in the header.
++The *vlmetalayers* object which stores the variable-length user meta data can change in size during the lifetime of the frame.
++This is an important feature and the reason why the *vlmetalayers* are stored in the trailer and not in the header.
++However, the *vlmetalayers* follows the same format than the metalayers stored in the header.
+ 
+-:usermeta_len:
+-    (``int32``) The length of the usermeta chunk.
+-
+-:usermeta_chunk:
+-    (``varlen``) The usermeta chunk (a Blosc chunk).
+ 
+ :trailer_len:
+     (``uint32``) Size of the trailer of the frame (including usermeta chunk).
+@@ -258,4 +258,4 @@ This is an important feature and the reason why the *usermeta* is stored in the
+     (``int8``) Fingerprint type:  0 -> no fp; 1 -> 32-bit; 2 -> 64-bit; 3 -> 128-bit
+ 
+ :fingerprint:
+-    (``uint128``) Fix storage space for the fingerprint, padded to the left.
++    (``uint128``) Fix storage space for the fingerprint (16 bytes), padded to the left.
+\ No newline at end of file
+diff --git a/RELEASE_NOTES.md b/RELEASE_NOTES.md
+index 16e04af57..f1c36f408 100644
+--- a/RELEASE_NOTES.md
++++ b/RELEASE_NOTES.md
+@@ -96,10 +96,10 @@ Changes from 2.0.0-beta.2 to 2.0.0-beta.3
+ Changes from 2.0.0-beta.1 to 2.0.0-beta.2
+ ========================================
+ 
+-* A new `usermeta` chunk in `schunk` allows to store arbitrary meta-information
++* A new `vlmetalayers` chunk in `schunk` allows to store arbitrary meta-information
+   that is up to the user.  If the `schunk` has an attached `frame`, the later
+   will be updated accordingly too.  For more info, see PR #74 and docstrings of
+-  new `blosc2_update_usermeta()` and `blosc2_get_usermeta()` functions.
++  new `blosc2_update_vlmetalayer()` and `blosc2_get_vlmetalayer()` functions.
+ 
+ * Metalayers must now be attached to super-chunks, not frames.  The reason is
+   that frames are increasingly treated as a storage specifier (in-memory or
+diff --git a/blosc/blosc2.h b/blosc/blosc2.h
+index ca36722ea..1d493383a 100644
+--- a/blosc/blosc2.h
++++ b/blosc/blosc2.h
+@@ -274,6 +274,8 @@ enum {
+   BLOSC2_ERROR_2GB_LIMIT = -22,       //!< Sizes larger than 2gb not supported
+   BLOSC2_ERROR_SCHUNK_COPY = -23,     //!< Super-chunk copy failure
+   BLOSC2_ERROR_FRAME_TYPE = -24,      //!< Wrong type for frame
++  BLOSC2_ERROR_FILE_TRUNCATE = -25,   //!< File truncate failure
++
+ };
+ 
+ /**
+@@ -1019,6 +1021,9 @@ BLOSC_EXPORT int blosc2_getitem_ctx(blosc2_context* context, const void* src,
+ #define BLOSC2_MAX_METALAYERS 16
+ #define BLOSC2_METALAYER_NAME_MAXLEN 31
+ 
++#define BLOSC2_MAX_VLMETALAYERS BLOSC2_MAX_METALAYERS
++#define BLOSC2_USERMETA_NAME_MAXLEN BLOSC2_METALAYER_NAME_MAXLEN
++
+ /**
+  * @brief This struct is meant for holding storage parameters for a
+  * for a blosc2 container, allowing to specify, for example, how to interpret
+@@ -1101,11 +1106,11 @@ typedef struct blosc2_schunk {
+   struct blosc2_metalayer *metalayers[BLOSC2_MAX_METALAYERS];
+   //!< The array of metalayers.
+   int16_t nmetalayers;
+-  //!< The number of metalayers in the frame
+-  uint8_t* usermeta;
+-  //<! The user-defined metadata.
+-  int32_t usermeta_len;
+-  //<! The (compressed) length of the user-defined metadata.
++  //!< The number of metalayers in the super-chunk
++  struct blosc2_metalayer *vlmetalayers[BLOSC2_MAX_VLMETALAYERS];
++  //<! The array of variable-length metalayers.
++  int16_t nvlmetalayers;
++  //!< The number of variable-length metalayers.
+ } blosc2_schunk;
+ 
+ /**
+@@ -1430,39 +1435,61 @@ BLOSC_EXPORT int blosc2_get_metalayer(blosc2_schunk *schunk, const char *name, u
+ 
+ 
+ /*********************************************************************
+-  Usermeta functions.
++  Variable-length metalayers functions.
+ *********************************************************************/
+ 
+ /**
+- * @brief Update content into a usermeta chunk.
++ * @brief Find whether the schunk has a variable-length metalayer or not.
+  *
+- * If the @p schunk has an attached frame, the later will be updated accordingly too.
++ * @param schunk The super-chunk from which the variable-length metalayer will be checked.
++ * @param name The name of the variable-length metalayer to be checked.
+  *
+- * @param schunk The super-chunk to add the usermeta chunk.
+- * @param content The content of the usermeta chunk.
++ * @return If successful, return the index of the variable-length metalayer. Else, return a negative value.
++ */
++BLOSC_EXPORT int blosc2_has_vlmetalayer(blosc2_schunk *schunk, const char *name);
++
++/**
++ * @brief Add content into a new variable-length metalayer.
++ *
++ * @param schunk The super-chunk to which the variable-length metalayer should be added.
++ * @param name The name of the variable-length metalayer.
++ * @param content The content to be added.
+  * @param content_len The length of the content.
+- * @param cparams The parameters for compressing the usermeta chunk.
++ * @param cparams The parameters for compressing the variable-length metalayer content.
+  *
+- * @note The previous content, if any, will be overwritten by the new content.
+- * The user is responsible to keep the new content in sync with any previous content.
++ * @return If successful, the index of the new variable-length metalayer. Else, return a negative value.
++ */
++BLOSC_EXPORT int blosc2_add_vlmetalayer(blosc2_schunk *schunk, const char *name,
++                                        uint8_t *content, uint32_t content_len, blosc2_cparams *cparams);
++
++/**
++ * @brief Update the content of an existing variable-length metalayer.
+  *
+- * @return If successful, return the number of compressed bytes that takes the content.
+- * Else, a negative value.
++ * @param schunk The super-chunk containing the variable-length metalayer.
++ * @param name The name of the variable-length metalayer to be updated.
++ * @param content The new content of the variable-length metalayer.
++ * @param content_len The length of the content.
++ *
++ * @return If successful, the index of the variable-length metalayer. Else, return a negative value.
+  */
+-BLOSC_EXPORT int blosc2_update_usermeta(blosc2_schunk *schunk, uint8_t *content,
+-                                        int32_t content_len, blosc2_cparams cparams);
++BLOSC_EXPORT int blosc2_update_vlmetalayer(blosc2_schunk *schunk, const char *name,
++                                           uint8_t *content, uint32_t content_len, blosc2_cparams *cparams);
+ 
+-/* @brief Retrieve the usermeta chunk in a decompressed form.
++/**
++ * @brief Get the content out of a variable-length metalayer.
+  *
+- * @param schunk The super-chunk to which add the usermeta chunk.
+- * @param content The content of the usermeta chunk (output).
++ * @param schunk The super-chunk containing the variable-length metalayer.
++ * @param name The name of the variable-length metalayer.
++ * @param content The pointer where the content will be put.
++ * @param content_len The pointer where the length of the content will be put.
+  *
+- * @note The user is responsible to free the @p content buffer.
++ * @warning The @p **content receives a malloc'ed copy of the content.
++ * The user is responsible of freeing it.
+  *
+- * @return If successful, return the size of the (decompressed) chunk.
+- * Else, a negative value.
++ * @return If successful, the index of the new variable-length metalayer. Else, return a negative value.
+  */
+-BLOSC_EXPORT int blosc2_get_usermeta(blosc2_schunk* schunk, uint8_t** content);
++BLOSC_EXPORT int blosc2_get_vlmetalayer(blosc2_schunk *schunk, const char *name,
++                                        uint8_t **content, uint32_t *content_len);
+ 
+ 
+ /*********************************************************************
+diff --git a/blosc/frame.c b/blosc/frame.c
+index a4bfc6d78..455c10a73 100644
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -38,11 +38,59 @@
+ #include <stdalign.h>
+ #endif
+ 
++// Truncate file
++#if defined(_WIN32)
++#include <io.h>
++#define TRUNCATE _chsize_s
++#else
++#include <unistd.h>
++#define TRUNCATE ftruncate
++#endif
++
++void little_store(void *dest, const void *pa, int size) {
++  bool little_endian = is_little_endian();
++  if (little_endian) {
++    memcpy(dest, pa, size);
++  }
++  else {
++    uint8_t* pa_ = (uint8_t*)pa;
++    uint8_t* pa2_ = malloc((size_t)size);
++    switch (size) {
++      case 8:
++        pa2_[0] = pa_[7];
++        pa2_[1] = pa_[6];
++        pa2_[2] = pa_[5];
++        pa2_[3] = pa_[4];
++        pa2_[4] = pa_[3];
++        pa2_[5] = pa_[2];
++        pa2_[6] = pa_[1];
++        pa2_[7] = pa_[0];
++        break;
++      case 4:
++        pa2_[0] = pa_[3];
++        pa2_[1] = pa_[2];
++        pa2_[2] = pa_[1];
++        pa2_[3] = pa_[0];
++        break;
++      case 2:
++        pa2_[0] = pa_[1];
++        pa2_[1] = pa_[0];
++        break;
++      case 1:
++        pa2_[0] = pa_[1];
++        break;
++      default:
++        BLOSC_TRACE_ERROR("Unhandled size: %d.", size);
++    }
++    memcpy(dest, pa2_, size);
++    free(pa2_);
++  }
++}
+ 
+ // big <-> little-endian and store it in a memory position.  Sizes supported: 1, 2, 4, 8 bytes.
+-void swap_store(void *dest, const void *pa, int size) {
++void big_store(void *dest, const void *pa, int size) {
+     bool little_endian = is_little_endian();
+-    if (little_endian) {
++    if (!little_endian) {
+       memcpy(dest, pa, size);
+     }
+     else {
+@@ -145,7 +193,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   *h2p = 0xcf;  // uint64
+   // Fill it with frame->len which is known *after* the creation of the frame (e.g. when updating the header)
+   int64_t flen = frame->len;
+-  swap_store(h2 + FRAME_LEN, &flen, sizeof(flen));
++  big_store(h2 + FRAME_LEN, &flen, sizeof(flen));
+   h2p += 1 + 8;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+@@ -193,7 +241,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   *h2p = 0xd3;  // int64
+   h2p += 1;
+   int64_t nbytes = schunk->nbytes;
+-  swap_store(h2p, &nbytes, sizeof(nbytes));
++  big_store(h2p, &nbytes, sizeof(nbytes));
+   h2p += 8;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+@@ -203,7 +251,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   *h2p = 0xd3;  // int64
+   h2p += 1;
+   int64_t cbytes = schunk->cbytes;
+-  swap_store(h2p, &cbytes, sizeof(cbytes));
++  big_store(h2p, &cbytes, sizeof(cbytes));
+   h2p += 8;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+@@ -213,7 +261,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   *h2p = 0xd2;  // int32
+   h2p += 1;
+   int32_t typesize = schunk->typesize;
+-  swap_store(h2p, &typesize, sizeof(typesize));
++  big_store(h2p, &typesize, sizeof(typesize));
+   h2p += 4;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+@@ -223,7 +271,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   *h2p = 0xd2;  // int32
+   h2p += 1;
+   int32_t chunksize = schunk->chunksize;
+-  swap_store(h2p, &chunksize, sizeof(chunksize));
++  big_store(h2p, &chunksize, sizeof(chunksize));
+   h2p += 4;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+@@ -233,7 +281,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   *h2p = 0xd1;  // int16
+   h2p += 1;
+   int16_t nthreads = (int16_t)schunk->cctx->nthreads;
+-  swap_store(h2p, &nthreads, sizeof(nthreads));
++  big_store(h2p, &nthreads, sizeof(nthreads));
+   h2p += 2;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+@@ -243,14 +291,14 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   *h2p = 0xd1;  // int16
+   h2p += 1;
+   nthreads = (int16_t)schunk->dctx->nthreads;
+-  swap_store(h2p, &nthreads, sizeof(nthreads));
++  big_store(h2p, &nthreads, sizeof(nthreads));
+   h2p += 2;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+   }
+ 
+-  // The boolean for FRAME_HAS_USERMETA
+-  *h2p = (schunk->usermeta_len > 0) ? (uint8_t)0xc3 : (uint8_t)0xc2;
++  // The boolean for variable-length metalayers
++  *h2p = (schunk->nvlmetalayers > 0) ? (uint8_t)0xc3 : (uint8_t)0xc2;
+   h2p += 1;
+   if (h2p - h2 >= FRAME_HEADER_MINLEN) {
+     return NULL;
+@@ -303,7 +351,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   // Map (index) of offsets for optional metalayers
+   *h2p = 0xde;  // map 16 with N keys
+   h2p += 1;
+-  swap_store(h2p, &nmetalayers, sizeof(nmetalayers));
++  big_store(h2p, &nmetalayers, sizeof(nmetalayers));
+   h2p += sizeof(nmetalayers);
+   int32_t current_header_len = (int32_t)(h2p - h2);
+   int32_t *offtooff = malloc(nmetalayers * sizeof(int32_t));
+@@ -341,7 +389,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+     return NULL;
+   }
+   uint16_t map_size = (uint16_t) (hsize2 - hsize);
+-  swap_store(h2 + FRAME_IDX_SIZE, &map_size, sizeof(map_size));
++  big_store(h2 + FRAME_IDX_SIZE, &map_size, sizeof(map_size));
+ 
+   // Make space for an (empty) array
+   hsize = (int32_t)(h2p - h2);
+@@ -351,7 +399,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   // Now, store the values in an array
+   *h2p = 0xdc;  // array 16 with N elements
+   h2p += 1;
+-  swap_store(h2p, &nmetalayers, sizeof(nmetalayers));
++  big_store(h2p, &nmetalayers, sizeof(nmetalayers));
+   h2p += sizeof(nmetalayers);
+   current_header_len = (int32_t)(h2p - h2);
+   for (int nmetalayer = 0; nmetalayer < nmetalayers; nmetalayer++) {
+@@ -364,12 +412,12 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+     // Store the serialized contents for this metalayer
+     *h2p = 0xc6;  // bin32
+     h2p += 1;
+-    swap_store(h2p, &(metalayer->content_len), sizeof(metalayer->content_len));
++    big_store(h2p, &(metalayer->content_len), sizeof(metalayer->content_len));
+     h2p += 4;
+     memcpy(h2p, metalayer->content, metalayer->content_len);  // buffer, no need to swap
+     h2p += metalayer->content_len;
+     // Update the offset now that we know it
+-    swap_store(h2 + offtooff[nmetalayer], &current_header_len, sizeof(current_header_len));
++    big_store(h2 + offtooff[nmetalayer], &current_header_len, sizeof(current_header_len));
+     current_header_len += 1 + 4 + metalayer->content_len;
+   }
+   free(offtooff);
+@@ -379,7 +427,7 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   }
+ 
+   // Set the length of the whole header now that we know it
+-  swap_store(h2 + FRAME_HEADER_LEN, &hsize, sizeof(hsize));
++  big_store(h2 + FRAME_HEADER_LEN, &hsize, sizeof(hsize));
+ 
+   return h2;
+ }
+@@ -428,13 +476,13 @@ int get_header_info(blosc2_frame_s *frame, int32_t *header_len, int64_t *frame_l
+   }
+ 
+   // Fetch some internal lengths
+-  swap_store(header_len, framep + FRAME_HEADER_LEN, sizeof(*header_len));
+-  swap_store(frame_len, framep + FRAME_LEN, sizeof(*frame_len));
+-  swap_store(nbytes, framep + FRAME_NBYTES, sizeof(*nbytes));
+-  swap_store(cbytes, framep + FRAME_CBYTES, sizeof(*cbytes));
+-  swap_store(chunksize, framep + FRAME_CHUNKSIZE, sizeof(*chunksize));
++  big_store(header_len, framep + FRAME_HEADER_LEN, sizeof(*header_len));
++  big_store(frame_len, framep + FRAME_LEN, sizeof(*frame_len));
++  big_store(nbytes, framep + FRAME_NBYTES, sizeof(*nbytes));
++  big_store(cbytes, framep + FRAME_CBYTES, sizeof(*cbytes));
++  big_store(chunksize, framep + FRAME_CHUNKSIZE, sizeof(*chunksize));
+   if (typesize != NULL) {
+-    swap_store(typesize, framep + FRAME_TYPESIZE, sizeof(*typesize));
++    big_store(typesize, framep + FRAME_TYPESIZE, sizeof(*typesize));
+   }
+ 
+   if (*header_len <= 0 || *header_len > *frame_len) {
+@@ -503,7 +551,7 @@ int64_t get_trailer_offset(blosc2_frame_s *frame, int32_t header_len, bool has_c
+ int update_frame_len(blosc2_frame_s* frame, int64_t len) {
+   int rc = 1;
+   if (frame->cframe != NULL) {
+-    swap_store(frame->cframe + FRAME_LEN, &len, sizeof(int64_t));
++    big_store(frame->cframe + FRAME_LEN, &len, sizeof(int64_t));
+   }
+   else {
+     FILE* fp = NULL;
+@@ -515,7 +563,7 @@ int update_frame_len(blosc2_frame_s* frame, int64_t len) {
+     }
+     fseek(fp, FRAME_LEN, SEEK_SET);
+     int64_t swap_len;
+-    swap_store(&swap_len, &len, sizeof(int64_t));
++    big_store(&swap_len, &len, sizeof(int64_t));
+     size_t wbytes = fwrite(&swap_len, 1, sizeof(int64_t), fp);
+     fclose(fp);
+     if (wbytes != sizeof(int64_t)) {
+@@ -533,7 +581,7 @@ int frame_update_trailer(blosc2_frame_s* frame, blosc2_schunk* schunk) {
+   }
+ 
+   // Create the trailer in msgpack (see the frame format document)
+-  uint32_t trailer_len = FRAME_TRAILER_MINLEN + schunk->usermeta_len;
++  uint32_t trailer_len = FRAME_TRAILER_MINLEN;
+   uint8_t* trailer = (uint8_t*)calloc((size_t)trailer_len, 1);
+   uint8_t* ptrailer = trailer;
+   *ptrailer = 0x90 + 4;  // fixarray with 4 elements
+@@ -541,18 +589,115 @@ int frame_update_trailer(blosc2_frame_s* frame, blosc2_schunk* schunk) {
+   // Trailer format version
+   *ptrailer = FRAME_TRAILER_VERSION;
+   ptrailer += 1;
+-  // usermeta
+-  *ptrailer = 0xc6;     // bin32
++
++  int32_t current_trailer_len = (int32_t)(ptrailer - trailer);
++
++  // Now, deal with variable-length metalayers
++  int16_t nvlmetalayers = schunk->nvlmetalayers;
++  if (nvlmetalayers < 0 || nvlmetalayers > BLOSC2_MAX_METALAYERS) {
++    return -1;
++  }
++
++  // Make space for the header of metalayers (array marker, size, map of offsets)
++  trailer = realloc(trailer, (size_t) current_trailer_len + 1 + 1 + 2 + 1 + 2);
++  ptrailer = trailer + current_trailer_len;
++
++  // The msgpack header for the metalayers (array_marker, size, map of offsets, list of metalayers)
++  *ptrailer = 0x90 + 3;  // array with 3 elements
++  ptrailer += 1;
++
++  int32_t tsize = (ptrailer - trailer);
++
++  // Size for the map (index) of metalayer offsets, including this uint16 size (to be filled out later on)
++  *ptrailer = 0xcd;  // uint16
++  ptrailer += 1 + 2;
++
++  // Map (index) of offsets for optional metalayers
++  *ptrailer = 0xde;  // map 16 with N keys
++  ptrailer += 1;
++  big_store(ptrailer, &nvlmetalayers, sizeof(nvlmetalayers));
++  ptrailer += sizeof(nvlmetalayers);
++  current_trailer_len = (int32_t)(ptrailer - trailer);
++  int32_t *offtodata = malloc(nvlmetalayers * sizeof(int32_t));
++  for (int nvlmetalayer = 0; nvlmetalayer < nvlmetalayers; nvlmetalayer++) {
++    if (frame == NULL) {
++      return -1;
++    }
++    blosc2_metalayer *vlmetalayer = schunk->vlmetalayers[nvlmetalayer];
++    uint8_t name_len = (uint8_t) strlen(vlmetalayer->name);
++    trailer = realloc(trailer, (size_t)current_trailer_len + 1 + name_len + 1 + 4);
++    ptrailer = trailer + current_trailer_len;
++    // Store the vlmetalayer
++    if (name_len >= (1U << 5U)) {  // metalayer strings cannot be longer than 32 bytes
++      free(offtodata);
++      return -1;
++    }
++    *ptrailer = (uint8_t)0xa0 + name_len;  // str
++    ptrailer += 1;
++    memcpy(ptrailer, vlmetalayer->name, name_len);
++    ptrailer += name_len;
++    // Space for storing the offset for the value of this vlmetalayer
++    *ptrailer = 0xd2;  // int32
++    ptrailer += 1;
++    offtodata[nvlmetalayer] = (int32_t)(ptrailer - trailer);
++    ptrailer += 4;
++    current_trailer_len += 1 + name_len + 1 + 4;
++  }
++  int32_t tsize2 = (int32_t)(ptrailer - trailer);
++  if (tsize2 != current_trailer_len) {  // sanity check
++    return -1;
++  }
++
++  // Map size + int16 size
++  if ((uint32_t) (tsize2 - tsize) >= (1U << 16U)) {
++    return -1;
++  }
++  uint16_t map_size = (uint16_t) (tsize2 - tsize);
++  big_store(trailer + 4, &map_size, sizeof(map_size));
++
++  // Make space for an (empty) array
++  tsize = (int32_t)(ptrailer - trailer);
++  trailer = realloc(trailer, (size_t) tsize + 2 + 1 + 2);
++  ptrailer = trailer + tsize;
++
++  // Now, store the values in an array
++  *ptrailer = 0xdc;  // array 16 with N elements
+   ptrailer += 1;
+-  swap_store(ptrailer, &(schunk->usermeta_len), 4);
+-  ptrailer += 4;
+-  if (schunk->usermeta_len > 0)
+-    memcpy(ptrailer, schunk->usermeta, schunk->usermeta_len);
+-  ptrailer += schunk->usermeta_len;
++  big_store(ptrailer, &nvlmetalayers, sizeof(nvlmetalayers));
++  ptrailer += sizeof(nvlmetalayers);
++  current_trailer_len = (int32_t)(ptrailer - trailer);
++  for (int nvlmetalayer = 0; nvlmetalayer < nvlmetalayers; nvlmetalayer++) {
++    if (frame == NULL) {
++      return -1;
++    }
++    blosc2_metalayer *vlmetalayer = schunk->vlmetalayers[nvlmetalayer];
++    trailer = realloc(trailer, (size_t)current_trailer_len + 1 + 4 + vlmetalayer->content_len);
++    ptrailer = trailer + current_trailer_len;
++    // Store the serialized contents for this vlmetalayer
++    *ptrailer = 0xc6;  // bin32
++    ptrailer += 1;
++    big_store(ptrailer, &(vlmetalayer->content_len), sizeof(vlmetalayer->content_len));
++    ptrailer += 4;
++    memcpy(ptrailer, vlmetalayer->content, vlmetalayer->content_len);  // buffer, no need to swap
++    ptrailer += vlmetalayer->content_len;
++    // Update the offset now that we know it
++    big_store(trailer + offtodata[nvlmetalayer], &current_trailer_len, sizeof(current_trailer_len));
++    current_trailer_len += 1 + 4 + vlmetalayer->content_len;
++  }
++  free(offtodata);
++  tsize = (int32_t)(ptrailer - trailer);
++  if (tsize != current_trailer_len) {  // sanity check
++    return -1;
++  }
++
++  trailer = realloc(trailer, (size_t)current_trailer_len + 23);
++  ptrailer = trailer + current_trailer_len;
++  trailer_len = (ptrailer - trailer) + 23;
++
+   // Trailer length
+   *ptrailer = 0xce;  // uint32
+   ptrailer += 1;
+-  swap_store(ptrailer, &(trailer_len), sizeof(uint32_t));
++  big_store(ptrailer, &trailer_len, sizeof(uint32_t));
+   ptrailer += sizeof(uint32_t);
+   // Up to 16 bytes for frame fingerprint (using XXH3 included in https://github.com/Cyan4973/xxHash)
+   // Maybe someone would need 256-bit in the future, but for the time being 128-bit seems like a good tradeoff
+@@ -560,13 +705,16 @@ int frame_update_trailer(blosc2_frame_s* frame, blosc2_schunk* schunk) {
+   ptrailer += 1;
+   *ptrailer = 0;  // fingerprint type: 0 -> no fp; 1 -> 32-bit; 2 -> 64-bit; 3 -> 128-bit
+   ptrailer += 1;
++
+   // Uncomment this when we compute an actual fingerprint
+   // memcpy(ptrailer, xxh3_fingerprint, sizeof(xxh3_fingerprint));
+   ptrailer += 16;
++
+   // Sanity check
+   if (ptrailer - trailer != trailer_len) {
+     return BLOSC2_ERROR_DATA;
+   }
++
+   int32_t header_len;
+   int64_t frame_len;
+   int64_t nbytes;
+@@ -603,11 +751,16 @@ int frame_update_trailer(blosc2_frame_s* frame, blosc2_schunk* schunk) {
+     }
+     fseek(fp, trailer_offset, SEEK_SET);
+     size_t wbytes = fwrite(trailer, 1, trailer_len, fp);
+-    fclose(fp);
+     if (wbytes != (size_t)trailer_len) {
+       BLOSC_TRACE_ERROR("Cannot write the trailer length in trailer.");
+       return BLOSC2_ERROR_FILE_WRITE;
+     }
++    if (TRUNCATE(fileno(fp), trailer_offset + trailer_len) != 0) {
++      BLOSC_TRACE_ERROR("Cannot truncate the frame.");
++      return BLOSC2_ERROR_FILE_TRUNCATE;
++    }
++    fclose(fp);
++
+   }
+   free(trailer);
+ 
+@@ -664,7 +817,7 @@ blosc2_frame_s* frame_from_file(const char* urlpath) {
+     return NULL;
+   }
+   int64_t frame_len;
+-  swap_store(&frame_len, header + FRAME_LEN, sizeof(frame_len));
++  big_store(&frame_len, header + FRAME_LEN, sizeof(frame_len));
+ 
+   blosc2_frame_s* frame = calloc(1, sizeof(blosc2_frame_s));
+   frame->urlpath = urlpath_cpy;
+@@ -688,7 +841,7 @@ blosc2_frame_s* frame_from_file(const char* urlpath) {
+     return NULL;
+   }
+   uint32_t trailer_len;
+-  swap_store(&trailer_len, trailer + trailer_offset, sizeof(trailer_len));
++  big_store(&trailer_len, trailer + trailer_offset, sizeof(trailer_len));
+   frame->trailer_len = trailer_len;
+ 
+   return frame;
+@@ -703,7 +856,7 @@ blosc2_frame_s* frame_from_cframe(uint8_t *cframe, int64_t len, bool copy) {
+   if (len < FRAME_HEADER_MINLEN) {
+     return NULL;
+   }
+-  swap_store(&frame_len, header + FRAME_LEN, sizeof(frame_len));
++  big_store(&frame_len, header + FRAME_LEN, sizeof(frame_len));
+   if (frame_len != len) {   // sanity check
+     return NULL;
+   }
+@@ -719,7 +872,7 @@ blosc2_frame_s* frame_from_cframe(uint8_t *cframe, int64_t len, bool copy) {
+     return NULL;
+   }
+   uint32_t trailer_len;
+-  swap_store(&trailer_len, trailer + trailer_offset, sizeof(trailer_len));
++  big_store(&trailer_len, trailer + trailer_offset, sizeof(trailer_len));
+   frame->trailer_len = trailer_len;
+ 
+   if (copy) {
+@@ -746,7 +899,7 @@ int64_t frame_from_schunk(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+     return BLOSC2_ERROR_DATA;
+   }
+   uint32_t h2len;
+-  swap_store(&h2len, h2 + FRAME_HEADER_LEN, sizeof(h2len));
++  big_store(&h2len, h2 + FRAME_HEADER_LEN, sizeof(h2len));
+   // Build the offsets chunk
+   int32_t chunksize = -1;
+   int32_t off_cbytes = 0;
+@@ -802,13 +955,13 @@ int64_t frame_from_schunk(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+   free(data_tmp);
+ 
+   // Now that we know them, fill the chunksize and frame length in header
+-  swap_store(h2 + FRAME_CHUNKSIZE, &chunksize, sizeof(chunksize));
+-  frame->len = h2len + cbytes + off_cbytes + FRAME_TRAILER_MINLEN + schunk->usermeta_len;
++  big_store(h2 + FRAME_CHUNKSIZE, &chunksize, sizeof(chunksize));
++  frame->len = h2len + cbytes + off_cbytes + FRAME_TRAILER_MINLEN;
+   if (frame->sframe) {
+-    frame->len = h2len + off_cbytes + FRAME_TRAILER_MINLEN + schunk->usermeta_len;
++    frame->len = h2len + off_cbytes + FRAME_TRAILER_MINLEN;
+   }
+   int64_t tbytes = frame->len;
+-  swap_store(h2 + FRAME_LEN, &tbytes, sizeof(tbytes));
++  big_store(h2 + FRAME_LEN, &tbytes, sizeof(tbytes));
+ 
+   // Create the frame and put the header at the beginning
+   if (frame->urlpath == NULL) {
+@@ -953,17 +1106,17 @@ int frame_update_header(blosc2_frame_s* frame, blosc2_schunk* schunk, bool new)
+     framep = header;
+   }
+   uint32_t prev_h2len;
+-  swap_store(&prev_h2len, framep + FRAME_HEADER_LEN, sizeof(prev_h2len));
++  big_store(&prev_h2len, framep + FRAME_HEADER_LEN, sizeof(prev_h2len));
+ 
+   // Build a new header
+   uint8_t* h2 = new_header_frame(schunk, frame);
+   uint32_t h2len;
+-  swap_store(&h2len, h2 + FRAME_HEADER_LEN, sizeof(h2len));
++  big_store(&h2len, h2 + FRAME_HEADER_LEN, sizeof(h2len));
+ 
+   // The frame length is outdated when adding a new metalayer, so update it
+   if (new) {
+     int64_t frame_len = h2len;  // at adding time, we only have to worry of the header for now
+-    swap_store(h2 + FRAME_LEN, &frame_len, sizeof(frame_len));
++    big_store(h2 + FRAME_LEN, &frame_len, sizeof(frame_len));
+     frame->len = frame_len;
+   }
+ 
+@@ -998,92 +1151,6 @@ int frame_update_header(blosc2_frame_s* frame, blosc2_schunk* schunk, bool new)
+ }
+ 
+ 
+-/* Get the (compressed) usermeta chunk out of a frame */
+-int32_t frame_get_usermeta(blosc2_frame_s* frame, uint8_t** usermeta) {
+-  int32_t header_len;
+-  int64_t frame_len;
+-  int64_t nbytes;
+-  int64_t cbytes;
+-  int32_t chunksize;
+-  int32_t nchunks;
+-  int ret = get_header_info(frame, &header_len, &frame_len, &nbytes, &cbytes, &chunksize, &nchunks,
+-                            NULL, NULL, NULL, NULL, NULL);
+-  if (ret < 0) {
+-    BLOSC_TRACE_ERROR("Unable to get the header info from frame.");
+-    return ret;
+-  }
+-  int64_t trailer_offset = get_trailer_offset(frame, header_len, nbytes > 0);
+-  if (trailer_offset < 0) {
+-    BLOSC_TRACE_ERROR("Unable to get the trailer offset from frame.");
+-    return BLOSC2_ERROR_INVALID_HEADER;
+-  }
+-  if (trailer_offset + FRAME_TRAILER_USERMETA_LEN_OFFSET + (signed)sizeof(int32_t) > frame_len) {
+-    BLOSC_TRACE_ERROR("Invalid trailer offset exceeds frame length.");
+-    return BLOSC2_ERROR_READ_BUFFER;
+-  }
+-
+-  // Get the size of usermeta (inside the trailer)
+-  int32_t usermeta_len_network;
+-  if (frame->cframe != NULL) {
+-    memcpy(&usermeta_len_network, frame->cframe + trailer_offset + FRAME_TRAILER_USERMETA_LEN_OFFSET, sizeof(int32_t));
+-  }
+-  else {
+-    FILE* fp = NULL;
+-    if (frame->sframe) {
+-      fp = sframe_open_index(frame->urlpath, "rb");
+-    }
+-    else {
+-      fp = fopen(frame->urlpath, "rb");
+-    }
+-    fseek(fp, trailer_offset + FRAME_TRAILER_USERMETA_LEN_OFFSET, SEEK_SET);
+-    size_t rbytes = fread(&usermeta_len_network, 1, sizeof(int32_t), fp);
+-    fclose(fp);
+-    if (rbytes != sizeof(int32_t)) {
+-      BLOSC_TRACE_ERROR("Cannot access the usermeta_len out of the frame.");
+-      return BLOSC2_ERROR_READ_BUFFER;
+-    }
+-  }
+-  int32_t usermeta_len;
+-  swap_store(&usermeta_len, &usermeta_len_network, sizeof(int32_t));
+-
+-  if (usermeta_len < 0) {
+-    BLOSC_TRACE_ERROR("Invalid usermeta length.");
+-    return BLOSC2_ERROR_READ_BUFFER;
+-  }
+-  if (usermeta_len == 0) {
+-    *usermeta = NULL;
+-    return 0;
+-  }
+-  if (trailer_offset + FRAME_TRAILER_USERMETA_OFFSET + usermeta_len > frame_len) {
+-    BLOSC_TRACE_ERROR("Invalid usermeta offset exceeds frame length.");
+-    return BLOSC2_ERROR_INVALID_HEADER;
+-  }
+-
+-  *usermeta = malloc(usermeta_len);
+-  if (frame->cframe != NULL) {
+-    memcpy(*usermeta, frame->cframe + trailer_offset + FRAME_TRAILER_USERMETA_OFFSET, usermeta_len);
+-  }
+-  else {
+-    FILE* fp = NULL;
+-    if (frame->sframe) {
+-      fp = sframe_open_index(frame->urlpath, "rb+");
+-    }
+-    else {
+-      fp = fopen(frame->urlpath, "rb+");
+-    }
+-    fseek(fp, trailer_offset + FRAME_TRAILER_USERMETA_OFFSET, SEEK_SET);
+-    size_t rbytes = fread(*usermeta, 1, usermeta_len, fp);
+-    fclose(fp);
+-    if (rbytes != (size_t)usermeta_len) {
+-      BLOSC_TRACE_ERROR("Cannot read the complete usermeta chunk in frame. %ld != %ld.",
+-              (long)rbytes, (long)usermeta_len);
+-      return BLOSC2_ERROR_READ_BUFFER;
+-    }
+-  }
+-
+-  return usermeta_len;
+-}
+-
+ static int frame_get_metalayers_from_header(blosc2_frame_s* frame, blosc2_schunk* schunk, uint8_t* header,
+                                             int32_t header_len) {
+   int64_t header_pos = FRAME_IDX_SIZE;
+@@ -1094,7 +1161,7 @@ static int frame_get_metalayers_from_header(blosc2_frame_s* frame, blosc2_schunk
+   if (header_len < header_pos) {
+     return BLOSC2_ERROR_READ_BUFFER;
+   }
+-  swap_store(&idx_size, header + FRAME_IDX_SIZE, sizeof(idx_size));
++  big_store(&idx_size, header + FRAME_IDX_SIZE, sizeof(idx_size));
+ 
+   // Get the actual index of metalayers
+   uint8_t* metalayers_idx = header + FRAME_IDX_SIZE + 2;
+@@ -1111,7 +1178,7 @@ static int frame_get_metalayers_from_header(blosc2_frame_s* frame, blosc2_schunk
+   if (header_len < header_pos) {
+     return BLOSC2_ERROR_READ_BUFFER;
+   }
+-  swap_store(&nmetalayers, idxp, sizeof(uint16_t));
++  big_store(&nmetalayers, idxp, sizeof(uint16_t));
+   idxp += 2;
+   if (nmetalayers < 0 || nmetalayers > BLOSC2_MAX_METALAYERS) {
+     return BLOSC2_ERROR_DATA;
+@@ -1158,7 +1225,7 @@ static int frame_get_metalayers_from_header(blosc2_frame_s* frame, blosc2_schunk
+     if (header_len < header_pos) {
+       return BLOSC2_ERROR_READ_BUFFER;
+     }
+-    swap_store(&offset, idxp, sizeof(offset));
++    big_store(&offset, idxp, sizeof(offset));
+     idxp += 4;
+     if (offset < 0 || offset >= header_len) {
+       // Offset is less than zero or exceeds header length
+@@ -1176,7 +1243,7 @@ static int frame_get_metalayers_from_header(blosc2_frame_s* frame, blosc2_schunk
+     if (header_len < header_pos) {
+       return BLOSC2_ERROR_READ_BUFFER;
+     }
+-    swap_store(&content_len, content_marker + 1, sizeof(content_len));
++    big_store(&content_len, content_marker + 1, sizeof(content_len));
+     if (content_len < 0) {
+       return BLOSC2_ERROR_DATA;
+     }
+@@ -1243,6 +1310,169 @@ int frame_get_metalayers(blosc2_frame_s* frame, blosc2_schunk* schunk) {
+   return ret;
+ }
+ 
++static int frame_get_vlmetalayers_from_trailer(blosc2_frame* frame, blosc2_schunk* schunk, uint8_t* trailer,
++                                               int32_t trailer_len) {
++  int64_t trailer_pos = FRAME_TRAILER_VLMETALAYERS;
++
++  // Get the size for the index of metalayers
++  uint16_t idx_size;
++  trailer_pos += 2 + sizeof(idx_size);
++  if (trailer_len < trailer_pos) {
++    return BLOSC2_ERROR_READ_BUFFER;
++  }
++  big_store(&idx_size, trailer + FRAME_TRAILER_VLMETALAYERS + 2, sizeof(idx_size));
++
++  // Get the actual index of metalayers
++  uint8_t* metalayers_idx = trailer + FRAME_TRAILER_VLMETALAYERS + 4;
++  trailer_pos += 1;
++  if (trailer_len < trailer_pos) {
++    return BLOSC2_ERROR_READ_BUFFER;
++  }
++  if (metalayers_idx[0] != 0xde) {   // sanity check
++    return BLOSC2_ERROR_DATA;
++  }
++  uint8_t* idxp = metalayers_idx + 1;
++  uint16_t nmetalayers;
++  trailer_pos += sizeof(nmetalayers);
++  if (trailer_len < trailer_pos) {
++    return BLOSC2_ERROR_READ_BUFFER;
++  }
++  big_store(&nmetalayers, idxp, sizeof(uint16_t));
++  idxp += 2;
++  if (nmetalayers < 0 || nmetalayers > BLOSC2_MAX_VLMETALAYERS) {
++    return BLOSC2_ERROR_DATA;
++  }
++  schunk->nvlmetalayers = nmetalayers;
++
++  // Populate the metalayers and its serialized values
++  for (int nmetalayer = 0; nmetalayer < nmetalayers; nmetalayer++) {
++    trailer_pos += 1;
++    if (trailer_len < trailer_pos) {
++      return BLOSC2_ERROR_READ_BUFFER;
++    }
++    if ((*idxp & 0xe0u) != 0xa0u) {   // sanity check
++      return BLOSC2_ERROR_DATA;
++    }
++    blosc2_metalayer* metalayer = calloc(sizeof(blosc2_metalayer), 1);
++    schunk->vlmetalayers[nmetalayer] = metalayer;
++
++    // Populate the metalayer string
++    int8_t nslen = *idxp & (uint8_t)0x1F;
++    idxp += 1;
++    trailer_pos += nslen;
++    if (trailer_len < trailer_pos) {
++      return BLOSC2_ERROR_READ_BUFFER;
++    }
++    char* ns = malloc((size_t)nslen + 1);
++    memcpy(ns, idxp, nslen);
++    ns[nslen] = '\0';
++    idxp += nslen;
++    metalayer->name = ns;
++
++    // Populate the serialized value for this metalayer
++    // Get the offset
++    trailer_pos += 1;
++    if (trailer_len < trailer_pos) {
++      return BLOSC2_ERROR_READ_BUFFER;
++    }
++    if ((*idxp & 0xffu) != 0xd2u) {   // sanity check
++      return BLOSC2_ERROR_DATA;
++    }
++    idxp += 1;
++    int32_t offset;
++    trailer_pos += sizeof(offset);
++    if (trailer_len < trailer_pos) {
++      return BLOSC2_ERROR_READ_BUFFER;
++    }
++    big_store(&offset, idxp, sizeof(offset));
++    idxp += 4;
++    if (offset < 0 || offset >= trailer_len) {
++      // Offset is less than zero or exceeds trailer length
++      return BLOSC2_ERROR_DATA;
++    }
++    // Go to offset and see if we have the correct marker
++    uint8_t* content_marker = trailer + offset;
++    if (*content_marker != 0xc6) {
++      return BLOSC2_ERROR_DATA;
++    }
++
++    // Read the size of the content
++    int32_t content_len;
++    trailer_pos += sizeof(content_len);
++    if (trailer_len < trailer_pos) {
++      return BLOSC2_ERROR_READ_BUFFER;
++    }
++    big_store(&content_len, content_marker + 1, sizeof(content_len));
++    metalayer->content_len = content_len;
++
++    // Finally, read the content
++    trailer_pos += content_len;
++    if (trailer_len < trailer_pos) {
++      return BLOSC2_ERROR_READ_BUFFER;
++    }
++    char* content = malloc((size_t)content_len);
++    memcpy(content, content_marker + 1 + 4, (size_t)content_len);
++    metalayer->content = (uint8_t*)content;
++  }
++  return 1;
++}
++
++int frame_get_vlmetalayers(blosc2_frame_s* frame, blosc2_schunk* schunk) {
++  int32_t header_len;
++  int64_t frame_len;
++  int64_t nbytes;
++  int64_t cbytes;
++  int32_t chunksize;
++  int32_t nchunks;
++  int ret = get_header_info(frame, &header_len, &frame_len, &nbytes, &cbytes, &chunksize, &nchunks,
++                            NULL, NULL, NULL, NULL, NULL);
++  if (ret < 0) {
++    BLOSC_TRACE_ERROR("Unable to get the trailer info from frame.");
++    return ret;
++  }
++
++
++  int32_t trailer_offset = get_trailer_offset(frame, header_len, nbytes > 0);
++  int32_t trailer_len = frame->trailer_len;
++
++  // Get the trailer
++  uint8_t* trailer = NULL;
++  if (frame->cframe != NULL) {
++    trailer = frame->cframe + trailer_offset;
++  } else {
++    size_t rbytes = 0;
++    trailer = malloc(trailer_len);
++    FILE* fp = NULL;
++    if (frame->sframe) {
++      char* eframe_name = malloc(strlen(frame->urlpath) + strlen("/chunks.b2frame") + 1);
++      sprintf(eframe_name, "%s/chunks.b2frame", frame->urlpath);
++      fp = fopen(eframe_name, "rb");
++      free(eframe_name);
++    }
++    else {
++      fp = fopen(frame->urlpath, "rb");
++    }
++    if (fp != NULL) {
++      fseek(fp, trailer_offset, SEEK_SET);
++      rbytes = fread(trailer, 1, trailer_len, fp);
++      fclose(fp);
++    }
++    if (rbytes != (size_t) trailer_len) {
++      BLOSC_TRACE_ERROR("Cannot access the trailer out of the fileframe.");
++      free(trailer);
++      return BLOSC2_ERROR_FILE_READ;
++    }
++  }
++
++  ret = frame_get_vlmetalayers_from_trailer(frame, schunk, trailer, trailer_len);
++
++  if (frame->cframe == NULL) {
++    free(trailer);
++  }
++
++  return ret;
++}
++
+ 
+ blosc2_storage* get_new_storage(const blosc2_storage* storage, const blosc2_cparams* cdefaults,
+                                 const blosc2_dparams* ddefaults) {
+@@ -1442,9 +1672,6 @@ blosc2_schunk* frame_to_schunk(blosc2_frame_s* frame, bool copy) {
+     return NULL;
+   }
+ 
+-  uint8_t* usermeta;
+-  int32_t usermeta_len;
+-
+   int rc;
+   out:
+   rc = frame_get_metalayers(frame, schunk);
+@@ -1454,14 +1681,12 @@ blosc2_schunk* frame_to_schunk(blosc2_frame_s* frame, bool copy) {
+     return NULL;
+   }
+ 
+-  usermeta_len = frame_get_usermeta(frame, &usermeta);
+-  if (usermeta_len < 0) {
++  rc = frame_get_vlmetalayers(frame, schunk);
++  if (rc < 0) {
+     blosc2_schunk_free(schunk);
+-    BLOSC_TRACE_ERROR("Cannot access the usermeta chunk.");
++    BLOSC_TRACE_ERROR("Cannot access the vlmetalayers.");
+     return NULL;
+   }
+-  schunk->usermeta = usermeta;
+-  schunk->usermeta_len = usermeta_len;
+ 
+   return schunk;
+ }
+@@ -1480,8 +1705,9 @@ int sort_offset(const void* a, const void* b) {
+ }
+ 
+ 
+-int get_coffset(blosc2_frame_s* frame, int32_t header_len, int64_t cbytes, int32_t nchunk, int64_t *offset) {
++int64_t get_coffset(blosc2_frame_s* frame, int32_t header_len, int64_t cbytes, int32_t nchunk) {
+   // Get the offset to nchunk
++  int64_t offset;
+   uint8_t *coffsets = get_coffsets(frame, header_len, cbytes, NULL);
+   if (coffsets == NULL) {
+     BLOSC_TRACE_ERROR("Cannot get the offset for chunk %d for the frame.", nchunk);
+@@ -1489,11 +1715,12 @@ int get_coffset(blosc2_frame_s* frame, int32_t header_len, int64_t cbytes, int32
+   }
+ 
+   // Get the 64-bit offset
+-  int rc = blosc_getitem(coffsets, nchunk, 1, offset);
++  int rc = blosc_getitem(coffsets, nchunk, 1, &offset);
+   if (rc < 0) {
+     BLOSC_TRACE_ERROR("Problems retrieving a chunk offset.");
++    return rc;
+   }
+-  return rc;
++  return offset;
+ }
+ 
+ 
+@@ -1553,7 +1780,6 @@ int frame_get_chunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool *ne
+   int32_t nchunks;
+   int32_t typesize;
+   int32_t chunk_cbytes;
+-  int64_t offset;
+ 
+   *chunk = NULL;
+   *needs_free = false;
+@@ -1571,11 +1797,7 @@ int frame_get_chunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool *ne
+   }
+ 
+   // Get the offset to nchunk
+-  ret = get_coffset(frame, header_len, cbytes, nchunk, &offset);
+-  if (ret < 0) {
+-    BLOSC_TRACE_ERROR("Unable to get offset to chunk %d.", nchunk);
+-    return ret;
+-  }
++  int64_t offset = get_coffset(frame, header_len, cbytes, nchunk);
+ 
+   if (offset < 0) {
+     // Special value
+@@ -1641,7 +1863,6 @@ int frame_get_lazychunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool
+   int32_t nchunks;
+   int32_t typesize;
+   size_t lazychunk_cbytes;
+-  int64_t offset;
+ 
+   *chunk = NULL;
+   *needs_free = false;
+@@ -1659,11 +1880,7 @@ int frame_get_lazychunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool
+   }
+ 
+   // Get the offset to nchunk
+-  ret = get_coffset(frame, header_len, cbytes, nchunk, &offset);
+-  if (ret < 0) {
+-    BLOSC_TRACE_ERROR("Unable to get offset to chunk %d.", nchunk);
+-    return ret;
+-  }
++  int64_t offset = get_coffset(frame, header_len, cbytes, nchunk);
+ 
+   if (offset < 0) {
+     // Special value
+@@ -1857,14 +2074,14 @@ void* frame_append_chunk(blosc2_frame_s* frame, void* chunk, blosc2_schunk* schu
+   switch (special_value) {
+     case BLOSC2_ZERO_RUNLEN:
+       // Zero chunk.  Code it in a special way.
+-      offset_value += (uint64_t)BLOSC2_ZERO_RUNLEN << (8 * 7);  // indicate a chunk of zeros
+-      swap_store(offsets + nchunks, &offset_value, sizeof(uint64_t));
++      offset_value += (uint64_t) BLOSC2_ZERO_RUNLEN << (8 * 7);  // indicate a chunk of zeros
++      little_store(offsets + nchunks, &offset_value, sizeof(uint64_t));
+       cbytes_chunk = 0;   // we don't need to store the chunk
+       break;
+     case BLOSC2_NAN_RUNLEN:
+       // NaN chunk.  Code it in a special way.
+       offset_value += (uint64_t)BLOSC2_NAN_RUNLEN << (8 * 7);  // indicate a chunk of NANs
+-      swap_store(offsets + nchunks, &offset_value, sizeof(uint64_t));
++      little_store(offsets + nchunks, &offset_value, sizeof(uint64_t));
+       cbytes_chunk = 0;   // we don't need to store the chunk
+       break;
+     default:
+@@ -2025,7 +2242,7 @@ void* frame_insert_chunk(blosc2_frame_s* frame, int nchunk, void* chunk, blosc2_
+       for (int i = nchunks; i > nchunk; i--) {
+         offsets[i] = offsets[i - 1];
+       }
+-      swap_store(offsets + nchunk, &offset_value, sizeof(uint64_t));
++      little_store(offsets + nchunk, &offset_value, sizeof(uint64_t));
+       cbytes_chunk = 0;   // we don't need to store the chunk
+           break;
+     case BLOSC2_NAN_RUNLEN:
+@@ -2034,7 +2251,7 @@ void* frame_insert_chunk(blosc2_frame_s* frame, int nchunk, void* chunk, blosc2_
+       for (int i = nchunks; i > nchunk; i--) {
+         offsets[i] = offsets[i - 1];
+       }
+-      swap_store(offsets + nchunk, &offset_value, sizeof(uint64_t));
++      little_store(offsets + nchunk, &offset_value, sizeof(uint64_t));
+       cbytes_chunk = 0;   // we don't need to store the chunk
+       break;
+     default:
+@@ -2196,13 +2413,13 @@ void* frame_update_chunk(blosc2_frame_s* frame, int nchunk, void* chunk, blosc2_
+     case BLOSC2_ZERO_RUNLEN:
+       // Zero chunk.  Code it in a special way.
+       offset_value += (uint64_t)BLOSC2_ZERO_RUNLEN << (8 * 7);  // indicate a chunk of zeros
+-      swap_store(offsets + nchunk, &offset_value, sizeof(uint64_t));
++      little_store(offsets + nchunk, &offset_value, sizeof(uint64_t));
+       cbytes_chunk = 0;   // we don't need to store the chunk
+       break;
+     case BLOSC2_NAN_RUNLEN:
+       // NaN chunk.  Code it in a special way.
+       offset_value += (uint64_t)BLOSC2_NAN_RUNLEN << (8 * 7);  // indicate a chunk of NANs
+-      swap_store(offsets + nchunk, &offset_value, sizeof(uint64_t));
++      little_store(offsets + nchunk, &offset_value, sizeof(uint64_t));
+       cbytes_chunk = 0;   // we don't need to store the chunk
+       break;
+     default:
+diff --git a/blosc/frame.h b/blosc/frame.h
+index 964db93af..3a34fa20c 100644
+--- a/blosc/frame.h
++++ b/blosc/frame.h
+@@ -41,10 +41,9 @@
+ #define FRAME_TRAILER_VERSION_BETA2 (0U)  // for beta.2 and former
+ #define FRAME_TRAILER_VERSION (1U)        // can be up to 127
+ 
+-#define FRAME_TRAILER_USERMETA_LEN_OFFSET (3)  // offset to usermeta length
+-#define FRAME_TRAILER_USERMETA_OFFSET (7)  // offset to usermeta chunk
+-#define FRAME_TRAILER_MINLEN (30)  // minimum length for the trailer (msgpack overhead)
++#define FRAME_TRAILER_MINLEN (35)  // minimum length for the trailer (msgpack overhead)
+ #define FRAME_TRAILER_LEN_OFFSET (22)  // offset to trailer length (counting from the end)
++#define FRAME_TRAILER_VLMETALAYERS (2)
+ 
+ 
+ typedef struct {
+diff --git a/blosc/schunk.c b/blosc/schunk.c
+index 22036ee81..13fda537d 100644
+--- a/blosc/schunk.c
++++ b/blosc/schunk.c
+@@ -257,7 +257,8 @@ blosc2_schunk* blosc2_schunk_copy(blosc2_schunk *schunk, blosc2_storage storage)
+       }
+     }
+   } else {
+-    uint8_t *buffer = malloc(schunk->chunksize);
++    int32_t chunksize = schunk->chunksize == -1 ? 0 : schunk->chunksize;
++    uint8_t *buffer = malloc(chunksize);
+     for (int nchunk = 0; nchunk < schunk->nchunks; ++nchunk) {
+       if (blosc2_schunk_decompress_chunk(schunk, nchunk, buffer, schunk->chunksize) < 0) {
+         BLOSC_TRACE_ERROR("Can not decompress the `chunk` %d.", nchunk);
+@@ -271,19 +272,19 @@ blosc2_schunk* blosc2_schunk_copy(blosc2_schunk *schunk, blosc2_storage storage)
+     free(buffer);
+   }
+ 
+-  // Copy user meta
+-  if (schunk->usermeta != NULL) {
+-    uint8_t *usermeta;
+-    int32_t usermeta_len = blosc2_get_usermeta(schunk, &usermeta);
+-    if (usermeta_len < 0) {
+-      BLOSC_TRACE_ERROR("Can not get `usermeta` from schunk");
+-      return NULL;
++  // Copy vlmetalayers
++  for (int nmeta = 0; nmeta < schunk->nvlmetalayers; ++nmeta) {
++    uint8_t *content;
++    uint32_t content_len;
++    char* name = schunk->vlmetalayers[nmeta]->name;
++    if (blosc2_get_vlmetalayer(schunk, name, &content, &content_len) < 0) {
++      BLOSC_TRACE_ERROR("Can not get %s `umetalayer`.", name);
+     }
+-    if (blosc2_update_usermeta(new_schunk, usermeta, usermeta_len, cparams) < 0) {
+-      BLOSC_TRACE_ERROR("Can not update the `usermeta`.");
++    if (blosc2_add_vlmetalayer(new_schunk, name, content, content_len, NULL) < 0) {
++      BLOSC_TRACE_ERROR("Can not add %s `umetalayer`.", name);
+       return NULL;
+     }
+-    free(usermeta);
++    free(content);
+   }
+   return new_schunk;
+ }
+@@ -420,8 +421,16 @@ int blosc2_schunk_free(blosc2_schunk *schunk) {
+     frame_free((blosc2_frame_s *) schunk->frame);
+   }
+ 
+-  if (schunk->usermeta_len > 0) {
+-    free(schunk->usermeta);
++  if (schunk->nvlmetalayers > 0) {
++    for (int i = 0; i < schunk->nvlmetalayers; ++i) {
++      if (schunk->vlmetalayers[i] != NULL) {
++        if (schunk->vlmetalayers[i]->name != NULL)
++          free(schunk->vlmetalayers[i]->name);
++        if (schunk->vlmetalayers[i]->content != NULL)
++          free(schunk->vlmetalayers[i]->content);
++        free(schunk->vlmetalayers[i]);
++      }
++    }
+   }
+ 
+   free(schunk);
+@@ -1007,57 +1016,146 @@ int blosc2_get_metalayer(blosc2_schunk *schunk, const char *name, uint8_t **cont
+   return nmetalayer;
+ }
+ 
++/* Find whether the schunk has a variable-length metalayer or not.
++ *
++ * If successful, return the index of the variable-length metalayer.  Else, return a negative value.
++ */
++int blosc2_has_vlmetalayer(blosc2_schunk *schunk, const char *name) {
++  if (strlen(name) > BLOSC2_METALAYER_NAME_MAXLEN) {
++    BLOSC_TRACE_ERROR("Variable-length metalayer names cannot be larger than %d chars.", BLOSC2_METALAYER_NAME_MAXLEN);
++    return BLOSC2_ERROR_INVALID_PARAM;
++  }
+ 
+-/* Update the content of the usermeta chunk. */
+-int blosc2_update_usermeta(blosc2_schunk *schunk, uint8_t *content, int32_t content_len,
+-                           blosc2_cparams cparams) {
+-  if ((uint32_t) content_len > (1u << 31u)) {
+-    BLOSC_TRACE_ERROR("content_len cannot exceed 2 GB.");
+-    return BLOSC2_ERROR_2GB_LIMIT;
++  for (int numeta = 0; numeta < schunk->nvlmetalayers; numeta++) {
++    if (strcmp(name, schunk->vlmetalayers[numeta]->name) == 0) {
++      return numeta;
++    }
+   }
++  return BLOSC2_ERROR_NOT_FOUND;
++}
+ 
+-  // Compress the usermeta chunk
+-  void* usermeta_chunk = malloc(content_len + BLOSC_MAX_OVERHEAD);
+-  blosc2_context *cctx = blosc2_create_cctx(cparams);
+-  int usermeta_cbytes = blosc2_compress_ctx(cctx, content, content_len, usermeta_chunk,
+-                                            content_len + BLOSC_MAX_OVERHEAD);
+-  blosc2_free_ctx(cctx);
+-  if (usermeta_cbytes < 0) {
+-    free(usermeta_chunk);
+-    return usermeta_cbytes;
++int umetalayer_flush(blosc2_schunk* schunk) {
++  int rc;
++  if (schunk->frame == NULL) {
++    return BLOSC2_ERROR_SUCCESS;
++  }
++  rc = frame_update_header(schunk->frame, schunk, false);
++  if (rc < 0) {
++    BLOSC_TRACE_ERROR("Unable to update metalayers into frame.");
++    return rc;
++  }
++  rc = frame_update_trailer(schunk->frame, schunk);
++  if (rc < 0) {
++    BLOSC_TRACE_ERROR("Unable to update trailer into frame.");
++    return rc;
+   }
++  return rc;
++}
+ 
+-  // Update the contents of the usermeta chunk
+-  if (schunk->usermeta_len > 0) {
+-    free(schunk->usermeta);
++/* Add content into a new variable-length metalayer.
++ *
++ * If successful, return the index of the new variable-length metalayer.  Else, return a negative value.
++ */
++int blosc2_add_vlmetalayer(blosc2_schunk *schunk, const char *name, uint8_t *content, uint32_t content_len,
++                           blosc2_cparams *cparams) {
++  int numeta = blosc2_has_vlmetalayer(schunk, name);
++  if (numeta >= 0) {
++    BLOSC_TRACE_ERROR("Variable-length metalayer \"%s\" already exists.", name);
++    return BLOSC2_ERROR_INVALID_PARAM;
+   }
+-  schunk->usermeta = malloc(usermeta_cbytes);
+-  memcpy(schunk->usermeta, usermeta_chunk, usermeta_cbytes);
+-  free(usermeta_chunk);
+-  schunk->usermeta_len = usermeta_cbytes;
+ 
+-  blosc2_frame_s* frame = (blosc2_frame_s*)schunk->frame;
+-  if (frame != NULL) {
+-    int rc = frame_update_trailer(frame, schunk);
+-    if (rc < 0) {
+-      return rc;
+-    }
++  // Add the umeta
++  blosc2_metalayer *umeta = malloc(sizeof(blosc2_metalayer));
++  umeta->name = strdup(name);
++  uint8_t* content_buf = malloc((size_t) content_len + BLOSC_MAX_OVERHEAD);
++
++  blosc2_context *cctx;
++  if (cparams != NULL) {
++    cctx = blosc2_create_cctx(*cparams);
++  } else {
++    cctx = blosc2_create_cctx(BLOSC2_CPARAMS_DEFAULTS);
++  }
++
++  int csize = blosc2_compress_ctx(cctx, content, content_len, content_buf, content_len + BLOSC_MAX_OVERHEAD);
++  if (csize < 0) {
++    BLOSC_TRACE_ERROR("Can not compress the `%s` variable-length metalayer.", name);
++    return csize;
+   }
++  blosc2_free_ctx(cctx);
++
++  umeta->content = realloc(content_buf, csize);
++  umeta->content_len = csize;
++  schunk->vlmetalayers[schunk->nvlmetalayers] = umeta;
++  schunk->nvlmetalayers += 1;
+ 
+-  return usermeta_cbytes;
++  // Propagate to frames
++  int rc = umetalayer_flush(schunk);
++  if (rc < 0) {
++    BLOSC_TRACE_ERROR("Can not propagate de `%s` variable-length metalayer to a frame.", name);
++    return rc;
++  }
++
++  return schunk->nvlmetalayers - 1;
+ }
+ 
+ 
+-/* Retrieve the usermeta chunk */
+-int32_t blosc2_get_usermeta(blosc2_schunk* schunk, uint8_t** content) {
++int blosc2_get_vlmetalayer(blosc2_schunk *schunk, const char *name, uint8_t **content,
++                           uint32_t *content_len) {
++  int numeta = blosc2_has_vlmetalayer(schunk, name);
++  if (numeta < 0) {
++    BLOSC_TRACE_ERROR("User metalayer \"%s\" not found.", name);
++    return numeta;
++  }
++  blosc2_metalayer *meta = schunk->vlmetalayers[numeta];
+   size_t nbytes, cbytes, blocksize;
+-  blosc_cbuffer_sizes(schunk->usermeta, &nbytes, &cbytes, &blocksize);
+-  *content = malloc(nbytes);
+-  blosc2_context *dctx = blosc2_create_dctx(BLOSC2_DPARAMS_DEFAULTS);
+-  int usermeta_nbytes = blosc2_decompress_ctx(dctx, schunk->usermeta, schunk->usermeta_len, *content, (int32_t)nbytes);
+-  blosc2_free_ctx(dctx);
+-  if (usermeta_nbytes < 0) {
+-    return usermeta_nbytes;
+-  }
+-  return (int32_t)nbytes;
++  blosc_cbuffer_sizes(meta->content, &nbytes, &cbytes, &blocksize);
++  if (cbytes != meta->content_len) {
++    BLOSC_TRACE_ERROR("User metalayer \"%s\" is corrupted.", meta->name);
++    return BLOSC2_ERROR_DATA;
++  }
++  *content_len = nbytes;
++  *content = malloc((size_t) nbytes);
++  int nbytes_ = blosc2_decompress_ctx(schunk->dctx, meta->content, meta->content_len, *content, nbytes);
++  if (nbytes_ != nbytes) {
++    BLOSC_TRACE_ERROR("User metalayer \"%s\" is corrupted.", meta->name);
++    return BLOSC2_ERROR_READ_BUFFER;
++  }
++  return numeta;
+ }
++
++int blosc2_update_vlmetalayer(blosc2_schunk *schunk, const char *name, uint8_t *content, uint32_t content_len,
++                              blosc2_cparams *cparams) {
++  int numeta = blosc2_has_vlmetalayer(schunk, name);
++  if (numeta < 0) {
++    BLOSC_TRACE_ERROR("User umeta \"%s\" not found.", name);
++    return numeta;
++  }
++
++  blosc2_metalayer *umeta = schunk->vlmetalayers[numeta];
++  free(umeta->content);
++  uint8_t* content_buf = malloc((size_t) content_len + BLOSC_MAX_OVERHEAD);
++
++  blosc2_context *cctx;
++  if (cparams != NULL) {
++    cctx = blosc2_create_cctx(*cparams);
++  } else {
++    cctx = blosc2_create_cctx(BLOSC2_CPARAMS_DEFAULTS);
++  }
++
++  int csize = blosc2_compress_ctx(cctx, content, content_len, content_buf, content_len + BLOSC_MAX_OVERHEAD);
++  if (csize < 0) {
++    BLOSC_TRACE_ERROR("Can not compress the `%s` variable-length metalayer.", name);
++    return csize;
++  }
++  umeta->content = realloc(content_buf, csize);
++  umeta->content_len = csize;
++
++  // Propagate to frames
++  int rc = umetalayer_flush(schunk);
++  if (rc < 0) {
++    BLOSC_TRACE_ERROR("Can not propagate de `%s` variable-length metalayer to a frame.", name);
++    return rc;
++  }
++
++  return numeta;
++}
+\ No newline at end of file
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 7d652c1fe..f9c1276c8 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # sources for examples
+ set(SOURCES contexts delta_schunk_ex multithread simple frame_metalayers noinit find_roots)
+ if(NOT DEACTIVATE_LZ4)
+-    set(SOURCES ${SOURCES} schunk_simple frame_simple sframe_simple frame_backed_schunk compress_file)
++    set(SOURCES ${SOURCES} schunk_simple frame_simple frame_umetalayers sframe_simple frame_backed_schunk compress_file)
+ endif()
+ if(NOT DEACTIVATE_ZSTD)
+     set(SOURCES ${SOURCES} zstd_dict)
+diff --git a/examples/frame_simple.c b/examples/frame_simple.c
+index d1669a856..9f8c6278c 100644
+--- a/examples/frame_simple.c
++++ b/examples/frame_simple.c
+@@ -74,11 +74,16 @@ int main(void) {
+     assert(nchunks == nchunk + 1);
+   }
+ 
+-  // Add some usermeta data
+-  int umlen = blosc2_update_usermeta(schunk, (uint8_t *) "This is a usermeta content.....", 32,
+-                                     BLOSC2_CPARAMS_DEFAULTS);
++  // Add some vlmetalayers data
++  uint32_t content_len = 10;
++  uint8_t *content = malloc(content_len);
++  for (uint32_t j = 0; j < content_len; ++j) {
++    content[j] = (uint8_t) j;
++  }
++  int umlen = blosc2_add_vlmetalayer(schunk, "umetalayer", content, content_len, NULL);
++  free(content);
+   if (umlen < 0) {
+-    printf("Cannot write usermeta chunk");
++    printf("Cannot write vlmetalayers chunk");
+     return umlen;
+   }
+ 
+@@ -92,8 +97,13 @@ int main(void) {
+   printf("Compression time: %.3g s, %.1f MB/s\n",
+          ttotal, nbytes / (ttotal * MB));
+   uint8_t* usermeta;
+-  int content_len = blosc2_get_usermeta(schunk, &usermeta);
+-  printf("Usermeta in schunk: '%s' with length: %d\n", usermeta, content_len);
++
++  blosc2_get_vlmetalayer(schunk, "umetalayer", &usermeta, &content_len);
++  printf("Usermeta length: %d\n", content_len);
++  for (int j = 0; j < content_len; ++j) {
++    printf("%3d", usermeta[j]);
++  }
++  printf("\n");
+   free(usermeta);
+ 
+   // Start different conversions between schunks, frames and fileframes
+@@ -166,8 +176,17 @@ int main(void) {
+   }
+   printf("Successful roundtrip schunk <-> frame <-> fileframe !\n");
+ 
+-  content_len = blosc2_get_usermeta(schunk1, &usermeta);
+-  printf("Usermeta in schunk1: '%s' with length: %d\n", usermeta, content_len);
++  blosc2_get_vlmetalayer(schunk1, "umetalayer", &usermeta, &content_len);
++  for (int j = 0; j < content_len; ++j) {
++    printf("%3d", usermeta[j]);
++  }
++  printf("\n");
++  free(usermeta);
++  blosc2_get_vlmetalayer(schunk2, "umetalayer", &usermeta, &content_len);
++  for (int j = 0; j < content_len; ++j) {
++    printf("%3d", usermeta[j]);
++  }
++  printf("\n");
+   free(usermeta);
+ 
+   /* Free resources */
+diff --git a/examples/frame_umetalayers.c b/examples/frame_umetalayers.c
+new file mode 100644
+index 000000000..e2d69c5e9
+--- /dev/null
++++ b/examples/frame_umetalayers.c
+@@ -0,0 +1,95 @@
++/*
++  Copyright (C) 2018  Francesc Alted
++  http://blosc.org
++  License: BSD 3-Clause (see LICENSE.txt)
++
++  Example program demonstrating use of the Blosc filter from C code.
++
++  To compile this program:
++
++  $ gcc frame_simple.c -o frame_simple -lblosc2
++
++  To run:
++
++  $ ./frame_simple
++  Blosc version info: 2.0.0a6.dev ($Date:: 2018-05-18 #$)
++  Compression ratio: 381.5 MB -> 9.5 MB (40.2x)
++  Compression time: 0.705 s, 541.0 MB/s
++  Time for schunk -> frame: 0.00796 s, 47905.3 MB/s
++  Frame length in memory: 9940344 bytes
++  Frame length on disk: 9940344 bytes
++  Time for frame -> fileframe (frame_simple.b2frame): 0.0108 s, 35159.6 MB/s
++  Time for fileframe (frame_simple.b2frame) -> frame : 0.000254 s, 1.5e+06 MB/s
++  Time for frame -> schunk: 1.1e-05 s, 3.48e+07 MB/s
++  Time for fileframe -> schunk: 1.25e-05 s, 3.05e+07 MB/s
++  Successful roundtrip schunk <-> frame <-> fileframe !
++
++ */
++
++#include <stdio.h>
++#include <assert.h>
++#include <blosc2.h>
++
++#define KB  1024.
++#define MB  (1024*KB)
++#define GB  (1024*MB)
++
++#define CHUNKSIZE (200 * 1000)
++#define NCHUNKS 100
++#define NTHREADS 4
++
++
++int main(void) {
++  size_t isize = CHUNKSIZE * sizeof(int32_t);
++
++  printf("Blosc version info: %s (%s)\n",
++         BLOSC_VERSION_STRING, BLOSC_VERSION_DATE);
++
++  /* Create a super-chunk container */
++  blosc2_cparams cparams = BLOSC2_CPARAMS_DEFAULTS;
++  cparams.typesize = sizeof(int32_t);
++  cparams.compcode = BLOSC_LZ4;
++  cparams.clevel = 9;
++  cparams.nthreads = NTHREADS;
++  blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
++  dparams.nthreads = NTHREADS;
++  blosc2_storage storage = {.contiguous=true, .urlpath="umeta.b2frame", .cparams=&cparams, .dparams=&dparams};
++  blosc2_schunk* schunk = blosc2_schunk_new(storage);
++
++
++  // Add a metalayer
++  int umlen = blosc2_add_metalayer(schunk, "umetalayer", (uint8_t *) "This is a vlmetalayers content...", 10);
++  if (umlen < 0) {
++    printf("Cannot write vlmetalayers chunk");
++    return umlen;
++  }
++
++  // Add some vlmetalayers data
++  umlen = blosc2_add_vlmetalayer(schunk, "umetalayer", (uint8_t *) "This is a vlmetalayers content...", 32, NULL);
++  if (umlen < 0) {
++    printf("Cannot write vlmetalayers chunk");
++    return umlen;
++  }
++
++  // Add some vlmetalayers data
++  umlen = blosc2_add_vlmetalayer(schunk, "umetalayer2", (uint8_t *) "This is a content...", 10, NULL);
++  if (umlen < 0) {
++    printf("Cannot write vlmetalayers chunk");
++    return umlen;
++  }
++
++  umlen = blosc2_update_vlmetalayer(schunk, "umetalayer", (uint8_t *) "This is a another umetalayer content...", 20,
++                                    NULL);
++  if (umlen < 0) {
++    printf("Cannot write vlmetalayers chunk");
++    return umlen;
++  }
++
++  blosc2_schunk *sc = blosc2_schunk_open("umeta.b2frame");
++
++  /* Free resources */
++  blosc2_schunk_free(schunk);
++  blosc2_schunk_free(sc);
++
++  return 0;
++}
+diff --git a/examples/sframe_simple.c b/examples/sframe_simple.c
+index c8125402b..f9ba31b6b 100644
+--- a/examples/sframe_simple.c
++++ b/examples/sframe_simple.c
+@@ -46,6 +46,9 @@ int main(void) {
+   cparams.nthreads = NTHREADS;
+   dparams.nthreads = NTHREADS;
+   blosc2_storage storage = {false, "dir1.b2frame", .cparams=&cparams, .dparams=&dparams};
++  /* Remove directory */
++  blosc2_remove_dir(storage.urlpath);
++
+   schunk = blosc2_schunk_new(storage);
+ 
+   blosc_set_timestamp(&last);
+diff --git a/tests/test_copy.c b/tests/test_copy.c
+index f86831f63..ea8c90626 100644
+--- a/tests/test_copy.c
++++ b/tests/test_copy.c
+@@ -123,7 +123,7 @@ CUTEST_TEST_TEST(copy) {
+     blosc2_add_metalayer(schunk, meta_name, (uint8_t *) &meta_content, meta_content_len);
+   }
+   if (usermeta) {
+-    blosc2_update_usermeta(schunk, (uint8_t *) &meta_content, meta_content_len, *storage.cparams);
++    blosc2_add_vlmetalayer(schunk, "umetalayer", (uint8_t *) &meta_content, meta_content_len, NULL);
+   }
+ 
+   /* Append the chunks */
+@@ -146,8 +146,9 @@ CUTEST_TEST_TEST(copy) {
+     free(content);
+   }
+   if (usermeta) {
++    uint32_t content_len;
+     int64_t *content;
+-    blosc2_get_usermeta(schunk_copy,  (uint8_t **) &content);
++    blosc2_get_vlmetalayer(schunk_copy, "umetalayer", (uint8_t **) &content, &content_len);
+     CUTEST_ASSERT("Usermeta are not equal.", *content == meta_content);
+     free(content);
+   }
+diff --git a/tests/test_empty_schunk.c b/tests/test_empty_schunk.c
+index 1f3b7ee15..b00a442a1 100644
+--- a/tests/test_empty_schunk.c
++++ b/tests/test_empty_schunk.c
+@@ -77,7 +77,7 @@ static char* test_schunk(void) {
+ 
+   blosc2_update_metalayer(schunk, "metalayer2", (uint8_t*)"my metalayer2", sizeof("my metalayer2"));
+   // Attach some user metadata into it
+-  blosc2_update_usermeta(schunk, (uint8_t *) "testing the usermeta", 16, BLOSC2_CPARAMS_DEFAULTS);
++  blosc2_add_vlmetalayer(schunk, "umetalayer", (uint8_t *) "testing the vlmetalayers", 16, NULL);
+ 
+   /* Gather some info */
+   nbytes = schunk->nbytes;
+@@ -126,10 +126,12 @@ static char* test_schunk(void) {
+     free(content);
+   }
+ 
+-  // Check the usermeta
++  // Check the vlmetalayers
+   uint8_t* content2;
+-  int32_t content2_len = blosc2_get_usermeta(schunk, &content2);
+-  mu_assert("ERROR: bad usermeta", strncmp((char*)content2, "testing the usermeta", 16) == 0);
++  uint32_t content2_len;
++  blosc2_get_vlmetalayer(schunk, "umetalayer", &content2, &content2_len);
++
++  mu_assert("ERROR: bad vlmetalayers", strncmp((char*)content2, "testing the vlmetalayers", 16) == 0);
+   mu_assert("ERROR: bad usermeta_len", content2_len == 16);
+   free(content2);
+ 
+diff --git a/tests/test_frame.c b/tests/test_frame.c
+index cacc88915..edda4d6cc 100644
+--- a/tests/test_frame.c
++++ b/tests/test_frame.c
+@@ -92,7 +92,7 @@ static char* test_frame(void) {
+   }
+ 
+   if (usermeta) {
+-    blosc2_update_usermeta(schunk, (uint8_t *) content, (int32_t) content_len, BLOSC2_CPARAMS_DEFAULTS);
++    blosc2_add_vlmetalayer(schunk, "umetalayer", (uint8_t *) content, (int32_t) content_len, NULL);
+   }
+ 
+   if (!sparse_schunk) {
+@@ -139,11 +139,12 @@ static char* test_frame(void) {
+   }
+ 
+   if (usermeta) {
+-    int content_len_ = blosc2_get_usermeta(schunk, &content_);
+-    mu_assert("ERROR: bad usermeta length in frame", (size_t) content_len_ == content_len);
+-    mu_assert("ERROR: bad usermeta data in frame", strncmp((char*)content_, content, content_len) == 0);
++    uint32_t content_len_;
++    blosc2_get_vlmetalayer(schunk, "umetalayer", &content_, &content_len_);
++    mu_assert("ERROR: bad vlmetalayers length in frame", (size_t) content_len_ == content_len);
++    mu_assert("ERROR: bad vlmetalayers data in frame", strncmp((char*)content_, content, content_len) == 0);
+     free(content_);
+-    blosc2_update_usermeta(schunk, (uint8_t *) content2, (int32_t) content_len2, BLOSC2_CPARAMS_DEFAULTS);
++    blosc2_update_vlmetalayer(schunk, "umetalayer", (uint8_t *) content2, (int32_t) content_len2, NULL);
+   }
+ 
+   // Feed it with data
+@@ -180,11 +181,12 @@ static char* test_frame(void) {
+   }
+ 
+   if (usermeta) {
+-    int content_len_ = blosc2_get_usermeta(schunk, &content_);
+-    mu_assert("ERROR: bad usermeta length in frame", (size_t) content_len_ == content_len2);
+-    mu_assert("ERROR: bad usermeta data in frame", strncmp((char*)content_, content2, content_len2) == 0);
++    uint32_t content_len_;
++    blosc2_get_vlmetalayer(schunk, "umetalayer", &content_, &content_len_);
++    mu_assert("ERROR: bad vlmetalayers length in frame", (size_t) content_len_ == content_len2);
++    mu_assert("ERROR: bad vlmetalayers data in frame", strncmp((char*)content_, content2, content_len2) == 0);
+     free(content_);
+-    blosc2_update_usermeta(schunk, (uint8_t *) content3, (int32_t) content_len3, BLOSC2_CPARAMS_DEFAULTS);
++    blosc2_update_vlmetalayer(schunk, "umetalayer", (uint8_t *) content3, (int32_t) content_len3, NULL);
+   }
+ 
+   if (!sparse_schunk) {
+@@ -240,9 +242,10 @@ static char* test_frame(void) {
+   }
+ 
+   if (usermeta) {
+-    int content_len_ = blosc2_get_usermeta(schunk, &content_);
+-    mu_assert("ERROR: bad usermeta length in frame", (size_t) content_len_ == content_len3);
+-    mu_assert("ERROR: bad usermeta data in frame", strncmp((char*)content_, content3, content_len3) == 0);
++    uint32_t content_len_;
++    blosc2_get_vlmetalayer(schunk, "umetalayer", &content_, &content_len_);
++    mu_assert("ERROR: bad vlmetalayers length in frame", (size_t) content_len_ == content_len3);
++    mu_assert("ERROR: bad vlmetalayers data in frame", strncmp((char*)content_, content3, content_len3) == 0);
+     free(content_);
+   }
+ 
+diff --git a/tests/test_schunk.c b/tests/test_schunk.c
+index 8419d8478..e9e550e42 100644
+--- a/tests/test_schunk.c
++++ b/tests/test_schunk.c
+@@ -54,8 +54,10 @@ static char* test_schunk(void) {
+   }
+ 
+   blosc2_update_metalayer(schunk, "metalayer2", (uint8_t*)"my metalayer2", sizeof("my metalayer2"));
++
+   // Attach some user metadata into it
+-  blosc2_update_usermeta(schunk, (uint8_t *) "testing the usermeta", 16, BLOSC2_CPARAMS_DEFAULTS);
++  blosc2_add_vlmetalayer(schunk, "umetalayer1", (uint8_t *) "testing the vlmetalayers", 23, NULL);
++  blosc2_add_vlmetalayer(schunk, "umetalayer2", (uint8_t *) "vlmetalayers", 11, NULL);
+ 
+   /* Gather some info */
+   nbytes = schunk->nbytes;
+@@ -91,6 +93,8 @@ static char* test_schunk(void) {
+       mu_assert("ERROR: bad roundtrip",data_dest[i] == i + nchunk * CHUNKSIZE);
+     }
+   }
++  // update metalayer
++  blosc2_update_vlmetalayer(schunk, "umetalayer1", (uint8_t *) "testing the  vlmetalayers", 24, NULL);
+ 
+   // metalayers
+   uint8_t* content;
+@@ -102,11 +106,14 @@ static char* test_schunk(void) {
+   mu_assert("ERROR: bad metalayer content", strncmp((char*)content, "my metalayer2", content_len) == 0);
+   free(content);
+ 
+-  // Check the usermeta
++  // Check the vlmetalayers
+   uint8_t* content2;
+-  int32_t content2_len = blosc2_get_usermeta(schunk, &content2);
+-  mu_assert("ERROR: bad usermeta", strncmp((char*)content2, "testing the usermeta", 16) == 0);
+-  mu_assert("ERROR: bad usermeta_len", content2_len == 16);
++  uint32_t content2_len;
++  blosc2_get_vlmetalayer(schunk, "umetalayer1", &content2, &content2_len);
++  mu_assert("ERROR: bad umetalayer content", strncmp((char*)content2, "testing the  vlmetalayers", content2_len) == 0);
++
++  blosc2_get_vlmetalayer(schunk, "umetalayer2", &content2, &content2_len);
++  mu_assert("ERROR: bad umetalayer content", strncmp((char*)content2, "vlmetalayers", content2_len) == 0);
+   free(content2);
+ 
+   /* Free resources */
+diff --git a/tests/test_sframe.c b/tests/test_sframe.c
+index 4b4b97728..fd515332d 100644
+--- a/tests/test_sframe.c
++++ b/tests/test_sframe.c
+@@ -66,6 +66,9 @@ static char* test_sframe(void) {
+     dparams.nthreads = 1;
+   }
+   blosc2_storage storage = {.contiguous=false, .urlpath=directory, .cparams=&cparams, .dparams=&dparams};
++  /* Remove directory */
++  blosc2_remove_dir(storage.urlpath);
++
+   schunk = blosc2_schunk_new(storage);
+   mu_assert("blosc2_schunk_new() failed", schunk != NULL);
+   char* content = "This is a pretty long string with a good number of chars";
+@@ -82,7 +85,8 @@ static char* test_sframe(void) {
+   }
+ 
+   if (usermeta) {
+-    blosc2_update_usermeta(schunk, (uint8_t *) content, (int32_t) content_len, BLOSC2_CPARAMS_DEFAULTS);
++    blosc2_add_vlmetalayer(schunk, "umetalayer", (uint8_t *) content, (int32_t) content_len, NULL);
++    blosc2_add_vlmetalayer(schunk, "umetalayer2", (uint8_t *) content2, (int32_t) content_len2, NULL);
+   }
+ 
+   if (free_new) {
+@@ -107,11 +111,12 @@ static char* test_sframe(void) {
+   }
+ 
+   if (usermeta) {
+-    int content_len_ = blosc2_get_usermeta(schunk, &content_);
+-    mu_assert("ERROR: bad usermeta length in frame", (size_t) content_len_ == content_len);
+-    mu_assert("ERROR: bad usermeta data in frame", strncmp((char*)content_, content, content_len) == 0);
++    uint32_t content_len_;
++    blosc2_get_vlmetalayer(schunk, "umetalayer", &content_, &content_len_);
++    mu_assert("ERROR: bad vlmetalayers length in frame", (size_t) content_len_ == content_len);
++    mu_assert("ERROR: bad vlmetalayers data in frame", strncmp((char*)content_, content, content_len) == 0);
+     free(content_);
+-    blosc2_update_usermeta(schunk, (uint8_t *) content2, (int32_t) content_len2, BLOSC2_CPARAMS_DEFAULTS);
++    blosc2_update_vlmetalayer(schunk, "umetalayer", (uint8_t *) content2, (int32_t) content_len2, NULL);
+   }
+ 
+   // Feed it with data
+@@ -142,11 +147,12 @@ static char* test_sframe(void) {
+   }
+ 
+   if (usermeta) {
+-    int content_len_ = blosc2_get_usermeta(schunk, &content_);
+-    mu_assert("ERROR: bad usermeta length in frame", (size_t) content_len_ == content_len2);
+-    mu_assert("ERROR: bad usermeta data in frame", strncmp((char*)content_, content2, content_len2) == 0);
++    uint32_t content_len_;
++    blosc2_get_vlmetalayer(schunk, "umetalayer", &content_, &content_len_);
++    mu_assert("ERROR: bad vlmetalayers length in frame", (size_t) content_len_ == content_len2);
++    mu_assert("ERROR: bad vlmetalayers data in frame", strncmp((char*)content_, content2, content_len2) == 0);
+     free(content_);
+-    blosc2_update_usermeta(schunk, (uint8_t *) content3, (int32_t) content_len3, BLOSC2_CPARAMS_DEFAULTS);
++    blosc2_update_vlmetalayer(schunk, "umetalayer", (uint8_t *) content3, (int32_t) content_len3, NULL);
+   }
+ 
+   if (free_new) {
+@@ -187,9 +193,10 @@ static char* test_sframe(void) {
+   }
+ 
+   if (usermeta) {
+-    int content_len_ = blosc2_get_usermeta(schunk, &content_);
+-    mu_assert("ERROR: bad usermeta length in frame", (size_t) content_len_ == content_len3);
+-    mu_assert("ERROR: bad usermeta data in frame", strncmp((char*)content_, content3, content_len3) == 0);
++    uint32_t content_len_;
++    blosc2_get_vlmetalayer(schunk, "umetalayer", &content_, &content_len_);
++    mu_assert("ERROR: bad vlmetalayers length in frame", (size_t) content_len_ == content_len3);
++    mu_assert("ERROR: bad vlmetalayers data in frame", strncmp((char*)content_, content3, content_len3) == 0);
+     free(content_);
+   }
+ 

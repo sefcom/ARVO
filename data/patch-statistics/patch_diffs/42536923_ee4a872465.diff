@@ -1,0 +1,409 @@
+From 99817dba81da6d621cddab1807c2fe2a775a649a Mon Sep 17 00:00:00 2001
+From: Sebastian Rasmussen <sebras@gmail.com>
+Date: Thu, 11 Jul 2024 02:27:49 +0200
+Subject: [PATCH] Determine backdrop component count once to avoid use of
+ uninitialized components.
+
+The fuzzed file causes read uninitialized data in lcms' Eval4Inputs().
+
+That data comes from the backdrop array which contains uninitialized
+data in fz_draw_begin_mask() since luminosity is 1. The backdrop is
+converted to grayscale from the colorfv array using as many components
+as indicated by the colorspace argument also passed into
+fz_draw_begin_mask().
+
+These two arguments are passed in from begin_softmask() which in
+turned obtained the backdrop color from the graphics state and the
+colorspace from the relevant softmask PDF object.
+
+The backdrop color in the graphics state was stored by
+pdf_run_gs_SMask() from corresponding components from the passed-in
+backdrop color array using as many components as the softmask object
+indicated at that point.
+
+The backdrop color array passed to pdf_run_gs_SMask() originated in
+pdf_process_extgstate() which first initializes the backdrop color
+array to black using as many components as indicated by the colorspace
+from the softmask's transparency group xobject. Next, each component
+of the backdrop color array is set to the corresponding component
+value specified by the softmask's /BC dictionary entry.
+
+This sounds reasonable: initialize the backdrop color to black,
+override the components specified by /BC and pass the backdrop color
+via the graphics state stack down to the draw device function that
+handles the soft masks and uses it while rendering.
+
+But there is a flaw exposed by the fuzzed file: the number of
+components in the backdrop color array is repeatedly derived from the
+softmask transparency group xobject. The reason this is problematic is
+that this value may change between reads in pdf_process_extgstate()
+and later on in fz_draw_begin_mask() because the PDF object contents
+change due to the PDF being repaired.
+
+This is what happens when parsing the file supplied by OSS-fuzz:
+
+In pdf_process_extgstate() the xobject colorspace is obtained from the
+softmask whose transparency group is specified via indirect object
+78 0 R. According to the initial xref this object should be located at
+offset 192748 in the file. Unfortunately, this is not accurate, so
+when MuPDF tries to resolve and cache and therefore parse the object,
+a parse error is raised.
+
+At this point, a repair is initiated by pdf_cache_object(). Once the
+repair is finished the xref indicates that the 78 0 R object is now
+located at offset 185643. Unfortunately due to the fuzzed nature of
+the file while attempting to repair object streams in the file a
+format error exception is thrown which means that there is no attempt
+to parse the 78 0 R at its new location.
+
+That format error exception is reported and the parsing of the 78 0 R
+object is assumed to be null. Because 78 0 R is supposed to be a
+softmask transparency group dictionary no value pairs can be looked up
+in that dictionary which means that pdf_xobject_colorspace() used to
+determine the colorspace of the softmask transparency group returns
+NULL. In pdf_process_extgstate() this causes the number of colorspace
+components to remain at the initial value of 1.
+
+This means that the first component of the backdrop color array is
+initialized to zero. Next only the first component of the 4 element
+/BC array is read and replaces the first component in the backdrop
+color array.
+
+Finally, the luminosity subtype is obtained from the softmask before
+the luminosity along with the backdrop color array is passed to the
+callback function pdf_run_gs_SMask().
+
+pdf_run_gs_SMask() again attempts to determine the softmask
+transparency group colorspace by calling pdf_xobject_colorspace(), and
+this time the 78 0 R is resolved and can be successfully parsed at the
+new location indicated by the repaired xref. The problem is that the
+colorspace is CMYK and therefore that four components should be used.
+pdf_run_gs_SMask() dutifully copies four components from the backdrop
+color array into the graphics state stack entry; the first component
+from /BC along with three uninitialized component values!
+
+Later on, while processing the page content stream when filling a path
+pdf_begin_group() is called which calls begin_softmask() which passes
+the half-uninitialized backdrop array to fz_begin_mask(), along with
+softmask transparency group's CMYK colorspace.
+
+Next in fz_draw_begin_mask(), because luminosity is set, it attempts
+to convert 4 components from the backdrop array to a grayscale value.
+During this conversion the uninitialized last three component of the
+backdrop array are accessed by lcms causing valgrind and OSS-fuzz to
+complain about computations using uninitialized data.
+
+There are several possible solutions here:
+
+ * pdf_xobject_colorspace() could be changed so that it tries to
+   reparse the softmask transparency group's colorspace if the PDF was
+   repaired during the first parsing of the colorspace. This would
+   mean that the correct number of components is obtained from the /BC
+   entry and no component values would be left uninitialized. But this
+   appears to be a band-aid solution, no better than always calling
+   pdf_dict_get() twice everywhere in case a value changes between the
+   not-yet repaired and repaired PDF.
+
+ * The initial backdrop array pdf_process_extgstate() could
+   be initialized to all zeros. This is a straightforward solution
+   that prevents the use of any uninitialized component values, but
+   the number of components read out from the backdrop array
+   would still vary.
+
+ * The backdropspace array length could be determined once
+   in pdf_process_extgstate() and passed through to pdf_run_gs_SMask()
+   when it saves the backdrop array in the graphics state
+   stack entry. Any components not set in the backdrop array
+   would remain the values of the previous graphics state (or zero if
+   it is at the bottommost state on the stack). This ensures that all
+   components of the backdrop are initialized and the number
+   of components is determined only once while parsing the PDF. The
+   drawback is that the softmask transparency group is parsed again to
+   determine the number of backdrop components in
+   begin_softmask(), and the colorspace used for that is reparsed
+   again in pdf_run_xobject(). So the component count could still
+   vary.
+
+ * The backdrop array could be dropped from the graphics
+   state stack and instead reparsed in begin_softmask() since a
+   pointer to the softmask PDF object is stored in the graphics state
+   anyway. This guarantees that the colorspace and the background
+   color array are obtained simultaneously so that the number of
+   components will always match. The drawback is that the PDF object
+   needs to be repeatedly reparsed.
+
+ * The softmask transparency group colorspace could be introduced
+   into the graphics state stack. In any case, it is the colorspace's
+   number of components that is used to determine the number of
+   components in the backdrop array, so it is as good as a
+   length value. This is also obvious from that fz_convert_color()
+   takes a component array and a colorspace which indicates the number
+   of components. The good thing about this solution is that the
+   parsing of PDF objects remains in pdf_process_extgstate() instead
+   of happening repeatedly in being_softmask(). Also, the parsing of
+   the colorspace occurs only once and thus the number of components
+   in the backdrop array is also determined only once. The
+   drawback is that yet another thing needs to hauled around in the
+   graphics state and reference counted everywhere.
+
+This commit therefore implements the last solution.
+
+This fixes OSS-fuzz issue 70620.
+---
+ include/mupdf/pdf/interpret.h |  2 +-
+ source/pdf/pdf-interpret.c    | 63 ++++++++++++++++++++---------------
+ source/pdf/pdf-op-color.c     |  4 +--
+ source/pdf/pdf-op-filter.c    |  4 +--
+ source/pdf/pdf-op-run.c       | 18 +++++-----
+ source/tools/pdfaudit.c       |  4 +--
+ 6 files changed, 52 insertions(+), 43 deletions(-)
+
+diff --git a/include/mupdf/pdf/interpret.h b/include/mupdf/pdf/interpret.h
+index bd8b688fd8..62a724bbc6 100644
+--- a/include/mupdf/pdf/interpret.h
++++ b/include/mupdf/pdf/interpret.h
+@@ -76,7 +76,7 @@ struct pdf_processor
+ 	void (*op_gs_BM)(fz_context *ctx, pdf_processor *proc, const char *blendmode);
+ 	void (*op_gs_ca)(fz_context *ctx, pdf_processor *proc, float alpha);
+ 	void (*op_gs_CA)(fz_context *ctx, pdf_processor *proc, float alpha);
+-	void (*op_gs_SMask)(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, float *bc, int luminosity, pdf_obj *tr);
++	void (*op_gs_SMask)(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, fz_colorspace *smask_cs, float *bc, int luminosity, pdf_obj *tr);
+ 	void (*op_gs_end)(fz_context *ctx, pdf_processor *proc);
+ 
+ 	/* special graphics state */
+diff --git a/source/pdf/pdf-interpret.c b/source/pdf/pdf-interpret.c
+index 15acf1740d..6059672910 100644
+--- a/source/pdf/pdf-interpret.c
++++ b/source/pdf/pdf-interpret.c
+@@ -317,17 +317,17 @@ pdf_process_extgstate(fz_context *ctx, pdf_processor *proc, pdf_csi *csi, pdf_ob
+ 		{
+ 			pdf_obj *xobj, *s, *bc, *tr;
+ 			float softmask_bc[FZ_MAX_COLORS];
+-			fz_colorspace *colorspace;
++			fz_colorspace *softmask_cs;
+ 			int colorspace_n = 1;
+ 			int k, luminosity;
+ 
+ 			xobj = pdf_dict_get(ctx, obj, PDF_NAME(G));
+ 
+-			colorspace = pdf_xobject_colorspace(ctx, xobj);
++			softmask_cs = pdf_xobject_colorspace(ctx, xobj);
+ 			fz_try(ctx)
+ 			{
+-				if (colorspace)
+-					colorspace_n = fz_colorspace_n(ctx, colorspace);
++				if (softmask_cs)
++					colorspace_n = fz_colorspace_n(ctx, softmask_cs);
+ 
+ 				/* Default background color is black. */
+ 				for (k = 0; k < colorspace_n; k++)
+@@ -335,36 +335,45 @@ pdf_process_extgstate(fz_context *ctx, pdf_processor *proc, pdf_csi *csi, pdf_ob
+ 				/* Which in CMYK means not all zeros! This should really be
+ 				 * a test for subtractive color spaces, but this will have
+ 				 * to do for now. */
+-				if (fz_colorspace_is_cmyk(ctx, colorspace))
+-					softmask_bc[3] = 1.0f;
+-			}
+-			fz_always(ctx)
+-				fz_drop_colorspace(ctx, colorspace);
+-			fz_catch(ctx)
+-				fz_rethrow(ctx);
++				if (fz_colorspace_is_cmyk(ctx, softmask_cs))
++				{
++					/* Default background color is black. */
++					for (k = 0; k < colorspace_n; k++)
++						softmask_bc[k] = 0;
++					/* Which in CMYK means not all zeros! This should really be
++					 * a test for subtractive color spaces, but this will have
++					 * to do for now. */
++					if (fz_colorspace_is_cmyk(ctx, softmask_cs))
++						softmask_bc[3] = 1.0f;
++				}
+ 
+-			bc = pdf_dict_get(ctx, obj, PDF_NAME(BC));
+-			if (pdf_is_array(ctx, bc))
+-			{
+-				for (k = 0; k < colorspace_n; k++)
+-					softmask_bc[k] = pdf_array_get_real(ctx, bc, k);
+-			}
++				bc = pdf_dict_get(ctx, obj, PDF_NAME(BC));
++				if (pdf_is_array(ctx, bc))
++				{
++					for (k = 0; k < colorspace_n; k++)
++						softmask_bc[k] = pdf_array_get_real(ctx, bc, k);
++				}
+ 
+-			s = pdf_dict_get(ctx, obj, PDF_NAME(S));
+-			if (pdf_name_eq(ctx, s, PDF_NAME(Luminosity)))
+-				luminosity = 1;
+-			else
+-				luminosity = 0;
++				s = pdf_dict_get(ctx, obj, PDF_NAME(S));
++				if (pdf_name_eq(ctx, s, PDF_NAME(Luminosity)))
++					luminosity = 1;
++				else
++					luminosity = 0;
+ 
+-			tr = pdf_dict_get(ctx, obj, PDF_NAME(TR));
+-			if (tr && pdf_name_eq(ctx, tr, PDF_NAME(Identity)))
+-				tr = NULL;
++				tr = pdf_dict_get(ctx, obj, PDF_NAME(TR));
++				if (tr && pdf_name_eq(ctx, tr, PDF_NAME(Identity)))
++					tr = NULL;
+ 
+-			proc->op_gs_SMask(ctx, proc, xobj, softmask_bc, luminosity, tr);
++				proc->op_gs_SMask(ctx, proc, xobj, softmask_cs, softmask_bc, luminosity, tr);
++			}
++			fz_always(ctx)
++				fz_drop_colorspace(ctx, softmask_cs);
++			fz_catch(ctx)
++				fz_rethrow(ctx);
+ 		}
+ 		else if (pdf_is_name(ctx, obj) && pdf_name_eq(ctx, obj, PDF_NAME(None)))
+ 		{
+-			proc->op_gs_SMask(ctx, proc, NULL, NULL, 0, NULL);
++			proc->op_gs_SMask(ctx, proc, NULL, NULL, NULL, 0, NULL);
+ 		}
+ 	}
+ }
+diff --git a/source/pdf/pdf-op-color.c b/source/pdf/pdf-op-color.c
+index 32de15f9ee..afedba0a16 100644
+--- a/source/pdf/pdf-op-color.c
++++ b/source/pdf/pdf-op-color.c
+@@ -584,12 +584,12 @@ pdf_color_gs_ca(fz_context *ctx, pdf_processor *proc, float alpha)
+ }
+ 
+ static void
+-pdf_color_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, float *bc, int luminosity, pdf_obj *tr)
++pdf_color_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, fz_colorspace *smask_cs, float *bc, int luminosity, pdf_obj *tr)
+ {
+ 	pdf_color_processor *p = (pdf_color_processor*)proc;
+ 
+ 	if (p->chain->op_gs_SMask)
+-		p->chain->op_gs_SMask(ctx, p->chain, smask, bc, luminosity, tr);
++		p->chain->op_gs_SMask(ctx, p->chain, smask, smask_cs, bc, luminosity, tr);
+ }
+ 
+ static void
+diff --git a/source/pdf/pdf-op-filter.c b/source/pdf/pdf-op-filter.c
+index de33dac02d..09b6a25a24 100644
+--- a/source/pdf/pdf-op-filter.c
++++ b/source/pdf/pdf-op-filter.c
+@@ -1190,7 +1190,7 @@ pdf_filter_gs_ca(fz_context *ctx, pdf_processor *proc, float alpha)
+ }
+ 
+ static void
+-pdf_filter_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, float *bc, int luminosity, pdf_obj *tr)
++pdf_filter_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, fz_colorspace *smask_cs, float *bc, int luminosity, pdf_obj *tr)
+ {
+ 	pdf_sanitize_processor *p = (pdf_sanitize_processor*)proc;
+ 
+@@ -1198,7 +1198,7 @@ pdf_filter_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, float
+ 		return;
+ 
+ 	if (p->chain->op_gs_SMask)
+-		p->chain->op_gs_SMask(ctx, p->chain, smask, bc, luminosity, tr);
++		p->chain->op_gs_SMask(ctx, p->chain, smask, smask_cs, bc, luminosity, tr);
+ }
+ 
+ static void
+diff --git a/source/pdf/pdf-op-run.c b/source/pdf/pdf-op-run.c
+index 5369540ae3..8c1dc07574 100644
+--- a/source/pdf/pdf-op-run.c
++++ b/source/pdf/pdf-op-run.c
+@@ -91,6 +91,7 @@ struct pdf_gstate
+ 	pdf_obj *softmask_resources;
+ 	pdf_obj *softmask_tr;
+ 	fz_matrix softmask_ctm;
++	fz_colorspace *softmask_cs;
+ 	float softmask_bc[FZ_MAX_COLORS];
+ 	int luminosity;
+ };
+@@ -291,9 +292,9 @@ begin_softmask(fz_context *ctx, pdf_run_processor *pr, softmask_save *save)
+ 
+ 	saved_blendmode = gstate->blendmode;
+ 
+-	mask_colorspace = pdf_xobject_colorspace(ctx, softmask);
++	mask_colorspace = gstate->softmask_cs;
+ 	if (gstate->luminosity && !mask_colorspace)
+-		mask_colorspace = fz_keep_colorspace(ctx, fz_device_gray(ctx));
++		mask_colorspace = fz_device_gray(ctx);
+ 
+ 	fz_try(ctx)
+ 	{
+@@ -314,7 +315,6 @@ begin_softmask(fz_context *ctx, pdf_run_processor *pr, softmask_save *save)
+ 	fz_always(ctx)
+ 	{
+ 		fz_drop_function(ctx, tr);
+-		fz_drop_colorspace(ctx, mask_colorspace);
+ 	}
+ 	fz_catch(ctx)
+ 		fz_rethrow(ctx);
+@@ -460,6 +460,8 @@ pdf_keep_gstate(fz_context *ctx, pdf_gstate *gs)
+ 		pdf_keep_obj(ctx, gs->softmask);
+ 	if (gs->softmask_resources)
+ 		pdf_keep_obj(ctx, gs->softmask_resources);
++	if (gs->softmask_cs)
++		fz_keep_colorspace(ctx, gs->softmask_cs);
+ 	fz_keep_stroke_state(ctx, gs->stroke_state);
+ 	pdf_keep_obj(ctx, gs->softmask_tr);
+ }
+@@ -472,6 +474,7 @@ pdf_drop_gstate(fz_context *ctx, pdf_gstate *gs)
+ 	pdf_drop_font(ctx, gs->text.font);
+ 	pdf_drop_obj(ctx, gs->softmask);
+ 	pdf_drop_obj(ctx, gs->softmask_resources);
++	fz_drop_colorspace(ctx, gs->softmask_cs);
+ 	fz_drop_stroke_state(ctx, gs->stroke_state);
+ 	pdf_drop_obj(ctx, gs->softmask_tr);
+ }
+@@ -2365,7 +2368,7 @@ static void pdf_run_gs_ca(fz_context *ctx, pdf_processor *proc, float alpha)
+ 	gstate->fill.alpha = fz_clamp(alpha, 0, 1);
+ }
+ 
+-static void pdf_run_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, float *bc, int luminosity, pdf_obj *tr)
++static void pdf_run_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, fz_colorspace *smask_cs, float *bc, int luminosity, pdf_obj *tr)
+ {
+ 	pdf_run_processor *pr = (pdf_run_processor *)proc;
+ 	pdf_gstate *gstate = pdf_flush_text(ctx, pr);
+@@ -2381,10 +2384,7 @@ static void pdf_run_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smas
+ 
+ 	if (smask)
+ 	{
+-		fz_colorspace *cs = pdf_xobject_colorspace(ctx, smask);
+-		int cs_n = 1;
+-		if (cs)
+-			cs_n = fz_colorspace_n(ctx, cs);
++		int cs_n = fz_colorspace_n(ctx, smask_cs);
+ 		gstate->softmask_ctm = gstate->ctm;
+ 		gstate->softmask = pdf_keep_obj(ctx, smask);
+ 		gstate->softmask_resources = pdf_keep_obj(ctx, pr->rstack->resources);
+@@ -2395,8 +2395,8 @@ static void pdf_run_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smas
+ 		}
+ 		for (i = 0; i < cs_n; ++i)
+ 			gstate->softmask_bc[i] = bc[i];
++		gstate->softmask_cs = fz_keep_colorspace(ctx, smask_cs);
+ 		gstate->luminosity = luminosity;
+-		fz_drop_colorspace(ctx, cs);
+ 	}
+ }
+ 
+diff --git a/source/tools/pdfaudit.c b/source/tools/pdfaudit.c
+index 2d724228e4..032332d06b 100644
+--- a/source/tools/pdfaudit.c
++++ b/source/tools/pdfaudit.c
+@@ -493,13 +493,13 @@ pdf_opcount_gs_ca(fz_context *ctx, pdf_processor *proc, float alpha)
+ }
+ 
+ static void
+-pdf_opcount_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, float *bc, int luminosity, pdf_obj *obj)
++pdf_opcount_gs_SMask(fz_context *ctx, pdf_processor *proc, pdf_obj *smask, fz_colorspace *smask_cs, float *bc, int luminosity, pdf_obj *obj)
+ {
+ 	pdf_opcount_processor *p = (pdf_opcount_processor*)proc;
+ 	size_t z = p->buffer->len;
+ 
+ 	if (p->mine->op_gs_SMask)
+-		p->mine->op_gs_SMask(ctx, p->mine, smask, bc, luminosity, obj);
++		p->mine->op_gs_SMask(ctx, p->mine, smask, smask_cs, bc, luminosity, obj);
+ 
+ 	z = p->buffer->len - z;
+ 	p->op_usage->len[OP_gs_SMask] += z;

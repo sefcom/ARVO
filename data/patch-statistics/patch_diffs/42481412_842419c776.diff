@@ -1,0 +1,101 @@
+From 8dd91f52a52f0804970fe65738fade9be4bafd54 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Mon, 27 Jan 2020 16:13:36 +0100
+Subject: [PATCH] Remove state pointer argument from php_strip_tags
+
+---
+ ext/filter/sanitizing_filters.c |  2 +-
+ ext/standard/php_string.h       |  4 ++--
+ ext/standard/string.c           | 22 ++++------------------
+ 3 files changed, 7 insertions(+), 21 deletions(-)
+
+diff --git a/ext/filter/sanitizing_filters.c b/ext/filter/sanitizing_filters.c
+index cb1d3a10b2eff..25b2f39fde38f 100644
+--- a/ext/filter/sanitizing_filters.c
++++ b/ext/filter/sanitizing_filters.c
+@@ -194,7 +194,7 @@ void php_filter_string(PHP_INPUT_FILTER_PARAM_DECL)
+ 	php_filter_encode_html(value, enc);
+ 
+ 	/* strip tags, implicitly also removes \0 chars */
+-	new_len = php_strip_tags_ex(Z_STRVAL_P(value), Z_STRLEN_P(value), NULL, NULL, 0, 1);
++	new_len = php_strip_tags_ex(Z_STRVAL_P(value), Z_STRLEN_P(value), NULL, 0, 1);
+ 	Z_STRLEN_P(value) = new_len;
+ 
+ 	if (new_len == 0) {
+diff --git a/ext/standard/php_string.h b/ext/standard/php_string.h
+index b7084d09802a5..2c3953b958699 100644
+--- a/ext/standard/php_string.h
++++ b/ext/standard/php_string.h
+@@ -123,8 +123,8 @@ PHPAPI char *php_stristr(char *s, char *t, size_t s_len, size_t t_len);
+ PHPAPI zend_string *php_str_to_str(const char *haystack, size_t length, const char *needle,
+ 		size_t needle_len, const char *str, size_t str_len);
+ PHPAPI zend_string *php_trim(zend_string *str, char *what, size_t what_len, int mode);
+-PHPAPI size_t php_strip_tags(char *rbuf, size_t len, uint8_t *state, const char *allow, size_t allow_len);
+-PHPAPI size_t php_strip_tags_ex(char *rbuf, size_t len, uint8_t *stateptr, const char *allow, size_t allow_len, zend_bool allow_tag_spaces);
++PHPAPI size_t php_strip_tags(char *rbuf, size_t len, const char *allow, size_t allow_len);
++PHPAPI size_t php_strip_tags_ex(char *rbuf, size_t len, const char *allow, size_t allow_len, zend_bool allow_tag_spaces);
+ PHPAPI void php_implode(const zend_string *delim, HashTable *arr, zval *return_value);
+ PHPAPI void php_explode(const zend_string *delim, zend_string *str, zval *return_value, zend_long limit);
+ 
+diff --git a/ext/standard/string.c b/ext/standard/string.c
+index ffa05a967b45a..6fb9683c5ad37 100644
+--- a/ext/standard/string.c
++++ b/ext/standard/string.c
+@@ -4659,7 +4659,7 @@ PHP_FUNCTION(strip_tags)
+ 	}
+ 
+ 	buf = zend_string_init(ZSTR_VAL(str), ZSTR_LEN(str), 0);
+-	ZSTR_LEN(buf) = php_strip_tags_ex(ZSTR_VAL(buf), ZSTR_LEN(str), NULL, allowed_tags, allowed_tags_len, 0);
++	ZSTR_LEN(buf) = php_strip_tags_ex(ZSTR_VAL(buf), ZSTR_LEN(str), allowed_tags, allowed_tags_len, 0);
+ 	smart_str_free(&tags_ss);
+ 	RETURN_NEW_STR(buf);
+ }
+@@ -4869,9 +4869,9 @@ int php_tag_find(char *tag, size_t len, const char *set) {
+ }
+ /* }}} */
+ 
+-PHPAPI size_t php_strip_tags(char *rbuf, size_t len, uint8_t *stateptr, const char *allow, size_t allow_len) /* {{{ */
++PHPAPI size_t php_strip_tags(char *rbuf, size_t len, const char *allow, size_t allow_len) /* {{{ */
+ {
+-	return php_strip_tags_ex(rbuf, len, stateptr, allow, allow_len, 0);
++	return php_strip_tags_ex(rbuf, len, allow, allow_len, 0);
+ }
+ /* }}} */
+ 
+@@ -4895,7 +4895,7 @@ PHPAPI size_t php_strip_tags(char *rbuf, size_t len, uint8_t *stateptr, const ch
+ 	swm: Added ability to strip <?xml tags without assuming it PHP
+ 	code.
+ */
+-PHPAPI size_t php_strip_tags_ex(char *rbuf, size_t len, uint8_t *stateptr, const char *allow, size_t allow_len, zend_bool allow_tag_spaces)
++PHPAPI size_t php_strip_tags_ex(char *rbuf, size_t len, const char *allow, size_t allow_len, zend_bool allow_tag_spaces)
+ {
+ 	char *tbuf, *tp, *rp, c, lc;
+ 	const char *buf, *p, *end;
+@@ -4920,18 +4920,6 @@ PHPAPI size_t php_strip_tags_ex(char *rbuf, size_t len, uint8_t *stateptr, const
+ 		tbuf = tp = NULL;
+ 	}
+ 
+-	if (stateptr) {
+-		state = *stateptr;
+-		switch (state) {
+-			case 1: goto state_1;
+-			case 2: goto state_2;
+-			case 3: goto state_3;
+-			case 4: goto state_4;
+-			default:
+-				break;
+-		}
+-	}
+-
+ state_0:
+ 	if (p >= end) {
+ 		goto finish;
+@@ -5225,8 +5213,6 @@ PHPAPI size_t php_strip_tags_ex(char *rbuf, size_t len, uint8_t *stateptr, const
+ 	if (allow_free) {
+ 		efree(allow_free);
+ 	}
+-	if (stateptr)
+-		*stateptr = state;
+ 
+ 	return (size_t)(rp - rbuf);
+ }

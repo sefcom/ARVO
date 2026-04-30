@@ -1,0 +1,143 @@
+From dbe46d13db44a0e2baa703cd560d3f5661ab5c01 Mon Sep 17 00:00:00 2001
+From: Lovell Fuller <lovell@users.noreply.github.com>
+Date: Mon, 13 Jan 2025 11:41:21 +0000
+Subject: [PATCH] gifsave: ensure return code is propagated (#4344)
+
+- checks for error after final sink disc write
+- adds support for eval callbacks
+- adds GIF timeout test
+---
+ ChangeLog                   |  1 +
+ libvips/foreign/cgifsave.c  |  7 ++++++
+ libvips/iofuncs/sinkdisc.c  |  4 +++
+ test/meson.build            | 11 +++++++++
+ test/test_timeout_gifsave.c | 49 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 72 insertions(+)
+ create mode 100644 test/test_timeout_gifsave.c
+
+diff --git a/ChangeLog b/ChangeLog
+index 540c2fbcff..b788a87725 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -14,6 +14,7 @@
+ - XYZ2Yxy: guard against divide by zero
+ - fix MSVC compile error [na-trium-144]
+ - exif: ensure enumerated entries can to converted to string values [lovell]
++- gifsave: add support for eval callback, ensure correct return code [lovell]
+ 
+ 10/10/24 8.16.0
+ 
+diff --git a/libvips/foreign/cgifsave.c b/libvips/foreign/cgifsave.c
+index db7e70bffe..c28d5e5f9c 100644
+--- a/libvips/foreign/cgifsave.c
++++ b/libvips/foreign/cgifsave.c
+@@ -48,6 +48,7 @@
+ #include <string.h>
+ 
+ #include <vips/vips.h>
++#include <vips/internal.h>
+ 
+ #include "pforeign.h"
+ #include "quantise.h"
+@@ -589,6 +590,12 @@ vips_foreign_save_cgif_write_frame(VipsForeignSaveCgif *cgif)
+ 
+ 	VIPS_FREEF(vips__quantise_image_destroy, image);
+ 
++	/* Remapping is relatively slow, trigger eval callbacks.
++	 */
++	vips_image_eval(cgif->in, n_pels);
++	if (vips_image_iskilled(cgif->in))
++		return -1;
++
+ 	/* Set up cgif on first use.
+ 	 */
+ 	if (!cgif->cgif_context) {
+diff --git a/libvips/iofuncs/sinkdisc.c b/libvips/iofuncs/sinkdisc.c
+index 236c271ac3..86a2549837 100644
+--- a/libvips/iofuncs/sinkdisc.c
++++ b/libvips/iofuncs/sinkdisc.c
+@@ -533,6 +533,10 @@ vips_sink_disc(VipsImage *im, VipsRegionWrite write_fn, void *a)
+ 
+ 	vips_image_posteval(im);
+ 
++	/* The final write might have failed, pick up any error code.
++	 */
++	result |= write.buf->write_errno;
++
+ 	write_free(&write);
+ 
+ 	vips_image_minimise_all(im);
+diff --git a/test/meson.build b/test/meson.build
+index 92b79d782e..90dc7e7779 100644
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -89,3 +89,14 @@ test('webpsave_timeout',
+     depends: test_timeout_webpsave,
+     workdir: meson.current_build_dir(),
+ )
++
++test_timeout_gifsave = executable('test_timeout_gifsave',
++    'test_timeout_gifsave.c',
++    dependencies: libvips_dep,
++)
++
++test('gifsave_timeout',
++    test_timeout_gifsave,
++    depends: test_timeout_gifsave,
++    workdir: meson.current_build_dir(),
++)
+diff --git a/test/test_timeout_gifsave.c b/test/test_timeout_gifsave.c
+new file mode 100644
+index 0000000000..a47f0cd88e
+--- /dev/null
++++ b/test/test_timeout_gifsave.c
+@@ -0,0 +1,49 @@
++#include <vips/vips.h>
++
++#define TIMEOUT_SECONDS 2
++
++static void
++eval_callback(VipsImage *image, VipsProgress *progress, gboolean *is_killed)
++{
++	if (progress->run >= TIMEOUT_SECONDS) {
++		*is_killed = TRUE;
++		vips_image_set_kill(image, TRUE);
++	}
++}
++
++int
++main(int argc, char **argv)
++{
++	VipsImage *im;
++	void *buf;
++	size_t len;
++	gboolean is_killed = FALSE;
++	int ret;
++
++	if (VIPS_INIT(argv[0]))
++		vips_error_exit(NULL);
++
++	if (!vips_type_find("VipsOperation", "gifsave"))
++		/* gifsave not available, skip test with return code 77.
++		 */
++		return 77;
++
++	if (vips_gaussnoise(&im, 8192, 8192, NULL))
++		vips_error_exit(NULL);
++
++	vips_image_set_progress(im, TRUE);
++	g_signal_connect(im, "eval",
++		G_CALLBACK(eval_callback), &is_killed);
++
++	buf = NULL;
++	ret = vips_gifsave_buffer(im, &buf, &len, NULL);
++	if (!ret)
++		printf("expected error return from vips_gifsave_buffer()\n");
++
++	g_object_unref(im);
++	if (buf)
++		g_free(buf);
++	g_assert(is_killed);
++
++	return !ret;
++}

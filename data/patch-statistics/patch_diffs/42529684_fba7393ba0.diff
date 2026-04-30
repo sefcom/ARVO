@@ -1,0 +1,70 @@
+From e399bd7e3d4cb4071e426ecb735084c6577a8644 Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Mon, 30 Oct 2023 09:21:57 +0100
+Subject: [PATCH] Custom rules: fix a stack overflow (#2128)
+
+```
+==19255==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7f515bb3bf80 at pc 0x55796e01394a bp 0x7fff4fb5c050 sp 0x7fff4fb5b7e0
+WRITE of size 58 at 0x7f515bb3bf80 thread T0
+    #0 0x55796e013949 in scanf_common(void*, int, bool, char const*, __va_list_tag*) asan_interceptors.cpp.o
+    #1 0x55796e0147df in __isoc99_sscanf (/home/ivan/svnrepos/nDPI/fuzz/fuzz_filecfg_protocols+0x77f7df) (BuildId: a88601afb2c538ead3968648f39b9aa4da53427c)
+    #2 0x55796e0fc74a in ndpi_add_host_ip_subprotocol /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:2771:13
+    #3 0x55796e0fb029 in ndpi_handle_rule /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:4411:16
+    #4 0x55796e103738 in ndpi_load_protocols_file_fd /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:4901:8
+    #5 0x55796e0ca96d in LLVMFuzzerTestOneInput /home/ivan/svnrepos/nDPI/fuzz/fuzz_filecfg_protocols.c:38:3
+    #6 0x55796dfd78e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_filecfg_protocols+0x7428e0) (BuildId: a88601afb2c538ead3968648f39b9aa4da53427c)
+    #7 0x55796dfc0e93 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_filecfg_protocols+0x72be93) (BuildId: a88601afb2c538ead3968648f39b9aa4da53427c)
+    #8 0x55796dfc6d96 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_filecfg_protocols+0x731d96) (BuildId: a88601afb2c538ead3968648f39b9aa4da53427c)
+    #9 0x55796dff1672 in main (/home/ivan/svnrepos/nDPI/fuzz/fuzz_filecfg_protocols+0x75c672) (BuildId: a88601afb2c538ead3968648f39b9aa4da53427c)
+    #10 0x7f515df19082 in __libc_start_main /build/glibc-BHL3KM/glibc-2.31/csu/../csu/libc-start.c:308:16
+    #11 0x55796dfbbb0d in _start (/home/ivan/svnrepos/nDPI/fuzz/fuzz_filecfg_protocols+0x726b0d) (BuildId: a88601afb2c538ead3968648f39b9aa4da53427c)
+
+Address 0x7f515bb3bf80 is located in stack of thread T0 at offset 128 in frame
+    #0 0x55796e0fb977 in ndpi_add_host_ip_subprotocol /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:2703
+
+  This frame has 4 object(s):
+    [32, 36) 'pin' (line 2705)
+    [48, 64) 'pin6' (line 2706)
+    [80, 96) 'd' (line 2769)
+    [112, 128) 'tail' (line 2770) <== Memory access at offset 128 overflows this variable
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+      (longjmp and C++ exceptions *are* supported)
+SUMMARY: AddressSanitizer: stack-buffer-overflow asan_interceptors.cpp.o in scanf_common(void*, int, bool, char const*, __va_list_tag*)
+Shadow bytes around the buggy address:
+
+```
+---
+ fuzz/corpus/fuzz_filecfg_protocols/domain.txt      | 1 +
+ fuzz/corpus/fuzz_filecfg_protocols/domain_ipv6.txt | 1 +
+ src/lib/ndpi_main.c                                | 2 +-
+ 3 files changed, 3 insertions(+), 1 deletion(-)
+ create mode 100644 fuzz/corpus/fuzz_filecfg_protocols/domain.txt
+ create mode 100644 fuzz/corpus/fuzz_filecfg_protocols/domain_ipv6.txt
+
+diff --git a/fuzz/corpus/fuzz_filecfg_protocols/domain.txt b/fuzz/corpus/fuzz_filecfg_protocols/domain.txt
+new file mode 100644
+index 00000000000..b2101c8dba4
+--- /dev/null
++++ b/fuzz/corpus/fuzz_filecfg_protocols/domain.txt
+@@ -0,0 +1 @@
++ip:www.ntop.org@ntop
+diff --git a/fuzz/corpus/fuzz_filecfg_protocols/domain_ipv6.txt b/fuzz/corpus/fuzz_filecfg_protocols/domain_ipv6.txt
+new file mode 100644
+index 00000000000..232d57d02f2
+--- /dev/null
++++ b/fuzz/corpus/fuzz_filecfg_protocols/domain_ipv6.txt
+@@ -0,0 +1 @@
++ipv6:www.ntop.org@ntop
+diff --git a/src/lib/ndpi_main.c b/src/lib/ndpi_main.c
+index 5b00c8491d0..b14297c16fd 100644
+--- a/src/lib/ndpi_main.c
++++ b/src/lib/ndpi_main.c
+@@ -2768,7 +2768,7 @@ static int ndpi_add_host_ip_subprotocol(struct ndpi_detection_module_struct *ndp
+     /* Check if the IP address is symbolic or numeric */
+     unsigned int d[4];
+     char tail[16] = { '\0' };
+-    int c = sscanf(value, "%3u.%3u.%3u.%3u%s", &d[0], &d[1], &d[2], &d[3], tail);
++    int c = sscanf(value, "%3u.%3u.%3u.%3u%15s", &d[0], &d[1], &d[2], &d[3], tail);
+ 
+     if ((c != 4) || tail[0]) {
+       /* This might be a symbolic IPv4 address */

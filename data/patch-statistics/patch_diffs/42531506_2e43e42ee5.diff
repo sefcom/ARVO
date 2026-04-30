@@ -1,0 +1,234 @@
+From 6a89d7c27099be84e5312a7ec73205d6a7abe1b4 Mon Sep 17 00:00:00 2001
+From: Charlie Gordon <github@chqrlie.org>
+Date: Sun, 3 Mar 2024 21:57:38 +0100
+Subject: [PATCH] Add CI targets, fix test_std.js (#247)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This switches the exec test to `SIGTERM` rather than `SIGQUIT` since the
+latter didn’t seem to work in QEMU, and the distinction doesn’t really
+matter for this test.
+
+This also makes the `isatty()` check smarter by checking whether `STDIN`
+is, in fact, a terminal.
+
+Added qemu-alpine targets i386, arm32v6, arm32v7, arm64v8, s390x
+
+Co-authored-by: Felipe Gasper <felipe@felipegasper.com>
+---
+ .github/workflows/ci.yml | 79 ++++++++++++++++++++++++++--------------
+ tests/test_std.js        | 10 +++--
+ 2 files changed, 58 insertions(+), 31 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 7565477ba..9eab46fd1 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -12,40 +12,41 @@ on:
+       - '.github/workflows/ci.yml'
+   push:
+     branches:
+-      - master
++      - '*'
+ 
+ jobs:
+   linux:
++    name: Linux (Ubuntu)
+     runs-on: ubuntu-latest
+     strategy:
+       fail-fast: false
+     steps:
+-      - uses: actions/checkout@v3
++      - uses: actions/checkout@v4
+         with:
+           submodules: true
+-      - name: build
++      - name: Build
+         run: |
+           make -j$(getconf _NPROCESSORS_ONLN) CONFIG_WERROR=y
+-      - name: stats
++      - name: Stats
+         run: |
+           ./qjs -qd
+-      - name: test
++      - name: Run built-in tests
+         run: |
+           make test
+-      - name: microbench
++      - name: Run microbench
+         run: |
+           make microbench
+ 
+   linux-asan:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/checkout@v3
++      - uses: actions/checkout@v4
+         with:
+           submodules: true
+-      - name: build
++      - name: Build
+         run: |
+           make -j$(getconf _NPROCESSORS_ONLN) CONFIG_WERROR=y CONFIG_ASAN=y
+-      - name: test
++      - name: Run built-in tests
+         env:
+           ASAN_OPTIONS: halt_on_error=1
+         run: |
+@@ -54,15 +55,15 @@ jobs:
+   linux-msan:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/checkout@v3
++      - uses: actions/checkout@v4
+         with:
+           submodules: true
+-      - name: build
++      - name: Build
+         env:
+           CC: clang
+         run: |
+           make -j$(getconf _NPROCESSORS_ONLN) CONFIG_WERROR=y CONFIG_MSAN=y CONFIG_CLANG=y
+-      - name: test
++      - name: Run built-in tests
+         env:
+           MSAN_OPTIONS: halt_on_error=1
+         run: |
+@@ -71,42 +72,43 @@ jobs:
+   linux-ubsan:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/checkout@v3
++      - uses: actions/checkout@v4
+         with:
+           submodules: true
+-      - name: build
++      - name: Build
+         run: |
+           make -j$(getconf _NPROCESSORS_ONLN) CONFIG_WERROR=y CONFIG_UBSAN=y
+-      - name: test
++      - name: Run built-in tests
+         env:
+           UBSAN_OPTIONS: halt_on_error=1
+         run: |
+           make CONFIG_UBSAN=y test
+ 
+   macos:
++    name: macOS
+     runs-on: macos-latest
+     strategy:
+       fail-fast: false
+     steps:
+-      - uses: actions/checkout@v3
+-      - name: build
++      - uses: actions/checkout@v4
++      - name: Build
+         run: |
+           make -j$(getconf _NPROCESSORS_ONLN) CONFIG_WERROR=y
+-      - name: stats
++      - name: Stats
+         run: |
+           ./qjs -qd
+-      - name: test
++      - name: Run built-in tests
+         run: |
+           make test
+ 
+   macos-asan:
+     runs-on: macos-latest
+     steps:
+-      - uses: actions/checkout@v3
+-      - name: build
++      - uses: actions/checkout@v4
++      - name: Build
+         run: |
+           make -j$(getconf _NPROCESSORS_ONLN) CONFIG_WERROR=y CONFIG_ASAN=y
+-      - name: test
++      - name: Run built-in tests
+         env:
+           ASAN_OPTIONS: halt_on_error=1
+         run: |
+@@ -115,11 +117,11 @@ jobs:
+   macos-ubsan:
+     runs-on: macos-latest
+     steps:
+-      - uses: actions/checkout@v3
+-      - name: build
++      - uses: actions/checkout@v4
++      - name: Build
+         run: |
+           make -j$(getconf _NPROCESSORS_ONLN) CONFIG_WERROR=y CONFIG_UBSAN=y
+-      - name: test
++      - name: Run built-in tests
+         env:
+           UBSAN_OPTIONS: halt_on_error=1
+         run: |
+@@ -128,8 +130,8 @@ jobs:
+   freebsd:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/checkout@v3
+-      - name: build + test
++      - uses: actions/checkout@v4
++      - name: Build + test
+         uses: vmactions/freebsd-vm@v1
+         with:
+           usesh: true
+@@ -139,3 +141,26 @@ jobs:
+             gmake
+             ./qjs -qd
+             gmake test
++
++  qemu-alpine:
++    runs-on: ubuntu-latest
++
++    strategy:
++      fail-fast: false
++      matrix:
++        platform:
++          - i386
++          - arm32v6
++          - arm32v7
++          - arm64v8
++          - s390x
++
++    steps:
++      - uses: actions/checkout@v4
++        with:
++            submodules: recursive
++      - name: Get qemu
++        run: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
++      - name: Run tests on ${{ matrix.platform }}
++        run: docker run --rm --interactive --mount type=bind,source=$(pwd),target=/host ${{ matrix.platform }}/alpine sh -c "apk add git patch make gcc libc-dev && cd /host && make test"
++
+diff --git a/tests/test_std.js b/tests/test_std.js
+index 86a242c0f..c84486921 100644
+--- a/tests/test_std.js
++++ b/tests/test_std.js
+@@ -144,8 +144,9 @@ function test_os()
+ {
+     var fd, fpath, fname, fdir, buf, buf2, i, files, err, fdate, st, link_path;
+ 
+-    // XXX(bnoordhuis) disabled because stdio is not a tty on CI
+-    //assert(os.isatty(0));
++    const stdinIsTTY = !os.exec(["/bin/sh", "-c", "test -t 0"], { usePath: false });
++
++    assert(os.isatty(0), stdinIsTTY, `isatty(STDIN)`);
+ 
+     fdir = "test_tmp_dir";
+     fname = "tmp_file.txt";
+@@ -254,10 +255,11 @@ function test_os_exec()
+ 
+     pid = os.exec(["cat"], { block: false } );
+     assert(pid >= 0);
+-    os.kill(pid, os.SIGQUIT);
++    os.kill(pid, os.SIGTERM);
+     [ret, status] = os.waitpid(pid, 0);
+     assert(ret, pid);
+-    assert(status & 0x7f, os.SIGQUIT);
++    assert(status !== 0, true, `expect nonzero exit code (got ${status})`);
++    assert(status & 0x7f, os.SIGTERM);
+ }
+ 
+ function test_timer()

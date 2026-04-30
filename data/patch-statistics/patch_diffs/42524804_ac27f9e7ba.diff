@@ -1,0 +1,273 @@
+From f95b4cdd852fca7052fc7a2b115e4958499f1df9 Mon Sep 17 00:00:00 2001
+From: Luca Deri <deri@ntop.org>
+Date: Wed, 7 Jun 2023 22:52:00 +0200
+Subject: [PATCH] Compilation warnign fixes and various boundary checks
+
+---
+ fuzz/onefile.cpp                        |  4 ++--
+ fuzz/stub/RedisStub.cpp                 | 16 ++++++++--------
+ src/HostPools.cpp                       | 19 +++++++++++++++----
+ src/IEC104Stats.cpp                     | 14 +++++---------
+ src/LuaEngine.cpp                       |  2 +-
+ src/LuaEngineInterface.cpp              |  6 +++---
+ src/NetworkInterface.cpp                | 13 ++++++++-----
+ src/flow_checks/CustomFlowLuaScript.cpp |  2 +-
+ src/host_checks/CustomHostLuaScript.cpp |  2 +-
+ 9 files changed, 44 insertions(+), 34 deletions(-)
+
+diff --git a/fuzz/onefile.cpp b/fuzz/onefile.cpp
+index 7fa68f8c3bea..7f9a6c340264 100644
+--- a/fuzz/onefile.cpp
++++ b/fuzz/onefile.cpp
+@@ -47,7 +47,7 @@ int main(int argc, char *argv[]) {
+     fseek(f, 0, SEEK_SET); /* same as rewind(f); */
+ 
+     uint8_t *string = (uint8_t *)malloc(fsize + 1);
+-    fread(string, fsize, 1, f);
++    size_t l = fread(string, fsize, 1, f);
+ 
+     fclose(f);
+ 
+@@ -58,4 +58,4 @@ int main(int argc, char *argv[]) {
+     return 0;
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/fuzz/stub/RedisStub.cpp b/fuzz/stub/RedisStub.cpp
+index 794930a5dece..52abb7a45d1b 100644
+--- a/fuzz/stub/RedisStub.cpp
++++ b/fuzz/stub/RedisStub.cpp
+@@ -60,10 +60,10 @@ int Redis::info(char *rsp, u_int rsp_len) {
+     if (rsp_len == 0) return -1;
+ 
+     stats.num_other++;
+-    if (snprintf(rsp, rsp_len, "") < 0) {
+-        rsp[0] = 0;
+-        return -1;
+-    }
++    if(rsp_len == 0)
++      return -1;
++    
++    rsp[0] = 0;
+     return 0;
+ }
+ 
+@@ -368,8 +368,8 @@ int Redis::lindex(const char *queue_name, int idx, char *buf, u_int buf_len) {
+ 
+     const auto &list = this->listStore[strKey];
+ 
+-    if (idx < 0) idx += list.size();
+-    if (idx < 0 || idx >= list.size()) {
++    if (idx < 0) idx += (int)list.size();
++    if (idx < 0 || idx >= (int)list.size()) {
+         buf[0] = 0;
+         return -1;
+     }
+@@ -458,7 +458,7 @@ int Redis::lrange(const char *list_name, char ***elements, int start_offset,
+     }
+ 
+     *elements = (char **)malloc(retList.size() * sizeof(char *));
+-    for (int i = 0; i < retList.size(); ++i)
++    for (int i = 0; i < (int)retList.size(); ++i)
+         (*elements)[i] = strdup(retList[i].c_str());
+ 
+     return retList.size();
+@@ -567,4 +567,4 @@ char *Redis::dump(char *key) {
+     return ret;
+ }
+ 
+-int Redis::restore(char *key, char *buf) { return 0; }
+\ No newline at end of file
++int Redis::restore(char *key, char *buf) { return 0; }
+diff --git a/src/HostPools.cpp b/src/HostPools.cpp
+index 9453c40cff02..695731b21fc1 100644
+--- a/src/HostPools.cpp
++++ b/src/HostPools.cpp
+@@ -309,7 +309,16 @@ void HostPools::reloadPools() {
+   if (!iface || (iface->get_id() == -1)) return;
+ 
+   new_tree = new (std::nothrow) VLANAddressTree;
++  if(new_tree == NULL) {
++    return;
++  }
++  
+   new_stats = new (std::nothrow) HostPoolStats *[MAX_NUM_HOST_POOLS];
++  if(new_stats == NULL) {
++    delete new_tree;
++    return;
++  }
++  
+   for (u_int32_t i = 0; i < MAX_NUM_HOST_POOLS; i++) new_stats[i] = NULL;
+ 
+   snprintf(kname, sizeof(kname), HOST_POOL_IDS_KEY);
+@@ -324,9 +333,12 @@ void HostPools::reloadPools() {
+   if (new_stats[0]) new_stats[0]->updateName(DEFAULT_POOL_NAME);
+ 
+   /* Keys are pool ids */
+-  if ((num_pools = redis->smembers(kname, &pools)) == -1)
++  if ((num_pools = redis->smembers(kname, &pools)) == -1) {
++    delete new_tree;
++    delete new_stats;
+     return; /* Something went wrong with redis? */
+-
++  }
++  
+   for (int i = 0; i < num_pools; i++) {
+     if (!pools[i]) continue;
+ 
+@@ -347,8 +359,7 @@ void HostPools::reloadPools() {
+ 
+     if (_pool_id != 0) {            /* Pool id 0 stats already updated */
+       if (stats && stats[_pool_id]) /* Duplicate existing statistics */
+-        new_stats[_pool_id] =
+-            new (std::nothrow) HostPoolStats(*stats[_pool_id]);
++        new_stats[_pool_id] = new (std::nothrow) HostPoolStats(*stats[_pool_id]);
+       else /* Brand new statistics */
+         new_stats[_pool_id] = new (std::nothrow) HostPoolStats(iface);
+     }
+diff --git a/src/IEC104Stats.cpp b/src/IEC104Stats.cpp
+index 1c67404518bd..84990b8166da 100644
+--- a/src/IEC104Stats.cpp
++++ b/src/IEC104Stats.cpp
+@@ -182,12 +182,8 @@ void IEC104Stats::processPacket(Flow *f, bool tx_direction,
+         bool initial_run =
+             ((rx_seq_num == 0) && (tx_seq_num == 0)) ? true : false;
+ 
+-        tx_value =
+-            ((((u_int16_t)payload[offset + 2]) << 8) + payload[offset + 1]) >>
+-            1;
+-        rx_value =
+-            ((((u_int16_t)payload[offset + 4]) << 8) + payload[offset + 3]) >>
+-            1;
++        tx_value = ((((u_int16_t)payload[offset + 2]) << 8) + payload[offset + 1]) >> 1;
++        rx_value = ((((u_int16_t)payload[offset + 4]) << 8) + payload[offset + 3]) >> 1;
+ 
+         if (!tx_direction) {
+           /* Counters are swapped */
+@@ -232,7 +228,7 @@ void IEC104Stats::processPacket(Flow *f, bool tx_direction,
+ 
+         /* Skip magic(1), len(1), type/TX(2), RX(2) = 6 */
+         len -= 6 /* Skip magic and len */,
+-            offset += 5 /* magic already skept */;
++	  offset += 5 /* magic already skept */;
+ 
+         if (payload_len >= (offset + len)) {
+           u_int8_t type_id = payload[offset];
+@@ -388,8 +384,8 @@ void IEC104Stats::processPacket(Flow *f, bool tx_direction,
+         // ntop->getTrace()->traceEvent(TRACE_WARNING, "*** short APDUs");
+         break;
+       }
+-
+-      if (payload[offset] == 0x68 /* IEC magic byte */)
++      
++      if((offset < payload_len) && (payload[offset] == 0x68 /* IEC magic byte */))
+         offset += 1; /* We skip the initial magic byte */
+       else {
+ #ifdef DEBUG_IEC60870
+diff --git a/src/LuaEngine.cpp b/src/LuaEngine.cpp
+index 156ee8db3277..9c2ead45cbad 100644
+--- a/src/LuaEngine.cpp
++++ b/src/LuaEngine.cpp
+@@ -971,7 +971,7 @@ int LuaEngine::handle_script_request(struct mg_connection *conn,
+   char key[64], ifname[MAX_INTERFACE_NAME_LEN];
+   bool is_interface_allowed;
+   AddressTree ptree;
+-  int rc, post_data_len;
++  int rc, post_data_len = 0;
+   const char *content_type;
+   u_int8_t valid_csrf = 1;
+   char *post_data = NULL;
+diff --git a/src/LuaEngineInterface.cpp b/src/LuaEngineInterface.cpp
+index 8748932aba47..6c93fe562c2d 100644
+--- a/src/LuaEngineInterface.cpp
++++ b/src/LuaEngineInterface.cpp
+@@ -5115,10 +5115,11 @@ static int ntop_interface_is_syslog_interface(lua_State *vm) {
+ /* ****************************************** */
+ 
+ static int ntop_clickhouse_exec_csv_query(lua_State *vm) {
++#ifdef HAVE_CLICKHOUSE
+   NetworkInterface *ntop_interface = getCurrentInterface(vm);
+   const char *sql;
+-  struct mg_connection *conn = getLuaVMUserdata(vm, conn);
+   bool use_json = false;
++  struct mg_connection *conn = getLuaVMUserdata(vm, conn);
+ 
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+@@ -5129,11 +5130,10 @@ static int ntop_clickhouse_exec_csv_query(lua_State *vm) {
+     return (ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_PARAM_ERROR));
+ 
+   sql = lua_tostring(vm, 1);
+-
++  
+   if (lua_type(vm, 2) == LUA_TBOOLEAN) /* optional */
+     use_json = lua_toboolean(vm, 2) ? true : false;
+ 
+-#ifdef HAVE_CLICKHOUSE
+   ntop_interface->exec_csv_query(sql, use_json, conn);
+ #endif
+ 
+diff --git a/src/NetworkInterface.cpp b/src/NetworkInterface.cpp
+index f064c0123190..2c6b77ceeae0 100644
+--- a/src/NetworkInterface.cpp
++++ b/src/NetworkInterface.cpp
+@@ -2483,8 +2483,11 @@ bool NetworkInterface::dissectPacket(u_int32_t bridge_iface_idx,
+     if (h->caplen < sizeof(u_int32_t))
+       return (false);
+ 
+-    memcpy(&null_type, &packet[eth_offset], sizeof(u_int32_t));
+-
++    if((eth_offset + sizeof(u_int32_t)) <= h->caplen)
++      memcpy(&null_type, &packet[eth_offset], sizeof(u_int32_t));
++    else
++      return (false);    
++    
+     switch (null_type) {
+       case BSD_AF_INET:
+         eth_type = ETHERTYPE_IP;
+@@ -2566,14 +2569,14 @@ bool NetworkInterface::dissectPacket(u_int32_t bridge_iface_idx,
+   */
+ decode_packet_eth:
+ 
+-  while (true) {
+-    if (eth_type == 0x8100 /* VLAN */) {
++  while (ip_offset < h->caplen) {
++    if((eth_type == 0x8100 /* VLAN */) && ((ip_offset + sizeof(Ether80211q)) < h->caplen)) {
+       Ether80211q *qType = (Ether80211q *)&packet[ip_offset];
+ 
+       vlan_id = ntohs(qType->vlanId) & 0xFFF;
+       eth_type = (packet[ip_offset + 2] << 8) + packet[ip_offset + 3];
+       ip_offset += 4;
+-    } else if (eth_type == 0x8847 /* MPLS */) {
++    } else if((eth_type == 0x8847 /* MPLS */) && ((unsigned int)(ip_offset + 2) <  h->caplen)) {
+       u_int8_t bos; /* bottom_of_stack */
+ 
+       bos = (((u_int8_t)packet[ip_offset + 2]) & 0x1), ip_offset += 4;
+diff --git a/src/flow_checks/CustomFlowLuaScript.cpp b/src/flow_checks/CustomFlowLuaScript.cpp
+index c7f3f5256fc2..98d0b9bf4493 100644
+--- a/src/flow_checks/CustomFlowLuaScript.cpp
++++ b/src/flow_checks/CustomFlowLuaScript.cpp
+@@ -37,7 +37,7 @@ CustomFlowLuaScript::CustomFlowLuaScript()
+ /* ***************************************************** */
+ 
+ LuaEngine *CustomFlowLuaScript::initVM(const char *script_path) {
+-  char where[256];
++  char where[512];
+   struct stat s;
+ 
+   snprintf(where, sizeof(where), "%s/%s", ntop->get_install_dir(), script_path);
+diff --git a/src/host_checks/CustomHostLuaScript.cpp b/src/host_checks/CustomHostLuaScript.cpp
+index f9c57d84dd6a..44660606a175 100644
+--- a/src/host_checks/CustomHostLuaScript.cpp
++++ b/src/host_checks/CustomHostLuaScript.cpp
+@@ -54,7 +54,7 @@ CustomHostLuaScript::~CustomHostLuaScript() {
+ LuaEngine *CustomHostLuaScript::initVM() {
+   const char *script_path =
+       "scripts/callbacks/checks/hosts/custom_host_lua_script.lua";
+-  char where[256];
++  char where[512];
+   struct stat s;
+ 
+   snprintf(where, sizeof(where), "%s/%s", ntop->get_install_dir(), script_path);

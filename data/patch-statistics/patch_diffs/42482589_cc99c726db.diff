@@ -1,0 +1,177 @@
+From 3c02d53db013190cb13b491f21737a5ce0199589 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@spatialys.com>
+Date: Tue, 24 Mar 2020 13:00:06 +0100
+Subject: [PATCH] ogr2ogr: allow to combine -nlt CONVERT_TO_LINEAR and -nlt
+ PROMOTE_TO_MULTI (fixes #2338)
+
+---
+ autotest/utilities/test_ogr2ogr_lib.py | 26 +++++++++++++++++
+ gdal/apps/ogr2ogr_lib.cpp              | 40 +++++++++++++++++++-------
+ gdal/doc/source/programs/ogr2ogr.rst   |  3 ++
+ gdal/swig/include/python/gdal_python.i |  6 +++-
+ gdal/swig/python/osgeo/gdal.py         |  6 +++-
+ 5 files changed, 69 insertions(+), 12 deletions(-)
+
+diff --git a/autotest/utilities/test_ogr2ogr_lib.py b/autotest/utilities/test_ogr2ogr_lib.py
+index 7f395b657250..d8e992c61b9e 100755
+--- a/autotest/utilities/test_ogr2ogr_lib.py
++++ b/autotest/utilities/test_ogr2ogr_lib.py
+@@ -533,3 +533,29 @@ def test_ogr2ogr_lib_ct_no_srs():
+     f = lyr.GetNextFeature()
+     #f.DumpReadable()
+     assert ogrtest.check_feature_geometry(f, "POLYGON ((-479819.84375 4765180.5,-479690.1875 4765259.5,-479647.0 4765369.5,-479730.375 4765400.5,-480039.03125 4765539.5,-480035.34375 4765558.5,-480159.78125 4765610.5,-480202.28125 4765482.0,-480365.0 4765015.5,-480389.6875 4764950.0,-480133.96875 4764856.5,-480080.28125 4764979.5,-480082.96875 4765049.5,-480088.8125 4765139.5,-480059.90625 4765239.5,-480019.71875 4765319.5,-479980.21875 4765409.5,-479909.875 4765370.0,-479859.875 4765270.0,-479819.84375 4765180.5))") == 0
++
++
++
++###############################################################################
++# Test -nlt CONVERT_TO_LINEAR -nlt PROMOTE_TO_MULTI
++
++@pytest.mark.parametrize('geometryType',
++                         [
++                            ['PROMOTE_TO_MULTI', 'CONVERT_TO_LINEAR'],
++                            ['CONVERT_TO_LINEAR', 'PROMOTE_TO_MULTI']
++                         ])
++def test_ogr2ogr_lib_convert_to_linear_promote_to_multi(geometryType):
++
++    src_ds = gdal.GetDriverByName('Memory').Create('', 0, 0, 0)
++    lyr = src_ds.CreateLayer('layer')
++    f = ogr.Feature(lyr.GetLayerDefn())
++    f.SetGeometry(ogr.CreateGeometryFromWkt('CIRCULARSTRING(0 0,1 0,0 0)'))
++    lyr.CreateFeature(f)
++
++    ds = gdal.VectorTranslate('', src_ds,
++                              format='Memory',
++                              geometryType=geometryType)
++    lyr = ds.GetLayer(0)
++    f = lyr.GetNextFeature()
++    g = f.GetGeometryRef()
++    assert g.GetGeometryType() == ogr.wkbMultiLineString
+diff --git a/gdal/apps/ogr2ogr_lib.cpp b/gdal/apps/ogr2ogr_lib.cpp
+index 62038952fd8f..32b42e554b5d 100644
+--- a/gdal/apps/ogr2ogr_lib.cpp
++++ b/gdal/apps/ogr2ogr_lib.cpp
+@@ -82,6 +82,7 @@ typedef enum
+     GTC_PROMOTE_TO_MULTI,
+     GTC_CONVERT_TO_LINEAR,
+     GTC_CONVERT_TO_CURVE,
++    GTC_PROMOTE_TO_MULTI_AND_CONVERT_TO_LINEAR,
+ } GeomTypeConversion;
+ 
+ #define GEOMTYPE_UNCHANGED  -2
+@@ -3331,22 +3332,30 @@ static OGRwkbGeometryType ConvertType(GeomTypeConversion eGeomTypeConversion,
+                                       OGRwkbGeometryType eGType)
+ {
+     OGRwkbGeometryType eRetType = eGType;
+-    if ( eGeomTypeConversion == GTC_PROMOTE_TO_MULTI )
++
++    if ( eGeomTypeConversion == GTC_CONVERT_TO_LINEAR ||
++         eGeomTypeConversion == GTC_PROMOTE_TO_MULTI_AND_CONVERT_TO_LINEAR )
++    {
++        eRetType = OGR_GT_GetLinear(eRetType);
++    }
++
++    if ( eGeomTypeConversion == GTC_PROMOTE_TO_MULTI ||
++         eGeomTypeConversion == GTC_PROMOTE_TO_MULTI_AND_CONVERT_TO_LINEAR )
+     {
+-        if( eGType == wkbTriangle || eGType == wkbTIN ||
+-            eGType == wkbPolyhedralSurface )
++        if( eRetType == wkbTriangle || eRetType == wkbTIN ||
++            eRetType == wkbPolyhedralSurface )
+         {
+             eRetType = wkbMultiPolygon;
+         }
+-        else if( !OGR_GT_IsSubClassOf(eGType, wkbGeometryCollection) )
++        else if( !OGR_GT_IsSubClassOf(eRetType, wkbGeometryCollection) )
+         {
+-            eRetType = OGR_GT_GetCollection(eGType);
++            eRetType = OGR_GT_GetCollection(eRetType);
+         }
+     }
+-    else if ( eGeomTypeConversion == GTC_CONVERT_TO_LINEAR )
+-        eRetType = OGR_GT_GetLinear(eGType);
++
+     if ( eGeomTypeConversion == GTC_CONVERT_TO_CURVE )
+-        eRetType = OGR_GT_GetCurve(eGType);
++        eRetType = OGR_GT_GetCurve(eRetType);
++
+     return eRetType;
+ }
+ 
+@@ -4822,6 +4831,7 @@ int LayerTranslator::Translate( OGRFeature* poFeatureIn,
+                 }
+                 else if( m_eGeomTypeConversion == GTC_PROMOTE_TO_MULTI ||
+                          m_eGeomTypeConversion == GTC_CONVERT_TO_LINEAR ||
++                         m_eGeomTypeConversion == GTC_PROMOTE_TO_MULTI_AND_CONVERT_TO_LINEAR ||
+                          m_eGeomTypeConversion == GTC_CONVERT_TO_CURVE )
+                 {
+                     if( poDstGeometry != nullptr )
+@@ -5167,9 +5177,19 @@ GDALVectorTranslateOptions *GDALVectorTranslateOptionsNew(char** papszArgv,
+             else if( EQUAL(osGeomName,"GEOMETRY") )
+                 psOptions->eGType = wkbUnknown;
+             else if( EQUAL(osGeomName,"PROMOTE_TO_MULTI") )
+-                psOptions->eGeomTypeConversion = GTC_PROMOTE_TO_MULTI;
++            {
++                if( psOptions->eGeomTypeConversion == GTC_CONVERT_TO_LINEAR )
++                    psOptions->eGeomTypeConversion = GTC_PROMOTE_TO_MULTI_AND_CONVERT_TO_LINEAR;
++                else
++                    psOptions->eGeomTypeConversion = GTC_PROMOTE_TO_MULTI;
++            }
+             else if( EQUAL(osGeomName,"CONVERT_TO_LINEAR") )
+-                psOptions->eGeomTypeConversion = GTC_CONVERT_TO_LINEAR;
++            {
++                if( psOptions->eGeomTypeConversion == GTC_PROMOTE_TO_MULTI )
++                    psOptions->eGeomTypeConversion = GTC_PROMOTE_TO_MULTI_AND_CONVERT_TO_LINEAR;
++                else
++                    psOptions->eGeomTypeConversion = GTC_CONVERT_TO_LINEAR;
++            }
+             else if( EQUAL(osGeomName,"CONVERT_TO_CURVE") )
+                 psOptions->eGeomTypeConversion = GTC_CONVERT_TO_CURVE;
+             else
+diff --git a/gdal/doc/source/programs/ogr2ogr.rst b/gdal/doc/source/programs/ogr2ogr.rst
+index fd6f2363b7c5..1c7bcf26002e 100644
+--- a/gdal/doc/source/programs/ogr2ogr.rst
++++ b/gdal/doc/source/programs/ogr2ogr.rst
+@@ -165,6 +165,9 @@ output coordinate system or even reprojecting the features during translation.
+     with ``-nlt POLYGON``, the resulting polygon will break the Simple Features
+     rules.
+ 
++    Starting with GDAL 3.0.5, ``-nlt CONVERT_TO_LINEAR`` and ``-nlt PROMOTE_TO_MULTI``
++    can be used simultaneously.
++
+ .. option:: -dim <val>
+ 
+     Force the coordinate dimension to val (valid values are ``XY``, ``XYZ``,
+diff --git a/gdal/swig/include/python/gdal_python.i b/gdal/swig/include/python/gdal_python.i
+index 52c3593e1d75..6e3b9b7f12aa 100644
+--- a/gdal/swig/include/python/gdal_python.i
++++ b/gdal/swig/include/python/gdal_python.i
+@@ -1755,7 +1755,11 @@ def VectorTranslateOptions(options=None, format=None,
+         if layerName is not None:
+             new_options += ['-nln', layerName]
+         if geometryType is not None:
+-            new_options += ['-nlt', geometryType]
++            if _is_str_or_unicode(geometryType):
++                new_options += ['-nlt', geometryType]
++            else:
++                for opt in geometryType:
++                    new_options += ['-nlt', opt]
+         if dim is not None:
+             new_options += ['-dim', dim]
+         if zField is not None:
+diff --git a/gdal/swig/python/osgeo/gdal.py b/gdal/swig/python/osgeo/gdal.py
+index 69869a682276..c3d24f58a8c8 100644
+--- a/gdal/swig/python/osgeo/gdal.py
++++ b/gdal/swig/python/osgeo/gdal.py
+@@ -790,7 +790,11 @@ def VectorTranslateOptions(options=None, format=None,
+         if layerName is not None:
+             new_options += ['-nln', layerName]
+         if geometryType is not None:
+-            new_options += ['-nlt', geometryType]
++            if _is_str_or_unicode(geometryType):
++                new_options += ['-nlt', geometryType]
++            else:
++                for opt in geometryType:
++                    new_options += ['-nlt', opt]
+         if dim is not None:
+             new_options += ['-dim', dim]
+         if zField is not None:

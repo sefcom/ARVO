@@ -1,0 +1,43 @@
+From 70728b49e266e2e71fe69d675d117a2b30435bdb Mon Sep 17 00:00:00 2001
+From: Ali Mohammad Pur <ali.mpfard@gmail.com>
+Date: Sat, 1 May 2021 12:44:09 +0430
+Subject: [PATCH] Shell: Move the heredocs vector to a local value before
+ processing it
+
+Otherwise we would end up trying to parse the same heredoc entry, if it
+contained a sequence terminated by a newline.
+e.g. `<<-x\n$({` would attempt to read a heredoc entry after `x`, and
+then after `{` while inside the first heredoc entry.
+To make this work, we can simply empty the instance vector and keep the
+state on the stack.
+Issue found through oss-fuzz:
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=33852
+---
+ Userland/Shell/Parser.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/Userland/Shell/Parser.cpp b/Userland/Shell/Parser.cpp
+index 7d980909df856c..410b633eda3af5 100644
+--- a/Userland/Shell/Parser.cpp
++++ b/Userland/Shell/Parser.cpp
+@@ -1982,8 +1982,10 @@ RefPtr<AST::Node> Parser::parse_heredoc_initiation_record()
+ 
+ bool Parser::parse_heredoc_entries()
+ {
++    auto heredocs = move(m_heredoc_initiations);
++    m_heredoc_initiations.clear();
+     // Try to parse heredoc entries, as reverse recorded in the initiation records
+-    for (auto& record : m_heredoc_initiations) {
++    for (auto& record : heredocs) {
+         auto rule_start = push_start();
+         if (m_rule_start_offsets.size() > max_allowed_nested_rule_depth) {
+             record.node->set_is_syntax_error(*create<AST::SyntaxError>(String::formatted("Expression nested too deep (max allowed is {})", max_allowed_nested_rule_depth)));
+@@ -2070,8 +2072,6 @@ bool Parser::parse_heredoc_entries()
+             record.node->set_contents(create<AST::DoubleQuotedString>(move(expr)));
+         }
+     }
+-
+-    m_heredoc_initiations.clear();
+     return true;
+ }
+ 

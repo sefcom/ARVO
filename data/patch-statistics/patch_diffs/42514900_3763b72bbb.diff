@@ -1,0 +1,95 @@
+From 55e9b06c6191af68938dc3301b7ed4153cf86f7a Mon Sep 17 00:00:00 2001
+From: Francesc Alted <francesc@blosc.org>
+Date: Sun, 21 Aug 2022 11:25:09 +0200
+Subject: [PATCH] Re-add the check for small buffers and a new test (see
+ https://github.com/Blosc/python-blosc2/issues/46)
+
+---
+ blosc/blosc2.c          |  4 ++++
+ include/blosc2.h        |  4 ++--
+ tests/test_compressor.c | 35 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+index 7a0393409..9f197a188 100644
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -2220,6 +2220,10 @@ static int write_compression_header(blosc2_context* context, bool extended_heade
+     /* Compression level 0 means buffer to be memcpy'ed */
+     context->header_flags |= (uint8_t)BLOSC_MEMCPYED;
+   }
++  if (context->sourcesize < BLOSC_MIN_BUFFERSIZE) {
++    /* Buffer is too small.  Try memcpy'ing. */
++    context->header_flags |= (uint8_t)BLOSC_MEMCPYED;
++  }
+ 
+   bool memcpyed = context->header_flags & (uint8_t)BLOSC_MEMCPYED;
+   if (extended_header) {
+diff --git a/include/blosc2.h b/include/blosc2.h
+index a5ebca92d..d931252c2 100644
+--- a/include/blosc2.h
++++ b/include/blosc2.h
+@@ -173,8 +173,8 @@ enum {
+   //!< Maximum typesize before considering source buffer as a stream of bytes.
+   //!< Cannot be larger than 255.
+ #endif // BLOSC_H
+-  BLOSC_MIN_BUFFERSIZE = 128,
+-  //!< Minimum buffer size to be compressed. Cannot be smaller than 66.
++  BLOSC_MIN_BUFFERSIZE = 32,
++  //!< Minimum buffer size to be compressed.
+ };
+ 
+ 
+diff --git a/tests/test_compressor.c b/tests/test_compressor.c
+index 12a8d9c2d..d17d44f49 100644
+--- a/tests/test_compressor.c
++++ b/tests/test_compressor.c
+@@ -237,6 +237,40 @@ static char *test_small_blocksize(void) {
+ }
+ 
+ 
++/* Check small buffer */
++static char *test_small_buffer(void) {
++  blosc2_cparams cparams = BLOSC2_CPARAMS_DEFAULTS;
++  cparams.typesize = 1;
++  blosc2_context *cctx = blosc2_create_cctx(cparams);
++  blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
++  blosc2_context *dctx = blosc2_create_dctx(dparams);
++  size = 2;
++  uint8_t *src2 = calloc(size, 1);
++  for (int i = 0; i < size; i++) {
++    src2[i] = (uint8_t)i;
++  }
++
++  /* Using contexts */
++  cbytes = blosc2_compress_ctx(cctx, src2, size, dest, size + BLOSC2_MAX_OVERHEAD);
++  nbytes = blosc2_decompress_ctx(dctx, dest, size + BLOSC2_MAX_OVERHEAD, src, size);
++  mu_assert("ERROR: nbytes is not correct", nbytes == size);
++
++  /* Not using contexts */
++  cbytes = blosc2_compress(9, 1, cparams.typesize, src2, size, dest, size + BLOSC2_MAX_OVERHEAD);
++  nbytes = blosc2_decompress(dest, size + BLOSC2_MAX_OVERHEAD, src, size);
++  mu_assert("ERROR: nbytes is not correct", nbytes == size);
++
++  /* Using Blosc1 interface */
++  cbytes = blosc1_compress(9, 1, cparams.typesize, size, src2, dest, size + BLOSC2_MAX_OVERHEAD);
++  nbytes = blosc1_decompress(dest, src, size);
++  mu_assert("ERROR: nbytes is not correct", nbytes == size);
++
++  free(src2);
++  blosc2_free_ctx(cctx);
++  blosc2_free_ctx(dctx);
++  return 0;
++}
++
+ 
+ static char *all_tests(void) {
+   mu_run_test(test_compressor);
+@@ -248,6 +282,7 @@ static char *all_tests(void) {
+   mu_run_test(test_delta);
+   mu_run_test(test_typesize);
+   mu_run_test(test_small_blocksize);
++  mu_run_test(test_small_buffer);
+ 
+   return 0;
+ }

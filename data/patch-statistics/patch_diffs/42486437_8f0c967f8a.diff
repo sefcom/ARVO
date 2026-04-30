@@ -1,0 +1,44 @@
+From 273291eab7da65883ad1e18fda70bd07ab20d31a Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Wed, 5 Jul 2017 15:09:31 +0000
+Subject: [PATCH] GTiff: avoid heap buffer overflow on corrupted files. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=2481. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@39491 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/frmts/gtiff/geotiff.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/gdal/frmts/gtiff/geotiff.cpp b/gdal/frmts/gtiff/geotiff.cpp
+index c0e6fe380531..58f7a61cab0d 100644
+--- a/gdal/frmts/gtiff/geotiff.cpp
++++ b/gdal/frmts/gtiff/geotiff.cpp
+@@ -9223,6 +9223,7 @@ bool GTiffDataset::IsBlockAvailable( int nBlockId,
+                 nStripArrayAllocNew = std::min(
+                     nStripArrayAllocNew, hTIFF->tif_dir.td_nstrips);
+             }
++            CPLAssert( static_cast<uint32>(nBlockId) < nStripArrayAllocNew );
+             const uint64 nArraySize64 =
+                 static_cast<uint64>(sizeof(uint64)) * nStripArrayAllocNew;
+             const size_t nArraySize = static_cast<size_t>(nArraySize64);
+@@ -14470,6 +14471,19 @@ void GTiffDataset::ScanDirectories()
+         *ppoActiveDSRef = NULL;
+     }
+ 
++    // Nasty hack. Probably something that should be fixed in libtiff
++    // In case the last directory cycles to the first directory, we have
++    // TIFFCurrentDirOffset(hTIFF) == nDirOffset, but the TIFFReadDirectory()
++    // hasn't done its job, so SetDirectory() would be confused and think it
++    // has nothing to do. To avoid that reset to a fake offset before calling
++    // SetDirectory()
++    if( TIFFCurrentDirOffset(hTIFF) == nDirOffset )
++    {
++        TIFFSetSubDirectory( hTIFF, 0 );
++        *ppoActiveDSRef = NULL;
++        SetDirectory();
++    }
++
+     // If we have a mask for the main image, loop over the overviews, and if
+     // they have a mask, let's set this mask as an overview of the main mask.
+     if( poMaskDS != NULL )

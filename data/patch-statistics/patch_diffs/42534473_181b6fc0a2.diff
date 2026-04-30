@@ -1,0 +1,144 @@
+From b088e83a822ec9fae56485be7457a3209c0f956b Mon Sep 17 00:00:00 2001
+From: itchyny <itchyny@cybozu.co.jp>
+Date: Sun, 18 May 2025 08:27:44 +0900
+Subject: [PATCH] Refactor splits/2 using foreach syntax (remove private filter
+ _nwise) (#3260)
+
+This commit refactors `splits/2` implementation using `foreach` syntax
+and reduces intermediate arrays. This refactoring removes an unnecessary
+private (and undocumented) filter `_nwise` and closes #3148.
+---
+ docs/content/manual/dev/manual.yml |  3 +++
+ jq.1.prebuilt                      |  4 ++++
+ src/builtin.jq                     | 30 ++++++++++--------------------
+ tests/manonig.test                 |  7 +++++++
+ tests/onig.test                    | 14 +++++++++++++-
+ 5 files changed, 37 insertions(+), 21 deletions(-)
+
+diff --git a/docs/content/manual/dev/manual.yml b/docs/content/manual/dev/manual.yml
+index e7c477377e..a00c403929 100644
+--- a/docs/content/manual/dev/manual.yml
++++ b/docs/content/manual/dev/manual.yml
+@@ -2736,6 +2736,9 @@ sections:
+           - program: 'splits(", *")'
+             input: '"ab,cd,   ef, gh"'
+             output: ['"ab"','"cd"','"ef"','"gh"']
++          - program: 'splits(",? *"; "n")'
++            input: '"ab,cd ef,  gh"'
++            output: ['"ab"','"cd"','"ef"','"gh"']
+ 
+       - title: "`sub(regex; tostring)`, `sub(regex; tostring; flags)`"
+         body: |
+diff --git a/jq.1.prebuilt b/jq.1.prebuilt
+index b9a82820da..07cc073bbb 100644
+--- a/jq.1.prebuilt
++++ b/jq.1.prebuilt
+@@ -3032,6 +3032,10 @@ These provide the same results as their \fBsplit\fR counterparts, but as a strea
+ jq \'splits(", *")\'
+    "ab,cd,   ef, gh"
+ => "ab", "cd", "ef", "gh"
++
++jq \'splits(",? *"; "n")\'
++   "ab,cd ef,  gh"
++=> "ab", "cd", "ef", "gh"
+ .
+ .fi
+ .
+diff --git a/src/builtin.jq b/src/builtin.jq
+index ba12d4e532..30ba847855 100644
+--- a/src/builtin.jq
++++ b/src/builtin.jq
+@@ -98,26 +98,16 @@ def scan($re; $flags):
+       else .string
+       end;
+ def scan($re): scan($re; null);
+-#
+-# If input is an array, then emit a stream of successive subarrays of length n (or less),
+-# and similarly for strings.
+-def _nwise($n):
+-  def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end;
+-  n;
+-def _nwise(a; $n): a | _nwise($n);
+-#
++
+ # splits/1 produces a stream; split/1 is retained for backward compatibility.
+-def splits($re; flags): . as $s
+-#  # multiple occurrences of "g" are acceptable
+-  | [ match($re; "g" + flags) | (.offset, .offset + .length) ]
+-  | [0] + . +[$s|length]
+-  | _nwise(2)
+-  | $s[.[0]:.[1] ] ;
++def splits($re; $flags):
++  .[foreach (match($re; $flags+"g"), null) as {$offset, $length}
++      (null; {start: .next, end: $offset, next: ($offset+$length)})];
+ def splits($re): splits($re; null);
+-#
++
+ # split emits an array for backward compatibility
+-def split($re; flags): [ splits($re; flags) ];
+-#
++def split($re; $flags): [ splits($re; $flags) ];
++
+ # If s contains capture variables, then create a capture object and pipe it to s, bearing
+ # in mind that s could be a stream
+ def sub($re; s; $flags):
+@@ -132,12 +122,12 @@ def sub($re; s; $flags):
+             | .previous = ($edit | .offset + .length ) )
+           | .result[] + $in[.previous:] )
+       // $in;
+-#
++
+ def sub($re; s): sub($re; s; "");
+-#
++
+ def gsub($re; s; flags): sub($re; s; flags + "g");
+ def gsub($re; s): sub($re; s; "g");
+-#
++
+ ########################################################################
+ # generic iterator/generator
+ def while(cond; update):
+diff --git a/tests/manonig.test b/tests/manonig.test
+index e7abb77ba9..b71c59586a 100644
+--- a/tests/manonig.test
++++ b/tests/manonig.test
+@@ -64,6 +64,13 @@ splits(", *")
+ "ef"
+ "gh"
+ 
++splits(",? *"; "n")
++"ab,cd ef,  gh"
++"ab"
++"cd"
++"ef"
++"gh"
++
+ sub("[^a-z]*(?<x>[a-z]+)"; "Z\(.x)"; "g")
+ "123abc456def"
+ "ZabcZdef"
+diff --git a/tests/onig.test b/tests/onig.test
+index 87aae375ea..3b189d4037 100644
+--- a/tests/onig.test
++++ b/tests/onig.test
+@@ -192,8 +192,20 @@ sub("(?<x>.)"; "\(.x)!")
+ "aB"
+ ["AB","ab","cc"]
+ 
+-# splits and _nwise
++# splits
+ [splits("")]
+ "ab"
+ ["","a","b",""]
+ 
++[splits("c")]
++"ab"
++["ab"]
++
++[splits("a+"; "i")]
++"abAABBabA"
++["","b","BB","b",""]
++
++[splits("b+"; "i")]
++"abAABBabA"
++["a","AA","a","A"]
++

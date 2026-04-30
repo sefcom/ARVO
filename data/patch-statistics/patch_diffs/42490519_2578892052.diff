@@ -1,0 +1,47 @@
+From e13c8162656665f9ec1c76a033cae5b011b8c658 Mon Sep 17 00:00:00 2001
+From: James Carter <jwcart2@gmail.com>
+Date: Thu, 8 Apr 2021 13:24:29 -0400
+Subject: [PATCH] libsepol/cil: Fix out-of-bound read of file context pattern
+ ending with "\"
+
+Based on patch by Nicolas Iooss, who writes:
+  OSS-Fuzz found a Heap-buffer-overflow in the CIL compiler when trying
+  to compile the following policy:
+
+    (sid SID)
+    (sidorder(SID))
+    (filecon "\" any ())
+    (filecon "" any ())
+
+  When cil_post_fc_fill_data() processes "\", it goes beyond the NUL
+  terminator of the string. Fix this by returning when '\0' is read
+  after a backslash.
+
+To be consistent with the function compute_diffdata() in
+refpolicy/support/fc_sort.py, also increment str_len in this case.
+
+Fixes: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=28484
+Reported-by: Nicolas Iooss <nicolas.iooss@m4x.org>
+Signed-off-by: James Carter <jwcart2@gmail.com>
+---
+ libsepol/cil/src/cil_post.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/libsepol/cil/src/cil_post.c b/libsepol/cil/src/cil_post.c
+index d2ecbd430a..fd4758dc58 100644
+--- a/libsepol/cil/src/cil_post.c
++++ b/libsepol/cil/src/cil_post.c
+@@ -186,6 +186,13 @@ static void cil_post_fc_fill_data(struct fc_data *fc, const char *path)
+ 			break;
+ 		case '\\':
+ 			c++;
++			if (path[c] == '\0') {
++				if (!fc->meta) {
++					fc->stem_len++;
++				}
++				fc->str_len++;
++				return;
++			}
+ 			/* FALLTHRU */
+ 		default:
+ 			if (!fc->meta) {

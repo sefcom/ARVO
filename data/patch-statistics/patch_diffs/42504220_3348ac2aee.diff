@@ -1,0 +1,140 @@
+From 7b9f73fad09a5ec76002625d562e32c4debc2a5e Mon Sep 17 00:00:00 2001
+From: Tom Tromey <tromey@adacore.com>
+Date: Mon, 8 Nov 2021 10:58:27 -0700
+Subject: [PATCH] Correctly handle DW_LLE_start_end
+
+When the code to handle DW_LLE_start_end was added (as part of some
+DWARF 5 work), it was written to add the base address.  However, this
+seems incorrect -- the DWARF standard describes this as an address,
+not an offset from the base address.
+
+This patch changes a couple of spots in dwarf2/loc.c to fix this
+problem.  It then changes decode_debug_loc_addresses to return
+DEBUG_LOC_OFFSET_PAIR instead, which preserves the previous semantics.
+
+This only showed up on the RISC-V target internally, due to the
+combination of DWARF 5 and a newer version of GCC.  I've updated a
+couple of existing loclists test cases to demonstrate the bug.
+---
+ gdb/dwarf2/loc.c                                | 17 ++++++++++++-----
+ .../gdb.dwarf2/loclists-multiple-cus.exp        |  5 ++++-
+ gdb/testsuite/gdb.dwarf2/loclists-start-end.exp |  3 +++
+ gdb/testsuite/lib/dwarf.exp                     | 12 +++++++++++-
+ 4 files changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/gdb/dwarf2/loc.c b/gdb/dwarf2/loc.c
+index eb128fa5fc6..b5936e13eee 100644
+--- a/gdb/dwarf2/loc.c
++++ b/gdb/dwarf2/loc.c
+@@ -139,7 +139,9 @@ decode_debug_loc_addresses (const gdb_byte *loc_ptr, const gdb_byte *buf_end,
+   if (*low == 0 && *high == 0)
+     return DEBUG_LOC_END_OF_LIST;
+ 
+-  return DEBUG_LOC_START_END;
++  /* We want the caller to apply the base address, so we must return
++     DEBUG_LOC_OFFSET_PAIR here.  */
++  return DEBUG_LOC_OFFSET_PAIR;
+ }
+ 
+ /* Decode the addresses in .debug_loclists entry.
+@@ -416,13 +418,15 @@ dwarf2_find_location_expression (struct dwarf2_loclist_baton *baton,
+ 	 .debug_addr which already has the DWARF "base address". We still add
+ 	 base_offset in case we're debugging a PIE executable. However, if the
+ 	 entry is DW_LLE_offset_pair from a DWO, add the base address as the
+-	 operands are offsets relative to the applicable base address.  */
++	 operands are offsets relative to the applicable base address.
++	 If the entry is DW_LLE_start_end or DW_LLE_start_length, then
++	 it already is an address, and we don't need to add the base.  */
+       if (baton->from_dwo && kind != DEBUG_LOC_OFFSET_PAIR)
+ 	{
+ 	  low += base_offset;
+ 	  high += base_offset;
+ 	}
+-      else
++      else if (kind == DEBUG_LOC_OFFSET_PAIR)
+ 	{
+ 	  low += base_address;
+ 	  high += base_address;
+@@ -3983,8 +3987,11 @@ loclist_describe_location (struct symbol *symbol, CORE_ADDR addr,
+ 	}
+ 
+       /* Otherwise, a location expression entry.  */
+-      low += base_address;
+-      high += base_address;
++      if (kind == DEBUG_LOC_OFFSET_PAIR)
++	{
++	  low += base_address;
++	  high += base_address;
++	}
+ 
+       low = gdbarch_adjust_dwarf2_addr (gdbarch, low);
+       high = gdbarch_adjust_dwarf2_addr (gdbarch, high);
+diff --git a/gdb/testsuite/gdb.dwarf2/loclists-multiple-cus.exp b/gdb/testsuite/gdb.dwarf2/loclists-multiple-cus.exp
+index 7844628bc16..a7af7fd0537 100644
+--- a/gdb/testsuite/gdb.dwarf2/loclists-multiple-cus.exp
++++ b/gdb/testsuite/gdb.dwarf2/loclists-multiple-cus.exp
+@@ -1,4 +1,4 @@
+-# Copyright 2020 Free Software Foundation, Inc.
++# Copyright 2020, 2021 Free Software Foundation, Inc.
+ 
+ # This program is free software; you can redistribute it and/or modify
+ # it under the terms of the GNU General Public License as published by
+@@ -105,6 +105,9 @@ foreach_with_prefix is_64 {false true} {
+ 
+ 		# For variable foo.
+ 		list_ {
++		    # This should not affect the following addresses.
++		    base_address 0xffff
++
+ 		    # When in func1.
+ 		    start_length $func1_addr $func1_len {
+ 			DW_OP_constu 0x123456
+diff --git a/gdb/testsuite/gdb.dwarf2/loclists-start-end.exp b/gdb/testsuite/gdb.dwarf2/loclists-start-end.exp
+index e3c12e5093f..18ef2bfaf90 100644
+--- a/gdb/testsuite/gdb.dwarf2/loclists-start-end.exp
++++ b/gdb/testsuite/gdb.dwarf2/loclists-start-end.exp
+@@ -96,6 +96,9 @@ foreach_with_prefix is_64 {false true} {
+ 
+ 		# For variable foo.
+ 		list_ {
++		    # This should not affect the following addresses.
++		    base_address 0xffff
++
+ 		    # When in func1.
+ 		    start_end $func1_addr "$func1_addr + $func1_len" {
+ 			DW_OP_constu 0x123456
+diff --git a/gdb/testsuite/lib/dwarf.exp b/gdb/testsuite/lib/dwarf.exp
+index b48cfad3b9e..774cac712a2 100644
+--- a/gdb/testsuite/lib/dwarf.exp
++++ b/gdb/testsuite/lib/dwarf.exp
+@@ -1894,9 +1894,10 @@ namespace eval Dwarf {
+ 	define_label $list_label
+ 
+ 	with_override Dwarf::start_length Dwarf::_loclists_start_length {
++	with_override Dwarf::base_address Dwarf::_loclists_base_address {
+ 	with_override Dwarf::start_end Dwarf::_loclists_start_end {
+ 	    uplevel $body
+-	}}
++	}}}
+ 
+ 	# Emit end of list.
+ 	_op .byte 0x00 "DW_LLE_end_of_list"
+@@ -1972,6 +1973,15 @@ namespace eval Dwarf {
+ 	incr _debug_loclists_locdesc_count
+     }
+ 
++    # Emit a DW_LLE_base_address entry.
++    proc _loclists_base_address {addr} {
++	variable _debug_loclists_addr_size
++	variable _debug_loclists_locdesc_count
++	_op .byte 0x06 "DW_LLE_base_address"
++	_op .${_debug_loclists_addr_size}byte $addr "base_address"
++	incr _debug_loclists_locdesc_count
++    }
++
+     # Emit a DWARF .debug_line unit.
+     # OPTIONS is a list with an even number of elements containing
+     # option-name and option-value pairs.
+-- 
+GitLab
+

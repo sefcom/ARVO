@@ -1,0 +1,40 @@
+From 2022f2e5c905995c79fa08bb6955777573f32669 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Mon, 31 Aug 2020 15:31:18 +0200
+Subject: [PATCH] Fix nullsafe operator with delayed oplines
+
+Closes GH-6056.
+---
+ Zend/zend_compile.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/Zend/zend_compile.c b/Zend/zend_compile.c
+index 18c149de546e3..190e7e49d843a 100644
+--- a/Zend/zend_compile.c
++++ b/Zend/zend_compile.c
+@@ -2224,7 +2224,12 @@ static zend_op *zend_delayed_compile_end(uint32_t offset) /* {{{ */
+ 	for (i = offset; i < count; ++i) {
+ 		opline = get_next_op();
+ 		memcpy(opline, &oplines[i], sizeof(zend_op));
++		if (opline->opcode == ZEND_JMP_NULL) {
++			uint32_t opnum = get_next_op_number() - 1;
++			zend_stack_push(&CG(short_circuiting_opnums), &opnum);
++		}
+ 	}
++
+ 	CG(delayed_oplines_stack).top = offset;
+ 	return opline;
+ }
+@@ -2799,7 +2804,11 @@ static zend_op *zend_delayed_compile_prop(znode *result, zend_ast *ast, uint32_t
+ 		opline = zend_delayed_compile_var(&obj_node, obj_ast, type, 0);
+ 		zend_separate_if_call_and_write(&obj_node, obj_ast, type);
+ 		if (nullsafe) {
+-			zend_emit_jmp_null(&obj_node);
++			/* We will push to the short_cirtcuiting_opnums stack in zend_delayed_compile_end(). */
++			opline = zend_delayed_emit_op(NULL, ZEND_JMP_NULL, &obj_node, NULL);
++			if (opline->op1_type == IS_CONST) {
++				Z_TRY_ADDREF_P(CT_CONSTANT(opline->op1));
++			}
+ 		}
+ 	}
+ 

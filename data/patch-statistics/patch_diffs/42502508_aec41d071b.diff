@@ -1,0 +1,76 @@
+From fe1633f0104521117edabefea78803d77d3d57b1 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Tue, 28 Sep 2021 11:34:44 +0200
+Subject: [PATCH] Undef result if undef dim warning promoted to exception
+
+Fixes oss-fuzz #39278.
+---
+ ext/opcache/jit/zend_jit_helpers.c            |  2 +
+ .../tests/jit/assign_dim_undef_exception.phpt | 38 +++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+ create mode 100644 ext/opcache/tests/jit/assign_dim_undef_exception.phpt
+
+diff --git a/ext/opcache/jit/zend_jit_helpers.c b/ext/opcache/jit/zend_jit_helpers.c
+index 362c73ea2f367..ce59a95deaf5c 100644
+--- a/ext/opcache/jit/zend_jit_helpers.c
++++ b/ext/opcache/jit/zend_jit_helpers.c
+@@ -684,6 +684,7 @@ static zval* ZEND_FASTCALL zend_jit_fetch_dim_rw_helper(zend_array *ht, zval *di
+ 			goto str_index;
+ 		case IS_UNDEF:
+ 			if (!zend_jit_undefined_op_helper_write(ht, EG(current_execute_data)->opline->op2.var)) {
++				undef_result_after_exception();
+ 				return NULL;
+ 			}
+ 			/* break missing intentionally */
+@@ -768,6 +769,7 @@ static zval* ZEND_FASTCALL zend_jit_fetch_dim_w_helper(zend_array *ht, zval *dim
+ 			goto str_index;
+ 		case IS_UNDEF:
+ 			if (!zend_jit_undefined_op_helper_write(ht, EG(current_execute_data)->opline->op2.var)) {
++				undef_result_after_exception();
+ 				return NULL;
+ 			}
+ 			/* break missing intentionally */
+diff --git a/ext/opcache/tests/jit/assign_dim_undef_exception.phpt b/ext/opcache/tests/jit/assign_dim_undef_exception.phpt
+new file mode 100644
+index 0000000000000..00bb22a3a9a6c
+--- /dev/null
++++ b/ext/opcache/tests/jit/assign_dim_undef_exception.phpt
+@@ -0,0 +1,38 @@
++--TEST--
++Undef to exception for assign dim offset
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=1M
++--FILE--
++<?php
++set_error_handler(function($_, $m){
++    throw new Exception($m);
++});
++function test1() {
++    $a = [];
++    $res = $a[$undef] = null;
++}
++function test2() {
++    $a = [];
++    $res = $a[$undef] += 1;
++}
++function test3() {
++    $a = [];
++    $res = isset($a[$undef]);
++}
++try {
++    test1();
++} catch (Exception $e) {
++    echo $e->getMessage(), "\n";
++}
++try {
++    test2();
++} catch (Exception $e) {
++    echo $e->getMessage(), "\n";
++}
++?>
++--EXPECT--
++Undefined variable $undef
++Undefined variable $undef

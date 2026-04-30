@@ -1,0 +1,302 @@
+From 90704f298875f2c06c07f3204934650c492951af Mon Sep 17 00:00:00 2001
+From: Kimball Thurston <kdt3rd@gmail.com>
+Date: Tue, 17 Sep 2024 04:33:35 +1200
+Subject: [PATCH] Address some initial fuzz reports after core rewrite merge
+ (#1821)
+
+* Add validation that the types of the attributes are correct, not just that they exist
+
+Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+
+* use constructor semantics to zero init the context pointer, avoid one memory sanitizer warning
+
+Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+
+* to avoid UB with streams, keep attr sizes with int32 size
+
+Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+
+* handle an empty buffer cleanly
+
+Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+
+---------
+
+Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+---
+ src/lib/OpenEXR/ImfContext.cpp     |   3 +-
+ src/lib/OpenEXRCore/internal_rle.c |   7 ++
+ src/lib/OpenEXRCore/parse_header.c |   3 +
+ src/lib/OpenEXRCore/validation.c   | 115 ++++++++++++++++++++++++-----
+ 4 files changed, 108 insertions(+), 20 deletions(-)
+
+diff --git a/src/lib/OpenEXR/ImfContext.cpp b/src/lib/OpenEXR/ImfContext.cpp
+index 4b5d4f196a..545896f086 100644
+--- a/src/lib/OpenEXR/ImfContext.cpp
++++ b/src/lib/OpenEXR/ImfContext.cpp
+@@ -106,12 +106,11 @@ class MemAttrStream : public OPENEXR_IMF_NAMESPACE::IStream
+ ////////////////////////////////////////
+ 
+ Context::Context ()
+-    : _ctxt (new exr_context_t, [] (exr_context_t* todel) {
++    : _ctxt (new exr_context_t(), [] (exr_context_t* todel) {
+         exr_finish (todel);
+         delete todel;
+     })
+ {
+-    *_ctxt = nullptr;
+ }
+ 
+ ////////////////////////////////////////
+diff --git a/src/lib/OpenEXRCore/internal_rle.c b/src/lib/OpenEXRCore/internal_rle.c
+index 8855451ee9..a8d693fa44 100644
+--- a/src/lib/OpenEXRCore/internal_rle.c
++++ b/src/lib/OpenEXRCore/internal_rle.c
+@@ -202,6 +202,13 @@ internal_exr_undo_rle (
+ {
+     exr_result_t rv;
+     uint64_t     unpackb;
++
++    if (packsz == 0 || src == NULL)
++    {
++        decode->bytes_decompressed = 0;
++        return EXR_ERR_SUCCESS;
++    }
++
+     rv = internal_decode_alloc_buffer (
+         decode,
+         EXR_TRANSCODE_BUFFER_SCRATCH1,
+diff --git a/src/lib/OpenEXRCore/parse_header.c b/src/lib/OpenEXRCore/parse_header.c
+index 17af950946..667bc5d4d2 100644
+--- a/src/lib/OpenEXRCore/parse_header.c
++++ b/src/lib/OpenEXRCore/parse_header.c
+@@ -73,6 +73,9 @@ scratch_attr_too_big (struct _internal_exr_seq_scratch* scr, int32_t attrsz)
+         int64_t foff = (int64_t) scr->fileoff;
+         if ((foff + test) > scr->ctxt->file_size) return 1;
+     }
++    else if (acmp > scr->navail && acmp >= INT32_MAX)
++        return 1;
++
+     return 0;
+ }
+ 
+diff --git a/src/lib/OpenEXRCore/validation.c b/src/lib/OpenEXRCore/validation.c
+index 65e2346bfd..c1a0f06fca 100644
+--- a/src/lib/OpenEXRCore/validation.c
++++ b/src/lib/OpenEXRCore/validation.c
+@@ -23,6 +23,11 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+     if (!curpart->channels)
+         return f->print_error (
+             f, EXR_ERR_MISSING_REQ_ATTR, "'channels' attribute not found");
++    else if (curpart->channels->type != EXR_ATTR_CHLIST)
++        return f->print_error (
++            f,
++            EXR_ERR_ATTR_TYPE_MISMATCH,
++            "'channels' attribute has wrong data type, expect chlist");
+     if (!curpart->compression)
+     {
+         if (adddefault)
+@@ -47,6 +52,11 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+                 "'compression' attribute not found");
+         }
+     }
++    else if (curpart->compression->type != EXR_ATTR_COMPRESSION)
++        return f->print_error (
++            f,
++            EXR_ERR_ATTR_TYPE_MISMATCH,
++            "'compression' attribute has wrong data type");
+ 
+     if (!curpart->dataWindow)
+     {
+@@ -75,6 +85,11 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+                 "'dataWindow' attribute not found");
+         }
+     }
++    else if (curpart->dataWindow->type != EXR_ATTR_BOX2I)
++        return f->print_error (
++            f,
++            EXR_ERR_ATTR_TYPE_MISMATCH,
++            "'dataWindow' attribute has wrong data type");
+ 
+     if (!curpart->displayWindow)
+     {
+@@ -101,6 +116,11 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+                 "'displayWindow' attribute not found");
+         }
+     }
++    else if (curpart->displayWindow->type != EXR_ATTR_BOX2I)
++        return f->print_error (
++            f,
++            EXR_ERR_ATTR_TYPE_MISMATCH,
++            "'displayWindow' attribute has wrong data type");
+ 
+     if (!curpart->lineOrder)
+     {
+@@ -124,6 +144,11 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+                 f, EXR_ERR_MISSING_REQ_ATTR, "'lineOrder' attribute not found");
+         }
+     }
++    else if (curpart->lineOrder->type != EXR_ATTR_LINEORDER)
++        return f->print_error (
++            f,
++            EXR_ERR_ATTR_TYPE_MISMATCH,
++            "'lineOrder' attribute has wrong data type");
+ 
+     if (!curpart->pixelAspectRatio)
+     {
+@@ -148,6 +173,11 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+                 "'pixelAspectRatio' attribute not found");
+         }
+     }
++    else if (curpart->pixelAspectRatio->type != EXR_ATTR_FLOAT)
++        return f->print_error (
++            f,
++            EXR_ERR_ATTR_TYPE_MISMATCH,
++            "'pixelAspectRatio' attribute has wrong data type");
+ 
+     if (!curpart->screenWindowCenter)
+     {
+@@ -173,6 +203,11 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+                 "'screenWindowCenter' attribute not found");
+         }
+     }
++    else if (curpart->screenWindowCenter->type != EXR_ATTR_V2F)
++        return f->print_error (
++            f,
++            EXR_ERR_ATTR_TYPE_MISMATCH,
++            "'screenWindowCenter' attribute has wrong data type");
+ 
+     if (!curpart->screenWindowWidth)
+     {
+@@ -197,14 +232,27 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+                 "'screenWindowWidth' attribute not found");
+         }
+     }
++    else if (curpart->screenWindowWidth->type != EXR_ATTR_FLOAT)
++        return f->print_error (
++            f,
++            EXR_ERR_ATTR_TYPE_MISMATCH,
++            "'screenWindowWidth' attribute has wrong data type, expect float");
+ 
+     if (f->is_multipart || f->has_nonimage_data)
+     {
+-        if (f->is_multipart && !curpart->name)
+-            return f->print_error (
+-                f,
+-                EXR_ERR_MISSING_REQ_ATTR,
+-                "'name' attribute for multipart file not found");
++        if (f->is_multipart)
++        {
++            if (!curpart->name)
++                return f->print_error (
++                    f,
++                    EXR_ERR_MISSING_REQ_ATTR,
++                    "'name' attribute for multipart file not found");
++            else if (curpart->name->type != EXR_ATTR_STRING)
++                return f->print_error (
++                    f,
++                    EXR_ERR_ATTR_TYPE_MISMATCH,
++                    "'name' attribute has wrong data type, expect string");
++        }
+         if (!curpart->type)
+         {
+             return f->print_error (
+@@ -212,6 +260,11 @@ validate_req_attr (exr_context_t f, exr_priv_part_t curpart, int adddefault)
+                 EXR_ERR_MISSING_REQ_ATTR,
+                 "'type' attribute for v2+ file not found");
+         }
++        else if (curpart->type->type != EXR_ATTR_STRING)
++            return f->print_error (
++                f,
++                EXR_ERR_ATTR_TYPE_MISMATCH,
++                "'type' attribute has wrong data type, expect string");
+         if (f->has_nonimage_data && !curpart->version)
+         {
+             if (adddefault)
+@@ -527,6 +580,11 @@ validate_tile_data (exr_context_t f, exr_priv_part_t curpart)
+                 f,
+                 EXR_ERR_MISSING_REQ_ATTR,
+                 "'tiles' attribute for tiled file not found");
++        else if (curpart->tiles->type != EXR_ATTR_TILEDESC)
++            return f->print_error (
++                f,
++                EXR_ERR_ATTR_TYPE_MISMATCH,
++                "'tiles' attribute has wrong data type, expect tile description");
+ 
+         desc    = curpart->tiles->tiledesc;
+         levmode = EXR_GET_TILE_LEVEL_MODE (*desc);
+@@ -680,9 +738,15 @@ internal_exr_validate_shared_attrs (exr_context_t ctxt,
+     {
+         if (curpart->displayWindow)
+         {
+-            if (memcmp (basepart->displayWindow->box2i,
+-                        curpart->displayWindow->box2i,
+-                        sizeof(exr_attr_box2i_t)))
++            if (basepart->displayWindow->type != EXR_ATTR_BOX2I ||
++                basepart->displayWindow->type !=
++                curpart->displayWindow->type)
++            {
++                rv = EXR_ERR_ATTR_TYPE_MISMATCH;
++            }
++            else if (memcmp (basepart->displayWindow->box2i,
++                             curpart->displayWindow->box2i,
++                             sizeof(exr_attr_box2i_t)))
+                 rv = EXR_ERR_ATTR_TYPE_MISMATCH;
+         }
+         else
+@@ -699,10 +763,15 @@ internal_exr_validate_shared_attrs (exr_context_t ctxt,
+     {
+         if (curpart->pixelAspectRatio)
+         {
+-            // NaN compares false, but if they're both NaN?
+-            if (memcmp (&(basepart->pixelAspectRatio->f),
+-                        &(curpart->pixelAspectRatio->f),
+-                        sizeof(float)))
++            if (basepart->pixelAspectRatio->type != EXR_ATTR_FLOAT ||
++                basepart->pixelAspectRatio->type !=
++                curpart->pixelAspectRatio->type)
++            {
++                rv = EXR_ERR_ATTR_TYPE_MISMATCH;
++            }
++            else if (memcmp (&(basepart->pixelAspectRatio->f),
++                             &(curpart->pixelAspectRatio->f),
++                             sizeof(float)))
+                 rv = EXR_ERR_ATTR_TYPE_MISMATCH;
+         }
+         else
+@@ -717,9 +786,14 @@ internal_exr_validate_shared_attrs (exr_context_t ctxt,
+     rv1 = exr_get_attribute_by_name (ctxt, curpartidx, "timecode", &cattr);
+     if (EXR_ERR_SUCCESS == rv && rv == rv1)
+     {
+-        if (memcmp (battr->timecode,
+-                    cattr->timecode,
+-                    sizeof(exr_attr_timecode_t)))
++        if (battr->type != EXR_ATTR_TIMECODE ||
++            battr->type != cattr->type)
++        {
++            rv = EXR_ERR_ATTR_TYPE_MISMATCH;
++        }
++        else if (memcmp (battr->timecode,
++                         cattr->timecode,
++                         sizeof(exr_attr_timecode_t)))
+         {
+             rv = EXR_ERR_ATTR_TYPE_MISMATCH;
+         }
+@@ -737,9 +811,14 @@ internal_exr_validate_shared_attrs (exr_context_t ctxt,
+     rv1 = exr_get_attribute_by_name (ctxt, curpartidx, "chromaticities", &cattr);
+     if (EXR_ERR_SUCCESS == rv && rv == rv1)
+     {
+-        if (memcmp (battr->chromaticities,
+-                    cattr->chromaticities,
+-                    sizeof(exr_attr_chromaticities_t)))
++        if (battr->type != EXR_ATTR_CHROMATICITIES ||
++            battr->type != cattr->type)
++        {
++            rv = EXR_ERR_ATTR_TYPE_MISMATCH;
++        }
++        else if (memcmp (battr->chromaticities,
++                         cattr->chromaticities,
++                         sizeof(exr_attr_chromaticities_t)))
+             rv = EXR_ERR_ATTR_TYPE_MISMATCH;
+         else
+             rv = EXR_ERR_SUCCESS;

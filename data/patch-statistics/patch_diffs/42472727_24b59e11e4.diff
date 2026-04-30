@@ -1,0 +1,81 @@
+From 4bd12b6f40cb4413c8970c52f15f3b6885b5e32f Mon Sep 17 00:00:00 2001
+From: Grzegorz Antoniak <ga@anadoxin.org>
+Date: Wed, 1 May 2019 06:21:58 +0200
+Subject: [PATCH] RAR5 reader: fix buffer overflow when parsing huffman tables.
+
+RAR5 compresses its Huffman tables by using an algorithm similar to Run
+Length Encoding. During uncompression of those tables, RAR5 reader
+didn't perform enough checks to prevent from buffer overflow in some
+cases.
+
+This commit adds additional check that prevents from encountering a
+buffer overflow error in some files.
+
+The commit also adds a unit test to guard against regression of this
+issue.
+
+Fixes OSSFuzz case #12466.
+---
+ libarchive/archive_read_support_format_rar5.c     |  2 +-
+ libarchive/test/test_read_format_rar5.c           | 15 +++++++++++++++
+ ...st_read_format_rar5_readtables_overflow.rar.uu | 15 +++++++++++++++
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+ create mode 100644 libarchive/test/test_read_format_rar5_readtables_overflow.rar.uu
+
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index 84d05c431..cf897657c 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -2323,7 +2323,7 @@ static int parse_tables(struct archive_read* a, struct rar5* rar,
+                 int k;
+ 
+                 /* Fill zeroes. */
+-                for(k = 0; k < value + 2; k++) {
++                for(k = 0; (k < value + 2) && (w < HUFF_BC); k++) {
+                     bit_length[w++] = 0;
+                 }
+             }
+diff --git a/libarchive/test/test_read_format_rar5.c b/libarchive/test/test_read_format_rar5.c
+index 9b684a73a..d52b6002c 100644
+--- a/libarchive/test/test_read_format_rar5.c
++++ b/libarchive/test/test_read_format_rar5.c
+@@ -950,3 +950,18 @@ DEFINE_TEST(test_read_format_rar5_extra_field_version)
+ 
+     EPILOGUE();
+ }
++
++DEFINE_TEST(test_read_format_rar5_readtables_overflow)
++{
++    uint8_t buf[16];
++
++    PROLOGUE("test_read_format_rar5_readtables_overflow.rar");
++
++    assertA(0 == archive_read_next_header(a, &ae));
++    /* This archive is invalid. However, processing it shouldn't cause any
++     * buffer overflow errors during reading rar5 tables. */
++    assertA(0 == archive_read_data(a, buf, sizeof(buf)));
++    assertA(ARCHIVE_EOF == archive_read_next_header(a, &ae));
++
++    EPILOGUE();
++}
+diff --git a/libarchive/test/test_read_format_rar5_readtables_overflow.rar.uu b/libarchive/test/test_read_format_rar5_readtables_overflow.rar.uu
+new file mode 100644
+index 000000000..611c2af23
+--- /dev/null
++++ b/libarchive/test/test_read_format_rar5_readtables_overflow.rar.uu
+@@ -0,0 +1,15 @@
++begin 644 test_read_format_rar5_readtables_overflow.rar
++M4F%R(1H'`0"-[P+2`)3+'_4`C>\"T@`"T@"4RQ_5]0#O0````,L?Q_T``(`"
++MT@"4RQ_=V-C8`)3+']W=]0"-\`+2`)3+']WU`(WO`M(``M(`E,L?U?4`[P+2
++M`)3+'\?]``"``M(`E,L?W=C8V`"4RQ_=]0#V`(WO`M'UV,?8V-C8$=C8V-C8
++MV(W8V-C8V-C8V-C8V-C8V-C8V-C8V-C8V-C8!]C8V-C8V-C8V-C8V-C8V-C8
++MV-C8V-C8V-C(V-C8V-C2`)3+']W8V-C8V-C8V-C8V-C8V-C8@-C8V-C8V-C8
++MV/+8V-C8V-C8V-C8`038V-C8V-C8V-C8V-C8V-C8V`?8V-C8V-C8V-C8!-C8
++MV-C8V-C8V-C8V-C8V-C8V`?8V-C8V-C8V-C8V-C8`(`"V`7V`(WO`M'U`]L?
++MW?4`C>\"T@`"T@"4'__U`(WO`N``E,L?W84`C0`0T@"4RQ_=V-C8V-C8V`"4
++MR_\R]0#V`(W8V-C8V-C8V-C8V-C8V-C8V-C8V-C8V`?8V-C8V-C8V-C8V-C8
++MV-C8V-C8V-C8V-C8R-C8V-C8T@"4RQ_=V-C8V-C8V-C8V-C8V-C8V(#8V-C8
++MV-C8````9-C8V-C8V!'8V-C8V-C8]]C8V-C8V-C8V-C8V/+8V-C8V-C8V-C8
++=`038V-C8V-C8V-C8V-C8V-C8V`?8V-C8V-C8V-@`
++`
++end

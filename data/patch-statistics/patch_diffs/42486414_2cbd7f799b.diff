@@ -1,0 +1,525 @@
+From 65cc3c5e0ccce9bc87c3e80703c7c55e8466c587 Mon Sep 17 00:00:00 2001
+From: Roman Lebedev <lebedev.ri@gmail.com>
+Date: Sat, 5 Aug 2017 23:14:55 +0300
+Subject: [PATCH] Split-off IiqDecoder out of MosDecoder
+
+---
+ .../decoders/TiffDecoders/CMakeLists.txt      |   1 +
+ .../decoders/TiffDecoders/main.cpp            |   1 +
+ src/librawspeed/decoders/CMakeLists.txt       |   2 +
+ src/librawspeed/decoders/IiqDecoder.cpp       | 180 ++++++++++++++++++
+ src/librawspeed/decoders/IiqDecoder.h         |  53 ++++++
+ src/librawspeed/decoders/MosDecoder.cpp       | 114 +----------
+ src/librawspeed/decoders/MosDecoder.h         |   2 -
+ src/librawspeed/parsers/TiffParser.cpp        |  24 ++-
+ src/librawspeed/parsers/TiffParser.h          |   2 +-
+ 9 files changed, 257 insertions(+), 122 deletions(-)
+ create mode 100644 src/librawspeed/decoders/IiqDecoder.cpp
+ create mode 100644 src/librawspeed/decoders/IiqDecoder.h
+
+diff --git a/fuzz/librawspeed/decoders/TiffDecoders/CMakeLists.txt b/fuzz/librawspeed/decoders/TiffDecoders/CMakeLists.txt
+index 9250d13d8..c60cf30c0 100644
+--- a/fuzz/librawspeed/decoders/TiffDecoders/CMakeLists.txt
++++ b/fuzz/librawspeed/decoders/TiffDecoders/CMakeLists.txt
+@@ -28,6 +28,7 @@ set(DECODERS
+   "DcsDecoder"
+   "DngDecoder"
+   "ErfDecoder"
++  "IiqDecoder"
+   "KdcDecoder"
+   "MefDecoder"
+   "MosDecoder"
+diff --git a/fuzz/librawspeed/decoders/TiffDecoders/main.cpp b/fuzz/librawspeed/decoders/TiffDecoders/main.cpp
+index 2a6b8b90a..213d5d06b 100644
+--- a/fuzz/librawspeed/decoders/TiffDecoders/main.cpp
++++ b/fuzz/librawspeed/decoders/TiffDecoders/main.cpp
+@@ -29,6 +29,7 @@
+ #include "decoders/DcsDecoder.h"      // IWYU pragma: keep
+ #include "decoders/DngDecoder.h"      // IWYU pragma: keep
+ #include "decoders/ErfDecoder.h"      // IWYU pragma: keep
++#include "decoders/IiqDecoder.h"      // IWYU pragma: keep
+ #include "decoders/KdcDecoder.h"      // IWYU pragma: keep
+ #include "decoders/MefDecoder.h"      // IWYU pragma: keep
+ #include "decoders/MosDecoder.h"      // IWYU pragma: keep
+diff --git a/src/librawspeed/decoders/CMakeLists.txt b/src/librawspeed/decoders/CMakeLists.txt
+index 3e509bf58..496f0e957 100644
+--- a/src/librawspeed/decoders/CMakeLists.txt
++++ b/src/librawspeed/decoders/CMakeLists.txt
+@@ -19,6 +19,8 @@ FILE(GLOB SOURCES
+   "DngDecoderSlices.h"
+   "ErfDecoder.cpp"
+   "ErfDecoder.h"
++  "IiqDecoder.cpp"
++  "IiqDecoder.h"
+   "KdcDecoder.cpp"
+   "KdcDecoder.h"
+   "MefDecoder.cpp"
+diff --git a/src/librawspeed/decoders/IiqDecoder.cpp b/src/librawspeed/decoders/IiqDecoder.cpp
+new file mode 100644
+index 000000000..a770a3ac5
+--- /dev/null
++++ b/src/librawspeed/decoders/IiqDecoder.cpp
+@@ -0,0 +1,180 @@
++/*
++    RawSpeed - RAW file decoder.
++
++    Copyright (C) 2009-2014 Klaus Post
++    Copyright (C) 2014-2015 Pedro Côrte-Real
++
++    This library is free software; you can redistribute it and/or
++    modify it under the terms of the GNU Lesser General Public
++    License as published by the Free Software Foundation; either
++    version 2 of the License, or (at your option) any later version.
++
++    This library is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++    Lesser General Public License for more details.
++
++    You should have received a copy of the GNU Lesser General Public
++    License along with this library; if not, write to the Free Software
++    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++*/
++
++#include "decoders/IiqDecoder.h"
++#include "common/Common.h"                          // for uint32, uchar8
++#include "common/Point.h"                           // for iPoint2D
++#include "decoders/RawDecoder.h"                    // for RawDecoder
++#include "decoders/RawDecoderException.h"           // for RawDecoderExcept...
++#include "decompressors/UncompressedDecompressor.h" // for UncompressedDeco...
++#include "io/BitPumpMSB32.h"                        // for BitPumpMSB32
++#include "io/Buffer.h"                              // for Buffer
++#include "io/ByteStream.h"                          // for ByteStream
++#include "io/Endianness.h"                          // for getU32LE, getLE
++#include "parsers/TiffParserException.h"            // for TiffParserException
++#include "tiff/TiffEntry.h"                         // for TiffEntry
++#include "tiff/TiffIFD.h"                           // for TiffRootIFD, Tif...
++#include "tiff/TiffTag.h"                           // for TiffTag::TILEOFF...
++#include <algorithm>                                // for move
++#include <cassert>                                  // for assert
++#include <cstring>                                  // for memchr
++#include <istream>                                  // for istringstream
++#include <memory>                                   // for unique_ptr
++#include <string>                                   // for string, allocator
++
++using std::string;
++
++namespace rawspeed {
++
++class CameraMetaData;
++
++bool IiqDecoder::isAppropriateDecoder(const TiffRootIFD* rootIFD,
++                                      const Buffer* file) {
++  const auto id = rootIFD->getID();
++  const std::string& make = id.make;
++
++  // FIXME: magic
++
++  return make == "Phase One A/S";
++}
++
++RawImage IiqDecoder::decodeRawInternal() {
++  uint32 base = 8;
++  // We get a pointer up to the end of the file as we check offset bounds later
++  const uchar8* insideTiff = mFile->getData(base, mFile->getSize() - base);
++  if (getU32LE(insideTiff) != 0x49494949)
++    ThrowRDE("Not IIQ. Why are you calling me?");
++
++  uint32 offset = getU32LE(insideTiff + 8);
++  if (offset + base + 4 > mFile->getSize())
++    ThrowRDE("offset out of bounds");
++
++  uint32 entries = getU32LE(insideTiff + offset);
++  uint32 pos = 8; // Skip another 4 bytes
++
++  uint32 width = 0;
++  uint32 height = 0;
++  uint32 strip_offset = 0;
++  uint32 data_offset = 0;
++  uint32 wb_offset = 0;
++  for (; entries > 0; entries--) {
++    if (offset + base + pos + 16 > mFile->getSize())
++      ThrowRDE("offset out of bounds");
++
++    uint32 tag = getU32LE(insideTiff + offset + pos + 0);
++    // uint32 type = getU32LE(insideTiff + offset + pos + 4);
++    // uint32 len  = getU32LE(insideTiff + offset + pos + 8);
++    uint32 data = getU32LE(insideTiff + offset + pos + 12);
++    pos += 16;
++    switch (tag) {
++    case 0x107:
++      wb_offset = data + base;
++      break;
++    case 0x108:
++      width = data;
++      break;
++    case 0x109:
++      height = data;
++      break;
++    case 0x10f:
++      data_offset = data + base;
++      break;
++    case 0x21c:
++      strip_offset = data + base;
++      break;
++    case 0x21d:
++      black_level = data >> 2;
++      break;
++    default:
++      break;
++    }
++  }
++  if (width <= 0 || height <= 0)
++    ThrowRDE("couldn't find width and height");
++  if (strip_offset + height * 4 > mFile->getSize())
++    ThrowRDE("strip offsets out of bounds");
++  if (data_offset > mFile->getSize())
++    ThrowRDE("data offset out of bounds");
++
++  mRaw->dim = iPoint2D(width, height);
++  mRaw->createData();
++
++  DecodePhaseOneC(data_offset, strip_offset, width, height);
++
++  const uchar8* data = mFile->getData(wb_offset, 12);
++  for (int i = 0; i < 3; i++) {
++    mRaw->metadata.wbCoeffs[i] = getLE<float>(data + i * 4);
++  }
++
++  return mRaw;
++}
++
++void IiqDecoder::DecodePhaseOneC(uint32 data_offset, uint32 strip_offset,
++                                 uint32 width, uint32 height) {
++  const int length[] = {8, 7, 6, 9, 11, 10, 5, 12, 14, 13};
++
++  for (uint32 row = 0; row < height; row++) {
++    uint32 off =
++        data_offset + getU32LE(mFile->getData(strip_offset + row * 4, 4));
++
++    BitPumpMSB32 pump(mFile, off);
++    int32 pred[2];
++    uint32 len[2];
++    pred[0] = pred[1] = 0;
++    auto* img = reinterpret_cast<ushort16*>(mRaw->getData(0, row));
++    for (uint32 col = 0; col < width; col++) {
++      if (col >= (width & -8))
++        len[0] = len[1] = 14;
++      else if ((col & 7) == 0) {
++        for (unsigned int& i : len) {
++          int32 j = 0;
++
++          for (; j < 5; j++)
++            if (pump.getBits(1) != 0)
++              break;
++
++          if (j > 0)
++            i = length[2 * (j - 1) + pump.getBits(1)];
++        }
++      }
++
++      int i = len[col & 1];
++      if (i == 14)
++        img[col] = pred[col & 1] = pump.getBits(16);
++      else
++        img[col] = pred[col & 1] +=
++            static_cast<signed>(pump.getBits(i)) + 1 - (1 << (i - 1));
++    }
++  }
++}
++
++void IiqDecoder::checkSupportInternal(const CameraMetaData* meta) {
++  checkCameraSupported(meta, mRootIFD->getID(), "");
++}
++
++void IiqDecoder::decodeMetaDataInternal(const CameraMetaData* meta) {
++  setMetaData(meta, "", 0);
++
++  if (black_level)
++    mRaw->blackLevel = black_level;
++}
++
++} // namespace rawspeed
+diff --git a/src/librawspeed/decoders/IiqDecoder.h b/src/librawspeed/decoders/IiqDecoder.h
+new file mode 100644
+index 000000000..194305289
+--- /dev/null
++++ b/src/librawspeed/decoders/IiqDecoder.h
+@@ -0,0 +1,53 @@
++/*
++    RawSpeed - RAW file decoder.
++
++    Copyright (C) 2009-2014 Klaus Post
++    Copyright (C) 2014 Pedro Côrte-Real
++
++    This library is free software; you can redistribute it and/or
++    modify it under the terms of the GNU Lesser General Public
++    License as published by the Free Software Foundation; either
++    version 2 of the License, or (at your option) any later version.
++
++    This library is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++    Lesser General Public License for more details.
++
++    You should have received a copy of the GNU Lesser General Public
++    License along with this library; if not, write to the Free Software
++    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++*/
++
++#pragma once
++
++#include "common/Common.h"                // for uint32
++#include "common/RawImage.h"              // for RawImage
++#include "decoders/AbstractTiffDecoder.h" // for AbstractTiffDecoder
++#include "tiff/TiffIFD.h"                 // for TiffRootIFDOwner
++#include <string>                         // for string
++
++namespace rawspeed {
++
++class CameraMetaData;
++class Buffer;
++
++class IiqDecoder final : public AbstractTiffDecoder {
++public:
++  static bool isAppropriateDecoder(const TiffRootIFD* rootIFD,
++                                   const Buffer* file);
++  IiqDecoder(TiffRootIFDOwner&& rootIFD, const Buffer* file)
++      : AbstractTiffDecoder(move(rootIFD), file) {}
++
++  RawImage decodeRawInternal() override;
++  void checkSupportInternal(const CameraMetaData* meta) override;
++  void decodeMetaDataInternal(const CameraMetaData* meta) override;
++
++protected:
++  int getDecoderVersion() const override { return 0; }
++  uint32 black_level = 0;
++  void DecodePhaseOneC(uint32 data_offset, uint32 strip_offset, uint32 width,
++                       uint32 height);
++};
++
++} // namespace rawspeed
+diff --git a/src/librawspeed/decoders/MosDecoder.cpp b/src/librawspeed/decoders/MosDecoder.cpp
+index 386955e18..d63b834ff 100644
+--- a/src/librawspeed/decoders/MosDecoder.cpp
++++ b/src/librawspeed/decoders/MosDecoder.cpp
+@@ -54,7 +54,7 @@ bool MosDecoder::isAppropriateDecoder(const TiffRootIFD* rootIFD,
+ 
+     // FIXME: magic
+ 
+-    return make == "Leaf" || make == "Phase One A/S";
++    return make == "Leaf";
+   } catch (const TiffParserException&) {
+     // Last ditch effort to identify Leaf cameras that don't have a Tiff Make
+     // set
+@@ -69,8 +69,6 @@ bool MosDecoder::isAppropriateDecoder(const TiffRootIFD* rootIFD,
+ 
+ MosDecoder::MosDecoder(TiffRootIFDOwner&& rootIFD, const Buffer* file)
+     : AbstractTiffDecoder(move(rootIFD), file) {
+-  black_level = 0;
+-
+   if (mRootIFD->getEntryRecursive(MAKE)) {
+     auto id = mRootIFD->getID();
+     make = id.make;
+@@ -99,74 +97,6 @@ string MosDecoder::getXMPTag(const string &xmp, const string &tag) {
+ RawImage MosDecoder::decodeRawInternal() {
+   uint32 off = 0;
+ 
+-  uint32 base = 8;
+-  // We get a pointer up to the end of the file as we check offset bounds later
+-  const uchar8 *insideTiff = mFile->getData(base, mFile->getSize()-base);
+-  if (getU32LE(insideTiff) == 0x49494949) {
+-    uint32 offset = getU32LE(insideTiff + 8);
+-    if (offset+base+4 > mFile->getSize())
+-      ThrowRDE("offset out of bounds");
+-
+-    uint32 entries = getU32LE(insideTiff + offset);
+-    uint32 pos = 8; // Skip another 4 bytes
+-
+-    uint32 width = 0;
+-    uint32 height = 0;
+-    uint32 strip_offset = 0;
+-    uint32 data_offset = 0;
+-    uint32 wb_offset = 0;
+-    for (; entries > 0; entries--) {
+-      if (offset+base+pos+16 > mFile->getSize())
+-        ThrowRDE("offset out of bounds");
+-
+-      uint32 tag = getU32LE(insideTiff + offset + pos + 0);
+-      // uint32 type = getU32LE(insideTiff + offset + pos + 4);
+-      // uint32 len  = getU32LE(insideTiff + offset + pos + 8);
+-      uint32 data = getU32LE(insideTiff + offset + pos + 12);
+-      pos += 16;
+-      switch (tag) {
+-      case 0x107:
+-        wb_offset = data + base;
+-        break;
+-      case 0x108:
+-        width = data;
+-        break;
+-      case 0x109:
+-        height = data;
+-        break;
+-      case 0x10f:
+-        data_offset = data + base;
+-        break;
+-      case 0x21c:
+-        strip_offset = data + base;
+-        break;
+-      case 0x21d:
+-        black_level = data >> 2;
+-        break;
+-      default:
+-        break;
+-      }
+-    }
+-    if (width <= 0 || height <= 0)
+-      ThrowRDE("couldn't find width and height");
+-    if (strip_offset+height*4 > mFile->getSize())
+-      ThrowRDE("strip offsets out of bounds");
+-    if (data_offset > mFile->getSize())
+-      ThrowRDE("data offset out of bounds");
+-
+-    mRaw->dim = iPoint2D(width, height);
+-    mRaw->createData();
+-
+-    DecodePhaseOneC(data_offset, strip_offset, width, height);
+-
+-    const uchar8 *data = mFile->getData(wb_offset, 12);
+-    for(int i=0; i<3; i++) {
+-      mRaw->metadata.wbCoeffs[i] = getLE<float>(data + i * 4);
+-    }
+-
+-    return mRaw;
+-  }
+-
+   const TiffIFD *raw = nullptr;
+ 
+   if (mRootIFD->hasEntryRecursive(TILEOFFSETS)) {
+@@ -205,45 +135,6 @@ RawImage MosDecoder::decodeRawInternal() {
+   return mRaw;
+ }
+ 
+-void MosDecoder::DecodePhaseOneC(uint32 data_offset, uint32 strip_offset, uint32 width, uint32 height)
+-{
+-  const int length[] = { 8,7,6,9,11,10,5,12,14,13 };
+-
+-  for (uint32 row = 0; row < height; row++) {
+-    uint32 off =
+-        data_offset + getU32LE(mFile->getData(strip_offset + row * 4, 4));
+-
+-    BitPumpMSB32 pump(mFile, off);
+-    int32 pred[2];
+-    uint32 len[2];
+-    pred[0] = pred[1] = 0;
+-    auto* img = reinterpret_cast<ushort16*>(mRaw->getData(0, row));
+-    for (uint32 col=0; col < width; col++) {
+-      if (col >= (width & -8))
+-        len[0] = len[1] = 14;
+-      else if ((col & 7) == 0) {
+-        for (unsigned int &i : len) {
+-          int32 j = 0;
+-
+-          for (; j < 5; j++)
+-            if (pump.getBits(1) != 0)
+-              break;
+-
+-          if (j > 0)
+-            i = length[2 * (j - 1) + pump.getBits(1)];
+-        }
+-      }
+-
+-      int i = len[col & 1];
+-      if (i == 14)
+-        img[col] = pred[col & 1] = pump.getBits(16);
+-      else
+-        img[col] = pred[col & 1] +=
+-            static_cast<signed>(pump.getBits(i)) + 1 - (1 << (i - 1));
+-    }
+-  }
+-}
+-
+ void MosDecoder::checkSupportInternal(const CameraMetaData* meta) {
+   RawDecoder::checkCameraSupported(meta, make, model, "");
+ }
+@@ -280,9 +171,6 @@ void MosDecoder::decodeMetaDataInternal(const CameraMetaData* meta) {
+       bs.skipBytes(1);
+     }
+   }
+-
+-  if (black_level)
+-    mRaw->blackLevel = black_level;
+ }
+ 
+ } // namespace rawspeed
+diff --git a/src/librawspeed/decoders/MosDecoder.h b/src/librawspeed/decoders/MosDecoder.h
+index 4f4bb4ec5..eb81da055 100644
+--- a/src/librawspeed/decoders/MosDecoder.h
++++ b/src/librawspeed/decoders/MosDecoder.h
+@@ -45,10 +45,8 @@ class MosDecoder final : public AbstractTiffDecoder
+ 
+ protected:
+   int getDecoderVersion() const override { return 0; }
+-  uint32 black_level;
+   std::string make, model;
+   std::string getXMPTag(const std::string &xmp, const std::string &tag);
+-  void DecodePhaseOneC(uint32 data_offset, uint32 strip_offset, uint32 width, uint32 height);
+ };
+ 
+ } // namespace rawspeed
+diff --git a/src/librawspeed/parsers/TiffParser.cpp b/src/librawspeed/parsers/TiffParser.cpp
+index 739aab381..487796578 100644
+--- a/src/librawspeed/parsers/TiffParser.cpp
++++ b/src/librawspeed/parsers/TiffParser.cpp
+@@ -29,6 +29,7 @@
+ #include "decoders/DcsDecoder.h"         // for DcsDecoder
+ #include "decoders/DngDecoder.h"         // for DngDecoder
+ #include "decoders/ErfDecoder.h"         // for ErfDecoder
++#include "decoders/IiqDecoder.h"         // for IiqDecoder
+ #include "decoders/KdcDecoder.h"         // for KdcDecoder
+ #include "decoders/MefDecoder.h"         // for MefDecoder
+ #include "decoders/MosDecoder.h"         // for MosDecoder
+@@ -113,13 +114,24 @@ std::unique_ptr<RawDecoder> TiffParser::constructor(TiffRootIFDOwner&& root,
+   { std::make_pair(&name::isAppropriateDecoder, &constructor<name>) }
+ 
+ const std::array<std::pair<TiffParser::checker_t, TiffParser::constructor_t>,
+-                 16>
++                 17>
+     TiffParser::Map = {{
+-        DECODER(DngDecoder), DECODER(MosDecoder), DECODER(Cr2Decoder),
+-        DECODER(RafDecoder), DECODER(NefDecoder), DECODER(OrfDecoder),
+-        DECODER(ArwDecoder), DECODER(PefDecoder), DECODER(Rw2Decoder),
+-        DECODER(SrwDecoder), DECODER(MefDecoder), DECODER(DcrDecoder),
+-        DECODER(DcsDecoder), DECODER(KdcDecoder), DECODER(ErfDecoder),
++        DECODER(DngDecoder),
++        DECODER(MosDecoder),
++        DECODER(IiqDecoder),
++        DECODER(Cr2Decoder),
++        DECODER(RafDecoder),
++        DECODER(NefDecoder),
++        DECODER(OrfDecoder),
++        DECODER(ArwDecoder),
++        DECODER(PefDecoder),
++        DECODER(Rw2Decoder),
++        DECODER(SrwDecoder),
++        DECODER(MefDecoder),
++        DECODER(DcrDecoder),
++        DECODER(DcsDecoder),
++        DECODER(KdcDecoder),
++        DECODER(ErfDecoder),
+         DECODER(ThreefrDecoder),
+ 
+     }};
+diff --git a/src/librawspeed/parsers/TiffParser.h b/src/librawspeed/parsers/TiffParser.h
+index 861f7a03d..af645c0e5 100644
+--- a/src/librawspeed/parsers/TiffParser.h
++++ b/src/librawspeed/parsers/TiffParser.h
+@@ -54,7 +54,7 @@ class TiffParser final : public RawParser {
+   using checker_t = bool (*)(const TiffRootIFD* root, const Buffer* data);
+   using constructor_t = std::unique_ptr<RawDecoder> (*)(TiffRootIFDOwner&& root,
+                                                         const Buffer* data);
+-  static const std::array<std::pair<checker_t, constructor_t>, 16> Map;
++  static const std::array<std::pair<checker_t, constructor_t>, 17> Map;
+ };
+ 
+ } // namespace rawspeed

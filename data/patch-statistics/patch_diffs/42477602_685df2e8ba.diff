@@ -1,0 +1,770 @@
+From 7a9958485036ef37b4e88df5cbe32bd7ec4c0d25 Mon Sep 17 00:00:00 2001
+From: tbeu <tbeu@users.noreply.github.com>
+Date: Mon, 2 Sep 2019 22:15:11 +0200
+Subject: [PATCH] Fix reading data from v4 MAT file
+
+As reported by https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=16857, https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=16858, https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=16874 and https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=16878
+---
+ src/mat4.c           | 220 +++++++++++++++++++++++++++++++------------
+ src/mat5.c           |   7 +-
+ src/read_data.c      |  12 +--
+ src/read_data_impl.h |  88 ++++++++---------
+ 4 files changed, 218 insertions(+), 109 deletions(-)
+
+diff --git a/src/mat4.c b/src/mat4.c
+index c3726a41..db38e801 100644
+--- a/src/mat4.c
++++ b/src/mat4.c
+@@ -314,22 +314,35 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+             if ( matvar->isComplex ) {
+                 mat_complex_split_t *complex_data = ComplexMalloc(matvar->nbytes);
+                 if ( NULL != complex_data ) {
+-                    matvar->data = complex_data;
+-                    ReadDoubleData(mat, (double*)complex_data->Re, matvar->data_type, nelems);
+-                    ReadDoubleData(mat, (double*)complex_data->Im, matvar->data_type, nelems);
++                    size_t readcount;
++                    readcount = ReadDoubleData(mat, (double*)complex_data->Re, matvar->data_type, nelems);
++                    err = readcount != nelems;
++                    readcount = ReadDoubleData(mat, (double*)complex_data->Im, matvar->data_type, nelems);
++                    err |= readcount != nelems;
++                    if ( 0 == err ) {
++                       matvar->data = complex_data;
++                    } else {
++                        ComplexFree(complex_data);
++                        return err;
++                    }
+                 }
+                 else {
+                     Mat_Critical("Couldn't allocate memory for the complex data");
+-                    err = 1;
++                    return 1;
+                 }
+             } else {
+                 matvar->data = malloc(matvar->nbytes);
+                 if ( NULL != matvar->data ) {
+-                    ReadDoubleData(mat, (double*)matvar->data, matvar->data_type, nelems);
++                    const size_t readcount = ReadDoubleData(mat, (double*)matvar->data, matvar->data_type, nelems);
++                    if ( readcount != nelems ) {
++                        free(matvar->data);
++                        matvar->data = NULL;
++                        return 1;
++                    }
+                 }
+                 else {
+                     Mat_Critical("Couldn't allocate memory for the data");
+-                    err = 1;
++                    return 1;
+                 }
+             }
+             /* Update data type to match format of matvar->data */
+@@ -340,11 +353,16 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+             matvar->nbytes = nelems;
+             matvar->data = malloc(matvar->nbytes);
+             if ( NULL != matvar->data ) {
+-                ReadUInt8Data(mat, (mat_uint8_t*)matvar->data, matvar->data_type, nelems);
++                const size_t readcount = ReadUInt8Data(mat, (mat_uint8_t*)matvar->data, matvar->data_type, nelems);
++                if ( readcount != nelems ) {
++                    free(matvar->data);
++                    matvar->data = NULL;
++                    return 1;
++                }
+             }
+             else {
+                 Mat_Critical("Couldn't allocate memory for the data");
+-                err = 1;
++                return 1;
+             }
+             matvar->data_type = MAT_T_UINT8;
+             break;
+@@ -357,6 +375,7 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+                 mat_sparse_t* sparse;
+                 long fpos;
+                 enum matio_types data_type = MAT_T_DOUBLE;
++                size_t readcount;
+ 
+                 /* matvar->dims[1] either is 3 for real or 4 for complex sparse */
+                 matvar->isComplex = matvar->dims[1] == 4 ? 1 : 0;
+@@ -365,7 +384,13 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+                 sparse->nzmax = sparse->nir;
+                 sparse->ir = (mat_int32_t*)malloc(sparse->nir*sizeof(mat_int32_t));
+                 if ( sparse->ir != NULL ) {
+-                    ReadInt32Data(mat, sparse->ir, data_type, sparse->nir);
++                    readcount = ReadInt32Data(mat, sparse->ir, data_type, sparse->nir);
++                    if ( readcount != sparse->nir ) {
++                        free(sparse->ir);
++                        free(matvar->data);
++                        matvar->data = NULL;
++                        return 1;
++                    }
+                     for ( i = 0; i < sparse->nir; i++ )
+                         sparse->ir[i] = sparse->ir[i] - 1;
+                 } else {
+@@ -374,7 +399,14 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+                     Mat_Critical("Couldn't allocate memory for the sparse row array");
+                     return 1;
+                 }
+-                ReadDoubleData(mat, &tmp, data_type, 1);
++                readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                if ( readcount != 1 || tmp > INT_MAX-1 || tmp < 0 ) {
++                    free(sparse->ir);
++                    free(matvar->data);
++                    matvar->data = NULL;
++                    Mat_Critical("Invalid row dimension for sparse matrix");
++                    return 1;
++                }
+                 matvar->dims[0] = (size_t)tmp;
+ 
+                 fpos = ftell((FILE*)mat->fp);
+@@ -385,10 +417,9 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+                     Mat_Critical("Couldn't determine file position");
+                     return 1;
+                 }
+-                (void)fseek((FILE*)mat->fp,sparse->nir*Mat_SizeOf(data_type),
+-                    SEEK_CUR);
+-                ReadDoubleData(mat, &tmp, data_type, 1);
+-                if ( tmp > INT_MAX-1 || tmp < 0 ) {
++                (void)fseek((FILE*)mat->fp,sparse->nir*Mat_SizeOf(data_type),SEEK_CUR);
++                readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                if ( readcount != 1 || tmp > INT_MAX-1 || tmp < 0 ) {
+                     free(sparse->ir);
+                     free(matvar->data);
+                     matvar->data = NULL;
+@@ -412,7 +443,15 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+                     if ( jc != NULL ) {
+                         int j = 0;
+                         sparse->jc[0] = 0;
+-                        ReadInt32Data(mat, jc, data_type, sparse->nir);
++                        readcount = ReadInt32Data(mat, jc, data_type, sparse->nir);
++                        if ( readcount != sparse->nir ) {
++                            free(jc);
++                            free(sparse->jc);
++                            free(sparse->ir);
++                            free(matvar->data);
++                            matvar->data = NULL;
++                            return 1;
++                        }
+                         for ( i = 1; i < sparse->njc-1; i++ ) {
+                             while ( j < sparse->nir && jc[j] <= i )
+                                 j++;
+@@ -436,7 +475,14 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+                     Mat_Critical("Couldn't allocate memory for the sparse index array");
+                     return 1;
+                 }
+-                ReadDoubleData(mat, &tmp, data_type, 1);
++                readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                if ( readcount != 1 ) {
++                    free(sparse->jc);
++                    free(sparse->ir);
++                    free(matvar->data);
++                    matvar->data = NULL;
++                    return 1;
++                }
+                 sparse->ndata = sparse->nir;
+                 data_type = matvar->data_type;
+                 if ( matvar->isComplex ) {
+@@ -447,66 +493,90 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+ #if defined(EXTENDED_SPARSE)
+                         switch ( data_type ) {
+                             case MAT_T_DOUBLE:
+-                                ReadDoubleData(mat, (double*)complex_data->Re,
++                                readcount = ReadDoubleData(mat, (double*)complex_data->Re,
+                                     data_type, sparse->ndata);
+-                                ReadDoubleData(mat, &tmp, data_type, 1);
+-                                ReadDoubleData(mat, (double*)complex_data->Im,
++                                err = readcount != sparse->ndata;
++                                readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                                err |= readcount != 1;
++                                readcount = ReadDoubleData(mat, (double*)complex_data->Im,
+                                     data_type, sparse->ndata);
+-                                ReadDoubleData(mat, &tmp, data_type, 1);
++                                err |= readcount != sparse->ndata;
++                                readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             case MAT_T_SINGLE:
+                             {
+                                 float tmp2;
+-                                ReadSingleData(mat, (float*)complex_data->Re,
++                                readcount = ReadSingleData(mat, (float*)complex_data->Re,
+                                     data_type, sparse->ndata);
+-                                ReadSingleData(mat, &tmp2, data_type, 1);
+-                                ReadSingleData(mat, (float*)complex_data->Im,
++                                err = readcount != sparse->ndata;
++                                readcount = ReadSingleData(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
++                                readcount = ReadSingleData(mat, (float*)complex_data->Im,
+                                     data_type, sparse->ndata);
+-                                ReadSingleData(mat, &tmp2, data_type, 1);
++                                err |= readcount != sparse->ndata;
++                                readcount = ReadSingleData(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             case MAT_T_INT32:
+                             {
+                                 mat_int32_t tmp2;
+-                                ReadInt32Data(mat, (mat_int32_t*)complex_data->Re,
++                                readcount = ReadInt32Data(mat, (mat_int32_t*)complex_data->Re,
+                                     data_type, sparse->ndata);
+-                                ReadInt32Data(mat, &tmp2, data_type, 1);
+-                                ReadInt32Data(mat, (mat_int32_t*)complex_data->Im,
++                                err = readcount != sparse->ndata;
++                                readcount = ReadInt32Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
++                                readcount = ReadInt32Data(mat, (mat_int32_t*)complex_data->Im,
+                                     data_type, sparse->ndata);
+-                                ReadInt32Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != sparse->ndata;
++                                readcount = ReadInt32Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             case MAT_T_INT16:
+                             {
+                                 mat_int16_t tmp2;
+-                                ReadInt16Data(mat, (mat_int16_t*)complex_data->Re,
++                                readcount = ReadInt16Data(mat, (mat_int16_t*)complex_data->Re,
+                                     data_type, sparse->ndata);
+-                                ReadInt16Data(mat, &tmp2, data_type, 1);
+-                                ReadInt16Data(mat, (mat_int16_t*)complex_data->Im,
++                                err = readcount != sparse->ndata;
++                                readcount = ReadInt16Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
++                                readcount = ReadInt16Data(mat, (mat_int16_t*)complex_data->Im,
+                                     data_type, sparse->ndata);
+-                                ReadInt16Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != sparse->ndata;
++                                readcount = ReadInt16Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             case MAT_T_UINT16:
+                             {
+                                 mat_uint16_t tmp2;
+-                                ReadUInt16Data(mat, (mat_uint16_t*)complex_data->Re,
++                                readcount = ReadUInt16Data(mat, (mat_uint16_t*)complex_data->Re,
+                                     data_type, sparse->ndata);
+-                                ReadUInt16Data(mat, &tmp2, data_type, 1);
+-                                ReadUInt16Data(mat, (mat_uint16_t*)complex_data->Im,
++                                err = readcount != sparse->ndata;
++                                readcount = ReadUInt16Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
++                                readcount = ReadUInt16Data(mat, (mat_uint16_t*)complex_data->Im,
+                                     data_type, sparse->ndata);
+-                                ReadUInt16Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != sparse->ndata;
++                                readcount = ReadUInt16Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             case MAT_T_UINT8:
+                             {
+                                 mat_uint8_t tmp2;
+-                                ReadUInt8Data(mat, (mat_uint8_t*)complex_data->Re,
++                                readcount = ReadUInt8Data(mat, (mat_uint8_t*)complex_data->Re,
+                                     data_type, sparse->ndata);
+-                                ReadUInt8Data(mat, &tmp2, data_type, 1);
+-                                ReadUInt8Data(mat, (mat_uint8_t*)complex_data->Im,
++                                err = readcount != sparse->ndata;
++                                readcount = ReadUInt8Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
++                                readcount = ReadUInt8Data(mat, (mat_uint8_t*)complex_data->Im,
+                                     data_type, sparse->ndata);
+-                                ReadUInt8Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != sparse->ndata;
++                                readcount = ReadUInt8Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             default:
+@@ -520,13 +590,25 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+                                 return 1;
+                         }
+ #else
+-                        ReadDoubleData(mat, (double*)complex_data->Re,
++                        readcount = ReadDoubleData(mat, (double*)complex_data->Re,
+                             data_type, sparse->ndata);
+-                        ReadDoubleData(mat, &tmp, data_type, 1);
+-                        ReadDoubleData(mat, (double*)complex_data->Im,
++                        err = readcount != sparse->ndata;
++                        readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                        err |= readcount != 1;
++                        readcount = ReadDoubleData(mat, (double*)complex_data->Im,
+                             data_type, sparse->ndata);
+-                        ReadDoubleData(mat, &tmp, data_type, 1);
++                        err |= readcount != sparse->ndata;
++                        readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                        err |= readcount != 1;
+ #endif
++                        if ( err ) {
++                            ComplexFree(complex_data);
++                            free(sparse->jc);
++                            free(sparse->ir);
++                            free(matvar->data);
++                            matvar->data = NULL;
++                            return err;
++                        }
+                     }
+                     else {
+                         free(sparse->jc);
+@@ -542,48 +624,60 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+ #if defined(EXTENDED_SPARSE)
+                         switch ( data_type ) {
+                             case MAT_T_DOUBLE:
+-                                ReadDoubleData(mat, (double*)sparse->data,
++                                readcount = ReadDoubleData(mat, (double*)sparse->data,
+                                     data_type, sparse->ndata);
+-                                ReadDoubleData(mat, &tmp, data_type, 1);
++                                err = readcount != sparse->ndata;
++                                readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             case MAT_T_SINGLE:
+                             {
+                                 float tmp2;
+-                                ReadSingleData(mat, (float*)sparse->data,
++                                readcount = ReadSingleData(mat, (float*)sparse->data,
+                                     data_type, sparse->ndata);
+-                                ReadSingleData(mat, &tmp2, data_type, 1);
++                                err = readcount != sparse->ndata;
++                                readcount = ReadSingleData(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             case MAT_T_INT32:
+                             {
+                                 mat_int32_t tmp2;
+-                                ReadInt32Data(mat, (mat_int32_t*)sparse->data,
++                                readcount = ReadInt32Data(mat, (mat_int32_t*)sparse->data,
+                                     data_type, sparse->ndata);
+-                                ReadInt32Data(mat, &tmp2, data_type, 1);
++                                err = readcount != sparse->ndata;
++                                readcount = ReadInt32Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             case MAT_T_INT16:
+                             {
+                                 mat_int16_t tmp2;
+-                                ReadInt16Data(mat, (mat_int16_t*)sparse->data,
++                                readcount = ReadInt16Data(mat, (mat_int16_t*)sparse->data,
+                                     data_type, sparse->ndata);
+-                                ReadInt16Data(mat, &tmp2, data_type, 1);
++                                err = readcount != sparse->ndata;
++                                readcount = ReadInt16Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             case MAT_T_UINT16:
+                             {
+                                 mat_uint16_t tmp2;
+-                                ReadUInt16Data(mat, (mat_uint16_t*)sparse->data,
++                                readcount = ReadUInt16Data(mat, (mat_uint16_t*)sparse->data,
+                                     data_type, sparse->ndata);
+-                                ReadUInt16Data(mat, &tmp2, data_type, 1);
++                                err = readcount != sparse->ndata;
++                                readcount = ReadUInt16Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             case MAT_T_UINT8:
+                             {
+                                 mat_uint8_t tmp2;
+-                                ReadUInt8Data(mat, (mat_uint8_t*)sparse->data,
++                                readcount = ReadUInt8Data(mat, (mat_uint8_t*)sparse->data,
+                                     data_type, sparse->ndata);
+-                                ReadUInt8Data(mat, &tmp2, data_type, 1);
++                                err = readcount != sparse->ndata;
++                                readcount = ReadUInt8Data(mat, &tmp2, data_type, 1);
++                                err |= readcount != 1;
+                                 break;
+                             }
+                             default:
+@@ -597,9 +691,19 @@ Mat_VarRead4(mat_t *mat,matvar_t *matvar)
+                                 return 1;
+                         }
+ #else
+-                        ReadDoubleData(mat, (double*)sparse->data, data_type, sparse->ndata);
+-                        ReadDoubleData(mat, &tmp, data_type, 1);
++                        readcount = ReadDoubleData(mat, (double*)sparse->data, data_type, sparse->ndata);
++                        err = readcount != sparse->ndata;
++                        readcount = ReadDoubleData(mat, &tmp, data_type, 1);
++                        err |= readcount != 1;
+ #endif
++                        if ( err ) {
++                            free(sparse->data);
++                            free(sparse->jc);
++                            free(sparse->ir);
++                            free(matvar->data);
++                            matvar->data = NULL;
++                            return err;
++                        }
+                     } else {
+                         free(sparse->jc);
+                         free(sparse->ir);
+diff --git a/src/mat5.c b/src/mat5.c
+index 87520037..373c028c 100644
+--- a/src/mat5.c
++++ b/src/mat5.c
+@@ -453,7 +453,8 @@ ReadSparse(mat_t *mat, matvar_t *matvar, int *n, mat_int32_t **v)
+                 * If the data was in the tag we started on a 4-byte
+                 * boundary so add 4 to make it an 8-byte
+                 */
+-            if ( data_in_tag )
++            nBytes *= Mat_SizeOf(packed_type);
++			if ( data_in_tag )
+                 nBytes+=4;
+             if ( (nBytes % 8) != 0 )
+                 (void)fseek((FILE*)mat->fp,8-(nBytes % 8),SEEK_CUR);
+@@ -2709,6 +2710,7 @@ Mat_VarReadNumeric5(mat_t *mat,matvar_t *matvar,void *data,size_t N)
+             default:
+                 break;
+         }
++        nBytes *= Mat_SizeOf(packed_type);
+         /*
+          * If the data was in the tag we started on a 4-byte
+          * boundary so add 4 to make it an 8-byte
+@@ -3142,6 +3144,7 @@ Mat_VarRead5(mat_t *mat, matvar_t *matvar)
+                     nBytes = ReadDoubleData(mat,(double*)complex_data->Re,
+                                  packed_type,data->ndata);
+ #endif
++                    nBytes *= Mat_SizeOf(packed_type);
+                     if ( data_in_tag )
+                         nBytes+=4;
+                     if ( (nBytes % 8) != 0 )
+@@ -3215,6 +3218,7 @@ Mat_VarRead5(mat_t *mat, matvar_t *matvar)
+                     nBytes = ReadDoubleData(mat,(double*)complex_data->Im,
+                                 packed_type,data->ndata);
+ #endif /* EXTENDED_SPARSE */
++                    nBytes *= Mat_SizeOf(packed_type);
+                     if ( data_in_tag )
+                         nBytes+=4;
+                     if ( (nBytes % 8) != 0 )
+@@ -3420,6 +3424,7 @@ Mat_VarRead5(mat_t *mat, matvar_t *matvar)
+                     nBytes = ReadDoubleData(mat,(double*)data->data,packed_type,
+                                  data->ndata);
+ #endif
++                    nBytes *= Mat_SizeOf(packed_type);
+                     if ( data_in_tag )
+                         nBytes+=4;
+                     if ( (nBytes % 8) != 0 )
+diff --git a/src/read_data.c b/src/read_data.c
+index ffb93409..80514cdc 100644
+--- a/src/read_data.c
++++ b/src/read_data.c
+@@ -44,20 +44,20 @@
+     do { \
+         const size_t block_size = READ_BLOCK_SIZE/data_size; \
+         if ( len <= block_size ) { \
+-            bytesread += fread(v, data_size, len, (FILE*)mat->fp); \
++            readcount += fread(v, data_size, len, (FILE*)mat->fp); \
+             for ( i = 0; i < len; i++ ) { \
+                 data[i] = (T)v[i]; \
+             } \
+         } else { \
+             size_t j; \
+             for ( i = 0; i < len - block_size; i += block_size ) { \
+-                bytesread += fread(v, data_size, block_size, (FILE*)mat->fp); \
++                readcount += fread(v, data_size, block_size, (FILE*)mat->fp); \
+                 for ( j = 0; j < block_size; j++ ) { \
+                     data[i + j] = (T)v[j]; \
+                 } \
+             } \
+             if ( len > i ) { \
+-                bytesread += fread(v, data_size, len - i, (FILE*)mat->fp); \
++                readcount += fread(v, data_size, len - i, (FILE*)mat->fp); \
+                 for ( j = 0; j < len - i; j++ ) { \
+                     data[i + j] = (T)v[j]; \
+                 } \
+@@ -70,20 +70,20 @@
+         if ( mat->byteswap ) { \
+             const size_t block_size = READ_BLOCK_SIZE/data_size; \
+             if ( len <= block_size ) { \
+-                bytesread += fread(v, data_size, len, (FILE*)mat->fp); \
++                readcount += fread(v, data_size, len, (FILE*)mat->fp); \
+                 for ( i = 0; i < len; i++ ) { \
+                     data[i] = (T)SwapFunc(&v[i]); \
+                 } \
+             } else { \
+                 size_t j; \
+                 for ( i = 0; i < len - block_size; i += block_size ) { \
+-                    bytesread += fread(v, data_size, block_size, (FILE*)mat->fp); \
++                    readcount += fread(v, data_size, block_size, (FILE*)mat->fp); \
+                     for ( j = 0; j < block_size; j++ ) { \
+                         data[i + j] = (T)SwapFunc(&v[j]); \
+                     } \
+                 } \
+                 if ( len > i ) { \
+-                    bytesread += fread(v, data_size, len - i, (FILE*)mat->fp); \
++                    readcount += fread(v, data_size, len - i, (FILE*)mat->fp); \
+                     for ( j = 0; j < len-i; j++ ) { \
+                         data[i + j] = (T)SwapFunc(&v[j]); \
+                     } \
+diff --git a/src/read_data_impl.h b/src/read_data_impl.h
+index 69823820..5543b5a7 100644
+--- a/src/read_data_impl.h
++++ b/src/read_data_impl.h
+@@ -42,9 +42,9 @@
+ static size_t
+ READ_TYPE_DOUBLE_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_DOUBLE
+-    bytesread += fread(data, sizeof(double), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(double), len, (FILE*)mat->fp);
+     if ( mat->byteswap ) {
+         size_t i;
+         for ( i = 0; i < len; i++ ) {
+@@ -57,15 +57,15 @@ READ_TYPE_DOUBLE_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+     double v[READ_BLOCK_SIZE/sizeof(double)];
+     READ_DATA(READ_TYPE, Mat_doubleSwap);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ 
+ static size_t
+ READ_TYPE_SINGLE_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_SINGLE
+-    bytesread += fread(data, sizeof(float), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(float), len, (FILE*)mat->fp);
+     if ( mat->byteswap ) {
+         size_t i;
+         for ( i = 0; i < len; i++ ) {
+@@ -78,15 +78,15 @@ READ_TYPE_SINGLE_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+     float v[READ_BLOCK_SIZE/sizeof(float)];
+     READ_DATA(READ_TYPE, Mat_floatSwap);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ 
+ static size_t
+ READ_TYPE_INT32_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_INT32
+-    bytesread += fread(data, sizeof(mat_int32_t), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(mat_int32_t), len, (FILE*)mat->fp);
+     if ( mat->byteswap ) {
+         size_t i;
+         for ( i = 0; i < len; i++ ) {
+@@ -99,15 +99,15 @@ READ_TYPE_INT32_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+     mat_int32_t v[READ_BLOCK_SIZE/sizeof(mat_int32_t)];
+     READ_DATA(READ_TYPE, Mat_int32Swap);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ 
+ static size_t
+ READ_TYPE_UINT32_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_UINT32
+-    bytesread += fread(data, sizeof(mat_uint32_t), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(mat_uint32_t), len, (FILE*)mat->fp);
+     if ( mat->byteswap ) {
+         size_t i;
+         for ( i = 0; i < len; i++ ) {
+@@ -120,15 +120,15 @@ READ_TYPE_UINT32_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+     mat_uint32_t v[READ_BLOCK_SIZE/sizeof(mat_uint32_t)];
+     READ_DATA(READ_TYPE, Mat_uint32Swap);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ 
+ static size_t
+ READ_TYPE_INT16_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_INT16
+-    bytesread += fread(data, sizeof(mat_int16_t), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(mat_int16_t), len, (FILE*)mat->fp);
+     if ( mat->byteswap ) {
+         size_t i;
+         for ( i = 0; i < len; i++ ) {
+@@ -141,15 +141,15 @@ READ_TYPE_INT16_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+     mat_int16_t v[READ_BLOCK_SIZE/sizeof(mat_int16_t)];
+     READ_DATA(READ_TYPE, Mat_int16Swap);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ 
+ static size_t
+ READ_TYPE_UINT16_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_UINT16
+-    bytesread += fread(data, sizeof(mat_uint16_t), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(mat_uint16_t), len, (FILE*)mat->fp);
+     if ( mat->byteswap ) {
+         size_t i;
+         for ( i = 0; i < len; i++ ) {
+@@ -162,46 +162,46 @@ READ_TYPE_UINT16_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+     mat_uint16_t v[READ_BLOCK_SIZE/sizeof(mat_uint16_t)];
+     READ_DATA(READ_TYPE, Mat_uint16Swap);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ 
+ static size_t
+ READ_TYPE_INT8_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_INT8
+-    bytesread += fread(data, sizeof(mat_int8_t), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(mat_int8_t), len, (FILE*)mat->fp);
+ #else
+     size_t i;
+     const size_t data_size = sizeof(mat_int8_t);
+     mat_int8_t v[READ_BLOCK_SIZE/sizeof(mat_int8_t)];
+     READ_DATA_NOSWAP(READ_TYPE);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ 
+ static size_t
+ READ_TYPE_UINT8_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_UINT8
+-    bytesread += fread(data, sizeof(mat_uint8_t), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(mat_uint8_t), len, (FILE*)mat->fp);
+ #else
+     size_t i;
+     const size_t data_size = sizeof(mat_uint8_t);
+     mat_uint8_t v[READ_BLOCK_SIZE/sizeof(mat_uint8_t)];
+     READ_DATA_NOSWAP(READ_TYPE);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ 
+ #ifdef HAVE_MAT_INT64_T
+ static size_t
+ READ_TYPE_INT64_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_INT64
+-    bytesread += fread(data, sizeof(mat_int64_t), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(mat_int64_t), len, (FILE*)mat->fp);
+     if ( mat->byteswap ) {
+         size_t i;
+         for ( i = 0; i < len; i++ ) {
+@@ -214,7 +214,7 @@ READ_TYPE_INT64_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+     mat_int64_t v[READ_BLOCK_SIZE/sizeof(mat_int64_t)];
+     READ_DATA(READ_TYPE, Mat_int64Swap);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ #endif /* HAVE_MAT_INT64_T */
+ 
+@@ -222,9 +222,9 @@ READ_TYPE_INT64_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ static size_t
+ READ_TYPE_UINT64_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount = 0;
+ #if READ_TYPE_TYPE == READ_TYPE_UINT64
+-    bytesread += fread(data, sizeof(mat_uint64_t), len, (FILE*)mat->fp);
++    readcount += fread(data, sizeof(mat_uint64_t), len, (FILE*)mat->fp);
+     if ( mat->byteswap ) {
+         size_t i;
+         for ( i = 0; i < len; i++ ) {
+@@ -237,7 +237,7 @@ READ_TYPE_UINT64_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+     mat_uint64_t v[READ_BLOCK_SIZE/sizeof(mat_uint64_t)];
+     READ_DATA(READ_TYPE, Mat_uint64Swap);
+ #endif
+-    return bytesread;
++    return readcount;
+ }
+ #endif /* HAVE_MAT_UINT64_T */
+ 
+@@ -252,56 +252,56 @@ READ_TYPE_UINT64_DATA(mat_t *mat, READ_TYPE *data, size_t len)
+  * @param data_type one of the @c matio_types enumerations which is the source
+  *                  data type in the file
+  * @param len Number of elements of type @c data_type to read from the file
+- * @retval Number of bytes read from the file
++ * @retval Number of elements read from the file
+  */
+ int
+ READ_TYPED_FUNC1(mat_t *mat, READ_TYPE *data, enum matio_types data_type, size_t len)
+ {
+-    size_t bytesread = 0;
++    size_t readcount;
+ 
+     if ( mat == NULL || data == NULL || mat->fp == NULL )
+         return 0;
+ 
+     switch ( data_type ) {
+         case MAT_T_DOUBLE:
+-            bytesread = READ_TYPE_DOUBLE_DATA(mat, data, len);
++            readcount = READ_TYPE_DOUBLE_DATA(mat, data, len);
+             break;
+         case MAT_T_SINGLE:
+-            bytesread = READ_TYPE_SINGLE_DATA(mat, data, len);
++            readcount = READ_TYPE_SINGLE_DATA(mat, data, len);
+             break;
+ #ifdef HAVE_MAT_INT64_T
+         case MAT_T_INT64:
+-            bytesread = READ_TYPE_INT64_DATA(mat, data, len);
++            readcount = READ_TYPE_INT64_DATA(mat, data, len);
+             break;
+ #endif /* HAVE_MAT_UINT64_T */
+ #ifdef HAVE_MAT_UINT64_T
+         case MAT_T_UINT64:
+-            bytesread = READ_TYPE_UINT64_DATA(mat, data, len);
++            readcount = READ_TYPE_UINT64_DATA(mat, data, len);
+             break;
+ #endif /* HAVE_MAT_UINT64_T */
+         case MAT_T_INT32:
+-            bytesread = READ_TYPE_INT32_DATA(mat, data, len);
++            readcount = READ_TYPE_INT32_DATA(mat, data, len);
+             break;
+         case MAT_T_UINT32:
+-            bytesread = READ_TYPE_UINT32_DATA(mat, data, len);
++            readcount = READ_TYPE_UINT32_DATA(mat, data, len);
+             break;
+         case MAT_T_INT16:
+-            bytesread = READ_TYPE_INT16_DATA(mat, data, len);
++            readcount = READ_TYPE_INT16_DATA(mat, data, len);
+             break;
+         case MAT_T_UINT16:
+-            bytesread = READ_TYPE_UINT16_DATA(mat, data, len);
++            readcount = READ_TYPE_UINT16_DATA(mat, data, len);
+             break;
+         case MAT_T_INT8:
+-            bytesread = READ_TYPE_INT8_DATA(mat, data, len);
++            readcount = READ_TYPE_INT8_DATA(mat, data, len);
+             break;
+         case MAT_T_UINT8:
+-            bytesread = READ_TYPE_UINT8_DATA(mat, data, len);
++            readcount = READ_TYPE_UINT8_DATA(mat, data, len);
+             break;
+         default:
++            readcount = 0;
+             break;
+     }
+-    bytesread *= Mat_SizeOf(data_type);
+-    return bytesread;
++    return readcount;
+ }
+ 
+ #undef READ_TYPE_DOUBLE_DATA

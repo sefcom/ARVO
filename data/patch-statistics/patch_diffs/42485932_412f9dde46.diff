@@ -1,0 +1,77 @@
+From 505b6937338e94f3f882867e97ca027ff733887e Mon Sep 17 00:00:00 2001
+From: Ingo Berg <github_contact@beltoforion.de>
+Date: Wed, 12 Aug 2020 22:24:14 +0200
+Subject: [PATCH] control characters in expressions will now cause an exception
+
+https://oss-fuzz.com/testcase-detail/5774597245632512
+---
+ src/muParserBase.cpp        | 12 ++----------
+ src/muParserTokenReader.cpp | 11 +++++++++--
+ 2 files changed, 11 insertions(+), 12 deletions(-)
+
+diff --git a/src/muParserBase.cpp b/src/muParserBase.cpp
+index 5d1c415..a54ba19 100644
+--- a/src/muParserBase.cpp
++++ b/src/muParserBase.cpp
+@@ -384,13 +384,11 @@ namespace mu
+ 		}
+ 	}
+ 
+-	//---------------------------------------------------------------------------
+-	/** \brief Check if a name contains invalid characters.
+ 
++	/** \brief Check if a name contains invalid characters.
+ 		\throw ParserException if the name contains invalid characters.
+ 	*/
+-	void ParserBase::CheckName(const string_type& a_sName,
+-		const string_type& a_szCharSet) const
++	void ParserBase::CheckName(const string_type& a_sName, const string_type& a_szCharSet) const
+ 	{
+ 		if (!a_sName.length() ||
+ 			(a_sName.find_first_not_of(a_szCharSet) != string_type::npos) ||
+@@ -400,7 +398,6 @@ namespace mu
+ 		}
+ 	}
+ 
+-	//---------------------------------------------------------------------------
+ 	/** \brief Set the formula.
+ 		\param a_strFormula Formula as string_type
+ 		\throw ParserException in case of syntax errors.
+@@ -410,11 +407,6 @@ namespace mu
+ 	*/
+ 	void ParserBase::SetExpr(const string_type& a_sExpr)
+ 	{
+-		if (std::all_of(a_sExpr.begin(), a_sExpr.end(), [](char_type c) { return !std::isgraph(c); }))
+-		{
+-			Error(ecINVALID_CHARACTERS_FOUND);
+-		}
+-
+ 		// Check locale compatibility
+ 		if (m_pTokenReader->GetArgSep() == std::use_facet<numpunct<char_type> >(s_locale).decimal_point())
+ 			Error(ecLOCALE);
+diff --git a/src/muParserTokenReader.cpp b/src/muParserTokenReader.cpp
+index dd15c4a..9bb4295 100644
+--- a/src/muParserTokenReader.cpp
++++ b/src/muParserTokenReader.cpp
+@@ -264,12 +264,19 @@ namespace mu
+ 	{
+ 		MUP_ASSERT(m_pParser != nullptr);
+ 
+-		const char_type* szFormula = m_strFormula.c_str();
++		const char_type* szExpr = m_strFormula.c_str();
+ 		token_type tok;
+ 
+ 		// Ignore all non printable characters when reading the expression
+-		while (szFormula[m_iPos] > 0 && szFormula[m_iPos] <= 0x20)
++		while (szExpr[m_iPos] > 0 && szExpr[m_iPos] <= 0x20)
++		{
++			// 14-31 are control characters. I donÄt want to have to deal with such strings at all!
++			// (see https://en.cppreference.com/w/cpp/string/byte/isprint)
++			if (szExpr[m_iPos] >= 14 && szExpr[m_iPos] <= 31)
++				Error(ecINVALID_CHARACTERS_FOUND, m_iPos);
++
+ 			++m_iPos;
++		}
+ 
+ 		// Check for end of formula
+ 		if (IsEOF(tok))

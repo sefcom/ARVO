@@ -1,0 +1,112 @@
+From cb44cf0fc82cf19efb002bba0eb5cc42e9527c3f Mon Sep 17 00:00:00 2001
+From: Nathan Moinvaziri <nathan@nathanm.com>
+Date: Thu, 18 Feb 2021 18:00:58 -0800
+Subject: [PATCH] Added a more secure version of blosc_getitem called
+ blosc2_getitem. Use blosc2_getitem in frame get_coffset to ensure we don't
+ read past the end of the frame boundary.
+ https://oss-fuzz.com/testcase-detail/5507944642904064
+
+---
+ blosc/blosc2.c | 13 ++++++++-----
+ blosc/blosc2.h | 18 ++++++++++++++++++
+ blosc/frame.c  |  6 ++++--
+ 3 files changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+index 8e3a720e0..f10cfce4a 100644
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -2553,10 +2553,7 @@ int _blosc_getitem(blosc2_context* context, blosc_header* header, const void* sr
+   return ntbytes;
+ }
+ 
+-
+-/* Specific routine optimized for decompression a small number of
+-   items out of a compressed chunk.  Public non-contextual API. */
+-int blosc_getitem(const void* src, int start, int nitems, void* dest) {
++int blosc2_getitem(const void* src, int32_t srcsize, int start, int nitems, void* dest, int32_t destsize) {
+   blosc2_context context;
+   int result;
+ 
+@@ -2567,7 +2564,7 @@ int blosc_getitem(const void* src, int start, int nitems, void* dest) {
+   context.nthreads = 1;  // force a serial decompression; fixes #95
+ 
+   /* Call the actual getitem function */
+-  result = blosc2_getitem_ctx(&context, src, INT32_MAX, start, nitems, dest, INT32_MAX);
++  result = blosc2_getitem_ctx(&context, src, srcsize, start, nitems, dest, destsize);
+ 
+   /* Release resources */
+   if (context.serial_context != NULL) {
+@@ -2576,6 +2573,12 @@ int blosc_getitem(const void* src, int start, int nitems, void* dest) {
+   return result;
+ }
+ 
++/* Specific routine optimized for decompression a small number of
++   items out of a compressed chunk.  Public non-contextual API. */
++int blosc_getitem(const void* src, int start, int nitems, void* dest) {
++  return blosc2_getitem(src, INT32_MAX, start, nitems, dest, INT32_MAX);
++}
++
+ int blosc2_getitem_ctx(blosc2_context* context, const void* src, int32_t srcsize,
+     int start, int nitems, void* dest, int32_t destsize) {
+   blosc_header header;
+diff --git a/blosc/blosc2.h b/blosc/blosc2.h
+index 2afe5082b..5022d0c94 100644
+--- a/blosc/blosc2.h
++++ b/blosc/blosc2.h
+@@ -441,6 +441,24 @@ BLOSC_EXPORT int blosc2_chunk_repeatval(size_t nbytes, size_t typesize,
+  */
+ BLOSC_EXPORT int blosc_getitem(const void* src, int start, int nitems, void* dest);
+ 
++/**
++ * @brief Get @p nitems (of @p typesize size) in @p src buffer starting in @p start.
++ * The items are returned in @p dest buffer. The dest buffer should have enough space
++ * for storing all items. This function is a more secure version of #blosc_getitem.
++ *
++ * @param src The compressed buffer from data will be decompressed.
++ * @param srcsize Size of the compressed buffer from data will be decompressed.
++ * @param start The position of the first item (of @p typesize size) from where data
++ * will be retrieved.
++ * @param nitems The number of items (of @p typesize size) that will be retrieved.
++ * @param dest The buffer where the decompressed data retrieved will be put.
++ * @param destsize Size of the buffer where decompressed data received.
++ *
++ * @return The number of bytes copied to @p dest or a negative value if
++ * some error happens.
++ */
++BLOSC_EXPORT int blosc2_getitem(const void* src, int32_t srcsize, int start, int nitems,
++                                void* dest, int32_t destsize);
+ 
+ /**
+   Pointer to a callback function that executes `dojob(jobdata + i*jobdata_elsize)` for `i = 0 to numjobs-1`,
+diff --git a/blosc/frame.c b/blosc/frame.c
+index b3b09283f..72559d3bc 100644
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -998,6 +998,7 @@ uint8_t* get_coffsets(blosc2_frame_s *frame, int32_t header_len, int64_t cbytes,
+   if (off_cbytes != NULL) {
+     *off_cbytes = coffsets_cbytes;
+   }
++
+   FILE* fp = NULL;
+   uint8_t* coffsets = malloc((size_t)coffsets_cbytes);
+   if (frame->sframe) {
+@@ -1670,15 +1671,16 @@ int sort_offset(const void* a, const void* b) {
+ 
+ 
+ int get_coffset(blosc2_frame_s* frame, int32_t header_len, int64_t cbytes, int32_t nchunk, int64_t *offset) {
++  int32_t off_cbytes;
+   // Get the offset to nchunk
+-  uint8_t *coffsets = get_coffsets(frame, header_len, cbytes, NULL);
++  uint8_t *coffsets = get_coffsets(frame, header_len, cbytes, &off_cbytes);
+   if (coffsets == NULL) {
+     BLOSC_TRACE_ERROR("Cannot get the offset for chunk %d for the frame.", nchunk);
+     return BLOSC2_ERROR_DATA;
+   }
+ 
+   // Get the 64-bit offset
+-  int rc = blosc_getitem(coffsets, nchunk, 1, offset);
++  int rc = blosc2_getitem(coffsets, frame->len - off_cbytes, nchunk, 1, offset, sizeof(int64_t));
+   if (rc < 0) {
+     BLOSC_TRACE_ERROR("Problems retrieving a chunk offset.");
+   } else if (*offset > frame->len) {

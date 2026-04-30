@@ -1,0 +1,75 @@
+From 7278dabf370f5bb18b02c8fbbbf15ad59ce6712c Mon Sep 17 00:00:00 2001
+From: Rob Davies <rmd+git@sanger.ac.uk>
+Date: Thu, 1 Feb 2024 16:48:08 +0000
+Subject: [PATCH] Fix possible heap overflow in cram_encode_aux() on bad RG:Z
+ tags
+
+RG:Z tags without a proper NUL termination could lead to use of
+invalid data, or a heap overflow when the tag is passed to
+sam_hrecs_find_rg(), or hts_log_warning() if the former returns
+NULL.  Fix by moving the line that skips to the end of the aux
+tag and then checking that it was terminated correctly, failing
+if it was not.
+
+Similar checks are also added for MD:Z and generic Z- or H- type
+tags, to prevent generation of unreadable CRAM files.
+
+Credit to OSS-Fuzz
+Fixes oss-fuzz 66369
+---
+ cram/cram_encode.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/cram/cram_encode.c b/cram/cram_encode.c
+index 9651abdec..4a762f7b0 100644
+--- a/cram/cram_encode.c
++++ b/cram/cram_encode.c
+@@ -2799,15 +2799,22 @@ static sam_hrec_rg_t *cram_encode_aux(cram_fd *fd, bam_seq_t *b,
+         // RG:Z
+         if (aux[0] == 'R' && aux[1] == 'G' && aux[2] == 'Z') {
+             char *rg = &aux[3];
++            aux = rg;
++            while (aux < aux_end && *aux++);
++            if (aux == aux_end && aux[-1] != '\0') {
++                hts_log_error("Unterminated RG:Z tag for read \"%s\"",
++                              bam_get_qname(b));
++                goto err;
++            }
+             brg = sam_hrecs_find_rg(fd->header->hrecs, rg);
+             if (brg) {
+-                while (aux < aux_end && *aux++);
+                 if (CRAM_MAJOR_VERS(fd->version) >= 4)
+                     BLOCK_APPEND(td_b, "RG*", 3);
+                 continue;
+             } else {
+                 // RG:Z tag will be stored verbatim
+                 hts_log_warning("Missing @RG header for RG \"%s\"", rg);
++                aux = rg - 3;
+             }
+         }
+ 
+@@ -2816,6 +2823,11 @@ static sam_hrec_rg_t *cram_encode_aux(cram_fd *fd, bam_seq_t *b,
+             if (cr->len && !no_ref && !(cr->flags & BAM_FUNMAP) && !verbatim_MD) {
+                 if (MD && MD->s && strncasecmp(MD->s, aux+3, orig + aux_size - (aux+3)) == 0) {
+                     while (aux < aux_end && *aux++);
++                    if (aux == aux_end && aux[-1] != '\0') {
++                        hts_log_error("Unterminated MD:Z tag for read \"%s\"",
++                                      bam_get_qname(b));
++                        goto err;
++                    }
+                     if (CRAM_MAJOR_VERS(fd->version) >= 4)
+                         BLOCK_APPEND(td_b, "MD*", 3);
+                     continue;
+@@ -3093,6 +3105,12 @@ static sam_hrec_rg_t *cram_encode_aux(cram_fd *fd, bam_seq_t *b,
+             aux += 3;
+             aux_s = aux;
+             while (aux < aux_end && *aux++);
++            if (aux == aux_end && aux[-1] != '\0') {
++                hts_log_error("Unterminated %c%c:%c tag for read \"%s\"",
++                              aux_s[-3], aux_s[-2], aux_s[-1],
++                              bam_get_qname(b));
++                goto err;
++            }
+             if (codec->encode(s, codec, aux_s, aux - aux_s) < 0)
+                 goto err;
+             break;

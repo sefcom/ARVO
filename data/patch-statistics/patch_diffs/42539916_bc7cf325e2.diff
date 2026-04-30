@@ -1,0 +1,197 @@
+From 5f3d02e8955b0b0eb62cf85eca1f56f55d64bd63 Mon Sep 17 00:00:00 2001
+From: Cristy <urban-warrior@imagemagick.org>
+Date: Thu, 17 May 2018 20:38:41 -0400
+Subject: [PATCH] =?UTF-8?q?Fix=20Schr=C3=B6dinger's=20cat=20problem=20with?=
+ =?UTF-8?q?=20clip=20/=20composite=20mask=20o=20Please=20enter=20the=20com?=
+ =?UTF-8?q?mit=20message=20for=20your=20changes.=20Lines=20starting?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ MagickCore/attribute.c | 15 ++++-----------
+ MagickCore/cache.c     | 15 +++++++++------
+ MagickCore/channel.c   |  5 +++++
+ MagickCore/image.c     |  8 +++++++-
+ MagickCore/image.h     |  3 +++
+ MagickCore/pixel.c     |  7 +++++++
+ 6 files changed, 35 insertions(+), 18 deletions(-)
+
+diff --git a/MagickCore/attribute.c b/MagickCore/attribute.c
+index 432df00956f..32ddfa06248 100644
+--- a/MagickCore/attribute.c
++++ b/MagickCore/attribute.c
+@@ -409,10 +409,7 @@ MagickExport size_t GetImageDepth(const Image *image,ExceptionInfo *exception)
+           {
+             PixelChannel channel = GetPixelChannelChannel(image,i);
+             PixelTrait traits = GetPixelChannelTraits(image,channel);
+-            if ((traits == UndefinedPixelTrait) ||
+-                (channel == IndexPixelChannel) ||
+-                (channel == ReadMaskPixelChannel) ||
+-                (channel == MetaPixelChannel))
++            if ((traits & UpdatePixelTrait) == 0)
+               continue;
+             if (depth_map[ScaleQuantumToMap(p[i])] > current_depth[id])
+               current_depth[id]=depth_map[ScaleQuantumToMap(p[i])];
+@@ -470,8 +467,7 @@ MagickExport size_t GetImageDepth(const Image *image,ExceptionInfo *exception)
+ 
+         channel=GetPixelChannelChannel(image,i);
+         traits=GetPixelChannelTraits(image,channel);
+-        if ((traits == UndefinedPixelTrait) || (channel == IndexPixelChannel) ||
+-            (channel == ReadMaskPixelChannel))
++        if ((traits & UpdatePixelTrait) == 0)
+           continue;
+         while (current_depth[id] < MAGICKCORE_QUANTUM_DEPTH)
+         {
+@@ -1094,9 +1090,7 @@ MagickExport MagickBooleanType SetImageDepth(Image *image,
+ 
+             channel=GetPixelChannelChannel(image,i);
+             traits=GetPixelChannelTraits(image,channel);
+-            if ((traits == UndefinedPixelTrait) ||
+-                (channel == IndexPixelChannel) ||
+-                (channel == ReadMaskPixelChannel))
++            if ((traits & UpdatePixelTrait) == 0)
+               continue;
+             q[i]=depth_map[ScaleQuantumToMap(q[i])];
+           }
+@@ -1153,8 +1147,7 @@ MagickExport MagickBooleanType SetImageDepth(Image *image,
+ 
+         channel=GetPixelChannelChannel(image,i);
+         traits=GetPixelChannelTraits(image,channel);
+-        if ((traits == UndefinedPixelTrait) || (channel == IndexPixelChannel) ||
+-            (channel == ReadMaskPixelChannel))
++        if ((traits & UpdatePixelTrait) == 0)
+           continue;
+         q[i]=ScaleAnyToQuantum(ScaleQuantumToAny(ClampPixel((MagickRealType)
+           q[i]),range),range);
+diff --git a/MagickCore/cache.c b/MagickCore/cache.c
+index a036f8b2fac..2a8f20ee928 100644
+--- a/MagickCore/cache.c
++++ b/MagickCore/cache.c
+@@ -5340,12 +5340,15 @@ MagickPrivate MagickBooleanType SyncAuthenticPixelCacheNexus(Image *image,
+   assert(cache_info->signature == MagickCoreSignature);
+   if (cache_info->type == UndefinedCache)
+     return(MagickFalse);
+-  if ((image->write_mask != MagickFalse) &&
+-      (ClipPixelCacheNexus(image,nexus_info,exception) == MagickFalse))
+-    return(MagickFalse);
+-  if ((image->composite_mask != MagickFalse) &&
+-      (MaskPixelCacheNexus(image,nexus_info,exception) == MagickFalse))
+-    return(MagickFalse);
++  if (image->mask_trait != UpdatePixelTrait)
++    {
++      if ((image->write_mask != MagickFalse) &&
++          (ClipPixelCacheNexus(image,nexus_info,exception) == MagickFalse))
++        return(MagickFalse);
++      if ((image->composite_mask != MagickFalse) &&
++          (MaskPixelCacheNexus(image,nexus_info,exception) == MagickFalse))
++        return(MagickFalse);
++    }
+   if (nexus_info->authentic_pixel_cache != MagickFalse)
+     {
+       image->taint=MagickTrue;
+diff --git a/MagickCore/channel.c b/MagickCore/channel.c
+index a5955833f10..c2aafb73839 100644
+--- a/MagickCore/channel.c
++++ b/MagickCore/channel.c
+@@ -376,6 +376,11 @@ MagickExport Image *ChannelFxImage(const Image *image,const char *expression,
+               destination_image->alpha_trait=BlendPixelTrait;
+               break;
+             }
++            case CompositeMaskPixelChannel:
++            {
++              destination_image->composite_mask=MagickTrue;
++              break;
++            }
+             case ReadMaskPixelChannel:
+             {
+               destination_image->read_mask=MagickTrue;
+diff --git a/MagickCore/image.c b/MagickCore/image.c
+index 21be905c59c..2b2bde8228d 100644
+--- a/MagickCore/image.c
++++ b/MagickCore/image.c
+@@ -828,7 +828,9 @@ MagickExport Image *CloneImage(const Image *image,const size_t columns,
+   clone_image->colorspace=image->colorspace;
+   clone_image->read_mask=image->read_mask;
+   clone_image->write_mask=image->write_mask;
++  clone_image->composite_mask=image->composite_mask;
+   clone_image->alpha_trait=image->alpha_trait;
++  clone_image->mask_trait=image->mask_trait;
+   clone_image->columns=image->columns;
+   clone_image->rows=image->rows;
+   clone_image->dither=image->dither;
+@@ -3193,6 +3195,7 @@ MagickExport MagickBooleanType SetImageMask(Image *image,const PixelMask type,
+   if (SyncImagePixelCache(image,exception) == MagickFalse)
+     return(MagickFalse);
+   status=MagickTrue;
++  image->mask_trait=UpdatePixelTrait;
+   mask_view=AcquireVirtualCacheView(mask,exception);
+   image_view=AcquireAuthenticCacheView(image,exception);
+ #if defined(MAGICKCORE_OPENMP_SUPPORT)
+@@ -3251,6 +3254,7 @@ MagickExport MagickBooleanType SetImageMask(Image *image,const PixelMask type,
+     if (SyncCacheViewAuthenticPixels(image_view,exception) == MagickFalse)
+       status=MagickFalse;
+   }
++  image->mask_trait=UndefinedPixelTrait;
+   mask_view=DestroyCacheView(mask_view);
+   image_view=DestroyCacheView(image_view);
+   return(status);
+@@ -3321,9 +3325,10 @@ MagickExport MagickBooleanType SetImageRegionMask(Image *image,
+     case WritePixelMask: image->write_mask=MagickTrue; break;
+     default: image->composite_mask=MagickTrue; break;
+   }
+-  if (SetImageStorageClass(image,DirectClass,exception) == MagickFalse)
++  if (SyncImagePixelCache(image,exception) == MagickFalse)
+     return(MagickFalse);
+   status=MagickTrue;
++  image->mask_trait=UpdatePixelTrait;
+   image_view=AcquireAuthenticCacheView(image,exception);
+ #if defined(MAGICKCORE_OPENMP_SUPPORT)
+   #pragma omp parallel for schedule(static) shared(status) \
+@@ -3377,6 +3382,7 @@ MagickExport MagickBooleanType SetImageRegionMask(Image *image,
+     if (SyncCacheViewAuthenticPixels(image_view,exception) == MagickFalse)
+       status=MagickFalse;
+   }
++  image->mask_trait=UndefinedPixelTrait;
+   image_view=DestroyCacheView(image_view);
+   return(status);
+ }
+diff --git a/MagickCore/image.h b/MagickCore/image.h
+index 1ef596baa7b..62a56a21d4e 100644
+--- a/MagickCore/image.h
++++ b/MagickCore/image.h
+@@ -358,6 +358,9 @@ struct _Image
+ 
+   MagickBooleanType
+     composite_mask;
++
++  PixelTrait
++    mask_trait;       /* apply the clip or composite mask */
+ };
+ 
+ /*
+diff --git a/MagickCore/pixel.c b/MagickCore/pixel.c
+index dd55ce52fac..f74170465aa 100644
+--- a/MagickCore/pixel.c
++++ b/MagickCore/pixel.c
+@@ -6239,6 +6239,11 @@ static void LogPixelChannels(const Image *image)
+         name="write-mask";
+         break;
+       }
++      case CompositeMaskPixelChannel:
++      {
++        name="composite-mask";
++        break;
++      }
+       case MetaPixelChannel:
+       {
+         name="meta";
+@@ -6318,6 +6323,8 @@ MagickExport ChannelType SetPixelChannelMask(Image *image,
+     SetPixelChannelTraits(image,ReadMaskPixelChannel,CopyPixelTrait);
+   if (image->write_mask != MagickFalse)
+     SetPixelChannelTraits(image,WriteMaskPixelChannel,CopyPixelTrait);
++  if (image->composite_mask != MagickFalse)
++    SetPixelChannelTraits(image,CompositeMaskPixelChannel,CopyPixelTrait);
+   if (image->debug != MagickFalse)
+     LogPixelChannels(image);
+   return(mask);

@@ -1,0 +1,60 @@
+From 0e5af04bc776a852c414bf39f82a77886538e474 Mon Sep 17 00:00:00 2001
+From: Will Jones <willjones127@gmail.com>
+Date: Fri, 31 Mar 2023 15:12:44 -0700
+Subject: [PATCH] GH-34831: [C++] Check REE child buffers are valid before
+ other checks (#34833)
+
+### Rationale for this change
+
+See issue. Invalid buffers can cause segfaults when `ValidateRunEndEncodedChildren` is called, so we need to validate the buffers first.
+
+### What changes are included in this PR?
+
+Move up buffer checks.
+
+### Are these changes tested?
+
+Checked against the fuzzer failure case that triggered the issue.
+
+### Are there any user-facing changes?
+
+**This PR contains a "Critical Fix".**
+* Closes: #34831
+
+Authored-by: Will Jones <willjones127@gmail.com>
+Signed-off-by: Will Jones <willjones127@gmail.com>
+---
+ cpp/src/arrow/array/validate.cc | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/cpp/src/arrow/array/validate.cc b/cpp/src/arrow/array/validate.cc
+index 04effeba004..0f2bd458357 100644
+--- a/cpp/src/arrow/array/validate.cc
++++ b/cpp/src/arrow/array/validate.cc
+@@ -651,9 +651,14 @@ struct ValidateArrayImpl {
+ 
+     const auto& run_ends_data = data.child_data[0];
+     const auto& values_data = data.child_data[1];
+-    RETURN_NOT_OK(ree_util::ValidateRunEndEncodedChildren(
+-        type, data.length, run_ends_data, values_data, data.GetNullCount(), data.offset));
+ 
++    if (!run_ends_data) {
++      return Status::Invalid("Run ends array is null pointer");
++    }
++    if (!values_data) {
++      return Status::Invalid("Values array is null pointer");
++    }
++    // We must validate child array buffers are valid before making additional checks.
+     const Status run_ends_valid = RecurseInto(*run_ends_data);
+     if (!run_ends_valid.ok()) {
+       return Status::Invalid("Run ends array invalid: ", run_ends_valid.message());
+@@ -663,6 +668,9 @@ struct ValidateArrayImpl {
+       return Status::Invalid("Values array invalid: ", values_valid.message());
+     }
+ 
++    RETURN_NOT_OK(ree_util::ValidateRunEndEncodedChildren(
++        type, data.length, run_ends_data, values_data, data.GetNullCount(), data.offset));
++
+     if (run_ends_data->length == 0) {
+       return Status::OK();
+     }

@@ -1,0 +1,186 @@
+From 0a9dc7bf4dcbfeeb99dd99d5d40e8821b8a885a1 Mon Sep 17 00:00:00 2001
+From: Nickolay Olshevsky <o.nickolay@gmail.com>
+Date: Fri, 31 Jul 2020 14:30:58 +0300
+Subject: [PATCH] Check string lengths when using strncmp for minimum bounds.
+
+---
+ src/librekey/key_store_g10.cpp                | 17 +++++----
+ src/librepgp/stream-armor.cpp                 | 35 +++++++++++--------
+ src/librepgp/stream-parse.cpp                 |  2 +-
+ .../test_stream_armor/too_short_header.asc    |  4 +++
+ src/tests/ffi.cpp                             |  8 +++++
+ 5 files changed, 42 insertions(+), 24 deletions(-)
+ create mode 100644 src/tests/data/test_stream_armor/too_short_header.asc
+
+diff --git a/src/librekey/key_store_g10.cpp b/src/librekey/key_store_g10.cpp
+index ab626bdc0..bb5835968 100644
+--- a/src/librekey/key_store_g10.cpp
++++ b/src/librekey/key_store_g10.cpp
+@@ -814,7 +814,7 @@ parse_protected_seckey(pgp_key_pkt_t *seckey, s_exp_t *s_exp, const char *passwo
+         goto done;
+     }
+     sub_el = sub_element_at(alg, 0);
+-    if (strncmp("sha1", (const char *) sub_el->block.bytes, sub_el->block.len) != 0) {
++    if ((sub_el->block.len != 4) || memcmp("sha1", sub_el->block.bytes, 4)) {
+         RNP_LOG("Wrong hashing algorithm, should be sha1 but %.*s\n",
+                 (int) sub_el->block.len,
+                 sub_el->block.bytes);
+@@ -892,16 +892,14 @@ parse_protected_seckey(pgp_key_pkt_t *seckey, s_exp_t *s_exp, const char *passwo
+             !sub_element_at(&sub_el->s_exp, 0)->is_block ||
+             !sub_element_at(&sub_el->s_exp, 1)->is_block ||
+             !sub_element_at(&sub_el->s_exp, 2)->is_block ||
+-            strncmp("hash",
+-                    (const char *) sub_element_at(&sub_el->s_exp, 0)->block.bytes,
+-                    sub_element_at(&sub_el->s_exp, 0)->block.len) != 0) {
++            (sub_element_at(&sub_el->s_exp, 0)->block.len != 4) ||
++            memcmp("hash", sub_element_at(&sub_el->s_exp, 0)->block.bytes, 4)) {
+             RNP_LOG("Has got wrong hash block at encrypted key data.");
+             goto done;
+         }
+ 
+-        if (strncmp("sha1",
+-                    (const char *) sub_element_at(&sub_el->s_exp, 1)->block.bytes,
+-                    sub_element_at(&sub_el->s_exp, 1)->block.len) != 0) {
++        if ((sub_element_at(&sub_el->s_exp, 1)->block.len != 4) ||
++            memcmp("sha1", sub_element_at(&sub_el->s_exp, 1)->block.bytes, 4)) {
+             RNP_LOG("Supported only sha1 hash at encrypted private key.");
+             goto done;
+         }
+@@ -965,9 +963,10 @@ g10_parse_seckey(pgp_key_pkt_t *seckey,
+     }
+ 
+     block = &sub_element_at(&s_exp, 0)->block;
+-    if (!strncmp("private-key", (const char *) block->bytes, block->len)) {
++    if ((block->len == 11) && !memcmp("private-key", block->bytes, block->len)) {
+         is_protected = false;
+-    } else if (!strncmp("protected-private-key", (const char *) block->bytes, block->len)) {
++    } else if ((block->len == 21) &&
++               !memcmp("protected-private-key", block->bytes, block->len)) {
+         is_protected = true;
+     } else {
+         RNP_LOG("Unsupported top-level block: '%.*s'", (int) block->len, block->bytes);
+diff --git a/src/librepgp/stream-armor.cpp b/src/librepgp/stream-armor.cpp
+index e11bbba5f..b7fbe14fc 100644
+--- a/src/librepgp/stream-armor.cpp
++++ b/src/librepgp/stream-armor.cpp
+@@ -196,7 +196,7 @@ armor_read_trailer(pgp_source_t *src)
+     }
+ 
+     stlen = strlen(param->armorhdr);
+-    if (stlen + 8 + 1 <= sizeof(st)) {
++    if ((stlen > 5) && (stlen + 8 + 1 <= sizeof(st))) {
+         memcpy(st, ST_ARMOR_END, 8); /* 8 here is mandatory */
+         memcpy(st + 8, param->armorhdr + 5, stlen - 5);
+         memcpy(st + stlen + 3, ST_DASHES, 5);
+@@ -453,29 +453,36 @@ find_armor_header(const char *buf, size_t len, size_t *hdrlen)
+     return NULL;
+ }
+ 
++static bool
++str_equals(const char *str, size_t len, const char *another)
++{
++    size_t alen = strlen(another);
++    return (len == alen) && !memcmp(str, another, alen);
++}
++
+ static pgp_armored_msg_t
+ armor_str_to_data_type(const char *str, size_t len)
+ {
+     if (!str) {
+         return PGP_ARMORED_UNKNOWN;
+     }
+-    if (!strncmp(str, "BEGIN PGP MESSAGE", len)) {
++    if (str_equals(str, len, "BEGIN PGP MESSAGE")) {
+         return PGP_ARMORED_MESSAGE;
+     }
+-    if (!strncmp(str, "BEGIN PGP PUBLIC KEY BLOCK", len) ||
+-        !strncmp(str, "BEGIN PGP PUBLIC KEY", len)) {
++    if (str_equals(str, len, "BEGIN PGP PUBLIC KEY BLOCK") ||
++        str_equals(str, len, "BEGIN PGP PUBLIC KEY")) {
+         return PGP_ARMORED_PUBLIC_KEY;
+     }
+-    if (!strncmp(str, "BEGIN PGP SECRET KEY BLOCK", len) ||
+-        !strncmp(str, "BEGIN PGP SECRET KEY", len) ||
+-        !strncmp(str, "BEGIN PGP PRIVATE KEY BLOCK", len) ||
+-        !strncmp(str, "BEGIN PGP PRIVATE KEY", len)) {
++    if (str_equals(str, len, "BEGIN PGP SECRET KEY BLOCK") ||
++        str_equals(str, len, "BEGIN PGP SECRET KEY") ||
++        str_equals(str, len, "BEGIN PGP PRIVATE KEY BLOCK") ||
++        str_equals(str, len, "BEGIN PGP PRIVATE KEY")) {
+         return PGP_ARMORED_SECRET_KEY;
+     }
+-    if (!strncmp(str, "BEGIN PGP SIGNATURE", len)) {
++    if (str_equals(str, len, "BEGIN PGP SIGNATURE")) {
+         return PGP_ARMORED_SIGNATURE;
+     }
+-    if (!strncmp(str, "BEGIN PGP SIGNED MESSAGE", len)) {
++    if (str_equals(str, len, "BEGIN PGP SIGNED MESSAGE")) {
+         return PGP_ARMORED_CLEARTEXT;
+     }
+     return PGP_ARMORED_UNKNOWN;
+@@ -620,19 +627,19 @@ armor_parse_headers(pgp_source_t *src)
+             return false;
+         }
+ 
+-        if (strncmp(header, ST_HEADER_VERSION, 9) == 0) {
++        if ((hdrlen >= 9) && !strncmp(header, ST_HEADER_VERSION, 9)) {
+             memcpy(hdrval, header + 9, hdrlen - 8);
+             free(param->version);
+             param->version = hdrval;
+-        } else if (strncmp(header, ST_HEADER_COMMENT, 9) == 0) {
++        } else if ((hdrlen >= 9) && !strncmp(header, ST_HEADER_COMMENT, 9)) {
+             memcpy(hdrval, header + 9, hdrlen - 8);
+             free(param->comment);
+             param->comment = hdrval;
+-        } else if (strncmp(header, ST_HEADER_HASH, 6) == 0) {
++        } else if ((hdrlen >= 5) && !strncmp(header, ST_HEADER_HASH, 6)) {
+             memcpy(hdrval, header + 6, hdrlen - 5);
+             free(param->hash);
+             param->hash = hdrval;
+-        } else if (strncmp(header, ST_HEADER_CHARSET, 9) == 0) {
++        } else if ((hdrlen >= 9) && !strncmp(header, ST_HEADER_CHARSET, 9)) {
+             memcpy(hdrval, header + 9, hdrlen - 8);
+             free(param->charset);
+             param->charset = hdrval;
+diff --git a/src/librepgp/stream-parse.cpp b/src/librepgp/stream-parse.cpp
+index c9c6040aa..a294e31dc 100644
+--- a/src/librepgp/stream-parse.cpp
++++ b/src/librepgp/stream-parse.cpp
+@@ -1004,7 +1004,7 @@ cleartext_parse_headers(pgp_source_t *src)
+             break;
+         }
+ 
+-        if (strncmp(hdr, ST_HEADER_HASH, 6) == 0) {
++        if ((hdrlen >= 6) && !strncmp(hdr, ST_HEADER_HASH, 6)) {
+             hval = hdr + 6;
+ 
+             std::string remainder = hval;
+diff --git a/src/tests/data/test_stream_armor/too_short_header.asc b/src/tests/data/test_stream_armor/too_short_header.asc
+new file mode 100644
+index 000000000..0d4db207b
+--- /dev/null
++++ b/src/tests/data/test_stream_armor/too_short_header.asc
+@@ -0,0 +1,4 @@
++----------
++-----BEGIN PGP 
++
++=azaS
+diff --git a/src/tests/ffi.cpp b/src/tests/ffi.cpp
+index d819f9e32..a3d884231 100644
+--- a/src/tests/ffi.cpp
++++ b/src/tests/ffi.cpp
+@@ -4689,6 +4689,14 @@ TEST_F(rnp_tests, test_ffi_dearmor_edge_cases)
+     assert_rnp_failure(rnp_dearmor(input, output));
+     rnp_input_destroy(input);
+     rnp_output_destroy(output);
++
++    /* too short armor header */
++    assert_rnp_success(
++      rnp_input_from_path(&input, "data/test_stream_armor/too_short_header.asc"));
++    assert_rnp_success(rnp_output_to_memory(&output, 0));
++    assert_rnp_failure(rnp_dearmor(input, output));
++    rnp_input_destroy(input);
++    rnp_output_destroy(output);
+ }
+ 
+ TEST_F(rnp_tests, test_ffi_customized_enarmor)

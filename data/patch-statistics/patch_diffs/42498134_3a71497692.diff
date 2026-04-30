@@ -1,0 +1,93 @@
+From 37340aa599e177597f81748a14951c0d3d38efaf Mon Sep 17 00:00:00 2001
+From: Idan Horowitz <idan.horowitz@gmail.com>
+Date: Thu, 17 Jun 2021 14:12:38 +0300
+Subject: [PATCH] LibJS: Add the Object.prototype.__proto__ native accessor
+ property
+
+This is part of the Annex B extension of the specification.
+---
+ .../LibJS/Runtime/CommonPropertyNames.h       |  1 +
+ .../LibJS/Runtime/ObjectPrototype.cpp         | 39 +++++++++++++++++++
+ .../Libraries/LibJS/Runtime/ObjectPrototype.h |  2 +
+ 3 files changed, 42 insertions(+)
+
+diff --git a/Userland/Libraries/LibJS/Runtime/CommonPropertyNames.h b/Userland/Libraries/LibJS/Runtime/CommonPropertyNames.h
+index 445f3e120d95db..a2bbf9e2b1e4b7 100644
+--- a/Userland/Libraries/LibJS/Runtime/CommonPropertyNames.h
++++ b/Userland/Libraries/LibJS/Runtime/CommonPropertyNames.h
+@@ -12,6 +12,7 @@
+ namespace JS {
+ 
+ #define ENUMERATE_STANDARD_PROPERTY_NAMES(P) \
++    P(__proto__)                             \
+     P(BYTES_PER_ELEMENT)                     \
+     P(BigInt)                                \
+     P(Boolean)                               \
+diff --git a/Userland/Libraries/LibJS/Runtime/ObjectPrototype.cpp b/Userland/Libraries/LibJS/Runtime/ObjectPrototype.cpp
+index cbb0730149db21..97e2049c36b681 100644
+--- a/Userland/Libraries/LibJS/Runtime/ObjectPrototype.cpp
++++ b/Userland/Libraries/LibJS/Runtime/ObjectPrototype.cpp
+@@ -35,6 +35,9 @@ void ObjectPrototype::initialize(GlobalObject& global_object)
+     define_native_function(vm.names.valueOf, value_of, 0, attr);
+     define_native_function(vm.names.propertyIsEnumerable, property_is_enumerable, 1, attr);
+     define_native_function(vm.names.isPrototypeOf, is_prototype_of, 1, attr);
++
++    // Annex B
++    define_native_accessor(vm.names.__proto__, proto_getter, proto_setter, Attribute::Configurable);
+ }
+ 
+ ObjectPrototype::~ObjectPrototype()
+@@ -144,4 +147,40 @@ JS_DEFINE_NATIVE_FUNCTION(ObjectPrototype::is_prototype_of)
+     }
+ }
+ 
++// B.2.2.1.1 get Object.prototype.__proto__, https://tc39.es/ecma262/#sec-get-object.prototype.__proto__
++JS_DEFINE_NATIVE_FUNCTION(ObjectPrototype::proto_getter)
++{
++    auto object = vm.this_value(global_object).to_object(global_object);
++    if (vm.exception())
++        return {};
++    auto proto = object->prototype();
++    if (vm.exception())
++        return {};
++    return proto;
++}
++
++// B.2.2.1.2 set Object.prototype.__proto__, https://tc39.es/ecma262/#sec-set-object.prototype.__proto__
++JS_DEFINE_NATIVE_FUNCTION(ObjectPrototype::proto_setter)
++{
++    auto object = require_object_coercible(global_object, vm.this_value(global_object));
++    if (vm.exception())
++        return {};
++
++    auto proto = vm.argument(0);
++    if (!proto.is_object() && !proto.is_null())
++        return js_undefined();
++
++    if (!object.is_object())
++        return js_undefined();
++
++    auto status = object.as_object().set_prototype(proto.is_object() ? &proto.as_object() : nullptr);
++    if (vm.exception())
++        return {};
++    if (!status) {
++        vm.throw_exception<TypeError>(global_object, ErrorType::ObjectSetPrototypeOfReturnedFalse);
++        return {};
++    }
++    return js_undefined();
++}
++
+ }
+diff --git a/Userland/Libraries/LibJS/Runtime/ObjectPrototype.h b/Userland/Libraries/LibJS/Runtime/ObjectPrototype.h
+index e303c03718fb78..b01208a93b90c1 100644
+--- a/Userland/Libraries/LibJS/Runtime/ObjectPrototype.h
++++ b/Userland/Libraries/LibJS/Runtime/ObjectPrototype.h
+@@ -27,6 +27,8 @@ class ObjectPrototype final : public Object {
+     JS_DECLARE_NATIVE_FUNCTION(value_of);
+     JS_DECLARE_NATIVE_FUNCTION(property_is_enumerable);
+     JS_DECLARE_NATIVE_FUNCTION(is_prototype_of);
++    JS_DECLARE_NATIVE_FUNCTION(proto_getter);
++    JS_DECLARE_NATIVE_FUNCTION(proto_setter);
+ };
+ 
+ }

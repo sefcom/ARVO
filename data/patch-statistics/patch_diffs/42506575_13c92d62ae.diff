@@ -1,0 +1,160 @@
+From 9cfc7a244052dced520776ff0ecc6f0a9390f62b Mon Sep 17 00:00:00 2001
+From: Gyan Doshi <ffmpeg@gyani.pro>
+Date: Sat, 27 Nov 2021 15:21:12 +0530
+Subject: [PATCH] avformat/mov: add option max_stts_delta
+
+Very high stts sample deltas may occasionally be intended but usually
+they are written in error or used to store a negative value for dts correction
+when treated as signed 32-bit integers.
+
+This option lets the user set an upper limit, beyond which the delta is clamped to 1.
+Values greater than the limit if negative when cast to int32 are used to adjust onward dts.
+
+Unit is the track time scale. Default is UINT_MAX - 48000*10 which
+allows upto a 10 second dts correction for 48 kHz audio streams while
+accommodating 99.9% of uint32 range.
+
+Signed-off-by: Gyan Doshi <ffmpeg@gyani.pro>
+Reviewed-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ doc/demuxers.texi  |  9 ++++++++
+ libavformat/isom.h |  1 +
+ libavformat/mov.c  | 55 +++++++++++++++++++++++++---------------------
+ 3 files changed, 40 insertions(+), 25 deletions(-)
+
+diff --git a/doc/demuxers.texi b/doc/demuxers.texi
+index b474a24278..26ae768d7a 100644
+--- a/doc/demuxers.texi
++++ b/doc/demuxers.texi
+@@ -726,6 +726,15 @@ specify.
+ 
+ @item decryption_key
+ 16-byte key, in hex, to decrypt files encrypted using ISO Common Encryption (CENC/AES-128 CTR; ISO/IEC 23001-7).
++
++@item max_stts_delta
++Very high sample deltas written in a trak's stts box may occasionally be intended but usually they are written in
++error or used to store a negative value for dts correction when treated as signed 32-bit integers. This option lets
++the user set an upper limit, beyond which the delta is clamped to 1. Values greater than the limit if negative when
++cast to int32 are used to adjust onward dts.
++
++Unit is the track time scale. Range is 0 to UINT_MAX. Default is @code{UINT_MAX - 48000*10} which allows upto
++a 10 second dts correction for 48 kHz audio streams while accommodating 99.9% of @code{uint32} range.
+ @end table
+ 
+ @subsection Audible AAX
+diff --git a/libavformat/isom.h b/libavformat/isom.h
+index ef8f19b18c..625dea8421 100644
+--- a/libavformat/isom.h
++++ b/libavformat/isom.h
+@@ -305,6 +305,7 @@ typedef struct MOVContext {
+     int32_t movie_display_matrix[3][3]; ///< display matrix from mvhd
+     int have_read_mfra_size;
+     uint32_t mfra_size;
++    uint32_t max_stts_delta;
+ } MOVContext;
+ 
+ int ff_mp4_read_descr_len(AVIOContext *pb);
+diff --git a/libavformat/mov.c b/libavformat/mov.c
+index 2aed6e80ef..351ecde770 100644
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -2925,6 +2925,8 @@ static int mov_read_stts(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+     unsigned int i, entries, alloc_size = 0;
+     int64_t duration = 0;
+     int64_t total_sample_count = 0;
++    int64_t current_dts = 0;
++    int64_t corrected_dts = 0;
+ 
+     if (c->fc->nb_streams < 1)
+         return 0;
+@@ -2965,11 +2967,34 @@ static int mov_read_stts(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+         sc->stts_data[i].count= sample_count;
+         sc->stts_data[i].duration= sample_duration;
+ 
+-        av_log(c->fc, AV_LOG_TRACE, "sample_count=%d, sample_duration=%d\n",
++        av_log(c->fc, AV_LOG_TRACE, "sample_count=%u, sample_duration=%u\n",
+                 sample_count, sample_duration);
+ 
+-        duration+=(int64_t)sample_duration*(uint64_t)sample_count;
+-        total_sample_count+=sample_count;
++        /* STTS sample offsets are uint32 but some files store it as int32
++         * with negative values used to correct DTS delays.
++           There may be abnormally large values as well. */
++        if (sample_duration > c->max_stts_delta) {
++            // assume high delta is a correction if negative when cast as int32
++            int32_t delta_magnitude = (int32_t)sample_duration;
++            av_log(c->fc, AV_LOG_WARNING, "Too large sample offset %u in stts entry %u with count %u in st:%d. Clipping to 1.\n",
++                   sample_duration, i, sample_count, st->index);
++            sc->stts_data[i].duration = 1;
++            corrected_dts += (delta_magnitude < 0 ? (int64_t)delta_magnitude : 1) * sample_count;
++        } else {
++            corrected_dts += sample_duration * sample_count;
++        }
++
++        current_dts += sc->stts_data[i].duration * sample_count;
++
++        if (current_dts > corrected_dts) {
++            int64_t drift = (current_dts - corrected_dts)/FFMAX(sample_count, 1);
++            uint32_t correction = (sc->stts_data[i].duration > drift) ? drift : sc->stts_data[i].duration - 1;
++            current_dts -= correction * sample_count;
++            sc->stts_data[i].duration -= correction;
++        }
++
++        duration+=(int64_t)sc->stts_data[i].duration*(uint64_t)sc->stts_data[i].count;
++        total_sample_count+=sc->stts_data[i].count;
+     }
+ 
+     sc->stts_count = i;
+@@ -3856,13 +3881,10 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
+         unsigned int distance = 0;
+         unsigned int rap_group_index = 0;
+         unsigned int rap_group_sample = 0;
+-        int64_t last_dts = 0;
+-        int64_t dts_correction = 0;
+         int rap_group_present = sc->rap_group_count && sc->rap_group;
+         int key_off = (sc->keyframe_count && sc->keyframes[0] > 0) || (sc->stps_count && sc->stps_data[0] > 0);
+ 
+         current_dts -= sc->dts_shift;
+-        last_dts     = current_dts;
+ 
+         if (!sc->sample_count || sti->nb_index_entries)
+             return;
+@@ -3973,26 +3995,8 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
+                 current_offset += sample_size;
+                 stream_size += sample_size;
+ 
+-                /* A negative sample duration is invalid based on the spec,
+-                 * but some samples need it to correct the DTS. */
+-                if (sc->stts_data[stts_index].duration < 0) {
+-                    av_log(mov->fc, AV_LOG_WARNING,
+-                           "Invalid SampleDelta %d in STTS, at %d st:%d\n",
+-                           sc->stts_data[stts_index].duration, stts_index,
+-                           st->index);
+-                    dts_correction += sc->stts_data[stts_index].duration - 1;
+-                    sc->stts_data[stts_index].duration = 1;
+-                }
+                 current_dts += sc->stts_data[stts_index].duration;
+-                if (!dts_correction || current_dts + dts_correction > last_dts) {
+-                    current_dts += dts_correction;
+-                    dts_correction = 0;
+-                } else {
+-                    /* Avoid creating non-monotonous DTS */
+-                    dts_correction += current_dts - last_dts - 1;
+-                    current_dts = last_dts + 1;
+-                }
+-                last_dts = current_dts;
++
+                 distance++;
+                 stts_sample++;
+                 current_sample++;
+@@ -8577,6 +8581,7 @@ static const AVOption mov_options[] = {
+     { "decryption_key", "The media decryption key (hex)", OFFSET(decryption_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
+     { "enable_drefs", "Enable external track support.", OFFSET(enable_drefs), AV_OPT_TYPE_BOOL,
+         {.i64 = 0}, 0, 1, FLAGS },
++    { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
+ 
+     { NULL },
+ };
+-- 
+2.25.1
+

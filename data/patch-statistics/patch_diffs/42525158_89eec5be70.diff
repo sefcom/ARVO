@@ -1,0 +1,60 @@
+From adfe003f518dac098ba9cdabcd6158fa55383710 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Thu, 8 Jun 2023 18:17:46 +0200
+Subject: [PATCH] avcodec/mpegvideo_dec: Add NULL pointer checks to
+ MPV_motion_lowres()
+
+This makes the null pointer checks match mpv_motion_internal()
+
+Fixes: NULL pointer dereference
+Fixes: 59671/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_MPEG1VIDEO_fuzzer-4993004566609920
+Fixes: 59678/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_MPEGVIDEO_fuzzer-4893168991338496
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/mpegvideo_dec.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/libavcodec/mpegvideo_dec.c b/libavcodec/mpegvideo_dec.c
+index c87ca77ae6..fcca147cd6 100644
+--- a/libavcodec/mpegvideo_dec.c
++++ b/libavcodec/mpegvideo_dec.c
+@@ -885,10 +885,9 @@ static inline void MPV_motion_lowres(MpegEncContext *s,
+                                s->mv[dir][1][0], s->mv[dir][1][1],
+                                block_s, mb_y);
+         } else {
+-            if (s->picture_structure != s->field_select[dir][0] + 1 &&
+-                s->pict_type != AV_PICTURE_TYPE_B && !s->first_field) {
++            if (   s->picture_structure != s->field_select[dir][0] + 1 && s->pict_type != AV_PICTURE_TYPE_B && !s->first_field
++                || !ref_picture[0]) {
+                 ref_picture = s->current_picture_ptr->f->data;
+-
+             }
+             mpeg_motion_lowres(s, dest_y, dest_cb, dest_cr,
+                                0, 0, s->field_select[dir][0],
+@@ -901,8 +900,9 @@ static inline void MPV_motion_lowres(MpegEncContext *s,
+         for (int i = 0; i < 2; i++) {
+             uint8_t *const *ref2picture;
+ 
+-            if (s->picture_structure == s->field_select[dir][i] + 1 ||
+-                s->pict_type == AV_PICTURE_TYPE_B || s->first_field) {
++            if ((s->picture_structure == s->field_select[dir][i] + 1 ||
++                 s->pict_type == AV_PICTURE_TYPE_B || s->first_field) &&
++                ref_picture[0]) {
+                 ref2picture = ref_picture;
+             } else {
+                 ref2picture = s->current_picture_ptr->f->data;
+@@ -933,6 +933,9 @@ static inline void MPV_motion_lowres(MpegEncContext *s,
+                 pix_op = s->h264chroma.avg_h264_chroma_pixels_tab;
+             }
+         } else {
++            if (!ref_picture[0]) {
++                ref_picture = s->current_picture_ptr->f->data;
++            }
+             for (int i = 0; i < 2; i++) {
+                 mpeg_motion_lowres(s, dest_y, dest_cb, dest_cr,
+                                    0, 0, s->picture_structure != i + 1,
+-- 
+2.25.1
+

@@ -1,0 +1,97 @@
+From 6a3ac623b960905b3450b78e7614453dae0540ed Mon Sep 17 00:00:00 2001
+From: Alex Rebert <alexandre.rebert@gmail.com>
+Date: Thu, 28 Oct 2021 23:13:29 -0400
+Subject: [PATCH] Fix out-of-bounds reads in OpenDDLParser
+
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=31795
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24463
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=36594
+---
+ contrib/openddlparser/code/OpenDDLParser.cpp  | 20 +++++++++++--------
+ .../openddlparser/OpenDDLParserUtils.h        |  3 ++-
+ 2 files changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/contrib/openddlparser/code/OpenDDLParser.cpp b/contrib/openddlparser/code/OpenDDLParser.cpp
+index 0c9e0bd980..e2bef97a74 100644
+--- a/contrib/openddlparser/code/OpenDDLParser.cpp
++++ b/contrib/openddlparser/code/OpenDDLParser.cpp
+@@ -292,12 +292,15 @@ char *OpenDDLParser::parseHeader(char *in, char *end) {
+ 
+         Property *first(nullptr);
+         in = lookForNextToken(in, end);
+-        if (*in == Grammar::OpenPropertyToken[0]) {
++        if (in != end && *in == Grammar::OpenPropertyToken[0]) {
+             in++;
+             Property *prop(nullptr), *prev(nullptr);
+-            while (*in != Grammar::ClosePropertyToken[0] && in != end) {
++            while (in != end && *in != Grammar::ClosePropertyToken[0]) {
+                 in = OpenDDLParser::parseProperty(in, end, &prop);
+                 in = lookForNextToken(in, end);
++                if(in == end) {
++                    break;
++                }
+ 
+                 if (*in != Grammar::CommaSeparator[0] && *in != Grammar::ClosePropertyToken[0]) {
+                     logInvalidTokenError(in, Grammar::ClosePropertyToken, m_logCallback);
+@@ -314,7 +317,9 @@ char *OpenDDLParser::parseHeader(char *in, char *end) {
+                     prev = prop;
+                 }
+             }
+-            ++in;
++            if(in != end) {
++                ++in;
++            }
+         }
+ 
+         // set the properties
+@@ -479,7 +484,7 @@ void OpenDDLParser::normalizeBuffer(std::vector<char> &buffer) {
+         // check for a comment
+         if (isCommentOpenTag(c, end)) {
+             ++readIdx;
+-            while (!isCommentCloseTag(&buffer[readIdx], end)) {
++            while (readIdx < len && !isCommentCloseTag(&buffer[readIdx], end)) {
+                 ++readIdx;
+             }
+             ++readIdx;
+@@ -489,7 +494,7 @@ void OpenDDLParser::normalizeBuffer(std::vector<char> &buffer) {
+             if (isComment<char>(c, end)) {
+                 ++readIdx;
+                 // skip the comment and the rest of the line
+-                while (!isEndofLine(buffer[readIdx])) {
++                while (readIdx < len && !isEndofLine(buffer[readIdx])) {
+                     ++readIdx;
+                 }
+             }
+@@ -548,8 +553,7 @@ char *OpenDDLParser::parseIdentifier(char *in, char *end, Text **id) {
+     // get size of id
+     size_t idLen(0);
+     char *start(in);
+-    while (!isSeparator(*in) &&
+-            !isNewLine(*in) && (in != end) &&
++    while ((in != end) && !isSeparator(*in) && !isNewLine(*in) &&
+             *in != Grammar::OpenPropertyToken[0] &&
+             *in != Grammar::ClosePropertyToken[0] &&
+             *in != '$') {
+@@ -861,7 +865,7 @@ char *OpenDDLParser::parseProperty(char *in, char *end, Property **prop) {
+     in = parseIdentifier(in, end, &id);
+     if (nullptr != id) {
+         in = lookForNextToken(in, end);
+-        if (*in == '=') {
++        if (in != end && *in == '=') {
+             ++in;
+             in = getNextToken(in, end);
+             Value *primData(nullptr);
+diff --git a/contrib/openddlparser/include/openddlparser/OpenDDLParserUtils.h b/contrib/openddlparser/include/openddlparser/OpenDDLParserUtils.h
+index 5f177f2525..42ad675f8d 100644
+--- a/contrib/openddlparser/include/openddlparser/OpenDDLParserUtils.h
++++ b/contrib/openddlparser/include/openddlparser/OpenDDLParserUtils.h
+@@ -318,7 +318,8 @@ static const unsigned char chartype_table[256] = {
+ 
+ template <class T>
+ inline bool isNumeric(const T in) {
+-    return (chartype_table[static_cast<size_t>(in)] == 1);
++    size_t idx = static_cast<size_t>(in);
++    return idx < sizeof(chartype_table) && (chartype_table[idx] == 1);
+ }
+ 
+ template <class T>

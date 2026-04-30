@@ -1,0 +1,215 @@
+From 50c87e92fc22ae3da5dda6f7340d3b786c6117a4 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Fri, 12 Jun 2020 14:57:08 +0200
+Subject: [PATCH] Use GC stack in nested data removal
+
+We should be doing this anyway to prevent stack overflow, but on
+master this is important for an additional reason: The temporary
+GC buffer provided for get_gc handlers may get reused if the scan
+is performed recursively instead of indirected via the GC stack.
+
+This fixes oss-fuzz #23350.
+---
+ Zend/tests/gc_043.phpt | 44 ++++++++++++++++++++++++++++++++++++++++++
+ Zend/zend_gc.c         | 43 +++++++++++++++++++++++------------------
+ 2 files changed, 68 insertions(+), 19 deletions(-)
+ create mode 100644 Zend/tests/gc_043.phpt
+
+diff --git a/Zend/tests/gc_043.phpt b/Zend/tests/gc_043.phpt
+new file mode 100644
+index 0000000000000..06b64de39acf9
+--- /dev/null
++++ b/Zend/tests/gc_043.phpt
+@@ -0,0 +1,44 @@
++--TEST--
++GC buffer shouldn't get reused when removing nested data
++--FILE--
++<?php
++$s = <<<'STR'
++O:8:"stdClass":2:{i:5;C:8:"SplStack":29:{i:4;:r:1;:O:8:"stdClass":0:{}}i:0;O:13:"RegexIterator":1:{i:5;C:8:"SplStack":29:{i:4;:r:1;:O:8:"stdClass":0:{}}}}
++STR;
++var_dump(unserialize($s));
++gc_collect_cycles();
++?>
++--EXPECT--
++object(stdClass)#1 (2) {
++  ["5"]=>
++  object(SplStack)#2 (2) {
++    ["flags":"SplDoublyLinkedList":private]=>
++    int(4)
++    ["dllist":"SplDoublyLinkedList":private]=>
++    array(2) {
++      [0]=>
++      *RECURSION*
++      [1]=>
++      object(stdClass)#3 (0) {
++      }
++    }
++  }
++  ["0"]=>
++  object(RegexIterator)#4 (2) {
++    ["replacement"]=>
++    NULL
++    ["5"]=>
++    object(SplStack)#5 (2) {
++      ["flags":"SplDoublyLinkedList":private]=>
++      int(4)
++      ["dllist":"SplDoublyLinkedList":private]=>
++      array(2) {
++        [0]=>
++        *RECURSION*
++        [1]=>
++        object(stdClass)#6 (0) {
++        }
++      }
++    }
++  }
++}
+diff --git a/Zend/zend_gc.c b/Zend/zend_gc.c
+index 0b895792da86f..5dd11f1597b4b 100644
+--- a/Zend/zend_gc.c
++++ b/Zend/zend_gc.c
+@@ -1328,14 +1328,14 @@ static int gc_collect_roots(uint32_t *flags, gc_stack *stack)
+ 	return count;
+ }
+ 
+-static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffer *root)
++static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffer *root, gc_stack *stack)
+ {
+ 	HashTable *ht = NULL;
+ 	Bucket *p, *end;
+ 	zval *zv;
+ 	int count = 0;
++	GC_STACK_DCL(stack);
+ 
+-tail_call:
+ 	do {
+ 		if (root) {
+ 			root = NULL;
+@@ -1348,11 +1348,11 @@ static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffe
+ 		} else if (GC_TYPE(ref) == IS_REFERENCE) {
+ 			if (Z_REFCOUNTED(((zend_reference*)ref)->val)) {
+ 				ref = Z_COUNTED(((zend_reference*)ref)->val);
+-				goto tail_call;
++				continue;
+ 			}
+-			return count;
++			goto next;
+ 		} else {
+-			return count;
++			goto next;
+ 		}
+ 
+ 		if (GC_TYPE(ref) == IS_OBJECT) {
+@@ -1364,10 +1364,10 @@ static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffe
+ 
+ 				ht = obj->handlers->get_gc(obj, &zv, &n);
+ 				if (EXPECTED(!ht)) {
+-					if (!n) return count;
++					if (!n) goto next;
+ 					end = zv + n;
+ 					while (!Z_REFCOUNTED_P(--end)) {
+-						if (zv == end) return count;
++						if (zv == end) goto next;
+ 					}
+ 				} else {
+ 					if (!n) goto handle_ht;
+@@ -1376,13 +1376,13 @@ static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffe
+ 				while (zv != end) {
+ 					if (Z_REFCOUNTED_P(zv)) {
+ 						ref = Z_COUNTED_P(zv);
+-						count += gc_remove_nested_data_from_buffer(ref, NULL);
++						GC_STACK_PUSH(ref);
+ 					}
+ 					zv++;
+ 				}
+ 				if (EXPECTED(!ht)) {
+ 					ref = Z_COUNTED_P(zv);
+-					goto tail_call;
++					continue;
+ 				}
+ handle_ht:
+ 				if (GC_REF_ADDRESS(ht) != 0 && GC_REF_CHECK_COLOR(ht, GC_BLACK)) {
+@@ -1390,15 +1390,15 @@ static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffe
+ 					GC_REMOVE_FROM_BUFFER(ht);
+ 				}
+ 			} else {
+-				return count;
++				goto next;
+ 			}
+ 		} else if (GC_TYPE(ref) == IS_ARRAY) {
+ 			ht = (zend_array*)ref;
+ 		} else {
+-			return count;
++			goto next;
+ 		}
+ 
+-		if (!ht->nNumUsed) return count;
++		if (!ht->nNumUsed) goto next;
+ 		p = ht->arData;
+ 		end = p + ht->nNumUsed;
+ 		while (1) {
+@@ -1410,7 +1410,7 @@ static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffe
+ 			if (Z_REFCOUNTED_P(zv)) {
+ 				break;
+ 			}
+-			if (p == end) return count;
++			if (p == end) goto next;
+ 		}
+ 		while (p != end) {
+ 			zv = &p->val;
+@@ -1419,7 +1419,7 @@ static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffe
+ 			}
+ 			if (Z_REFCOUNTED_P(zv)) {
+ 				ref = Z_COUNTED_P(zv);
+-				count += gc_remove_nested_data_from_buffer(ref, NULL);
++				GC_STACK_PUSH(ref);
+ 			}
+ 			p++;
+ 		}
+@@ -1428,8 +1428,12 @@ static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffe
+ 			zv = Z_INDIRECT_P(zv);
+ 		}
+ 		ref = Z_COUNTED_P(zv);
+-		goto tail_call;
+-	} while (0);
++		continue;
++
++next:
++		ref = GC_STACK_POP();
++	} while (ref);
++	return count;
+ }
+ 
+ static void zend_get_gc_buffer_release();
+@@ -1464,11 +1468,10 @@ ZEND_API int zend_gc_collect_cycles(void)
+ 		GC_TRACE("Collecting roots");
+ 		count = gc_collect_roots(&gc_flags, &stack);
+ 
+-		gc_stack_free(&stack);
+-
+ 		if (!GC_G(num_roots)) {
+ 			/* nothing to free */
+ 			GC_TRACE("Nothing to free");
++			gc_stack_free(&stack);
+ 			zend_get_gc_buffer_release();
+ 			GC_G(gc_active) = 0;
+ 			return 0;
+@@ -1518,7 +1521,7 @@ ZEND_API int zend_gc_collect_cycles(void)
+ 			while (idx != end) {
+ 				if (GC_IS_DTOR_GARBAGE(current->ref)) {
+ 					p = GC_GET_PTR(current->ref);
+-					count -= gc_remove_nested_data_from_buffer(p, current);
++					count -= gc_remove_nested_data_from_buffer(p, current, &stack);
+ 				}
+ 				current++;
+ 				idx++;
+@@ -1557,6 +1560,8 @@ ZEND_API int zend_gc_collect_cycles(void)
+ 			}
+ 		}
+ 
++		gc_stack_free(&stack);
++
+ 		/* Destroy zvals. The root buffer may be reallocated. */
+ 		GC_TRACE("Destroying zvals");
+ 		idx = GC_FIRST_ROOT;

@@ -1,0 +1,95 @@
+From 6e3b7982dbcf8087374694253e0e248fbc6c6e3e Mon Sep 17 00:00:00 2001
+From: m-holger <m-holger@kubitscheck.org>
+Date: Wed, 17 Jan 2024 10:39:06 +0000
+Subject: [PATCH] Fix incorrect handling of invalid negative object ids
+
+Fix two errors introduced in #1110 and #1112. Since
+#1110, encountering the invalid indirect reference #1110
+-2147483648 n R produces an integer underflow which, if
+ undetected, immediately trigger a logic error. Since
+ #1112, object -1 0 R may be incorrectly identified as
+ an earlier generation of itself and deleted,
+ invalidating a live iterator.
+---
+ fuzz/CMakeLists.txt        |   2 ++
+ fuzz/qpdf_extra/65773.fuzz |   1 +
+ fuzz/qpdf_extra/65777.fuzz | Bin 0 -> 67 bytes
+ fuzz/qtest/fuzz.test       |   2 +-
+ libqpdf/QPDF.cc            |   9 +++++----
+ 5 files changed, 9 insertions(+), 5 deletions(-)
+ create mode 100644 fuzz/qpdf_extra/65773.fuzz
+ create mode 100644 fuzz/qpdf_extra/65777.fuzz
+
+diff --git a/fuzz/CMakeLists.txt b/fuzz/CMakeLists.txt
+index df1fa8074..e4a8cf36e 100644
+--- a/fuzz/CMakeLists.txt
++++ b/fuzz/CMakeLists.txt
+@@ -111,6 +111,8 @@ set(CORPUS_OTHER
+   37740.fuzz
+   57639.fuzz
+   65681.fuzz
++  65773.fuzz
++  65777.fuzz
+ )
+ 
+ set(CORPUS_DIR ${CMAKE_CURRENT_BINARY_DIR}/qpdf_corpus)
+diff --git a/fuzz/qpdf_extra/65773.fuzz b/fuzz/qpdf_extra/65773.fuzz
+new file mode 100644
+index 000000000..2d0aabf58
+--- /dev/null
++++ b/fuzz/qpdf_extra/65773.fuzz
+@@ -0,0 +1 @@
++trailer<</Root<<[-2147483648 7 R 8 4 R]>>>>
+\ No newline at end of file
+diff --git a/fuzz/qpdf_extra/65777.fuzz b/fuzz/qpdf_extra/65777.fuzz
+new file mode 100644
+index 0000000000000000000000000000000000000000..066c960b11f99e6eecc3b4b9832b271aa1814b7e
+GIT binary patch
+literal 67
+zcmY$eP%u!)Ps*~f(GSk7N>wn@52-9j)sF~DP16sLHdHWDFpRacD=sNYP0VFbP*7mt
+R(lvzWP)N;70cuqE4*+-p6H5R9
+
+literal 0
+HcmV?d00001
+
+diff --git a/fuzz/qtest/fuzz.test b/fuzz/qtest/fuzz.test
+index adce995c6..7ca371fd0 100644
+--- a/fuzz/qtest/fuzz.test
++++ b/fuzz/qtest/fuzz.test
+@@ -20,7 +20,7 @@ my @fuzzers = (
+     ['pngpredictor' => 1],
+     ['runlength' => 6],
+     ['tiffpredictor' => 1],
+-    ['qpdf' => 54],             # increment when adding new files
++    ['qpdf' => 56],             # increment when adding new files
+     );
+ 
+ my $n_tests = 0;
+diff --git a/libqpdf/QPDF.cc b/libqpdf/QPDF.cc
+index 89d4a0a88..8cff3dfd2 100644
+--- a/libqpdf/QPDF.cc
++++ b/libqpdf/QPDF.cc
+@@ -709,10 +709,11 @@ QPDF::read_xref(qpdf_offset_t xref_offset)
+ 
+     // Make sure we keep only the highest generation for any object.
+     QPDFObjGen last_og{-1, 0};
+-    for (auto const& og: m->xref_table) {
+-        if (og.first.getObj() == last_og.getObj())
++    for (auto const& item: m->xref_table) {
++        auto id = item.first.getObj();
++        if (id == last_og.getObj() && id > 0)
+             removeObject(last_og);
+-        last_og = og.first;
++        last_og = item.first;
+     }
+ }
+ 
+@@ -2405,7 +2406,7 @@ QPDF::getCompressibleObjGens()
+     while (!queue.empty()) {
+         auto obj = queue.back();
+         queue.pop_back();
+-        if (obj.isIndirect()) {
++        if (obj.getObjectID() > 0) {
+             QPDFObjGen og = obj.getObjGen();
+             const size_t id = toS(og.getObj() - 1);
+             if (id >= max_obj)

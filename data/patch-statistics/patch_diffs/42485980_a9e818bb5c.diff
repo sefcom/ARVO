@@ -1,0 +1,1359 @@
+From db15b372a13380693c9ebd33d270c6bddf394883 Mon Sep 17 00:00:00 2001
+From: Greg Landrum <greg.landrum@gmail.com>
+Date: Sat, 22 Jan 2022 04:30:06 +0100
+Subject: [PATCH] Fix some problems turned up by ossfuzz (#4927)
+
+* resolves oss-fuzz #24399
+
+* clean up some undefined behavior
+
+* fix some UB in mergeQueryHs
+
+* be more defensive
+
+* defensive programming
+
+* fix a _cxsmilesBondIdx bug
+
+* more defensive programming
+---
+ Code/GraphMol/AddHs.cpp                       |  18 +-
+ .../GraphMol/FileParsers/MolSGroupParsing.cpp |  31 +++-
+ Code/GraphMol/FileParsers/MolSGroupParsing.h  |  11 +-
+ .../FileParsers/file_parsers_catch.cpp        |  60 +++++++
+ Code/GraphMol/MolDraw2D/MolDraw2D.cpp         |   3 +-
+ .../MolEnumerator/PositionVariation.cpp       |   3 +-
+ Code/GraphMol/MolPickler.cpp                  |   3 +-
+ Code/GraphMol/QueryOps.cpp                    |  17 +-
+ Code/GraphMol/SmilesParse/CXSmilesOps.cpp     |  53 +++---
+ Code/GraphMol/SmilesParse/SmartsWrite.cpp     | 159 +++++++++---------
+ Code/GraphMol/SmilesParse/SmartsWrite.h       |  12 +-
+ .../GraphMol/SmilesParse/smiles.tab.cpp.cmake | 155 +++++++++--------
+ Code/GraphMol/SmilesParse/smiles.yy           |   1 -
+ 13 files changed, 305 insertions(+), 221 deletions(-)
+
+diff --git a/Code/GraphMol/AddHs.cpp b/Code/GraphMol/AddHs.cpp
+index c133aebc285..dacb02a2365 100644
+--- a/Code/GraphMol/AddHs.cpp
++++ b/Code/GraphMol/AddHs.cpp
+@@ -1099,12 +1099,12 @@ void mergeQueryHs(RWMol &mol, bool mergeUnmappedOnly) {
+ 
+       // recurse if needed (was github isusue 544)
+       if (atom->hasQuery()) {
+-        // std::cerr<<"  q: "<<atom->getQuery()->getDescription()<<std::endl;
+         if (atom->getQuery()->getDescription() == "RecursiveStructure") {
+-          auto *rqm = static_cast<RWMol *>(const_cast<ROMol *>(
+-              static_cast<RecursiveStructureQuery *>(atom->getQuery())
+-                  ->getQueryMol()));
++          auto *rsq = dynamic_cast<RecursiveStructureQuery *>(atom->getQuery());
++          CHECK_INVARIANT(rsq, "could not convert recursive structure query");
++          RWMol *rqm = new RWMol(*rsq->getQueryMol());
+           mergeQueryHs(*rqm, mergeUnmappedOnly);
++          rsq->setQueryMol(rqm);
+         }
+ 
+         // FIX: shouldn't be repeating this code here
+@@ -1113,14 +1113,12 @@ void mergeQueryHs(RWMol &mol, bool mergeUnmappedOnly) {
+         while (childStack.size()) {
+           QueryAtom::QUERYATOM_QUERY::CHILD_TYPE qry = childStack.front();
+           childStack.pop_front();
+-          // std::cerr<<"      child: "<<qry->getDescription()<<std::endl;
+           if (qry->getDescription() == "RecursiveStructure") {
+-            // std::cerr<<"    recurse"<<std::endl;
+-            auto *rqm = static_cast<RWMol *>(const_cast<ROMol *>(
+-                static_cast<RecursiveStructureQuery *>(qry.get())
+-                    ->getQueryMol()));
++            auto *rsq = dynamic_cast<RecursiveStructureQuery *>(qry.get());
++            CHECK_INVARIANT(rsq, "could not convert recursive structure query");
++            RWMol *rqm = new RWMol(*rsq->getQueryMol());
+             mergeQueryHs(*rqm, mergeUnmappedOnly);
+-            // std::cerr<<"    back"<<std::endl;
++            rsq->setQueryMol(rqm);
+           } else if (qry->beginChildren() != qry->endChildren()) {
+             childStack.insert(childStack.end(), qry->beginChildren(),
+                               qry->endChildren());
+diff --git a/Code/GraphMol/FileParsers/MolSGroupParsing.cpp b/Code/GraphMol/FileParsers/MolSGroupParsing.cpp
+index 5d9b97fd1db..e5c7ae4892b 100644
+--- a/Code/GraphMol/FileParsers/MolSGroupParsing.cpp
++++ b/Code/GraphMol/FileParsers/MolSGroupParsing.cpp
+@@ -934,7 +934,8 @@ void ParseSGroupV2000SBTLine(IDX_TO_SGROUP_MAP &sGroupMap, RWMol *mol,
+ /* ------------------ V3000 Utils  ------------------ */
+ 
+ template <class T>
+-std::vector<T> ParseV3000Array(std::stringstream &stream) {
++std::vector<T> ParseV3000Array(std::stringstream &stream, int maxV,
++                               bool strictParsing) {
+   auto paren = stream.get();  // discard parentheses
+   if (paren != '(') {
+     BOOST_LOG(rdWarningLog)
+@@ -944,6 +945,11 @@ std::vector<T> ParseV3000Array(std::stringstream &stream) {
+   unsigned int count;
+   stream >> count;
+   std::vector<T> values;
++  if (maxV >= 0 && count > static_cast<unsigned int>(maxV)) {
++    SGroupWarnOrThrow(strictParsing, "invalid count value");
++    return values;
++  }
++
+   values.reserve(count);
+   T value;
+   for (unsigned i = 0; i < count; ++i) {
+@@ -959,8 +965,9 @@ std::vector<T> ParseV3000Array(std::stringstream &stream) {
+ }
+ 
+ // force instantiation of the versions of this that we use
+-template std::vector<unsigned int> ParseV3000Array(std::stringstream &stream);
+-template std::vector<int> ParseV3000Array(std::stringstream &stream);
++template std::vector<unsigned int> ParseV3000Array(std::stringstream &stream,
++                                                   int, bool);
++template std::vector<int> ParseV3000Array(std::stringstream &stream, int, bool);
+ 
+ void ParseV3000CStateLabel(RWMol *mol, SubstanceGroup &sgroup,
+                            std::stringstream &stream, unsigned int line,
+@@ -1075,28 +1082,32 @@ void ParseV3000ParseLabel(const std::string &label,
+                           std::stringstream &lineStream, STR_VECT &dataFields,
+                           unsigned int line, SubstanceGroup &sgroup, size_t,
+                           RWMol *mol, bool strictParsing) {
++  PRECONDITION(mol, "bad mol");
+   // TODO: we could handle these in a more structured way
+   try {
+     if (label == "XBHEAD" || label == "XBCORR") {
+-      std::vector<unsigned int> bvect =
+-          ParseV3000Array<unsigned int>(lineStream);
++      std::vector<unsigned int> bvect = ParseV3000Array<unsigned int>(
++          lineStream, mol->getNumBonds(), strictParsing);
+       std::transform(bvect.begin(), bvect.end(), bvect.begin(),
+                      [](unsigned int v) -> unsigned int { return v - 1; });
+       sgroup.setProp(label, bvect);
+     } else if (label == "ATOMS") {
+-      for (auto atomIdx : ParseV3000Array<unsigned int>(lineStream)) {
++      for (auto atomIdx : ParseV3000Array<unsigned int>(
++               lineStream, mol->getNumAtoms(), strictParsing)) {
+         sgroup.addAtomWithBookmark(atomIdx);
+       }
+     } else if (label == "PATOMS") {
+-      for (auto patomIdx : ParseV3000Array<unsigned int>(lineStream)) {
++      for (auto patomIdx : ParseV3000Array<unsigned int>(
++               lineStream, mol->getNumAtoms(), strictParsing)) {
+         sgroup.addParentAtomWithBookmark(patomIdx);
+       }
+     } else if (label == "CBONDS" || label == "XBONDS") {
+-      for (auto bondIdx : ParseV3000Array<unsigned int>(lineStream)) {
++      for (auto bondIdx : ParseV3000Array<unsigned int>(
++               lineStream, mol->getNumBonds(), strictParsing)) {
+         sgroup.addBondWithBookmark(bondIdx);
+       }
+     } else if (label == "BRKXYZ") {
+-      auto coords = ParseV3000Array<double>(lineStream);
++      auto coords = ParseV3000Array<double>(lineStream, 9, strictParsing);
+       if (coords.size() != 9) {
+         std::ostringstream errout;
+         errout << "Unexpected number of coordinates for BRKXYZ on line "
+@@ -1167,6 +1178,8 @@ void ParseV3000ParseLabel(const std::string &label,
+ std::string ParseV3000SGroupsBlock(std::istream *inStream, unsigned int line,
+                                    unsigned int nSgroups, RWMol *mol,
+                                    bool strictParsing) {
++  PRECONDITION(inStream, "no stream");
++  PRECONDITION(mol, "no molecule");
+   unsigned int defaultLineNum = 0;
+   std::string defaultString;
+ 
+diff --git a/Code/GraphMol/FileParsers/MolSGroupParsing.h b/Code/GraphMol/FileParsers/MolSGroupParsing.h
+index acd239b1319..4f683a066d5 100644
+--- a/Code/GraphMol/FileParsers/MolSGroupParsing.h
++++ b/Code/GraphMol/FileParsers/MolSGroupParsing.h
+@@ -130,17 +130,18 @@ void ParseSGroupV2000SBTLine(IDX_TO_SGROUP_MAP &sGroupMap, RWMol *mol,
+ 
+ template <class T>
+ RDKIT_FILEPARSERS_EXPORT std::vector<T> ParseV3000Array(
+-    std::stringstream &stream);
++    std::stringstream &stream, int maxV = -1, bool strictParsing = false);
+ #if defined(_MSC_VER) && defined(RDKIT_DYN_LINK)
+ template RDKIT_FILEPARSERS_EXPORT std::vector<int> ParseV3000Array(
+-    std::stringstream &);
++    std::stringstream &, int, bool);
+ template RDKIT_FILEPARSERS_EXPORT std::vector<unsigned int> ParseV3000Array(
+-    std::stringstream &);
++    std::stringstream &, int, bool);
+ #endif
+ template <class T>
+-std::vector<T> ParseV3000Array(const std::string &s) {
++std::vector<T> ParseV3000Array(const std::string &s, int maxV = -1,
++                               bool strictParsing = false) {
+   std::stringstream stream(s);
+-  return ParseV3000Array<T>(stream);
++  return ParseV3000Array<T>(stream, maxV, strictParsing);
+ }
+ 
+ void ParseV3000CStateLabel(RWMol *mol, SubstanceGroup &sgroup,
+diff --git a/Code/GraphMol/FileParsers/file_parsers_catch.cpp b/Code/GraphMol/FileParsers/file_parsers_catch.cpp
+index 72f2efed6ee..13216fba0a4 100644
+--- a/Code/GraphMol/FileParsers/file_parsers_catch.cpp
++++ b/Code/GraphMol/FileParsers/file_parsers_catch.cpp
+@@ -4358,3 +4358,63 @@ M  END
+     REQUIRE(mol);
+   }
+ }
++TEST_CASE("checking array bounds") {
++  SECTION("XBONDS") {
++    auto mb = R"CTAB(
++  Mrv2108 01202214292D          
++
++  0  0  0     0  0            999 V3000
++M  V30 BEGIN CTAB
++M  V30 COUNTS 4 3 1 0 0
++M  V30 BEGIN ATOM
++M  V30 1 * -6.6667 7.5833 0 0
++M  V30 2 C -5.333 8.3533 0 0
++M  V30 3 C -3.9993 7.5833 0 0
++M  V30 4 * -2.6656 8.3533 0 0
++M  V30 END ATOM
++M  V30 BEGIN BOND
++M  V30 1 1 1 2
++M  V30 2 1 2 3
++M  V30 3 1 3 4
++M  V30 END BOND
++M  V30 BEGIN SGROUP
++M  V30 1 SRU 0 ATOMS=(2 2 3) XBONDS=(20 1 3) BRKXYZ=(9 -3.9121 8.7006 0 -
++M  V30 -2.9881 7.1002 0 0 0 0) BRKXYZ=(9 -5.4201 7.2361 0 -6.3441 8.8365 0 0 -
++M  V30 0 0) CONNECT=HT LABEL=n
++M  V30 END SGROUP
++M  V30 END CTAB
++M  END
++)CTAB";
++    std::unique_ptr<RWMol> mol;
++    REQUIRE_THROWS_AS(mol.reset(MolBlockToMol(mb)), FileParseException);
++  }
++  SECTION("ATOMS") {
++    auto mb = R"CTAB(
++  Mrv2108 01202214292D          
++
++  0  0  0     0  0            999 V3000
++M  V30 BEGIN CTAB
++M  V30 COUNTS 4 3 1 0 0
++M  V30 BEGIN ATOM
++M  V30 1 * -6.6667 7.5833 0 0
++M  V30 2 C -5.333 8.3533 0 0
++M  V30 3 C -3.9993 7.5833 0 0
++M  V30 4 * -2.6656 8.3533 0 0
++M  V30 END ATOM
++M  V30 BEGIN BOND
++M  V30 1 1 1 2
++M  V30 2 1 2 3
++M  V30 3 1 3 4
++M  V30 END BOND
++M  V30 BEGIN SGROUP
++M  V30 1 SRU 0 ATOMS=(12 2 3) XBONDS=(2 1 3) BRKXYZ=(9 -3.9121 8.7006 0 -
++M  V30 -2.9881 7.1002 0 0 0 0) BRKXYZ=(9 -5.4201 7.2361 0 -6.3441 8.8365 0 0 -
++M  V30 0 0) CONNECT=HT LABEL=n
++M  V30 END SGROUP
++M  V30 END CTAB
++M  END
++)CTAB";
++    std::unique_ptr<RWMol> mol;
++    REQUIRE_THROWS_AS(mol.reset(MolBlockToMol(mb)), FileParseException);
++  }
++}
+\ No newline at end of file
+diff --git a/Code/GraphMol/MolDraw2D/MolDraw2D.cpp b/Code/GraphMol/MolDraw2D/MolDraw2D.cpp
+index 5f286e1deec..8422b4f9197 100644
+--- a/Code/GraphMol/MolDraw2D/MolDraw2D.cpp
++++ b/Code/GraphMol/MolDraw2D/MolDraw2D.cpp
+@@ -2814,7 +2814,8 @@ void MolDraw2D::extractVariableBonds(const ROMol &mol) {
+         bond->getPropIfPresent(common_properties::_MolFileBondAttach, attach)) {
+       // FIX: maybe distinguish between "ANY" and "ALL" values of attach here?
+       std::vector<unsigned int> oats =
+-          RDKit::SGroupParsing::ParseV3000Array<unsigned int>(endpts);
++          RDKit::SGroupParsing::ParseV3000Array<unsigned int>(
++              endpts, mol.getNumAtoms(), false);
+       atomsInvolved.reset();
+       // decrement the indices and do error checking:
+       for (auto &oat : oats) {
+diff --git a/Code/GraphMol/MolEnumerator/PositionVariation.cpp b/Code/GraphMol/MolEnumerator/PositionVariation.cpp
+index ba092a00563..1185ab8cc36 100644
+--- a/Code/GraphMol/MolEnumerator/PositionVariation.cpp
++++ b/Code/GraphMol/MolEnumerator/PositionVariation.cpp
+@@ -52,7 +52,8 @@ void PositionVariationOp::initFromMol() {
+       }
+       d_dummiesAtEachPoint.push_back(bond->getOtherAtomIdx(atom->getIdx()));
+       std::vector<unsigned int> oats =
+-          RDKit::SGroupParsing::ParseV3000Array<unsigned int>(endpts);
++          RDKit::SGroupParsing::ParseV3000Array<unsigned int>(
++              endpts, dp_mol->getNumAtoms(), false);
+       // decrement the indices and do error checking and whatever additional
+       // cleanup is required:
+       for (auto &oat : oats) {
+diff --git a/Code/GraphMol/MolPickler.cpp b/Code/GraphMol/MolPickler.cpp
+index 79d484d8f0a..bb901962c75 100644
+--- a/Code/GraphMol/MolPickler.cpp
++++ b/Code/GraphMol/MolPickler.cpp
+@@ -214,8 +214,7 @@ QueryDetails getQueryDetails(const Query<int, T const *, true> *query) {
+             ->getLower(),
+         static_cast<const RangeQuery<int, T const *, true> *>(query)
+             ->getUpper(),
+-        static_cast<const EqualityQuery<int, T const *, true> *>(query)
+-            ->getTol(),
++        static_cast<const RangeQuery<int, T const *, true> *>(query)->getTol(),
+         ends));
+   } else if (typeid(*query) == typeid(SetQuery<int, T const *, true>)) {
+     std::set<int32_t> tset(
+diff --git a/Code/GraphMol/QueryOps.cpp b/Code/GraphMol/QueryOps.cpp
+index f5a310281ac..a80d8f50f4f 100644
+--- a/Code/GraphMol/QueryOps.cpp
++++ b/Code/GraphMol/QueryOps.cpp
+@@ -941,18 +941,20 @@ bool isAtomAromatic(const Atom *a) {
+ 
+ namespace QueryOps {
+ namespace {
+-void completeQueryAndChildren(ATOM_EQUALS_QUERY *query, Atom *tgt,
++void completeQueryAndChildren(Atom::QUERYATOM_QUERY *query, Atom *tgt,
+                               unsigned int magicVal) {
+   PRECONDITION(query, "no query");
+   PRECONDITION(tgt, "no atom");
+-  if (static_cast<unsigned int>(query->getVal()) == magicVal) {
+-    int tgtVal = query->getDataFunc()(tgt);
+-    query->setVal(tgtVal);
++  auto eqQuery = dynamic_cast<ATOM_EQUALS_QUERY *>(query);
++  if (eqQuery) {
++    if (static_cast<unsigned int>(eqQuery->getVal()) == magicVal) {
++      int tgtVal = eqQuery->getDataFunc()(tgt);
++      eqQuery->setVal(tgtVal);
++    }
+   }
+   for (auto childIt = query->beginChildren(); childIt != query->endChildren();
+        ++childIt) {
+-    completeQueryAndChildren((ATOM_EQUALS_QUERY *)(childIt->get()), tgt,
+-                             magicVal);
++    completeQueryAndChildren(childIt->get(), tgt, magicVal);
+   }
+ }
+ }  // namespace
+@@ -960,8 +962,7 @@ void completeMolQueries(RWMol *mol, unsigned int magicVal) {
+   PRECONDITION(mol, "bad molecule");
+   for (auto atom : mol->atoms()) {
+     if (atom->hasQuery()) {
+-      auto *query = static_cast<ATOM_EQUALS_QUERY *>(atom->getQuery());
+-      completeQueryAndChildren(query, atom, magicVal);
++      completeQueryAndChildren(atom->getQuery(), atom, magicVal);
+     }
+   }
+ }
+diff --git a/Code/GraphMol/SmilesParse/CXSmilesOps.cpp b/Code/GraphMol/SmilesParse/CXSmilesOps.cpp
+index 5dce31c985f..d5e8a6b4c14 100644
+--- a/Code/GraphMol/SmilesParse/CXSmilesOps.cpp
++++ b/Code/GraphMol/SmilesParse/CXSmilesOps.cpp
+@@ -93,7 +93,7 @@ const std::string _tailCrossings = "_tailCrossings";
+ template <typename Iterator>
+ bool read_int(Iterator &first, Iterator last, unsigned int &res) {
+   std::string num = "";
+-  while (first != last && *first >= '0' && *first <= '9') {
++  while (first <= last && *first >= '0' && *first <= '9') {
+     num += *first;
+     ++first;
+   }
+@@ -108,7 +108,7 @@ bool read_int_list(Iterator &first, Iterator last,
+                    std::vector<unsigned int> &res, char sep = ',') {
+   while (1) {
+     std::string num = "";
+-    while (first != last && *first >= '0' && *first <= '9') {
++    while (first <= last && *first >= '0' && *first <= '9') {
+       num += *first;
+       ++first;
+     }
+@@ -140,7 +140,7 @@ std::string read_text_to(Iterator &first, Iterator last, std::string delims) {
+   std::string res = "";
+   Iterator start = first;
+   // EFF: there are certainly faster ways to do this
+-  while (first != last && delims.find_first_of(*first) == std::string::npos) {
++  while (first <= last && delims.find_first_of(*first) == std::string::npos) {
+     if (*first == '&' && std::distance(first, last) > 2 &&
+         *(first + 1) == '#') {
+       // escaped char
+@@ -316,18 +316,18 @@ bool parse_atom_values(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+   }
+   ++first;
+   unsigned int atIdx = 0;
+-  while (first != last && *first != '$') {
++  while (first <= last && *first != '$') {
+     std::string tkn = read_text_to(first, last, ";$");
+     if (tkn != "") {
+       mol.getAtomWithIdx(atIdx)->setProp(RDKit::common_properties::molFileValue,
+                                          tkn);
+     }
+     ++atIdx;
+-    if (first != last && *first != '$') {
++    if (first <= last && *first != '$') {
+       ++first;
+     }
+   }
+-  if (first == last || *first != '$') {
++  if (first >= last || *first != '$') {
+     return false;
+   }
+   ++first;
+@@ -339,16 +339,16 @@ bool parse_atom_props(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+   if (first >= last) {
+     return false;
+   }
+-  while (first != last && *first != '|' && *first != ',') {
++  while (first <= last && *first != '|' && *first != ',') {
+     unsigned int atIdx;
+     if (read_int(first, last, atIdx)) {
+-      if (first == last || *first != '.') {
++      if (first >= last || *first != '.') {
+         return false;
+       }
+       ++first;
+       std::string pname = read_text_to(first, last, ".");
+       if (pname != "") {
+-        if (first == last || *first != '.') {
++        if (first >= last || *first != '.') {
+           return false;
+         }
+         ++first;
+@@ -358,11 +358,11 @@ bool parse_atom_props(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+         }
+       }
+     }
+-    if (first != last && *first != '|' && *first != ',') {
++    if (first <= last && *first != '|' && *first != ',') {
+       ++first;
+     }
+   }
+-  if (first != last && *first != '|' && *first != ',') {
++  if (first <= last && *first != '|' && *first != ',') {
+     return false;
+   }
+   if (*first != '|') {
+@@ -378,18 +378,18 @@ bool parse_atom_labels(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+   }
+   ++first;
+   unsigned int atIdx = 0;
+-  while (first != last && *first != '$') {
++  while (first <= last && *first != '$') {
+     std::string tkn = read_text_to(first, last, ";$");
+     if (tkn != "") {
+       mol.getAtomWithIdx(atIdx)->setProp(RDKit::common_properties::atomLabel,
+                                          tkn);
+     }
+     ++atIdx;
+-    if (first != last && *first != '$') {
++    if (first <= last && *first != '$') {
+       ++first;
+     }
+   }
+-  if (first == last || *first != '$') {
++  if (first >= last || *first != '$') {
+     return false;
+   }
+   ++first;
+@@ -406,7 +406,7 @@ bool parse_coords(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+   mol.addConformer(conf);
+   ++first;
+   unsigned int atIdx = 0;
+-  while (first != last && *first != ')') {
++  while (first <= last && *first != ')') {
+     RDGeom::Point3D pt;
+     std::string tkn = read_text_to(first, last, ";)");
+     if (tkn != "") {
+@@ -425,11 +425,11 @@ bool parse_coords(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+ 
+     conf->setAtomPos(atIdx, pt);
+     ++atIdx;
+-    if (first != last && *first != ')') {
++    if (first <= last && *first != ')') {
+       ++first;
+     }
+   }
+-  if (first == last || *first != ')') {
++  if (first >= last || *first != ')') {
+     return false;
+   }
+   ++first;
+@@ -447,7 +447,7 @@ bool parse_coordinate_bonds(Iterator &first, Iterator last, RDKit::RWMol &mol,
+     return false;
+   }
+   ++first;
+-  while (first != last && *first >= '0' && *first <= '9') {
++  while (first <= last && *first >= '0' && *first <= '9') {
+     unsigned int aidx;
+     unsigned int bidx;
+     if (read_int_pair(first, last, aidx, bidx)) {
+@@ -603,6 +603,9 @@ bool parse_linknodes(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+     if (!read_int(first, last, startReps)) {
+       return false;
+     }
++    if (first + 1 >= last || *first != '.') {
++      return false;
++    }
+     ++first;
+     unsigned int endReps;
+     if (!read_int(first, last, endReps)) {
+@@ -732,7 +735,7 @@ bool parse_sgroup_hierarchy(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+     }
+     sgs[parentId].getPropIfPresent("index", parentId);
+ 
+-    if (first != last && *first == ':') {
++    if (first <= last && *first == ':') {
+       ++first;
+       std::vector<unsigned int> children;
+       if (!read_int_list(first, last, children, '.')) {
+@@ -744,7 +747,7 @@ bool parse_sgroup_hierarchy(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+         }
+         sgs[childId].setProp("PARENT", parentId);
+       }
+-      if (first != last && *first == ',') {
++      if (first <= last && *first == ',') {
+         ++first;
+       } else {
+         break;
+@@ -801,20 +804,20 @@ bool parse_polymer_sgroup(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+   }
+   std::vector<unsigned int> headCrossing;
+   std::vector<unsigned int> tailCrossing;
+-  if (first != last && *first == ':') {
++  if (first <= last && *first == ':') {
+     ++first;
+     std::string subscript = read_text_to(first, last, ":|");
+     if (!subscript.empty()) {
+       sgroup.setProp("LABEL", subscript);
+     }
+-    if (first != last && *first == ':') {
++    if (first <= last && *first == ':') {
+       ++first;
+       std::string superscript = read_text_to(first, last, ":|,");
+       if (!superscript.empty()) {
+         sgroup.setProp("CONNECT", superscript);
+       }
+ 
+-      if (first != last && *first == ':') {
++      if (first <= last && *first == ':') {
+         ++first;
+         if (!read_int_list(first, last, headCrossing)) {
+           return false;
+@@ -822,7 +825,7 @@ bool parse_polymer_sgroup(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+         if (!headCrossing.empty()) {
+           sgroup.setProp(_headCrossings, headCrossing, true);
+         }
+-        if (first != last && *first == ':') {
++        if (first <= last && *first == ':') {
+           ++first;
+           if (!read_int_list(first, last, tailCrossing)) {
+             return false;
+@@ -1041,7 +1044,7 @@ bool parse_enhanced_stereo(Iterator &first, Iterator last, RDKit::RWMol &mol) {
+   ++first;
+ 
+   std::vector<Atom *> atoms;
+-  while (first != last && *first >= '0' && *first <= '9') {
++  while (first <= last && *first >= '0' && *first <= '9') {
+     unsigned int aidx;
+     if (read_int(first, last, aidx)) {
+       Atom *atom = mol.getAtomWithIdx(aidx);
+diff --git a/Code/GraphMol/SmilesParse/SmartsWrite.cpp b/Code/GraphMol/SmilesParse/SmartsWrite.cpp
+index eb996d43bdd..bc5f7977c54 100644
+--- a/Code/GraphMol/SmilesParse/SmartsWrite.cpp
++++ b/Code/GraphMol/SmilesParse/SmartsWrite.cpp
+@@ -99,10 +99,12 @@ void describeQuery(const T *query, std::string leader = "\t") {
+ 
+ const static std::string _qatomHasStereoSet = "_qatomHasStereoSet";
+ std::string getAtomSmartsSimple(const QueryAtom *qatom,
+-                                const ATOM_EQUALS_QUERY *query,
++                                const Atom::QUERYATOM_QUERY *query,
+                                 bool &needParen) {
+   PRECONDITION(query, "bad query");
+ 
++  auto *equery = dynamic_cast<const ATOM_EQUALS_QUERY *>(query);
++
+   std::string descrip = query->getDescription();
+   bool hasVal = false;
+   enum class Modifiers : std::uint8_t { NONE, RANGE, LESS, GREATER };
+@@ -170,7 +172,7 @@ std::string getAtomSmartsSimple(const QueryAtom *qatom,
+     needParen = true;
+   } else if (descrip == "AtomInNRings") {
+     res << "R";
+-    if (mods == Modifiers::NONE && query->getVal() >= 0) {
++    if (mods == Modifiers::NONE && equery && equery->getVal() >= 0) {
+       hasVal = true;
+     }
+     needParen = true;
+@@ -189,7 +191,8 @@ std::string getAtomSmartsSimple(const QueryAtom *qatom,
+     hasVal = true;
+     needParen = true;
+   } else if (descrip == "AtomFormalCharge") {
+-    int val = query->getVal();
++    int val = equery ? equery->getVal() : 0;
++
+     if (val < 0) {
+       res << "-";
+     } else {
+@@ -200,7 +203,7 @@ std::string getAtomSmartsSimple(const QueryAtom *qatom,
+     }
+     needParen = true;
+   } else if (descrip == "AtomNegativeFormalCharge") {
+-    int val = query->getVal();
++    int val = equery ? equery->getVal() : 0;
+     if (val < 0) {
+       res << "+";
+     } else {
+@@ -210,9 +213,9 @@ std::string getAtomSmartsSimple(const QueryAtom *qatom,
+       res << abs(val);
+     }
+     needParen = true;
+-  } else if (descrip == "AtomHybridization") {
++  } else if (descrip == "AtomHybridization" && equery) {
+     res << "^";
+-    switch (query->getVal()) {
++    switch (equery->getVal()) {
+       case Atom::S:
+         res << "0";
+         break;
+@@ -233,11 +236,11 @@ std::string getAtomSmartsSimple(const QueryAtom *qatom,
+         break;
+     }
+     needParen = true;
+-  } else if (descrip == "AtomMass") {
+-    res << query->getVal() / massIntegerConversionFactor << "*";
++  } else if (descrip == "AtomMass" && equery) {
++    res << equery->getVal() / massIntegerConversionFactor << "*";
+     needParen = true;
+-  } else if (descrip == "AtomIsotope") {
+-    res << query->getVal() << "*";
++  } else if (descrip == "AtomIsotope" && equery) {
++    res << equery->getVal() << "*";
+     needParen = true;
+   } else if (descrip == "AtomRingBondCount") {
+     res << "x";
+@@ -246,10 +249,10 @@ std::string getAtomSmartsSimple(const QueryAtom *qatom,
+   } else if (descrip == "AtomUnsaturated") {
+     res << "$(*=,:,#*)";
+     needParen = true;
+-  } else if (descrip == "AtomType") {
++  } else if (descrip == "AtomType" && equery) {
+     int atNum;
+     bool isAromatic;
+-    parseAtomType(query->getVal(), atNum, isAromatic);
++    parseAtomType(equery->getVal(), atNum, isAromatic);
+     std::string symbol = PeriodicTable::getTable()->getElementSymbol(atNum);
+     if (isAromatic) {
+       symbol[0] += ('a' - 'A');
+@@ -267,23 +270,26 @@ std::string getAtomSmartsSimple(const QueryAtom *qatom,
+ 
+   if (mods != Modifiers::NONE) {
+     res << "{";
++    const ATOM_RANGE_QUERY *rquery = nullptr;
+     switch (mods) {
+       case Modifiers::LESS:
+-        res << ((const ATOM_LESSEQUAL_QUERY *)query)->getVal() << "-";
++        res << equery->getVal() << "-";
+         break;
+       case Modifiers::RANGE:
++        rquery = dynamic_cast<const ATOM_RANGE_QUERY *>(query);
++        CHECK_INVARIANT(rquery, "query could not be converted to range query");
+         res << ((const ATOM_RANGE_QUERY *)query)->getLower() << "-"
+             << ((const ATOM_RANGE_QUERY *)query)->getUpper();
+         break;
+       case Modifiers::GREATER:
+-        res << "-" << ((const ATOM_GREATEREQUAL_QUERY *)query)->getVal();
++        res << "-" << equery->getVal();
+         break;
+       default:
+         break;
+     }
+     res << "}";
+   } else if (hasVal) {
+-    res << query->getVal();
++    res << equery->getVal();
+   }
+ 
+   // handle atomic stereochemistry
+@@ -315,7 +321,8 @@ std::string getRecursiveStructureQuerySmarts(
+     const QueryAtom::QUERYATOM_QUERY *query) {
+   PRECONDITION(query, "bad query");
+   PRECONDITION(query->getDescription() == "RecursiveStructure", "bad query");
+-  const auto *rquery = static_cast<const RecursiveStructureQuery *>(query);
++  const auto *rquery = dynamic_cast<const RecursiveStructureQuery *>(query);
++  PRECONDITION(rquery, "could not convert query to RecursiveStructureQuery");
+   auto *qmol = const_cast<ROMol *>(rquery->getQueryMol());
+   std::string res = MolToSmarts(*qmol);
+   res = "$(" + res + ")";
+@@ -365,11 +372,13 @@ std::string getBasicBondRepr(Bond::BondType typ, Bond::BondDir dir,
+ }  // namespace
+ 
+ std::string getBondSmartsSimple(const Bond *bond,
+-                                const BOND_EQUALS_QUERY *bquery,
++                                const QueryBond::QUERYBOND_QUERY *bquery,
+                                 int atomToLeftIdx) {
+   PRECONDITION(bond, "bad bond");
+-
+   PRECONDITION(bquery, "bad query");
++
++  auto *equery = dynamic_cast<const BOND_EQUALS_QUERY *>(bquery);
++
+   std::string descrip = bquery->getDescription();
+   std::string res = "";
+   if (descrip == "BondNull") {
+@@ -384,8 +393,8 @@ std::string getBondSmartsSimple(const Bond *bond,
+     res += "=,:";
+   } else if (descrip == "SingleOrDoubleOrAromaticBond") {
+     res += "-,=,:";
+-  } else if (descrip == "BondDir") {
+-    int val = bquery->getVal();
++  } else if (descrip == "BondDir" && equery) {
++    int val = equery->getVal();
+     if (val == static_cast<int>(Bond::ENDDOWNRIGHT)) {
+       res += "\\";
+     } else if (val == static_cast<int>(Bond::ENDUPRIGHT)) {
+@@ -393,14 +402,14 @@ std::string getBondSmartsSimple(const Bond *bond,
+     } else {
+       throw "Can't write smarts for this bond dir type";
+     }
+-  } else if (descrip == "BondOrder") {
++  } else if (descrip == "BondOrder" && equery) {
+     bool reverseDative =
+         (atomToLeftIdx >= 0 &&
+          bond->getBeginAtomIdx() != static_cast<unsigned int>(atomToLeftIdx));
+     bool doIsoSmiles =
+         !bond->hasOwningMol() ||
+         bond->getOwningMol().hasProp(common_properties::_doIsoSmiles);
+-    res += getBasicBondRepr(static_cast<Bond::BondType>(bquery->getVal()),
++    res += getBasicBondRepr(static_cast<Bond::BondType>(equery->getVal()),
+                             bond->getBondDir(), doIsoSmiles, reverseDative);
+   } else {
+     std::stringstream msg;
+@@ -455,9 +464,8 @@ std::string _recurseGetSmarts(const QueryAtom *qatom,
+     features |= static_cast<unsigned int>(QueryBoolFeatures::HAS_RECURSION);
+   } else if ((dsc1 != "AtomOr") && (dsc1 != "AtomAnd")) {
+     // child 1 is a simple node
+-    const auto *tchild = static_cast<const ATOM_EQUALS_QUERY *>(child1);
+-    csmarts1 = getAtomSmartsSimple(qatom, tchild, needParen);
+-    bool nneg = (negate) ^ (tchild->getNegation());
++    csmarts1 = getAtomSmartsSimple(qatom, child1, needParen);
++    bool nneg = (negate) ^ (child1->getNegation());
+     if (nneg) {
+       csmarts1 = "!" + csmarts1;
+     }
+@@ -490,9 +498,8 @@ std::string _recurseGetSmarts(const QueryAtom *qatom,
+       features |= static_cast<unsigned int>(QueryBoolFeatures::HAS_RECURSION);
+     } else if ((dsc2 != "AtomOr") && (dsc2 != "AtomAnd")) {
+       // child 2 is a simple node
+-      const auto *tchild = static_cast<const ATOM_EQUALS_QUERY *>(child2);
+-      csmarts2 = getAtomSmartsSimple(qatom, tchild, needParen);
+-      bool nneg = (negate) ^ (tchild->getNegation());
++      csmarts2 = getAtomSmartsSimple(qatom, child2, needParen);
++      bool nneg = (negate) ^ (child2->getNegation());
+       if (nneg) {
+         csmarts2 = "!" + csmarts2;
+       }
+@@ -648,15 +655,15 @@ std::string FragmentSmartsConstruct(
+   for (auto &msCI : molStack) {
+     switch (msCI.type) {
+       case Canon::MOL_STACK_ATOM: {
+-        auto *qatm = static_cast<QueryAtom *>(msCI.obj.atom);
+-        res << SmartsWrite::GetAtomSmarts(qatm);
+-        atomOrdering.push_back(qatm->getIdx());
++        auto *atm = msCI.obj.atom;
++        res << SmartsWrite::GetAtomSmarts(atm);
++        atomOrdering.push_back(atm->getIdx());
+         break;
+       }
+       case Canon::MOL_STACK_BOND: {
+-        auto *qbnd = static_cast<QueryBond *>(msCI.obj.bond);
+-        res << SmartsWrite::GetBondSmarts(qbnd, msCI.number);
+-        bondOrdering.push_back(qbnd->getIdx());
++        auto *bnd = msCI.obj.bond;
++        res << SmartsWrite::GetBondSmarts(bnd, msCI.number);
++        bondOrdering.push_back(bnd->getIdx());
+         break;
+       }
+       case Canon::MOL_STACK_RING: {
+@@ -684,30 +691,30 @@ std::string FragmentSmartsConstruct(
+ 
+ // this is the used when converting a SMILES or
+ // non-query atom from a mol file into SMARTS.
+-std::string getNonQueryAtomSmarts(const QueryAtom *qatom) {
+-  PRECONDITION(qatom, "bad atom");
+-  PRECONDITION(!qatom->hasQuery(), "atom should not have query");
++std::string getNonQueryAtomSmarts(const Atom *atom) {
++  PRECONDITION(atom, "bad atom");
++  PRECONDITION(!atom->hasQuery(), "atom should not have query");
+   std::stringstream res;
+   res << "[";
+ 
+-  int isotope = qatom->getIsotope();
++  int isotope = atom->getIsotope();
+   if (isotope) {
+     res << isotope;
+   }
+ 
+-  if (SmilesWrite::inOrganicSubset(qatom->getAtomicNum())) {
+-    res << "#" << qatom->getAtomicNum();
++  if (SmilesWrite::inOrganicSubset(atom->getAtomicNum())) {
++    res << "#" << atom->getAtomicNum();
+   } else {
+-    res << qatom->getSymbol();
++    res << atom->getSymbol();
+   }
+ 
+-  if (qatom->hasOwningMol() &&
+-      qatom->getOwningMol().hasProp(common_properties::_doIsoSmiles)) {
+-    if (qatom->getChiralTag() != Atom::CHI_UNSPECIFIED &&
+-        !qatom->hasProp(_qatomHasStereoSet) &&
+-        !qatom->hasProp(common_properties::_brokenChirality)) {
+-      qatom->setProp(_qatomHasStereoSet, 1);
+-      switch (qatom->getChiralTag()) {
++  if (atom->hasOwningMol() &&
++      atom->getOwningMol().hasProp(common_properties::_doIsoSmiles)) {
++    if (atom->getChiralTag() != Atom::CHI_UNSPECIFIED &&
++        !atom->hasProp(_qatomHasStereoSet) &&
++        !atom->hasProp(common_properties::_brokenChirality)) {
++      atom->setProp(_qatomHasStereoSet, 1);
++      switch (atom->getChiralTag()) {
+         case Atom::CHI_TETRAHEDRAL_CW:
+           res << "@@";
+           break;
+@@ -720,7 +727,7 @@ std::string getNonQueryAtomSmarts(const QueryAtom *qatom) {
+     }
+   }
+ 
+-  auto hs = qatom->getNumExplicitHs();
++  auto hs = atom->getNumExplicitHs();
+   // FIX: probably should be smarter about Hs:
+   if (hs) {
+     res << "H";
+@@ -728,20 +735,20 @@ std::string getNonQueryAtomSmarts(const QueryAtom *qatom) {
+       res << hs;
+     }
+   }
+-  auto chg = qatom->getFormalCharge();
++  auto chg = atom->getFormalCharge();
+   if (chg) {
+     if (chg == -1) {
+       res << "-";
+     } else if (chg == 1) {
+       res << "+";
+     } else if (chg < 0) {
+-      res << qatom->getFormalCharge();
++      res << atom->getFormalCharge();
+     } else {
+-      res << "+" << qatom->getFormalCharge();
++      res << "+" << atom->getFormalCharge();
+     }
+   }
+   int mapNum;
+-  if (qatom->getPropIfPresent(common_properties::molAtomMapNumber, mapNum)) {
++  if (atom->getPropIfPresent(common_properties::molAtomMapNumber, mapNum)) {
+     res << ":";
+     res << mapNum;
+   }
+@@ -751,9 +758,8 @@ std::string getNonQueryAtomSmarts(const QueryAtom *qatom) {
+ 
+ // this is the used when converting a SMILES or
+ // non-query bond from a mol file into SMARTS.
+-std::string getNonQueryBondSmarts(const QueryBond *qbond, int atomToLeftIdx) {
++std::string getNonQueryBondSmarts(const Bond *qbond, int atomToLeftIdx) {
+   PRECONDITION(qbond, "bad bond");
+-  PRECONDITION(!qbond->hasQuery(), "bond should not have query");
+   std::string res;
+ 
+   if (qbond->getIsAromatic()) {
+@@ -822,31 +828,32 @@ std::string molToSmarts(const ROMol &inmol, bool doIsomericSmiles,
+ }  // namespace
+ 
+ namespace SmartsWrite {
+-std::string GetAtomSmarts(const QueryAtom *qatom) {
+-  PRECONDITION(qatom, "bad atom");
++std::string GetAtomSmarts(const Atom *atom) {
++  PRECONDITION(atom, "bad atom");
+   std::string res;
+   bool needParen = false;
+ 
+   // BOOST_LOG(rdInfoLog)<<"Atom: " <<qatom->getIdx()<<std::endl;
+-  if (!qatom->hasQuery()) {
+-    res = getNonQueryAtomSmarts(qatom);
++  if (!atom->hasQuery()) {
++    res = getNonQueryAtomSmarts(atom);
+     // BOOST_LOG(rdInfoLog)<<"\tno query:" <<res;
+     return res;
+   }
+-  const auto query = qatom->getQuery();
++  const auto query = atom->getQuery();
+   PRECONDITION(query, "atom has no query");
+-  // describeQuery(query);
+   unsigned int queryFeatures = 0;
+-  std::string descrip = qatom->getQuery()->getDescription();
++  std::string descrip = query->getDescription();
+   if (descrip.empty()) {
+     // we have simple atom - just generate the smiles and return
+-    res = SmilesWrite::GetAtomSmiles(qatom);
++    res = SmilesWrite::GetAtomSmiles(atom);
+     if (res[0] == '[') {
+       // chop the brackets off, we'll put them back on later:
+       needParen = true;
+       res = res.substr(1, res.size() - 2);
+     }
+   } else if ((descrip == "AtomOr") || (descrip == "AtomAnd")) {
++    const QueryAtom *qatom = dynamic_cast<const QueryAtom *>(atom);
++    PRECONDITION(qatom, "could not convert atom to query atom");
+     // we have a composite query
+     needParen = true;
+     res = _recurseGetSmarts(qatom, query, query->getNegation(), queryFeatures);
+@@ -858,14 +865,15 @@ std::string GetAtomSmarts(const QueryAtom *qatom) {
+     res = getRecursiveStructureQuerySmarts(query);
+     needParen = true;
+   } else {  // we have a simple smarts
+-    auto *tquery = static_cast<ATOM_EQUALS_QUERY *>(qatom->getQuery());
+-    res = getAtomSmartsSimple(qatom, tquery, needParen);
+-    if (tquery->getNegation()) {
++    const QueryAtom *qatom = dynamic_cast<const QueryAtom *>(atom);
++    PRECONDITION(qatom, "could not convert atom to query atom");
++    res = getAtomSmartsSimple(qatom, query, needParen);
++    if (query->getNegation()) {
+       res = "!" + res;
+     }
+   }
+   std::string mapNum;
+-  if (qatom->getPropIfPresent(common_properties::molAtomMapNumber, mapNum)) {
++  if (atom->getPropIfPresent(common_properties::molAtomMapNumber, mapNum)) {
+     needParen = true;
+     res += ":" + mapNum;
+   }
+@@ -875,7 +883,7 @@ std::string GetAtomSmarts(const QueryAtom *qatom) {
+   return res;
+ }
+ 
+-std::string GetBondSmarts(const QueryBond *bond, int atomToLeftIdx) {
++std::string GetBondSmarts(const Bond *bond, int atomToLeftIdx) {
+   PRECONDITION(bond, "bad bond");
+   std::string res = "";
+ 
+@@ -889,14 +897,16 @@ std::string GetBondSmarts(const QueryBond *bond, int atomToLeftIdx) {
+     return res;
+   }
+   // describeQuery(bond->getQuery());
+-  if ((typeid(*bond) == typeid(Bond)) &&
+-      ((bond->getBondType() == Bond::SINGLE) ||
+-       (bond->getBondType() == Bond::AROMATIC))) {
++  auto qbond = dynamic_cast<const QueryBond *>(bond);
++  if (!qbond && ((bond->getBondType() == Bond::SINGLE) ||
++                 (bond->getBondType() == Bond::AROMATIC))) {
+     BOOST_LOG(rdInfoLog) << "\tbasic:" << res << std::endl;
+     return res;
+   }
+-  const auto query = bond->getQuery();
+-  PRECONDITION(query, "bond has no query");
++  CHECK_INVARIANT(qbond, "could not convert bond to QueryBond");
++
++  const auto query = qbond->getQuery();
++  CHECK_INVARIANT(query, "bond has no query");
+ 
+   unsigned int queryFeatures = 0;
+   auto descrip = query->getDescription();
+@@ -909,8 +919,7 @@ std::string GetBondSmarts(const QueryBond *bond, int atomToLeftIdx) {
+     if (query->getNegation()) {
+       res = "!";
+     }
+-    const auto *tquery = static_cast<const BOND_EQUALS_QUERY *>(query);
+-    res += getBondSmartsSimple(bond, tquery, atomToLeftIdx);
++    res += getBondSmartsSimple(bond, query, atomToLeftIdx);
+   }
+   // BOOST_LOG(rdInfoLog) << "\t  query:" << descrip << " " << res << std::endl;
+   return res;
+diff --git a/Code/GraphMol/SmilesParse/SmartsWrite.h b/Code/GraphMol/SmilesParse/SmartsWrite.h
+index f679ee9d243..dec86d09744 100644
+--- a/Code/GraphMol/SmilesParse/SmartsWrite.h
++++ b/Code/GraphMol/SmilesParse/SmartsWrite.h
+@@ -15,13 +15,13 @@
+ #include <vector>
+ 
+ namespace RDKit {
+-class QueryAtom;
+-class QueryBond;
++class Atom;
++class Bond;
+ namespace SmartsWrite {
+-//! returns the SMARTS for a QueryAtom
+-RDKIT_SMILESPARSE_EXPORT std::string GetAtomSmarts(const QueryAtom *qatom);
+-//! returns the SMARTS for a QueryBond
+-RDKIT_SMILESPARSE_EXPORT std::string GetBondSmarts(const QueryBond *qbond,
++//! returns the SMARTS for an Atom
++RDKIT_SMILESPARSE_EXPORT std::string GetAtomSmarts(const Atom *qatom);
++//! returns the SMARTS for a Bond
++RDKIT_SMILESPARSE_EXPORT std::string GetBondSmarts(const Bond *qbond,
+                                                    int atomToLeftIdx = -1);
+ }  // namespace SmartsWrite
+ 
+diff --git a/Code/GraphMol/SmilesParse/smiles.tab.cpp.cmake b/Code/GraphMol/SmilesParse/smiles.tab.cpp.cmake
+index f2792373c16..0e6738eb656 100644
+--- a/Code/GraphMol/SmilesParse/smiles.tab.cpp.cmake
++++ b/Code/GraphMol/SmilesParse/smiles.tab.cpp.cmake
+@@ -608,12 +608,12 @@ static const yytype_int16 yyrline[] =
+ {
+        0,   112,   112,   115,   119,   122,   126,   130,   133,   138,
+      141,   149,   150,   151,   152,   160,   171,   182,   203,   212,
+-     218,   239,   263,   283,   294,   316,   325,   338,   339,   345,
+-     346,   352,   360,   361,   362,   363,   364,   365,   366,   370,
+-     371,   372,   373,   374,   375,   376,   377,   378,   382,   383,
+-     384,   388,   389,   390,   391,   392,   393,   397,   398,   402,
+-     403,   404,   405,   406,   407,   408,   412,   413,   417,   418,
+-     429,   430
++     218,   239,   263,   282,   293,   315,   324,   337,   338,   344,
++     345,   351,   359,   360,   361,   362,   363,   364,   365,   369,
++     370,   371,   372,   373,   374,   375,   376,   377,   381,   382,
++     383,   387,   388,   389,   390,   391,   392,   396,   397,   401,
++     402,   403,   404,   405,   406,   407,   411,   412,   416,   417,
++     428,   429
+ };
+ #endif
+ 
+@@ -1800,7 +1800,6 @@ yyreduce:
+   Atom *atom=mp->getActiveAtom();
+   Bond *newB = mp->createPartialBond(atom->getIdx(),
+ 				     Bond::SINGLE);
+-  newB->setProp("_cxsmilesBondIdx",numBondsParsed++);
+   mp->setAtomBookmark(atom,(yyvsp[0].ival));
+   mp->setBondBookmark(newB,(yyvsp[0].ival));
+   if(!(mp->getAllBondsWithBookmark((yyvsp[0].ival)).size()%2)){
+@@ -1814,11 +1813,11 @@ yyreduce:
+   tmp.push_back(-((yyvsp[0].ival)+1));
+   atom->setProp(RDKit::common_properties::_RingClosures,tmp);
+ }
+-#line 1818 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1817 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 23:
+-#line 283 "smiles.yy"
++#line 282 "smiles.yy"
+                              {
+   RWMol *mp = (*molList)[(yyval.moli)];
+   Atom *a1 = mp->getActiveAtom();
+@@ -1830,11 +1829,11 @@ yyreduce:
+   //delete $3;
+   branchPoints->push_back(atomIdx1);
+ }
+-#line 1834 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1833 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 24:
+-#line 294 "smiles.yy"
++#line 293 "smiles.yy"
+                                          {
+   RWMol *mp = (*molList)[(yyval.moli)];
+   int atomIdx1 = mp->getActiveAtom()->getIdx();
+@@ -1857,11 +1856,11 @@ yyreduce:
+   //delete $4;
+   branchPoints->push_back(atomIdx1);
+ }
+-#line 1861 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1860 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 25:
+-#line 316 "smiles.yy"
++#line 315 "smiles.yy"
+                                          {
+   RWMol *mp = (*molList)[(yyval.moli)];
+   int atomIdx1 = mp->getActiveAtom()->getIdx();
+@@ -1871,11 +1870,11 @@ yyreduce:
+   //delete $4;
+   branchPoints->push_back(atomIdx1);
+ }
+-#line 1875 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1874 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 26:
+-#line 325 "smiles.yy"
++#line 324 "smiles.yy"
+                         {
+   if(branchPoints->empty()){
+      yyerror(input,molList,branchPoints,scanner,start_token,"extra close parentheses");
+@@ -1886,194 +1885,194 @@ yyreduce:
+   mp->setActiveAtom(branchPoints->back());
+   branchPoints->pop_back();
+ }
+-#line 1890 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1889 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 28:
+-#line 339 "smiles.yy"
++#line 338 "smiles.yy"
+                         {
+           (yyval.bond) = new Bond(Bond::SINGLE);
+           }
+-#line 1898 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1897 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 30:
+-#line 347 "smiles.yy"
++#line 346 "smiles.yy"
+ {
+   (yyval.atom) = (yyvsp[-3].atom);
+   (yyval.atom)->setNoImplicit(true);
+   (yyval.atom)->setProp(RDKit::common_properties::molAtomMapNumber,(yyvsp[-1].ival));
+ }
+-#line 1908 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1907 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 31:
+-#line 353 "smiles.yy"
++#line 352 "smiles.yy"
+ {
+   (yyval.atom) = (yyvsp[-1].atom);
+   (yyvsp[-1].atom)->setNoImplicit(true);
+ }
+-#line 1917 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1916 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 33:
+-#line 361 "smiles.yy"
++#line 360 "smiles.yy"
+                        { (yyvsp[-1].atom)->setFormalCharge(1); }
+-#line 1923 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1922 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 34:
+-#line 362 "smiles.yy"
++#line 361 "smiles.yy"
+                                   { (yyvsp[-2].atom)->setFormalCharge(2); }
+-#line 1929 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1928 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 35:
+-#line 363 "smiles.yy"
++#line 362 "smiles.yy"
+                               { (yyvsp[-2].atom)->setFormalCharge((yyvsp[0].ival)); }
+-#line 1935 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1934 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 36:
+-#line 364 "smiles.yy"
++#line 363 "smiles.yy"
+                         { (yyvsp[-1].atom)->setFormalCharge(-1); }
+-#line 1941 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1940 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 37:
+-#line 365 "smiles.yy"
++#line 364 "smiles.yy"
+                                     { (yyvsp[-2].atom)->setFormalCharge(-2); }
+-#line 1947 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1946 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 38:
+-#line 366 "smiles.yy"
++#line 365 "smiles.yy"
+                                { (yyvsp[-2].atom)->setFormalCharge(-(yyvsp[0].ival)); }
+-#line 1953 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1952 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 39:
+-#line 370 "smiles.yy"
++#line 369 "smiles.yy"
+                         { (yyval.atom) = new Atom(1); }
+-#line 1959 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1958 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 40:
+-#line 371 "smiles.yy"
++#line 370 "smiles.yy"
+                                  { (yyval.atom) = new Atom(1); (yyval.atom)->setIsotope((yyvsp[-1].ival)); }
+-#line 1965 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1964 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 41:
+-#line 372 "smiles.yy"
++#line 371 "smiles.yy"
+                                   { (yyval.atom) = new Atom(1); (yyval.atom)->setNumExplicitHs(1); }
+-#line 1971 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1970 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 42:
+-#line 373 "smiles.yy"
++#line 372 "smiles.yy"
+                                          { (yyval.atom) = new Atom(1); (yyval.atom)->setIsotope((yyvsp[-2].ival)); (yyval.atom)->setNumExplicitHs(1);}
+-#line 1977 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1976 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 43:
+-#line 374 "smiles.yy"
++#line 373 "smiles.yy"
+                                          { (yyval.atom) = new Atom(1); (yyval.atom)->setNumExplicitHs((yyvsp[0].ival)); }
+-#line 1983 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1982 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 44:
+-#line 375 "smiles.yy"
++#line 374 "smiles.yy"
+                                                 { (yyval.atom) = new Atom(1); (yyval.atom)->setIsotope((yyvsp[-3].ival)); (yyval.atom)->setNumExplicitHs((yyvsp[0].ival));}
+-#line 1989 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1988 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 46:
+-#line 377 "smiles.yy"
++#line 376 "smiles.yy"
+                                                         { (yyval.atom) = (yyvsp[-1].atom); (yyvsp[-1].atom)->setNumExplicitHs(1);}
+-#line 1995 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 1994 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 47:
+-#line 378 "smiles.yy"
++#line 377 "smiles.yy"
+                                                 { (yyval.atom) = (yyvsp[-2].atom); (yyvsp[-2].atom)->setNumExplicitHs((yyvsp[0].ival));}
+-#line 2001 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2000 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 49:
+-#line 383 "smiles.yy"
++#line 382 "smiles.yy"
+                    { (yyvsp[-1].atom)->setChiralTag(Atom::CHI_TETRAHEDRAL_CCW); }
+-#line 2007 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2006 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 50:
+-#line 384 "smiles.yy"
++#line 383 "smiles.yy"
+                             { (yyvsp[-2].atom)->setChiralTag(Atom::CHI_TETRAHEDRAL_CW); }
+-#line 2013 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2012 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 52:
+-#line 389 "smiles.yy"
++#line 388 "smiles.yy"
+                                            { (yyvsp[0].atom)->setIsotope( (yyvsp[-1].ival) ); (yyval.atom) = (yyvsp[0].atom); }
+-#line 2019 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2018 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 54:
+-#line 391 "smiles.yy"
++#line 390 "smiles.yy"
+                                                    { (yyvsp[0].atom)->setIsotope( (yyvsp[-1].ival) ); (yyval.atom) = (yyvsp[0].atom); }
+-#line 2025 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2024 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 55:
+-#line 392 "smiles.yy"
++#line 391 "smiles.yy"
+                                                  { (yyval.atom) = new Atom((yyvsp[0].ival)); }
+-#line 2031 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2030 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 56:
+-#line 393 "smiles.yy"
++#line 392 "smiles.yy"
+                                                          { (yyval.atom) = new Atom((yyvsp[0].ival)); (yyval.atom)->setIsotope((yyvsp[-2].ival)); }
+-#line 2037 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2036 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 60:
+-#line 403 "smiles.yy"
++#line 402 "smiles.yy"
+                                           { (yyval.ival) = (yyvsp[-1].ival)*10+(yyvsp[0].ival); }
+-#line 2043 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2042 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 61:
+-#line 404 "smiles.yy"
++#line 403 "smiles.yy"
+                                                          { (yyval.ival) = (yyvsp[-1].ival); }
+-#line 2049 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2048 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 62:
+-#line 405 "smiles.yy"
++#line 404 "smiles.yy"
+                                                                { (yyval.ival) = (yyvsp[-2].ival)*10+(yyvsp[-1].ival); }
+-#line 2055 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2054 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 63:
+-#line 406 "smiles.yy"
++#line 405 "smiles.yy"
+                                                                      { (yyval.ival) = (yyvsp[-3].ival)*100+(yyvsp[-2].ival)*10+(yyvsp[-1].ival); }
+-#line 2061 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2060 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 64:
+-#line 407 "smiles.yy"
++#line 406 "smiles.yy"
+                                                                            { (yyval.ival) = (yyvsp[-4].ival)*1000+(yyvsp[-3].ival)*100+(yyvsp[-2].ival)*10+(yyvsp[-1].ival); }
+-#line 2067 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2066 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 65:
+-#line 408 "smiles.yy"
++#line 407 "smiles.yy"
+                                                                                  { (yyval.ival) = (yyvsp[-5].ival)*10000+(yyvsp[-4].ival)*1000+(yyvsp[-3].ival)*100+(yyvsp[-2].ival)*10+(yyvsp[-1].ival); }
+-#line 2073 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2072 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+   case 69:
+-#line 418 "smiles.yy"
++#line 417 "smiles.yy"
+                        { 
+   if((yyvsp[-1].ival) >= std::numeric_limits<std::int32_t>::max()/10 || 
+      (yyvsp[-1].ival)*10 >= std::numeric_limits<std::int32_t>::max()-(yyvsp[0].ival) ){
+@@ -2083,11 +2082,11 @@ yyreduce:
+   }
+   (yyval.ival) = (yyvsp[-1].ival)*10 + (yyvsp[0].ival); 
+   }
+-#line 2087 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2086 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+     break;
+ 
+ 
+-#line 2091 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
++#line 2090 "/scratch/RDKit_git/Code/GraphMol/SmilesParse/smiles.tab.cpp"
+ 
+       default: break;
+     }
+@@ -2319,5 +2318,5 @@ yyreturn:
+ #endif
+   return yyresult;
+ }
+-#line 440 "smiles.yy"
++#line 439 "smiles.yy"
+ 
+diff --git a/Code/GraphMol/SmilesParse/smiles.yy b/Code/GraphMol/SmilesParse/smiles.yy
+index df63666bff6..c0b34761caa 100644
+--- a/Code/GraphMol/SmilesParse/smiles.yy
++++ b/Code/GraphMol/SmilesParse/smiles.yy
+@@ -265,7 +265,6 @@ mol: atomd {
+   Atom *atom=mp->getActiveAtom();
+   Bond *newB = mp->createPartialBond(atom->getIdx(),
+ 				     Bond::SINGLE);
+-  newB->setProp("_cxsmilesBondIdx",numBondsParsed++);
+   mp->setAtomBookmark(atom,$3);
+   mp->setBondBookmark(newB,$3);
+   if(!(mp->getAllBondsWithBookmark($3).size()%2)){

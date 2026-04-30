@@ -1,0 +1,200 @@
+diff --git a/src/codec/SkBmpRLECodec.cpp b/src/codec/SkBmpRLECodec.cpp
+index 8fc0ea8..6690629 100644
+--- a/src/codec/SkBmpRLECodec.cpp
++++ b/src/codec/SkBmpRLECodec.cpp
+@@ -275,11 +275,10 @@
+  */
+ int SkBmpRLECodec::decodeRows(const SkImageInfo& info, void* dst, size_t dstRowBytes,
+         const Options& opts) {
+-    const int width = this->dimensions().width();
+     int height = info.height();
+ 
+     // Account for sampling.
+-    SkImageInfo dstInfo = info.makeWH(get_scaled_dimension(width, fSampleX), height);
++    SkImageInfo dstInfo = info.makeWH(this->fillWidth(), height);
+ 
+     // Set the background as transparent.  Then, if the RLE code skips pixels,
+     // the skipped pixels will be transparent.
+@@ -538,6 +537,10 @@
+         SkASSERT(fCodec);
+     }
+ 
++    int fillWidth() const override {
++        return fCodec->fillWidth();
++    }
++
+ private:
+     int onSetSampleX(int sampleX) override {
+         return fCodec->setSampleX(sampleX);
+@@ -547,20 +550,19 @@
+     SkBmpRLECodec* fCodec;
+ };
+ 
+-SkSampler* SkBmpRLECodec::getSampler(bool /*createIfNecessary*/) {
+-    // We will always create an SkBmpRLESampler if one is requested.
+-    // This allows clients to always use the SkBmpRLESampler's
+-    // version of fill(), which does nothing since RLE decodes have
+-    // already filled pixel memory.  This seems fine, since creating
+-    // an SkBmpRLESampler is pretty inexpensive.
+-    if (!fSampler) {
++SkSampler* SkBmpRLECodec::getSampler(bool createIfNecessary) {
++    if (!fSampler && createIfNecessary) {
+         fSampler.reset(new SkBmpRLESampler(this));
+     }
+ 
+     return fSampler.get();
+ }
+ 
+-int SkBmpRLECodec::setSampleX(int sampleX){
++int SkBmpRLECodec::setSampleX(int sampleX) {
+     fSampleX = sampleX;
+-    return get_scaled_dimension(this->dimensions().width(), sampleX);
++    return this->fillWidth();
++}
++
++int SkBmpRLECodec::fillWidth() const {
++    return get_scaled_dimension(this->dimensions().width(), fSampleX);
+ }
+diff --git a/src/codec/SkBmpRLECodec.h b/src/codec/SkBmpRLECodec.h
+index dc6f26d..4ed12d0 100644
+--- a/src/codec/SkBmpRLECodec.h
++++ b/src/codec/SkBmpRLECodec.h
+@@ -41,6 +41,8 @@
+ 
+     int setSampleX(int);
+ 
++    int fillWidth() const;
++
+ protected:
+ 
+     Result onGetPixels(const SkImageInfo& dstInfo, void* dst,
+diff --git a/src/codec/SkCodec.cpp b/src/codec/SkCodec.cpp
+index f9c34dd..dfd1e0a 100644
+--- a/src/codec/SkCodec.cpp
++++ b/src/codec/SkCodec.cpp
+@@ -559,41 +559,22 @@
+     }
+ }
+ 
+-static void fill_proc(const SkImageInfo& info, void* dst, size_t rowBytes,
+-                      SkCodec::ZeroInitialized zeroInit, SkSampler* sampler) {
+-    if (sampler) {
+-        sampler->fill(info, dst, rowBytes, zeroInit);
+-    } else {
+-        SkSampler::Fill(info, dst, rowBytes, zeroInit);
+-    }
+-}
+-
+ void SkCodec::fillIncompleteImage(const SkImageInfo& info, void* dst, size_t rowBytes,
+         ZeroInitialized zeroInit, int linesRequested, int linesDecoded) {
++    if (kYes_ZeroInitialized == zeroInit) {
++        return;
++    }
+ 
+-    void* fillDst;
+     const int linesRemaining = linesRequested - linesDecoded;
+     SkSampler* sampler = this->getSampler(false);
+ 
+-    int fillWidth = info.width();
+-    if (fOptions.fSubset) {
+-        fillWidth = fOptions.fSubset->width();
+-    }
+-
+-    switch (this->getScanlineOrder()) {
+-        case kTopDown_SkScanlineOrder: {
+-            const SkImageInfo fillInfo = info.makeWH(fillWidth, linesRemaining);
+-            fillDst = SkTAddOffset<void>(dst, linesDecoded * rowBytes);
+-            fill_proc(fillInfo, fillDst, rowBytes, zeroInit, sampler);
+-            break;
+-        }
+-        case kBottomUp_SkScanlineOrder: {
+-            fillDst = dst;
+-            const SkImageInfo fillInfo = info.makeWH(fillWidth, linesRemaining);
+-            fill_proc(fillInfo, fillDst, rowBytes, zeroInit, sampler);
+-            break;
+-        }
+-    }
++    const int fillWidth = sampler          ? sampler->fillWidth()      :
++                          fOptions.fSubset ? fOptions.fSubset->width() :
++                                             info.width()              ;
++    void* fillDst = this->getScanlineOrder() == kBottomUp_SkScanlineOrder ? dst :
++                        SkTAddOffset<void>(dst, linesDecoded * rowBytes);
++    const auto fillInfo = info.makeWH(fillWidth, linesRemaining);
++    SkSampler::Fill(fillInfo, fillDst, rowBytes, kNo_ZeroInitialized);
+ }
+ 
+ static inline bool select_xform_format(SkColorType colorType, bool forColorTable,
+diff --git a/src/codec/SkGifCodec.cpp b/src/codec/SkGifCodec.cpp
+index 2e03b79..24d1720 100644
+--- a/src/codec/SkGifCodec.cpp
++++ b/src/codec/SkGifCodec.cpp
+@@ -343,10 +343,8 @@
+             //   draw anything, so we need to fill.
+             if (frameContext->frameRect() != this->bounds()
+                     || frameContext->interlaced() || !fCurrColorTableIsReal) {
+-                // fill ignores the width (replaces it with the actual, scaled width).
+-                // But we need to scale in Y.
+-                auto fillInfo = dstInfo.makeWH(0, scaledHeight);
+-                fSwizzler->fill(fillInfo, fDst, fDstRowBytes, opts.fZeroInitialized);
++                auto fillInfo = dstInfo.makeWH(fSwizzler->fillWidth(), scaledHeight);
++                SkSampler::Fill(fillInfo, fDst, fDstRowBytes, opts.fZeroInitialized);
+                 filledBackground = true;
+             }
+         } else {
+diff --git a/src/codec/SkMaskSwizzler.h b/src/codec/SkMaskSwizzler.h
+index b8289f3..eff43ee 100644
+--- a/src/codec/SkMaskSwizzler.h
++++ b/src/codec/SkMaskSwizzler.h
+@@ -35,13 +35,8 @@
+      */
+     void swizzle(void* dst, const uint8_t* SK_RESTRICT src);
+ 
+-    /**
+-     * Implement fill using a custom width.
+-     */
+-    void fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+-              SkCodec::ZeroInitialized zeroInit) override {
+-        const SkImageInfo fillInfo = info.makeWH(fDstWidth, info.height());
+-        SkSampler::Fill(fillInfo, dst, rowBytes, zeroInit);
++    int fillWidth() const override {
++        return fDstWidth;
+     }
+ 
+     /**
+diff --git a/src/codec/SkSampler.h b/src/codec/SkSampler.h
+index 815153b..05043b9 100644
+--- a/src/codec/SkSampler.h
++++ b/src/codec/SkSampler.h
+@@ -68,11 +68,7 @@
+     static void Fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+                      SkCodec::ZeroInitialized zeroInit);
+ 
+-    /**
+-     * Allow subclasses to implement unique versions of fill().
+-     */
+-    virtual void fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+-                      SkCodec::ZeroInitialized zeroInit) {} // FIXME: Can this be abstract?
++    virtual int fillWidth() const = 0;
+ 
+     SkSampler()
+         : fSampleY(1)
+diff --git a/src/codec/SkSwizzler.h b/src/codec/SkSwizzler.h
+index df2cf9f..b172e45 100644
+--- a/src/codec/SkSwizzler.h
++++ b/src/codec/SkSwizzler.h
+@@ -53,13 +53,8 @@
+      */
+     void swizzle(void* dst, const uint8_t* SK_RESTRICT src);
+ 
+-    /**
+-     * Implement fill using a custom width.
+-     */
+-    void fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+-            SkCodec::ZeroInitialized zeroInit) override {
+-        const SkImageInfo fillInfo = info.makeWH(fAllocatedWidth, info.height());
+-        SkSampler::Fill(fillInfo, dst, rowBytes, zeroInit);
++    int fillWidth() const override {
++        return fAllocatedWidth;
+     }
+ 
+     /**

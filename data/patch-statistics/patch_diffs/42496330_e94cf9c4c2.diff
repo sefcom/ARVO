@@ -1,0 +1,112 @@
+From 7f6ada4eea089bbcb3ac3ff5d7e8c55c98b47740 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sun, 2 May 2021 15:47:36 +0200
+Subject: [PATCH] avcodec/mjpegdec: Decode to PAL8 independant of the location
+ of LSE
+
+This simply performs a 2nd pass if a LSE is encountered with GRAY8
+
+Fixes: tickets/3933/128.jls
+
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/jpeglsdec.c |  6 ++++--
+ libavcodec/mjpegdec.c  | 10 +++++++---
+ libavcodec/mjpegdec.h  |  1 +
+ tests/fate/image.mak   |  2 +-
+ 4 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/libavcodec/jpeglsdec.c b/libavcodec/jpeglsdec.c
+index d79bbe1ee3..bd9224d97d 100644
+--- a/libavcodec/jpeglsdec.c
++++ b/libavcodec/jpeglsdec.c
+@@ -118,8 +118,10 @@ int ff_jpegls_decode_lse(MJpegDecodeContext *s)
+                 shift = 8 - s->avctx->bits_per_raw_sample;
+             }
+ 
+-            s->picture_ptr->format =
+-            s->avctx->pix_fmt = AV_PIX_FMT_PAL8;
++            s->force_pal8 = 1;
++            if (!pal)
++                return 1;
++
+             for (i=s->palette_index; i<=maxtab; i++) {
+                 uint8_t k = i << shift;
+                 pal[k] = 0;
+diff --git a/libavcodec/mjpegdec.c b/libavcodec/mjpegdec.c
+index 7c66ff8637..0691148027 100644
+--- a/libavcodec/mjpegdec.c
++++ b/libavcodec/mjpegdec.c
+@@ -582,7 +582,7 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
+         case 0x43000000:
+         case 0x44000000:
+             if(s->bits <= 8)
+-                s->avctx->pix_fmt = AV_PIX_FMT_GRAY8;
++                s->avctx->pix_fmt = s->force_pal8 ? AV_PIX_FMT_PAL8 : AV_PIX_FMT_GRAY8;
+             else
+                 s->avctx->pix_fmt = AV_PIX_FMT_GRAY16;
+             break;
+@@ -681,7 +681,7 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
+             } else if (s->nb_components != 1) {
+                 av_log(s->avctx, AV_LOG_ERROR, "Unsupported number of components %d\n", s->nb_components);
+                 return AVERROR_PATCHWELCOME;
+-            } else if (s->palette_index && s->bits <= 8)
++            } else if (s->palette_index && s->bits <= 8 || s->force_pal8)
+                 s->avctx->pix_fmt = AV_PIX_FMT_PAL8;
+             else if (s->bits <= 8)
+                 s->avctx->pix_fmt = AV_PIX_FMT_GRAY8;
+@@ -2398,6 +2398,8 @@ int ff_mjpeg_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+     int ret = 0;
+     int is16bit;
+ 
++    s->force_pal8 = 0;
++
+     if (avctx->codec_id == AV_CODEC_ID_SMVJPEG && s->smv_next_frame > 0)
+         return smv_process_frame(avctx, frame);
+ 
+@@ -2411,7 +2413,7 @@ int ff_mjpeg_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+     ret = mjpeg_get_packet(avctx);
+     if (ret < 0)
+         return ret;
+-
++redo_for_pal8:
+     buf_ptr = s->pkt->data;
+     buf_end = s->pkt->data + s->pkt->size;
+     while (buf_ptr < buf_end) {
+@@ -2542,6 +2544,8 @@ int ff_mjpeg_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+             if (!CONFIG_JPEGLS_DECODER ||
+                 (ret = ff_jpegls_decode_lse(s)) < 0)
+                 goto fail;
++            if (ret == 1)
++                goto redo_for_pal8;
+             break;
+         case EOI:
+ eoi_parser:
+diff --git a/libavcodec/mjpegdec.h b/libavcodec/mjpegdec.h
+index 2400a179f1..648dd714e1 100644
+--- a/libavcodec/mjpegdec.h
++++ b/libavcodec/mjpegdec.h
+@@ -117,6 +117,7 @@ typedef struct MJpegDecodeContext {
+     uint8_t *last_nnz[MAX_COMPONENTS];
+     uint64_t coefs_finished[MAX_COMPONENTS]; ///< bitmask of which coefs have been completely decoded (progressive mode)
+     int palette_index;
++    int force_pal8;
+     ScanTable scantable;
+     BlockDSPContext bdsp;
+     HpelDSPContext hdsp;
+diff --git a/tests/fate/image.mak b/tests/fate/image.mak
+index d8316fddc3..07316542e1 100644
+--- a/tests/fate/image.mak
++++ b/tests/fate/image.mak
+@@ -350,7 +350,7 @@ fate-jpegls-5bpc: CMD = framecrc -idct simple -i $(TARGET_SAMPLES)/jpegls/32.jls
+ FATE_JPEGLS += fate-jpegls-7bpc
+ fate-jpegls-7bpc: CMD = framecrc -idct simple -i $(TARGET_SAMPLES)/jpegls/128.jls -pix_fmt rgb24 -vf scale
+ 
+-#FATE_JPEGLS-$(call DEMDEC, IMAGE2, JPEGLS) += $(FATE_JPEGLS)
++FATE_JPEGLS-$(call DEMDEC, IMAGE2, JPEGLS) += $(FATE_JPEGLS)
+ FATE_IMAGE += $(FATE_JPEGLS-yes)
+ fate-jpegls: $(FATE_JPEGLS-yes)
+ 
+-- 
+2.25.1
+

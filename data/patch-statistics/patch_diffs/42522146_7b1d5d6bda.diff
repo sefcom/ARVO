@@ -1,0 +1,62 @@
+diff --git a/src/core/SkSafeRange.h b/src/core/SkSafeRange.h
+index c640ffd..ef068c2 100644
+--- a/src/core/SkSafeRange.h
++++ b/src/core/SkSafeRange.h
+@@ -30,6 +30,14 @@
+         return static_cast<T>(value);
+     }
+ 
++    int checkGE(int value, int min) {
++        if (value < min) {
++            fOK = false;
++            value = min;
++        }
++        return value;
++    }
++
+ private:
+     bool fOK = true;
+ };
+diff --git a/src/core/SkVertices.cpp b/src/core/SkVertices.cpp
+index 08edca0..7253109 100644
+--- a/src/core/SkVertices.cpp
++++ b/src/core/SkVertices.cpp
+@@ -199,15 +199,17 @@
+     SkSafeRange safe;
+ 
+     const uint32_t packed = reader.readInt();
+-    const int vertexCount = reader.readInt();
+-    const int indexCount = reader.readInt();
+-
++    const int vertexCount = safe.checkGE(reader.readInt(), 0);
++    const int indexCount = safe.checkGE(reader.readInt(), 0);
+     const VertexMode mode = safe.checkLE<VertexMode>(packed & kMode_Mask,
+                                                      SkVertices::kLast_VertexMode);
++    if (!safe) {
++        return nullptr;
++    }
+     const bool hasTexs = SkToBool(packed & kHasTexs_Mask);
+     const bool hasColors = SkToBool(packed & kHasColors_Mask);
+     Sizes sizes(vertexCount, indexCount, hasTexs, hasColors);
+-    if (!sizes.isValid() || !safe) {
++    if (!sizes.isValid()) {
+         return nullptr;
+     }
+     // logically we can be only 2-byte aligned, but our buffer is always 4-byte aligned
+@@ -221,6 +223,15 @@
+     reader.read(builder.texCoords(), sizes.fTSize);
+     reader.read(builder.colors(), sizes.fCSize);
+     reader.read(builder.indices(), sizes.fISize);
+-
++    if (indexCount > 0) {
++        // validate that the indicies are in range
++        SkASSERT(indexCount == builder.indexCount());
++        const uint16_t* indices = builder.indices();
++        for (int i = 0; i < indexCount; ++i) {
++            if (indices[i] >= (unsigned)vertexCount) {
++                return nullptr;
++            }
++        }
++    }
+     return builder.detach();
+ }

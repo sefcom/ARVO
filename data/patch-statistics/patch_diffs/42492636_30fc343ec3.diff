@@ -1,0 +1,87 @@
+From 550e6fe6fcd96e507763db66873791b96f19fe2b Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Mon, 11 Oct 2021 23:08:10 +0200
+Subject: [PATCH] QUIC: fix an integer overflow (#1337)
+
+Long standing bug: credits to @lnslbrty for digging into it and to
+@aouinizied for the CI improvements
+---
+ src/lib/protocols/quic.c                   |  22 ++++++++++-----------
+ tests/pcap/quic-fuzz-overflow.pcapng       | Bin 0 -> 1372 bytes
+ tests/result/quic-fuzz-overflow.pcapng.out |   7 +++++++
+ 3 files changed, 17 insertions(+), 12 deletions(-)
+ create mode 100644 tests/pcap/quic-fuzz-overflow.pcapng
+ create mode 100644 tests/result/quic-fuzz-overflow.pcapng.out
+
+diff --git a/src/lib/protocols/quic.c b/src/lib/protocols/quic.c
+index dbdb9e6f11a..af19fe7eaa8 100644
+--- a/src/lib/protocols/quic.c
++++ b/src/lib/protocols/quic.c
+@@ -1348,14 +1348,14 @@ static void process_chlo(struct ndpi_detection_module_struct *ndpi_struct,
+     if(prev_offset > offset)
+       break;
+     len = offset - prev_offset;
+-    if(tag_offset_start + prev_offset + len > crypto_data_len)
++    /* Promote to uint64_t to avoid unsigned wrapping */
++    if((uint64_t)tag_offset_start + prev_offset + len > (uint64_t)crypto_data_len)
+       break;
+ #if 0
+-    printf("crypto_data_len %u prev_offset %u offset %u len %d\n",
+-	   crypto_data_len, prev_offset, offset, len);
++    printf("crypto_data_len %u tag_offset_start %u prev_offset %u offset %u len %u\n",
++	   crypto_data_len, tag_offset_start, prev_offset, offset, len);
+ #endif
+-    if((memcmp(tag, "SNI\0", 4) == 0) &&
+-       (tag_offset_start + prev_offset + len < crypto_data_len)) {
++    if(memcmp(tag, "SNI\0", 4) == 0) {
+       sni_len = MIN(len, sizeof(flow->protos.tls_quic_stun.tls_quic.client_requested_server_name) - 1);
+       memcpy(flow->protos.tls_quic_stun.tls_quic.client_requested_server_name,
+              &crypto_data[tag_offset_start + prev_offset], sni_len);
+@@ -1381,15 +1381,13 @@ static void process_chlo(struct ndpi_detection_module_struct *ndpi_struct,
+     if(memcmp(tag, "UAID", 4) == 0) {
+       u_int uaid_offset = tag_offset_start + prev_offset;
+             
+-      if((uaid_offset + len) < crypto_data_len) {      
+-	NDPI_LOG_DBG2(ndpi_struct, "UA: [%.*s]\n", len, &crypto_data[uaid_offset]);
++      NDPI_LOG_DBG2(ndpi_struct, "UA: [%.*s]\n", len, &crypto_data[uaid_offset]);
+ 	
+-	http_process_user_agent(ndpi_struct, flow, &crypto_data[uaid_offset], len); /* http.c */
+-	ua_found = 1;
++      http_process_user_agent(ndpi_struct, flow, &crypto_data[uaid_offset], len); /* http.c */
++      ua_found = 1;
+ 	
+-	if (sni_found)
+-	  return;
+-      }
++      if (sni_found)
++        return;
+     }
+ 
+     prev_offset = offset;
+diff --git a/tests/pcap/quic-fuzz-overflow.pcapng b/tests/pcap/quic-fuzz-overflow.pcapng
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d8ee61ed0fb18e12c5c9468fe540df0ed9fb27b
+GIT binary patch
+literal 1372
+zcmd<$<>iuLU|{gI(UxKa(*L0VBnIM(0PzzbW?*0ev)O<w9agXagYY?428Rz9(iuQ}
+zAa+$?Wl&I1U{DZLP=Fc(<U+uSKm#Ka7zarI{|`|DWHK-;U{qjn_VDosYE=kz^mKta
+z0)<A>3}T|lAvkEN2yhYlkXZyYAxR_aq7@s-x}n2_2L{Z^Z~^KuU`9h|xVfmp_;_$F
+zG-TkjpGY}$*CA^|mm`CZY#dfL8D`?qf?)+7wZuvhYbLSkh_e^NG$vpf2?L-q5&-`r
+B3)BDr
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/result/quic-fuzz-overflow.pcapng.out b/tests/result/quic-fuzz-overflow.pcapng.out
+new file mode 100644
+index 00000000000..1c517a3a3f7
+--- /dev/null
++++ b/tests/result/quic-fuzz-overflow.pcapng.out
+@@ -0,0 +1,7 @@
++Guessed flow protos:	0
++
++DPI Packets (UDP):	1	(1.00 pkts/flow)
++
++QUIC	1	1280	1
++
++	1	UDP 255.255.255.255:8224 -> 255.255.255.32:8224 [proto: 188/QUIC][Encrypted][cat: Web/5][1 pkts/1280 bytes -> 0 pkts/0 bytes][Goodput ratio: 98/0][< 1 sec][Risk: ** Known protocol on non standard port **** SNI TLS extension was missing **][Risk Score: 60][PLAIN TEXT (         )][Plen Bins: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0]

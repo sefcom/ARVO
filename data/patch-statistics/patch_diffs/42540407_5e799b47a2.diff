@@ -1,0 +1,657 @@
+From 36c30b646d1374cafb45ea894787152999fb4941 Mon Sep 17 00:00:00 2001
+From: Cristy <urban-warrior@imagemagick.org>
+Date: Thu, 22 Nov 2018 09:33:30 -0500
+Subject: [PATCH] ...
+
+---
+ MagickCore/enhance.c             | 277 +++++++++++++++++++++++++++++++
+ MagickCore/enhance.h             |   2 +
+ MagickCore/threshold.c           | 214 ------------------------
+ MagickCore/threshold.h           |   2 -
+ MagickWand/mogrify.c             |   6 +-
+ MagickWand/operation.c           |   5 +-
+ PerlMagick/Magick.xs             |  12 +-
+ PerlMagick/quantum/quantum.xs.in |   7 +-
+ 8 files changed, 292 insertions(+), 233 deletions(-)
+
+diff --git a/MagickCore/enhance.c b/MagickCore/enhance.c
+index 984e8e2cdef..4682f532a30 100644
+--- a/MagickCore/enhance.c
++++ b/MagickCore/enhance.c
+@@ -256,6 +256,283 @@ MagickExport MagickBooleanType BrightnessContrastImage(Image *image,
+ %                                                                             %
+ %                                                                             %
+ %                                                                             %
++%     C L A H E I m a g e                                                     %
++%                                                                             %
++%                                                                             %
++%                                                                             %
++%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++%
++%  CLAHEImage() is a variant of adaptive histogram equalization in which the
++%  contrast amplification is limited, so as to reduce this problem of noise
++%  amplification.
++%
++%  The format of the CLAHEImage method is:
++%
++%      MagickBooleanType CLAHEImage(Image *image,const size_t width,
++%        const size_t height,const double bias,const double sans,
++%        ExceptionInfo *exception)
++%
++%  A description of each parameter follows:
++%
++%    o image: the image.
++%
++%    o width: the width of the local neighborhood.
++%
++%    o height: the height of the local neighborhood.
++%
++%    o bias: the mean bias.
++%
++%    o sans: not used
++%
++%    o exception: return any errors or warnings in this structure.
++%
++*/
++MagickExport MagickBooleanType CLAHEImage(Image *image,const size_t width,
++  const size_t height,const double bias,const double sans,
++  ExceptionInfo *exception)
++{
++#define CLAHEImageTag  "CLAHE/Image"
++
++  CacheView
++    *image_view;
++
++  double
++    black[CompositePixelChannel+1],
++    *clahe_map,
++    *histogram,
++    *map,
++    white[CompositePixelChannel+1];
++
++  MagickBooleanType
++    status;
++
++  MagickOffsetType
++    progress;
++
++  register ssize_t
++    i;
++
++  ssize_t
++    y;
++
++  /*
++    Allocate and initialize histogram arrays.
++  */
++  assert(image != (Image *) NULL);
++  assert(image->signature == MagickCoreSignature);
++  (void) width;
++  (void) height;
++  (void) bias;
++  (void) sans;
++  if (image->debug != MagickFalse)
++    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",image->filename);
++  clahe_map=(double *) AcquireQuantumMemory(MaxMap+1UL,MaxPixelChannels*
++    sizeof(*clahe_map));
++  histogram=(double *) AcquireQuantumMemory(MaxMap+1UL,MaxPixelChannels*
++    sizeof(*histogram));
++  map=(double *) AcquireQuantumMemory(MaxMap+1UL,MaxPixelChannels*sizeof(*map));
++  if ((clahe_map == (double *) NULL) || (histogram == (double *) NULL) ||
++      (map == (double *) NULL))
++    {
++      if (map != (double *) NULL)
++        map=(double *) RelinquishMagickMemory(map);
++      if (histogram != (double *) NULL)
++        histogram=(double *) RelinquishMagickMemory(histogram);
++      if (clahe_map != (double *) NULL)
++        clahe_map=(double *) RelinquishMagickMemory(clahe_map);
++      ThrowBinaryException(ResourceLimitError,"MemoryAllocationFailed",
++        image->filename);
++    }
++  /*
++    Form histogram.
++  */
++  status=MagickTrue;
++  (void) memset(histogram,0,(MaxMap+1)*GetPixelChannels(image)*
++    sizeof(*histogram));
++  image_view=AcquireVirtualCacheView(image,exception);
++  for (y=0; y < (ssize_t) image->rows; y++)
++  {
++    register const Quantum
++      *magick_restrict p;
++
++    register ssize_t
++      x;
++
++    if (status == MagickFalse)
++      continue;
++    p=GetCacheViewVirtualPixels(image_view,0,y,image->columns,1,exception);
++    if (p == (const Quantum *) NULL)
++      {
++        status=MagickFalse;
++        continue;
++      }
++    for (x=0; x < (ssize_t) image->columns; x++)
++    {
++      for (i=0; i < (ssize_t) GetPixelChannels(image); i++)
++      {
++        double
++          intensity;
++
++        intensity=(double) p[i];
++        if ((image->channel_mask & SyncChannels) != 0)
++          intensity=GetPixelIntensity(image,p);
++        histogram[GetPixelChannels(image)*ScaleQuantumToMap(
++          ClampToQuantum(intensity))+i]++;
++      }
++      p+=GetPixelChannels(image);
++    }
++  }
++  image_view=DestroyCacheView(image_view);
++  /*
++    Integrate the histogram to get the equalization map.
++  */
++  for (i=0; i < (ssize_t) GetPixelChannels(image); i++)
++  {
++    double
++      intensity;
++
++    register ssize_t
++      j;
++
++    intensity=0.0;
++    for (j=0; j <= (ssize_t) MaxMap; j++)
++    {
++      intensity+=histogram[GetPixelChannels(image)*j+i];
++      map[GetPixelChannels(image)*j+i]=intensity;
++    }
++  }
++  (void) memset(clahe_map,0,(MaxMap+1)*GetPixelChannels(image)*
++    sizeof(*clahe_map));
++  (void) memset(black,0,sizeof(*black));
++  (void) memset(white,0,sizeof(*white));
++  for (i=0; i < (ssize_t) GetPixelChannels(image); i++)
++  {
++    register ssize_t
++      j;
++
++    black[i]=map[i];
++    white[i]=map[GetPixelChannels(image)*MaxMap+i];
++    if (black[i] != white[i])
++      for (j=0; j <= (ssize_t) MaxMap; j++)
++        clahe_map[GetPixelChannels(image)*j+i]=(double)
++          ScaleMapToQuantum((double) ((MaxMap*(map[
++          GetPixelChannels(image)*j+i]-black[i]))/(white[i]-black[i])));
++  }
++  histogram=(double *) RelinquishMagickMemory(histogram);
++  map=(double *) RelinquishMagickMemory(map);
++  if (image->storage_class == PseudoClass)
++    {
++      register ssize_t
++        j;
++
++      /*
++        CLAHE colormap.
++      */
++      for (j=0; j < (ssize_t) image->colors; j++)
++      {
++        if ((GetPixelRedTraits(image) & UpdatePixelTrait) != 0)
++          {
++            PixelChannel channel = GetPixelChannelChannel(image,RedPixelChannel);
++            if (black[channel] != white[channel])
++              image->colormap[j].red=clahe_map[GetPixelChannels(image)*
++                ScaleQuantumToMap(ClampToQuantum(image->colormap[j].red))+
++                channel];
++          }
++        if ((GetPixelGreenTraits(image) & UpdatePixelTrait) != 0)
++          {
++            PixelChannel channel = GetPixelChannelChannel(image,
++              GreenPixelChannel);
++            if (black[channel] != white[channel])
++              image->colormap[j].green=clahe_map[GetPixelChannels(image)*
++                ScaleQuantumToMap(ClampToQuantum(image->colormap[j].green))+
++                channel];
++          }
++        if ((GetPixelBlueTraits(image) & UpdatePixelTrait) != 0)
++          {
++            PixelChannel channel = GetPixelChannelChannel(image,BluePixelChannel);
++            if (black[channel] != white[channel])
++              image->colormap[j].blue=clahe_map[GetPixelChannels(image)*
++                ScaleQuantumToMap(ClampToQuantum(image->colormap[j].blue))+
++                channel];
++          }
++        if ((GetPixelAlphaTraits(image) & UpdatePixelTrait) != 0)
++          {
++            PixelChannel channel = GetPixelChannelChannel(image,
++              AlphaPixelChannel);
++            if (black[channel] != white[channel])
++              image->colormap[j].alpha=clahe_map[GetPixelChannels(image)*
++                ScaleQuantumToMap(ClampToQuantum(image->colormap[j].alpha))+
++                channel];
++          }
++      }
++    }
++  /*
++    CLAHE image.
++  */
++  progress=0;
++  image_view=AcquireAuthenticCacheView(image,exception);
++#if defined(MAGICKCORE_OPENMP_SUPPORT)
++  #pragma omp parallel for schedule(static) shared(progress,status) \
++    magick_number_threads(image,image,image->rows,1)
++#endif
++  for (y=0; y < (ssize_t) image->rows; y++)
++  {
++    register Quantum
++      *magick_restrict q;
++
++    register ssize_t
++      x;
++
++    if (status == MagickFalse)
++      continue;
++    q=GetCacheViewAuthenticPixels(image_view,0,y,image->columns,1,exception);
++    if (q == (Quantum *) NULL)
++      {
++        status=MagickFalse;
++        continue;
++      }
++    for (x=0; x < (ssize_t) image->columns; x++)
++    {
++      register ssize_t
++        j;
++
++      for (j=0; j < (ssize_t) GetPixelChannels(image); j++)
++      {
++        PixelChannel channel = GetPixelChannelChannel(image,j);
++        PixelTrait traits = GetPixelChannelTraits(image,channel);
++        if (((traits & UpdatePixelTrait) == 0) || (black[j] == white[j]))
++          continue;
++        q[j]=ClampToQuantum(clahe_map[GetPixelChannels(image)*
++          ScaleQuantumToMap(q[j])+j]);
++      }
++      q+=GetPixelChannels(image);
++    }
++    if (SyncCacheViewAuthenticPixels(image_view,exception) == MagickFalse)
++      status=MagickFalse;
++    if (image->progress_monitor != (MagickProgressMonitor) NULL)
++      {
++        MagickBooleanType
++          proceed;
++
++#if defined(MAGICKCORE_OPENMP_SUPPORT)
++        #pragma omp atomic
++#endif
++        progress++;
++        proceed=SetImageProgress(image,CLAHEImageTag,progress,image->rows);
++        if (proceed == MagickFalse)
++          status=MagickFalse;
++      }
++  }
++  image_view=DestroyCacheView(image_view);
++  clahe_map=(double *) RelinquishMagickMemory(clahe_map);
++  return(status);
++}
++
++/*
++%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++%                                                                             %
++%                                                                             %
++%                                                                             %
+ %     C l u t I m a g e                                                       %
+ %                                                                             %
+ %                                                                             %
+diff --git a/MagickCore/enhance.h b/MagickCore/enhance.h
+index d531a50959d..e72a914112b 100644
+--- a/MagickCore/enhance.h
++++ b/MagickCore/enhance.h
+@@ -28,6 +28,8 @@ extern MagickExport MagickBooleanType
+   AutoGammaImage(Image *,ExceptionInfo *),
+   AutoLevelImage(Image *,ExceptionInfo *),
+   BrightnessContrastImage(Image *,const double,const double,ExceptionInfo *),
++  CLAHEImage(Image *,const size_t,const size_t,const double,const double,
++    ExceptionInfo *),
+   ClutImage(Image *,const Image *,const PixelInterpolateMethod,ExceptionInfo *),
+   ColorDecisionListImage(Image *,const char *,ExceptionInfo *),
+   ContrastImage(Image *,const MagickBooleanType,ExceptionInfo *),
+diff --git a/MagickCore/threshold.c b/MagickCore/threshold.c
+index 1fd5d5360f8..a5ed0250101 100644
+--- a/MagickCore/threshold.c
++++ b/MagickCore/threshold.c
+@@ -1058,220 +1058,6 @@ MagickExport MagickBooleanType BlackThresholdImage(Image *image,
+ %                                                                             %
+ %                                                                             %
+ %                                                                             %
+-%     C A L H E I m a g e                                                     %
+-%                                                                             %
+-%                                                                             %
+-%                                                                             %
+-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+-%
+-%  CLAHEImage() is a variant of adaptive histogram equalization in which the
+-%  contrast amplification is limited, so as to reduce this problem of noise
+-%  amplification.
+-%
+-%      Image *CLAHEImage(const Image *image,const size_t width,
+-%        const size_t height,const double bias,const double sans,
+-%        ExceptionInfo *exception)
+-%
+-%  A description of each parameter follows:
+-%
+-%    o image: the image.
+-%
+-%    o width: the width of the local neighborhood.
+-%
+-%    o height: the height of the local neighborhood.
+-%
+-%    o bias: the mean bias.
+-%
+-%    o sans: not used
+-%
+-%    o exception: return any errors or warnings in this structure.
+-%
+-*/
+-MagickExport Image *CLAHEImage(const Image *image,
+-  const size_t width,const size_t height,const double bias,const double sans,
+-  ExceptionInfo *exception)
+-{
+-#define CLAHEImageTag  "CLAHE/Image"
+-
+-  CacheView
+-    *image_view,
+-    *threshold_view;
+-
+-  Image
+-    *threshold_image;
+-
+-  MagickBooleanType
+-    status;
+-
+-  MagickOffsetType
+-    progress;
+-
+-  MagickSizeType
+-    number_pixels;
+-
+-  ssize_t
+-    y;
+-
+-  /*
+-    Initialize threshold image attributes.
+-  */
+-  assert(image != (Image *) NULL);
+-  assert(image->signature == MagickCoreSignature);
+-  if (image->debug != MagickFalse)
+-    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",image->filename);
+-  assert(exception != (ExceptionInfo *) NULL);
+-  assert(exception->signature == MagickCoreSignature);
+-  (void) sans;
+-  threshold_image=CloneImage(image,0,0,MagickTrue,exception);
+-  if (threshold_image == (Image *) NULL)
+-    return((Image *) NULL);
+-  status=SetImageStorageClass(threshold_image,DirectClass,exception);
+-  if (status == MagickFalse)
+-    {
+-      threshold_image=DestroyImage(threshold_image);
+-      return((Image *) NULL);
+-    }
+-  /*
+-    Threshold image.
+-  */
+-  status=MagickTrue;
+-  progress=0;
+-  number_pixels=(MagickSizeType) width*height;
+-  image_view=AcquireVirtualCacheView(image,exception);
+-  threshold_view=AcquireAuthenticCacheView(threshold_image,exception);
+-#if defined(MAGICKCORE_OPENMP_SUPPORT)
+-  #pragma omp parallel for schedule(static) shared(progress,status) \
+-    magick_number_threads(image,threshold_image,image->rows,1)
+-#endif
+-  for (y=0; y < (ssize_t) image->rows; y++)
+-  {
+-    double
+-      channel_bias[MaxPixelChannels],
+-      channel_sum[MaxPixelChannels];
+-
+-    register const Quantum
+-      *magick_restrict p,
+-      *magick_restrict pixels;
+-
+-    register Quantum
+-      *magick_restrict q;
+-
+-    register ssize_t
+-      i,
+-      x;
+-
+-    ssize_t
+-      center,
+-      u,
+-      v;
+-
+-    if (status == MagickFalse)
+-      continue;
+-    p=GetCacheViewVirtualPixels(image_view,-((ssize_t) width/2L),y-(ssize_t)
+-      (height/2L),image->columns+width,height,exception);
+-    q=QueueCacheViewAuthenticPixels(threshold_view,0,y,threshold_image->columns,
+-      1,exception);
+-    if ((p == (const Quantum *) NULL) || (q == (Quantum *) NULL))
+-      {
+-        status=MagickFalse;
+-        continue;
+-      }
+-    center=(ssize_t) GetPixelChannels(image)*(image->columns+width)*(height/2L)+
+-      GetPixelChannels(image)*(width/2);
+-    for (i=0; i < (ssize_t) GetPixelChannels(image); i++)
+-    {
+-      PixelChannel channel = GetPixelChannelChannel(image,i);
+-      PixelTrait traits = GetPixelChannelTraits(image,channel);
+-      PixelTrait threshold_traits=GetPixelChannelTraits(threshold_image,
+-        channel);
+-      if ((traits == UndefinedPixelTrait) ||
+-          (threshold_traits == UndefinedPixelTrait))
+-        continue;
+-      if ((threshold_traits & CopyPixelTrait) != 0)
+-        {
+-          SetPixelChannel(threshold_image,channel,p[center+i],q);
+-          continue;
+-        }
+-      pixels=p;
+-      channel_bias[channel]=0.0;
+-      channel_sum[channel]=0.0;
+-      for (v=0; v < (ssize_t) height; v++)
+-      {
+-        for (u=0; u < (ssize_t) width; u++)
+-        {
+-          if (u == (ssize_t) (width-1))
+-            channel_bias[channel]+=pixels[i];
+-          channel_sum[channel]+=pixels[i];
+-          pixels+=GetPixelChannels(image);
+-        }
+-        pixels+=GetPixelChannels(image)*image->columns;
+-      }
+-    }
+-    for (x=0; x < (ssize_t) image->columns; x++)
+-    {
+-      for (i=0; i < (ssize_t) GetPixelChannels(image); i++)
+-      {
+-        double
+-          mean;
+-
+-        PixelChannel channel = GetPixelChannelChannel(image,i);
+-        PixelTrait traits = GetPixelChannelTraits(image,channel);
+-        PixelTrait threshold_traits=GetPixelChannelTraits(threshold_image,
+-          channel);
+-        if ((traits == UndefinedPixelTrait) ||
+-            (threshold_traits == UndefinedPixelTrait))
+-          continue;
+-        if ((threshold_traits & CopyPixelTrait) != 0)
+-          {
+-            SetPixelChannel(threshold_image,channel,p[center+i],q);
+-            continue;
+-          }
+-        channel_sum[channel]-=channel_bias[channel];
+-        channel_bias[channel]=0.0;
+-        pixels=p;
+-        for (v=0; v < (ssize_t) height; v++)
+-        {
+-          channel_bias[channel]+=pixels[i];
+-          pixels+=(width-1)*GetPixelChannels(image);
+-          channel_sum[channel]+=pixels[i];
+-          pixels+=GetPixelChannels(image)*(image->columns+1);
+-        }
+-        mean=(double) (channel_sum[channel]/number_pixels+bias);
+-        SetPixelChannel(threshold_image,channel,(Quantum) ((double)
+-          p[center+i] <= mean ? 0 : QuantumRange),q);
+-      }
+-      p+=GetPixelChannels(image);
+-      q+=GetPixelChannels(threshold_image);
+-    }
+-    if (SyncCacheViewAuthenticPixels(threshold_view,exception) == MagickFalse)
+-      status=MagickFalse;
+-    if (image->progress_monitor != (MagickProgressMonitor) NULL)
+-      {
+-        MagickBooleanType
+-          proceed;
+-
+-#if defined(MAGICKCORE_OPENMP_SUPPORT)
+-        #pragma omp atomic
+-#endif
+-        progress++;
+-        proceed=SetImageProgress(image,CLAHEImageTag,progress,image->rows);
+-        if (proceed == MagickFalse)
+-          status=MagickFalse;
+-      }
+-  }
+-  threshold_image->type=image->type;
+-  threshold_view=DestroyCacheView(threshold_view);
+-  image_view=DestroyCacheView(image_view);
+-  if (status == MagickFalse)
+-    threshold_image=DestroyImage(threshold_image);
+-  return(threshold_image);
+-}
+-
+-/*
+-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+-%                                                                             %
+-%                                                                             %
+-%                                                                             %
+ %     C l a m p I m a g e                                                     %
+ %                                                                             %
+ %                                                                             %
+diff --git a/MagickCore/threshold.h b/MagickCore/threshold.h
+index 63a76630025..731ae68aabf 100644
+--- a/MagickCore/threshold.h
++++ b/MagickCore/threshold.h
+@@ -35,8 +35,6 @@ typedef struct _ThresholdMap
+ 
+ extern MagickExport Image
+   *AdaptiveThresholdImage(const Image *,const size_t,const size_t,const double,
+-    ExceptionInfo *),
+-  *CLAHEImage(const Image *,const size_t,const size_t,const double,const double,
+     ExceptionInfo *);
+ 
+ extern MagickExport ThresholdMap
+diff --git a/MagickWand/mogrify.c b/MagickWand/mogrify.c
+index ff3962ed25f..1d24af45fb1 100644
+--- a/MagickWand/mogrify.c
++++ b/MagickWand/mogrify.c
+@@ -1087,9 +1087,9 @@ WandExport MagickBooleanType MogrifyImage(ImageInfo *image_info,const int argc,
+             */
+             (void) SyncImageSettings(mogrify_info,*image,exception);
+             flags=ParseGeometry(argv[i+1],&geometry_info);
+-            mogrify_image=CLAHEImage(*image,(size_t) geometry_info.rho,
+-              (size_t) geometry_info.sigma,(double) geometry_info.xi,
+-              geometry_info.psi,exception);
++            (void) CLAHEImage(*image,(size_t) geometry_info.rho,(size_t)
++              geometry_info.sigma,(double) geometry_info.xi,geometry_info.psi,
++              exception);
+             break;
+           }
+         if (LocaleCompare("clip",option+1) == 0)
+diff --git a/MagickWand/operation.c b/MagickWand/operation.c
+index ed675030de1..efad5761261 100644
+--- a/MagickWand/operation.c
++++ b/MagickWand/operation.c
+@@ -1971,9 +1971,8 @@ static MagickBooleanType CLISimpleOperatorImage(MagickCLI *cli_wand,
+           flags=ParseGeometry(arg1,&geometry_info);
+           if ((flags & (RhoValue|SigmaValue)) == 0)
+             CLIWandExceptArgBreak(OptionError,"InvalidArgument",option,arg1);
+-          new_image=CLAHEImage(_image,(size_t) geometry_info.rho,
+-            (size_t) geometry_info.sigma,geometry_info.xi,geometry_info.xi,
+-            _exception);
++          (void) CLAHEImage(_image,(size_t) geometry_info.rho,(size_t)
++            geometry_info.sigma,geometry_info.xi,geometry_info.xi,_exception);
+           break;
+         }
+       if (LocaleCompare("clamp",option+1) == 0)
+diff --git a/PerlMagick/Magick.xs b/PerlMagick/Magick.xs
+index fdb10a5fe90..4ef0bc6ddf5 100644
+--- a/PerlMagick/Magick.xs
++++ b/PerlMagick/Magick.xs
+@@ -9088,8 +9088,7 @@ Mogrify(ref,...)
+             draw_info->pointsize=argument_list[16].real_reference;
+           if (attribute_flag[17] != 0)
+             {
+-              draw_info->stroke_antialias=argument_list[17].integer_reference != 0
+-                ? MagickTrue : MagickFalse;
++              draw_info->stroke_antialias=argument_list[17].integer_reference != 0 ? MagickTrue : MagickFalse;
+               draw_info->text_antialias=draw_info->stroke_antialias;
+             }
+           if (attribute_flag[18] != 0)
+@@ -9148,7 +9147,7 @@ Mogrify(ref,...)
+           if (attribute_flag[32] != 0)
+             draw_info->direction=(DirectionType)
+               argument_list[32].integer_reference;
+-          DrawImage(image,draw_info,exception);
++          (void) DrawImage(image,draw_info,exception);
+           draw_info=DestroyDrawInfo(draw_info);
+           break;
+         }
+@@ -9157,7 +9156,7 @@ Mogrify(ref,...)
+           if (attribute_flag[0] != 0)
+             channel=(ChannelType) argument_list[0].integer_reference;
+           channel_mask=SetImageChannelMask(image,channel);
+-          EqualizeImage(image,exception);
++          (void) EqualizeImage(image,exception);
+           (void) SetImageChannelMask(image,channel_mask);
+           break;
+         }
+@@ -11494,9 +11493,8 @@ Mogrify(ref,...)
+             geometry_info.xi=argument_list[3].integer_reference;;
+           if (attribute_flag[4] != 0)
+             geometry_info.psi=argument_list[4].integer_reference;;
+-          image=CLAHEImage(image,(size_t) geometry_info.rho,
+-            (size_t) geometry_info.sigma,geometry_info.xi,geometry_info.psi,
+-            exception);
++          (void) CLAHEImage(image,(size_t) geometry_info.rho,(size_t)
++            geometry_info.sigma,geometry_info.xi,geometry_info.psi,exception);
+           break;
+         }
+       }
+diff --git a/PerlMagick/quantum/quantum.xs.in b/PerlMagick/quantum/quantum.xs.in
+index a86d6293bdb..09a097b07dd 100644
+--- a/PerlMagick/quantum/quantum.xs.in
++++ b/PerlMagick/quantum/quantum.xs.in
+@@ -9163,7 +9163,7 @@ Mogrify(ref,...)
+           if (attribute_flag[0] != 0)
+             channel=(ChannelType) argument_list[0].integer_reference;
+           channel_mask=SetImageChannelMask(image,channel);
+-          EqualizeImage(image,exception);
++          (void) EqualizeImage(image,exception);
+           (void) SetImageChannelMask(image,channel_mask);
+           break;
+         }
+@@ -11499,9 +11499,8 @@ Mogrify(ref,...)
+             geometry_info.xi=argument_list[3].integer_reference;;
+           if (attribute_flag[4] != 0)
+             geometry_info.psi=argument_list[4].integer_reference;;
+-          image=CLAHEImage(image,(size_t) geometry_info.rho,
+-            (size_t) geometry_info.sigma,geometry_info.xi,geometry.psi,
+-            exception);
++          (void) CLAHEImage(image,(size_t) geometry_info.rho,(size_t)
++            geometry_info.sigma,geometry_info.xi,geometry.psi,exception);
+           break;
+         }
+       }

@@ -1,0 +1,58 @@
+From 363e91ea656f4ce46584b4b0af6285030f236b7e Mon Sep 17 00:00:00 2001
+From: Alex Tutubalin <lexa@lexa.ru>
+Date: Thu, 29 Jul 2021 20:50:20 +0300
+Subject: [PATCH] FP DNG: check for bit range: 16, 24,32 only
+
+---
+ src/metadata/identify.cpp | 11 +++++++----
+ src/metadata/tiff.cpp     |  2 +-
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/src/metadata/identify.cpp b/src/metadata/identify.cpp
+index c68e7f16b..9443d8fac 100644
+--- a/src/metadata/identify.cpp
++++ b/src/metadata/identify.cpp
+@@ -958,15 +958,16 @@ void LibRaw::identify()
+     {
+     case 0: // Compression not set, assuming uncompressed
+     case 1:
+-      // Uncompressed float: decoder set in apply_tiff
+-      if (load_raw != &LibRaw::uncompressed_fp_dng_load_raw)
++      // Uncompressed float: decoder set in apply_tiff for valid files; not set for non-valid with sampleformat==3
++      if ((load_raw != &LibRaw::uncompressed_fp_dng_load_raw)  && (tiff_sampleformat != 3))
+         load_raw = &LibRaw::packed_dng_load_raw;
+       break;
+     case 7:
+       load_raw = &LibRaw::lossless_dng_load_raw;
+       break;
+     case 8:
+-      load_raw = &LibRaw::deflate_dng_load_raw;
++        if (tiff_sampleformat == 3 && tiff_bps > 8 && (tiff_bps % 8 == 0) && tiff_bps <= 32)
++            load_raw = &LibRaw::deflate_dng_load_raw;
+       break;
+ #ifdef USE_GPRSDK
+     case 9:
+@@ -1108,7 +1109,9 @@ void LibRaw::identify()
+       (tiff_bps > 16 &&
+        (load_raw != &LibRaw::deflate_dng_load_raw &&
+         load_raw != &LibRaw::uncompressed_fp_dng_load_raw )) ||
+-      tiff_samples > 4 || colors > 4 || colors < 1)
++      ((load_raw == &LibRaw::deflate_dng_load_raw || load_raw != &LibRaw::uncompressed_fp_dng_load_raw)
++        && (tiff_bps < 16 || tiff_bps > 32 || (tiff_bps % 8))   )
++      ||tiff_samples > 4 || colors > 4 || colors < 1)
+   {
+     is_raw = 0;
+     RUN_CALLBACK(LIBRAW_PROGRESS_IDENTIFY, 1, 2);
+diff --git a/src/metadata/tiff.cpp b/src/metadata/tiff.cpp
+index 2439e4f49..d55fdc94b 100644
+--- a/src/metadata/tiff.cpp
++++ b/src/metadata/tiff.cpp
+@@ -1793,7 +1793,7 @@ void LibRaw::apply_tiff()
+     case 0:
+     case 1:
+         if (dng_version && tiff_sampleformat == 3 &&
+-            (tiff_bps > 8 && (tiff_bps % 8 == 0))) // 16,24,32,48...
++          (tiff_bps > 8 && (tiff_bps % 8 == 0) && (tiff_bps <= 32))) // only 16,24, and 32 are allowed
+         {
+             load_raw = &LibRaw::uncompressed_fp_dng_load_raw;
+             break;

@@ -1,0 +1,64 @@
+From 3db005a65baf5fb53a3d2078c30dd7d365115b5e Mon Sep 17 00:00:00 2001
+From: Dan Baston <dbaston@gmail.com>
+Date: Wed, 26 Jun 2024 17:08:40 -0400
+Subject: [PATCH] LineIntersector: Fix invalid read on mixed-dimensionality
+ inputs (#1115)
+
+---
+ include/geos/algorithm/LineIntersector.h | 16 ++++++++++++++--
+ tests/unit/capi/GEOSIntersectionTest.cpp | 16 ++++++++++++++++
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/include/geos/algorithm/LineIntersector.h b/include/geos/algorithm/LineIntersector.h
+index 958dbbf12..ebf676b10 100644
+--- a/include/geos/algorithm/LineIntersector.h
++++ b/include/geos/algorithm/LineIntersector.h
+@@ -589,8 +589,20 @@ private:
+     {
+         geom::CoordinateXYZM ptInt(Intersection::intersection(p1, p2, q1, q2));
+         if (ptInt.isNull()) {
+-            // FIXME need to cast to correct type in mixed-dimensionality case
+-            ptInt = static_cast<const C1&>(nearestEndpoint(p1, p2, q1, q2));
++            const geom::CoordinateXY& nearest = nearestEndpoint(p1, p2, q1, q2);
++#if __cplusplus >= 201703L
++            if constexpr (std::is_same<C1, C2>::value) {
++#else
++            if (std::is_same<C1, C2>::value) {
++#endif
++                ptInt = static_cast<const C1&>(nearest);
++            } else {
++                if (&nearest == static_cast<const geom::CoordinateXY*>(&p1) || &nearest == static_cast<const geom::CoordinateXY*>(&p2)) {
++                    ptInt = static_cast<const C1&>(nearest);
++                } else {
++                    ptInt = static_cast<const C2&>(nearest);
++                }
++            }
+         }
+         return ptInt;
+     }
+diff --git a/tests/unit/capi/GEOSIntersectionTest.cpp b/tests/unit/capi/GEOSIntersectionTest.cpp
+index 2377c609f..c94b056a7 100644
+--- a/tests/unit/capi/GEOSIntersectionTest.cpp
++++ b/tests/unit/capi/GEOSIntersectionTest.cpp
+@@ -157,5 +157,21 @@ void object::test<8>()
+     ensure("curved geometry not supported", result_ == nullptr);
+ }
+ 
++// https://github.com/libgeos/geos/issues/1074
++// Make sure no crash occurs when LineIntersector has mixed-dimensionality
++// inputs and substitutes a segment endpoint for intersection point
++template<>
++template<>
++void object::test<9>()
++{
++    geom1_ = fromWKT("GEOMETRYCOLLECTION(POINT(0 0 59.083333333333336), POINT(1 1 59.083333333333336), LINESTRING(2 4 111 1, 2 223 22 2), POLYGON((42 -2.222222223222222e+155 111 1, 2 3 1 1, 2 4 111 NaN, 42 -2.222222223222222e+155 111 NaN)), POLYGON((2.2222222212222224e+149 4 111 1, 42 -2.222222222222222e+149 22 2, 2 4 111 1, 22 2222222222222223 22 NaN, 2.2222222212222224e+149 4 111 NaN)))");
++    geom2_ = fromWKT("LINESTRING (1.6409301755752343e+149 -5.298190649085575e+148, 1.6666666660752404e+149 -5.55555555396982e+148)");
++
++    result_ = GEOSIntersection(geom1_, geom2_);
++    ensure(result_ != nullptr);
++    ensure("HasZ", GEOSHasZ(result_));
++    ensure("HasM", GEOSHasM(result_));
++}
++
+ } // namespace tut
+ 

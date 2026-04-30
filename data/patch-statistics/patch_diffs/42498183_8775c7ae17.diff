@@ -1,0 +1,1937 @@
+From efdec07f3d9b54bc0b4b5ec93b05c7870dfd4539 Mon Sep 17 00:00:00 2001
+From: Dennis Heimbigner <dennis.heimbigner@gmail.com>
+Date: Fri, 18 Oct 2024 19:23:59 -0600
+Subject: [PATCH] Extend the netcdf API to support programmatic changes to the
+ plugin search path
+
+Replaces PR https://github.com/Unidata/netcdf-c/pull/3024
+         and PR https://github.com/Unidata/netcdf-c/pull/3033
+
+re: https://github.com/Unidata/netcdf-c/issues/2753
+
+As suggested by Ed Hartnett, This PR extends the netcdf.h API to support programmatic control over the search path used to locate plugins.
+
+I created several different APIs, but finally settled on the following API as being the simplest possible. It does have the disadvantage that it requires use of a global lock (not implemented) if used in a threaded environment.
+
+Specifically, note that modifying the plugin path must be done "atomically". That is, in a multi-threaded environment, it is important that the sequence of actions involved in setting up the plugin path must be done by a single processor or in some other way as to guarantee that two or more processors are not simultaneously accessing the plugin path get/set operations.
+
+As an example, assume there exists a mutex lock called PLUGINLOCK. Then any processor accessing the plugin paths should operate as follows:
+````
+lock(PLUGINLOCK);
+nc_plugin_path_get(...);
+<rebuild plugin path>
+nc_plugin_path_set(...);
+unlock(PLUGINLOCK);
+````
+## Internal Architecture
+
+It is assumed here that there only needs to be a single set of plugin path directories that is shared by all filter code and is independent of any file descriptor; it is global in other words. This means, for example, that the path list for NCZarr and for HDF5 will always be the same.
+
+However internally, processing the set of plugin paths depends on the particular NC_FORMATX value (NC_FORMATX_NC_HDF5 and NC_FORMATX_NCZARR, currently). So the *nc_plugin_path_set* function, will take the paths it is given and propagate them to each of the NC_FORMATX dispatchers to store in a way that is appropriate to the given dispatcher.
+
+There is a complication with respect to the *nc_plugin_path_get* function. It is possible for users to bypass the netcdf API and modify the HDF5 plugin paths directly. This can result in an inconsistent plugin path between the value used by HDF5 and the global value used by netcdf-c. Since there is no obvious fix for this, we warn the user of this possibility and otherwise ignore it.
+
+## Test Changes
+* New tests<br>
+    a. unit_test/run_pluginpaths.sh -- was created to test this new capability.<br>
+    b. A new test utility has been added as *unit_test/run_dfaltpluginpath.sh* to test the default plugin path list.
+* New test support utilities<br>
+    a. unit_test/ncpluginpath.c -- report current state of the plugin path<br>
+    b. unit_test/tst_pluginpaths.c -- test program to support run_pluginpaths.sh
+
+## Documentation
+* A new file -- docs/pluginpath.md -- provides documentation of the new API. It includes some
+  material taken fro filters.md.
+
+## Other Major Changes
+1. Cleanup the whole plugin path decision tree. This is described in the *docs/pluginpath.md* document and summarized in Addendum 2 below.
+2. I noticed that the ncdump/testpathcvt.sh had been disabled, so fixed and re-enabled it. This necessitated some significant changes to dpathmgr.c.
+
+## Misc. Changes
+1. Add some path manipulation utilities to netcf_aux.h
+2. Fix some minor bugs in netcdf_json.h
+3. Convert netcdf_json.h and netcdf_proplist.h to BUILT_SOURCE.
+4. Add NETCDF_ENABLE_HDF5 as synonym for USE_HDF5
+5. Fix some size_t <-> int conversion warnings.
+6. Encountered and fixed the Windows \r\n problem in tst_pluginpaths.c.
+7. Cleanup some minor CMakeLists.txt problems.
+8. Provide an implementation of echo -n since it appears to not be
+   available on all platforms.
+9. Add a property list mechanism to pass environmental information to filters.
+10. Cleanup Doxyfile.in
+11. Fixed a memory leak in libdap2; surprised that I did not find this earlier.
+
+## Addendum 1: Proposed API
+
+The API makes use of a counted vector of strings representing the sequence of directories in the path. The relevant type definition is as follows.
+````
+typedef struct NCPluginList {size_t ndirs; char** dirs;} NCPluginList;
+````
+
+The API proposed in this PR looks like this (from netcdf-c/include/netcdf_filter.h).
+
+* ````int nc_plugin_path_ndirs(size_t* ndirsp);````
+    Arguments: *ndirsp* -- store the number of directories in this memory.
+
+    This function returns the number of directories in the sequence if internal directories of the internal plugin path list.
+
+* ````int nc_plugin_path_get(NCPluginList* dirs);````
+    Arguments:  *dirs* -- counted vector for storing the sequence of directies in the internal path list.
+
+    This function returns the current sequence of directories from the internal plugin path list. Since this function does not modify the plugin path, it does not need to be locked; it is only when used to get the path to be modified that locking is required.  If the value of *dirs.dirs* is NULL (the normal case), then memory is allocated to hold the vector of directories. Otherwise, use the memory of *dirs.dirs* to hold the vector of directories.
+
+* ````int nc_plugin_path_set(const NCPluginList* dirs);````
+    Arguments: *dirs* -- counted vector for providing the new sequence of directories in the internal path list.
+
+    This function empties the current internal path sequence and replaces it with the sequence of directories argument. Using an *ndirs* argument of 0 will clear the set of plugin paths.
+
+## Addendum 2: Build-Time and Run-Time Constants.
+
+### Build-Time Constants
+<table style="border:2px solid black;border-collapse:collapse">
+<tr style="outline: thin solid;" align="center"><td colspan="4">Table showing the build-time computation of NETCDF_PLUGIN_INSTALL_DIR and NETCDF_PLUGIN_SEARCH_PATH.</td>
+<tr style="outline: thin solid" ><th>--with-plugin-dir<th>--prefix<th>NETCDF_PLUGIN_INSTALL_DIR<th>NETCDF_PLUGIN_SEARCH_PATH
+<tr style="outline: thin solid" ><td>undefined<td>undefined<td>undefined<td>PLATFORMDEFALT
+<tr style="outline: thin solid" ><td>undefined<td>&lt;abspath-prefix&gt;<td>&lt;abspath-prefix&gt;/hdf5/lib/plugin<td>&lt;abspath-prefix&gt;/hdf5/lib/plugin&lt;SEP&gt;PLATFORMDEFALT
+<tr style="outline: thin solid" ><td>&lt;abspath-plugins&gt;<td>N.A.<td>&lt;abspath-plugins&gt;<td>&lt;abspath-plugins&gt;&lt;SEP&gt;PLATFORMDEFALT
+</table>
+
+<table style="border:2px solid black;border-collapse:collapse">
+<tr style="outline: thin solid" align="center"><td colspan="2">Table showing the computation of the initial global plugin path</td>
+<tr style="outline: thin solid"><th>HDF5_PLUGIN_PATH<th>Initial global plugin path
+<tr style="outline: thin solid"><td>undefined<td>NETCDF_PLUGIN_SEARCH_PATH
+<tr style="outline: thin solid"><td>&lt;path1;...pathn&gt;<td>&lt;path1;...pathn&gt;
+</table>
+---
+ CMakeLists.txt                   | 130 ++++++++++++-------------------
+ cmake/modules/FindBlosc.cmake    |   9 +--
+ cmake/modules/FindSzip.cmake     |   8 +-
+ config.h.cmake.in                |   6 ++
+ configure.ac                     | 109 +++++++++++++++-----------
+ docs/pluginpath.md               |  60 +++++++++-----
+ include/ncpathmgr.h              |  13 ++--
+ libdispatch/daux.c               |  12 ++-
+ libdispatch/dpathmgr.c           |  49 +++++++-----
+ libdispatch/dplugins.c           | 113 +++++++++++++--------------
+ libnczarr/CMakeLists.txt         |   4 +
+ libnetcdf.settings.in            |   2 +-
+ ncdump/echon.c                   |  41 ++++++----
+ ncdump/ncpathcvt.c               | 102 ++++++++++++++----------
+ ncdump/ref_pathcvt.txt           |  40 ++++------
+ ncdump/testpathcvt.sh            |  53 +++++++++----
+ oc2/dap.y                        |  46 +++++------
+ oc2/dapy.c                       |  46 +++++------
+ oc2/ocinternal.c                 |   3 +
+ plugins/CMakeLists.txt           |  19 +----
+ plugins/Makefile.am              |   2 +-
+ test_common.in                   |   7 +-
+ unit_test/Makefile.am            |   6 +-
+ unit_test/ncpluginpath.c         |   4 +-
+ unit_test/run_dfaltpluginpath.sh |  65 ++++++++++++----
+ unit_test/test_pathcvt.c         |  16 ++--
+ 26 files changed, 529 insertions(+), 436 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ebe46d9fcc..7954186ee3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -626,93 +626,63 @@ option(NETCDF_ENABLE_FILTER_BZ2   "Enable use of Bz2 compression library if it i
+ option(NETCDF_ENABLE_FILTER_BLOSC "Enable use of blosc compression library if it is available." ON)
+ option(NETCDF_ENABLE_FILTER_ZSTD  "Enable use of Zstd compression library if it is available." ON)
+ 
+-# If user wants, then install selected plugins (default on)
+-set(NETCDF_PLUGIN_INSTALL_DIR "YES" CACHE STRING "Whether and where we should install plugins; defaults to yes")
+-if(NOT NETCDF_ENABLE_PLUGINS)
+-  unset(NETCDF_PLUGIN_INSTALL_DIR CACHE)
+-endif()
+-
+-# This is ugly, but seems necessary because of CMake's boolean structure
+-set(boolval FALSE)
+-if(DEFINED NETCDF_PLUGIN_INSTALL_DIR)
+-  booleanize(${NETCDF_PLUGIN_INSTALL_DIR} boolval)
+-  if(boolval)
+-    set(ENABLE_PLUGIN_INSTALL YES)
+-    # No actual value was specified
+-    unset(NETCDF_PLUGIN_INSTALL_DIR CACHE)
+-  else()
+-    if(boolval STREQUAL "NOTFOUND")
+-      # Must be an actual value
+-      set(ENABLE_PLUGIN_INSTALL YES)
+-    else()
+-      set(ENABLE_PLUGIN_INSTALL NO)
+-    endif()
+-  endif()
++# If user wants, then install selected plugins (default off)
++option(NETCDF_PLUGIN_INSTALL "Enable plugin installation" NO)
++
++# Note: the term PLATFORMDEFAULT stands for:
++# -- /usr/loca/hdf5/lib/plugin If on a *nix* machine
++# -- %ALLUSERSPROFILE%/hdf5/lib/plugins If on a windows or Mingw platform
++if(ISMSVC OR ISMINGW)
++    set(PLATFORMDEFAULT "$ENV{ALLUSERSPROFILE}\\hdf5\\lib\\plugin")
++    set(PLATFORMSEP ";")
+ else()
+-  set(ENABLE_PLUGIN_INSTALL NO)
++    set(PLATFORMDEFAULT "/usr/local/hdf5/lib/plugin")
++    set(PLATFORMSEP ":")
+ endif()
+ 
+-# Ensure no defined plugin dir if not enabled
+-if(NOT ENABLE_PLUGIN_INSTALL)
+-    unset(NETCDF_PLUGIN_INSTALL_DIR CACHE)
+-endif()
++# Internally, the variable DEFAULT_PLUGIN_INSTALL_DIR is the default
++# directory into which plugins are installed; this may be undefined if
++# plugin installation is disabled (the usual case). It is exported as
++# NETCDF_DEFAULT_PLUGIN_INSTALL_DIR.
++#
++# Similarly the variable DEFAULT_PLUGIN_SEARCH_PATH is the default list
++# of directories to search to locate plugins.
++#
++# See configure.ac to see a table defining the rules for computing these two variables.
+ 
+-# Internally, the variable HDF5_PLUGIN_PATH
+-# is always used as a surrogate for the default
+-# plugin path. If it was not defined by the user,
+-# then set it internally.
+-if((NOT DEFINED HDF5_PLUGIN_PATH) OR ("${HDF5_PLUGIN_PATH}" STREQUAL ""))
+-  if(ISMSVC OR ISMINGW)
+-    string(REPLACE "\\" "/" AUP "$ENV{ALLUSERSPROFILE}")
+-    set(HDF5_PLUGIN_PATH "${AUP}/hdf5/lib/plugin")
+-  else()
+-    if(NOT DEFINED CMAKE_INSTALL_PREFIX)
+-      set(HDF5_PLUGIN_PATH "/usr/local/hdf5/lib/plugin")
+-    else()
+-      set(HDF5_PLUGIN_PATH "${CMAKE_INSTALL_PREFIX}/hdf5/lib/plugin")
+-    endif(NOT DEFINED CMAKE_INSTALL_PREFIX)
+-  endif()
+-  set(ENV{HDF5_PLUGIN_PATH} "${HDF5_PLUGIN_PATH}")
+-endif()
+-
+-# The --with-plugin-dir gives the user control of the plugin
+-# directory. If set to 'yes' (the default), then the last directory in
+-# HDF5_PLUGIN_PATH is used (see above).
+-# If a specific directory is provided, it will be used.
+-# If 'no', then plugins will not be installed.
+-
+-if(NETCDF_ENABLE_PLUGIN_INSTALL)
+-    if(DEFINED NETCDF_PLUGIN_INSTALL_DIR)
+-      set(NETCDF_PLUGIN_INSTALL_DIR "${HDF5_PLUGIN_PATH}")
+-      # Default to HDF5_PLUGIN_PATH or its default directories
+-      if(DEFINED ENV{HDF5_PLUGIN_PATH})
+-        set(NETCDF_PLUGIN_INSTALL_DIR "$ENV{HDF5_PLUGIN_PATH}")
+-      else()
+-        if(ISMSVC OR ISMINGW)
+-	        set(NETCDF_PLUGIN_INSTALL_DIR "$ENV{ALLUSERSPROFILE}\\hdf5\\lib\\plugin")
+-	      else()
+-          if(NOT DEFINED CMAKE_INSTALL_PREFIX)
+-            set(NETCDF_PLUGIN_INSTALL_DIR "/usr/local/hdf5/lib/plugin")
+-          else()
+-            set(NETCDF_PLUGIN_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/hdf5/lib/plugin")
+-          endif(NOT DEFINED CMAKE_INSTALL_PREFIX)
+-        endif(ISMSVC OR ISMINGW)
+-      endif(DEFINED ENV{HDF5_PLUGIN_PATH})
+-      message(STATUS "Defaulting to -DPLUGIN_INSTALL_DIR=${NETCDF_PLUGIN_INSTALL_DIR}")
+-    endif()
+-endif(NETCDF_ENABLE_PLUGIN_INSTALL)
++# Inferences about plugins
+ 
+-if(ENABLE_PLUGIN_INSTALL)
+-  # Use the lowest priority dir in the path
+-  getlastdir("${HDF5_PLUGIN_PATH}" "NETCDF_PLUGIN_INSTALL_DIR")
+-  message(STATUS "Final value of-DPLUGIN_INSTALL_DIR=${NETCDF_PLUGIN_INSTALL_DIR}")
+-else() # No option specified
+-    unset(NETCDF_PLUGIN_INSTALL_DIR)
+-    unset(NETCDF_PLUGIN_INSTALL_DIR CACHE)
+-    set(PLUGIN_INSTALL_DIR_SETTING "N.A.")
++if(NETCDF_WITH_PLUGIN_DIR)
++set(NETCDF_ENABLE_PLUGINS yes)
+ endif()
+ 
+-message(STATUS "ENABLE_PLUGIN_INSTALL=${ENABLE_PLUGIN_INSTALL} PLUGIN_INSTALL_DIR=${NETCDF_PLUGIN_INSTALL_DIR}")
++if(NOT NETCDF_ENABLE_PLUGINS)
++  unset(NETCDF_PLUGIN_INSTALL)
++  unset(NETCDF_WITH_PLUGIN_DIR)
++endif()
++
++if (DEFINED NETCDF_WITH_PLUGIN_DIR) # Table row 3
++    set(DEFAULT_PLUGIN_INSTALL_DIR "${NETCDF_WITH_PLUGIN_DIR}")
++    set(DEFAULT_PLUGIN_SEARCH_PATH "${NETCDF_WITH_PLUGIN_DIR}${PLATFORMSEP}${PLATFORMDEFAULT}")
++elseif (DEFINED CMAKE_INSTALL_PREFIX) # Table row 2
++    set(DEFAULT_PLUGIN_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/hdf5/lib/plugin")
++    set(DEFAULT_PLUGIN_SEARCH_PATH "${DEFAULT_PLUGIN_INSTALL_DIR}${PLATFORMSEP}${PLATFORMDEFAULT}")
++else() # Table row 1
++    unset(DEFAULT_PLUGIN_INSTALL_DIR)
++    set(DEFAULT_PLUGIN_SEARCH_PATH "${PLATFORMDEFAULT}")
++endif()
++# canonical form is all forward slashes
++string(REPLACE "\\" "/" DEFAULT_PLUGIN_INSTALL_DIR "${DEFAULT_PLUGIN_INSTALL_DIR}")
++string(REPLACE "\\" "/" DEFAULT_PLUGIN_SEARCH_PATH "${DEFAULT_PLUGIN_SEARCH_PATH}")
++
++# Inferences
++if (DEFINED DEFAULT_PLUGIN_INSTALL_DIR)
++    set(ENABLE_PLUGIN_DIR yes)
++else()
++    set(ENABLE_PLUGIN_DIR no)
++endif()
++set(NETCDF_PLUGIN_INSTALL_DIR "${DEFAULT_PLUGIN_INSTALL_DIR}")
++set(NETCDF_PLUGIN_SEARCH_PATH "${DEFAULT_PLUGIN_SEARCH_PATH}")
+ 
+ # Try to enable NCZarr zip support
+ option(NETCDF_ENABLE_NCZARR_ZIP "Enable NCZarr ZIP support." ${NETCDF_ENABLE_NCZARR})
+diff --git a/cmake/modules/FindBlosc.cmake b/cmake/modules/FindBlosc.cmake
+index da280a8101..40d470c3a9 100644
+--- a/cmake/modules/FindBlosc.cmake
++++ b/cmake/modules/FindBlosc.cmake
+@@ -26,17 +26,14 @@ IF(Blosc_INCLUDE_DIRS)
+     GET_FILENAME_COMPONENT(Blosc_LIBRARY_DIRS ${Blosc_LIBRARY_DIRS} PATH)
+   ENDIF("${Blosc_LIBRARY_DIRS}" MATCHES "/include$")
+ 
+-  IF(EXISTS "${Blosc_LIBRARY_DIRS}/lib")
+-    SET(Blosc_LIBRARY_DIRS ${Blosc_LIBRARY_DIRS}/lib)
+-  ENDIF(EXISTS "${Blosc_LIBRARY_DIRS}/lib")
+-
+   # Find Blosc libraries
+   FIND_LIBRARY(Blosc_DEBUG_LIBRARY NAMES bloscd blosc_d libbloscd libblosc_d libblosc
+                PATH_SUFFIXES Debug ${CMAKE_LIBRARY_ARCHITECTURE} ${CMAKE_LIBRARY_ARCHITECTURE}/Debug
+-               PATHS ${Blosc_LIBRARY_DIRS} NO_DEFAULT_PATH)
++               PATHS ${Blosc_LIBRARY_DIRS} ${Blosc_LIBRARY_DIRS}/lib ${Blosc_LIBRARY_DIRS}/lib64 NO_DEFAULT_PATH)
+   FIND_LIBRARY(Blosc_RELEASE_LIBRARY NAMES blosc libblosc
+                PATH_SUFFIXES Release ${CMAKE_LIBRARY_ARCHITECTURE} ${CMAKE_LIBRARY_ARCHITECTURE}/Release
+-               PATHS ${Blosc_LIBRARY_DIRS} NO_DEFAULT_PATH)
++               PATHS ${Blosc_LIBRARY_DIRS} ${Blosc_LIBRARY_DIRS}/lib ${Blosc_LIBRARY_DIRS}/lib64 NO_DEFAULT_PATH)
++
+ 
+   SET(Blosc_LIBRARIES )
+   IF(Blosc_DEBUG_LIBRARY AND Blosc_RELEASE_LIBRARY)
+diff --git a/cmake/modules/FindSzip.cmake b/cmake/modules/FindSzip.cmake
+index c6f56f5bf2..2ede6287fc 100644
+--- a/cmake/modules/FindSzip.cmake
++++ b/cmake/modules/FindSzip.cmake
+@@ -29,17 +29,13 @@ IF(Szip_INCLUDE_DIRS)
+     GET_FILENAME_COMPONENT(Szip_LIBRARY_DIRS ${Szip_LIBRARY_DIRS} PATH)
+   ENDIF("${Szip_LIBRARY_DIRS}" MATCHES "/include$")
+ 
+-  IF(EXISTS "${Szip_LIBRARY_DIRS}/lib")
+-    SET(Szip_LIBRARY_DIRS ${Szip_LIBRARY_DIRS}/lib)
+-  ENDIF(EXISTS "${Szip_LIBRARY_DIRS}/lib")
+-
+   # Find Szip libraries
+   FIND_LIBRARY(Szip_DEBUG_LIBRARY NAMES szipd szip_d libszipd libszip_d szip libszip sz2 libsz2
+                PATH_SUFFIXES Debug ${CMAKE_LIBRARY_ARCHITECTURE} ${CMAKE_LIBRARY_ARCHITECTURE}/Debug
+-               PATHS ${Szip_LIBRARY_DIRS} NO_DEFAULT_PATH)
++               PATHS ${Szip_LIBRARY_DIRS} ${Szip_LIBRARY_DIRS}/lib ${Szip_LIBRARY_DIRS}/lib64 NO_DEFAULT_PATH)
+   FIND_LIBRARY(Szip_RELEASE_LIBRARY NAMES szip libszip sz libsz sz2 libsz2
+                PATH_SUFFIXES Release ${CMAKE_LIBRARY_ARCHITECTURE} ${CMAKE_LIBRARY_ARCHITECTURE}/Release
+-               PATHS ${Szip_LIBRARY_DIRS} NO_DEFAULT_PATH)
++               PATHS ${Szip_LIBRARY_DIRS} ${Szip_LIBRARY_DIRS}/lib ${Szip_LIBRARY_DIRS}/lib64 NO_DEFAULT_PATH)
+ 
+   SET(Szip_LIBRARIES)
+   SET(Szip_LIBRARY)
+diff --git a/config.h.cmake.in b/config.h.cmake.in
+index e088afb1b2..26a5b4773b 100644
+--- a/config.h.cmake.in
++++ b/config.h.cmake.in
+@@ -163,6 +163,12 @@ are set when opening a binary file on Windows. */
+ /* if true, Allow dynamically loaded plugins */
+ #cmakedefine NETCDF_ENABLE_PLUGINS 1
+ 
++/* Define the plugin install dir */
++#cmakedefine NETCDF_PLUGIN_INSTALL_DIR "${NETCDF_PLUGIN_INSTALL_DIR}"
++
++/* Define the plugin search path */
++#cmakedefine NETCDF_PLUGIN_SEARCH_PATH "${NETCDF_PLUGIN_SEARCH_PATH}"
++
+ /* if true, enable S3 support */
+ #cmakedefine NETCDF_ENABLE_S3 1
+ 
+diff --git a/configure.ac b/configure.ac
+index acb52c8c05..35e23d8cb6 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2143,67 +2143,82 @@ fi
+ 
+ AC_SUBST(STD_FILTERS,[$std_filters])
+ 
+-# Internally, the variable HDF5_PLUGIN_PATH
+-# is always used as a surrogate for the default
+-# plugin path. If it was not defined by the user,
+-# then set it internally.
+-if test "x${HDF5_PLUGIN_PATH}" = x ; then
+-  if test "x$ISMSVC" = xyes || test "x$ISMINGW" = xyes; then
+-    HDF5_PLUGIN_PATH="${ALLUSERSPROFILE}\\hdfd5\\lib\\plugin"
+-  else
+-    HDF5_PLUGIN_PATH="/usr/local/hdf5/lib/plugin"
+-  fi
+-fi
+-
+-# The --with-plugin-dir gives the user control of the plugin
+-# directory. If set to 'yes' (the default), then the last directory in
+-# HDF5_PLUGIN_PATH is used (see above).
++# The --with-plugin-dir option gives the user control of the plugin install
++# directory. This also used as one of the default plugin directory when
++# searching for plugins.
+ # If a specific directory is provided, it will be used.
+-# If 'no', then plugins will not be installed.
+-
++# If not defined or defined with the value no, or --without-plugin-dir, then
++# plugin installation will be suppressed (but see below).
+ AC_MSG_CHECKING([whether and where we should install plugins])
+-AC_ARG_WITH([plugin-dir], [AS_HELP_STRING([--with-plugin-dir=<absolute directory>|yes|no|--without-plugin-dir],
++AC_ARG_WITH([plugin-dir], [AS_HELP_STRING([--with-plugin-dir=<absolute directory>|no|--without-plugin-dir],
+               [Install selected standard filters in specified or default directory])],
+ 	      [],[with_plugin_dir=no])
+ AC_MSG_RESULT([$with_plugin_dir])
++
+ # Using selected filter options forces installation
+ if test "x$have_zstd" = xyes; then
+-   if test "x$enable_plugins" = xyes && test "x$with_plugin_dir" = xno; then
+-      AC_MSG_WARN([--enable_filter-zstd => --with-plugin-dir.])
+-      with_plugin_dir=yes
+-   fi
+-fi
+-if test "x$with_plugin_dir" = xno ; then # option missing|disabled
+-    with_plugin_dir=no
+-    with_plugin_dir_setting="N.A."
+-    enable_plugin_dir=no
+-elif test "x$with_plugin_dir" != x ; then
+-    if test "x$with_plugin_dir" != xyes && test "x$with_plugin_dir" != xno ; then
+-      # Presume true directory
+-      HDF5_PLUGIN_PATH="${with_plugin_dir}"
+-    fi
++    AC_MSG_WARN([--enable_filter-zstd => --enable-plugins.])
++    enable_plugins=yes
+ fi
+ 
+-# Use the last dir (lowest search priority) in HDF5_PLUGIN_PATH
+-PLUGIN_PATH="$HDF5_PLUGIN_PATH"
++# Note: the term PLATFORMDEFAULT stands for:
++# -- /usr/loca/hdf5/lib/plugin If on a *nix* machine
++# -- %ALLUSERSPROFILE%/hdf5/lib/plugins If on a windows or Mingw platform
+ if test "x$ISMSVC" = xyes || test "x$ISMINGW" = xyes; then
+-  PLUGIN_DIR=`echo "$PLUGIN_PATH" | tr ';' ' '`
++    PLATFORMDEFAULT="${ALLUSERSPROFILE}\\hdf5\\lib\\plugin"
++    PLATFORMSEP=";"
+ else
+-  PLUGIN_DIR=`echo "$PLUGIN_PATH" | tr ':;' '  '`
++    PLATFORMDEFAULT="/usr/local/hdf5/lib/plugin"
++    PLATFORMSEP=":"
++fi
++
++# Internally, the variable DEFAULT_PLUGIN_INSTALL_DIR is the default
++# directory into which plugins are installed; this may be undefined if
++# plugin installation is disabled (the usual case). It is exported as
++# NETCDF_PLUGIN_INSTALL_DIR.
++#
++# Similarly the variable DEFAULT_PLUGIN_SEARCH_PATH is the default list
++# of directories to search to locate plugins. It is exported as
++# NETCDF_PLUGIN_SEARCH_PATH
++#
++# See the document docs/pluginpath.md for a more detailed discussion
++# of how NETCDF_PLUGIN_INSTALL_DIR and NETCDF_PLUGIN_SEARCH_PATH are
++# computed.
++
++# Canonicalize --with-prefix-dir and --prefix
++if test "x$with_plugin_dir" = xno ; then unset with_plugin_dir ; fi
++if test "xprefix" = x ; then prefix=NONE ; fi
++if test "x$with_plugin_dir" != x ; then  # Table row 3
++    DEFAULT_PLUGIN_INSTALL_DIR="${with_plugin_dir}"
++    DEFAULT_PLUGIN_SEARCH_PATH="${with_plugin_dir}${PLATFORMSEP}${PLATFORMDEFAULT}"
++elif test "x$prefix" != xNONE ; then  # Table row 2
++    DEFAULT_PLUGIN_INSTALL_DIR="${prefix}/hdf5/lib/plugin"
++    DEFAULT_PLUGIN_SEARCH_PATH="${prefix}/hdf5/lib/plugin${PLATFORMSEP}${PLATFORMDEFAULT}"
++else # Table row 1
++    unset DEFAULT_PLUGIN_INSTALL_DIR
++    DEFAULT_PLUGIN_SEARCH_PATH="${PLATFORMDEFAULT}"
+ fi
+-last=
+-for pp in ${PLUGIN_DIR} ; do last="$pp"; done
+-PLUGIN_DIR="$last"
+-with_plugin_dir_setting="$PLUGIN_DIR"
+ # canonical form is all forward slashes
+-with_plugin_dir=`echo "$PLUGIN_DIR" | tr '\\\\' '/'`
+-enable_plugin_dir=yes
+-AC_MSG_NOTICE([Final --with-plugin-dir=$with_plugin_dir])
++DEFAULT_PLUGIN_INSTALL_DIR=`echo "$DEFAULT_PLUGIN_INSTALL_DIR" | tr '\\\\' '/'`
++DEFAULT_PLUGIN_SEARCH_PATH=`echo "$DEFAULT_PLUGIN_SEARCH_PATH" | tr '\\\\' '/'`
++
++# Inferences
++if test "x$DEFAULT_PLUGIN_INSTALL_DIR" = x ; then # option missing|disabled
++    enable_plugin_dir=no
++else
++    enable_plugin_dir=yes
++fi
++
++if test "x$enable_plugin_dir" = xyes ; then
++  AC_DEFINE([ENABLE_PLUGIN_DIR], [1], [If true, enable filter installation])
++fi
++
+ AM_CONDITIONAL([ENABLE_PLUGIN_DIR], [test "x$enable_plugin_dir" = xyes])
+-AC_SUBST([PLUGIN_INSTALL_DIR], [$with_plugin_dir])
+-# Better value for libnetcdf.settings
+-AC_SUBST([PLUGIN_INSTALL_DIR_SETTING], [$with_plugin_dir_setting])
+-AC_SUBST(NETCDF_PLUGIN_INSTALL_DIR, [$PLUGIN_INSTALL_DIR])
++AC_DEFINE_UNQUOTED([NETCDF_PLUGIN_INSTALL_DIR], ["${DEFAULT_PLUGIN_INSTALL_DIR}"], [Final Install Dir])
++AC_DEFINE_UNQUOTED([NETCDF_PLUGIN_SEARCH_PATH], ["${DEFAULT_PLUGIN_SEARCH_PATH}"], [Final Search Path])
++AC_SUBST([NETCDF_PLUGIN_INSTALL_DIR], [${DEFAULT_PLUGIN_INSTALL_DIR}])
++AC_SUBST([NETCDF_PLUGIN_SEARCH_PATH], [${DEFAULT_PLUGIN_SEARCH_PATH}])
++
+ # Access netcdf specific version of config.h
+ AH_BOTTOM([#include "ncconfigure.h"])
+ 
+diff --git a/docs/pluginpath.md b/docs/pluginpath.md
+index 14fc1bed08..0458bcd759 100644
+--- a/docs/pluginpath.md
++++ b/docs/pluginpath.md
+@@ -75,30 +75,52 @@ This initial global plugin path will be propagated to HDF5 and NCZarr.
+ At build-time, the target location directory into which libraries implementing plugins are installed is specified using a special *./configure* option
+ ````
+ --with-plugin-dir=<directorypath>
+-or
+---with-plugin-dir
+ ````
+ or its corresponding *cmake* option.
+ ````
+--DNETCDF_PLUGIN_INSTALL_DIR=<directorypath>
+-or
+--DNETCDF_PLUGIN_INSTALL_DIR=YES
++-DNETCDF_WITH_PLUGIN_DIR=<directorypath>
+ ````
+-If this option is specified but with no specific directory,
+-then it defaults to one of three values:
+-1. If *HDF5\_PLUGIN\_PATH* defined, then use the last directory in that path,
+-2. else use `/usr/local/hdf5/lib/plugin` for linux/unix operating systems (including Cygwin) else use
+-3. `%ALLUSERSPROFILE%\\hdf5\\lib\\plugin` for Windows and MinGW.
+ 
+-If the option is specified with an absolute directory path, then all plugin libraries will be installed in that directory only.
+-
+-If the option is not specified at all, or one of the following options is used,
+-then no attempt will be made to install plugins.
+-````
+---without-plugin-dir
+-or (cmake)
+--DNETCDF_PLUGIN_INSTALL_DIR=NO
+-````
++## Build-Time Operations
++
++At build time, certain plugin-related constants are constructed.
++1. NETCDF_PLUGIN_INSTALL_DIR -- the directory into which compiled plugins should be installed
++2. NETCDF_PLUGIN_SEARCH_PATH -- the default search path to be used at run-time if not over-ridden by the *HDF5_PLUGIN_PATH* environment variable.
++
++<table style="border:2px solid black;border-collapse:collapse">
++<tr style="outline: thin solid;" align="center"><td colspan="4">Table showing the build-time computation of DEFAULT_PLUGIN_INSTALL_DIR and DEFAULT_PLUGIN_SEARCH_PATH.</td>
++<tr style="outline: thin solid" ><th>--with-plugin-dir<th>--prefix<th>DEFAULT_PLUGIN_INSTALL_DIR<th>DEFAULT_PLUGIN_SEARCH_PATH
++<tr style="outline: thin solid" ><td>undefined<td>undefined<td>undefined<td>PLATFORMDEFALT
++<tr style="outline: thin solid" ><td>undefined<td>&lt;abspath-prefix&gt;<td>&lt;abspath-prefix&gt;/hdf5/lib/plugin<td>&lt;abspath-prefix&gt;/hdf5/lib/plugin&lt;SEP&gt;PLATFORMDEFALT
++<tr style="outline: thin solid" ><td>&lt;abspath-plugins&gt;<td>N.A.<td>&lt;abspath-plugins&gt;<td>&lt;abspath-plugins&gt;&lt;SEP&gt;PLATFORMDEFALT
++</table>
++
++Notes:
++1. HDF5_PLUGIN_PATH is ignored at build time.
++
++2. ';' is used as a placeholder for PLATFORMSEP.
++
++3. The term PLATFORMDEFAULT stands for:
++    - /usr/local/hdf5/lib/plugin If on a *nix* machine
++    - %ALLUSERSPROFILE%/hdf5/lib/plugins If on a windows or Mingw platform
++4. The term SEP stands for:
++    - ':' If on a *nix* machine
++    - ';' If on a windows or Mingw platform
++
++## Run-Time Operations
++
++When the netcdf-c library initializes itself (at runtime), it chooses an
++initial global plugin path for the config.h value.
++This value defaults to  *NETCDF_PLUGIN_SEARCH_PATH*.
++If, however, HDF5_PLUGIN_PATH is defined, then it is used to override
++*NETCDF_PLUGIN_SEARCH_PATH*.
++
++<table style="border:2px solid black;border-collapse:collapse">
++<tr style="outline: thin solid" align="center"><td colspan="2">Table showing the computation of the initial global plugin path</td>
++<tr style="outline: thin solid"><th>HDF5_PLUGIN_PATH<th>Initial global plugin path
++<tr style="outline: thin solid"><td>undefined<td>NETCDF_PLUGIN_SEARCH_PATH
++<tr style="outline: thin solid"><td>&lt;path1;...pathn&gt;<td>&lt;path1;...pathn&gt;
++</table>
+ 
+ ## Multi-Threaded Access to the Plugin Path.
+ Specifically, note that modifying the plugin path must be done "atomically".
+diff --git a/include/ncpathmgr.h b/include/ncpathmgr.h
+index 6a5a0d2698..fb660af659 100644
+--- a/include/ncpathmgr.h
++++ b/include/ncpathmgr.h
+@@ -33,9 +33,9 @@ Assumptions about Input path:
+ 2. It conforms to the format expected by one of the following:
+        Linux (/x/y/...),
+        Cygwin (/cygdrive/D/...),
+-       Windows|MINGW (D:\...),
++       Windows|MINGW|MSYS (D:\...),
+        Windows network path (\\mathworks\...)
+-       MSYS (/D/...),
++       MSYS (/D/...) but only if local platform is Windows or MSYS.
+ 4. It is encoded in the local platform character set.  Note that
+    for most systems, this is utf-8. But for Windows, the
+    encoding is most likely some form of ANSI code page, probably
+@@ -50,11 +50,11 @@ Parsing Rules:
+ 2. A leading '/cygdrive/D' will be converted to
+    drive letter D if D is alpha-char.
+ 3. A leading D:/... is treated as a windows drive letter
+-4. A leading /d/... is treated as a windows drive letter
+-   if the platform is MSYS2.
+-5. A leading // is a windows network path and is converted
++4. A leading // is a windows network path and is converted
+    to a drive letter using the fake drive letter "/".
+    So '//svc/x/y' translates to '/:/svc/x/y'.
++5. If the platform is Windows or MSYS, then a leading /D/ is treated
++   as a drive letter.
+ 6. All other cases are assumed to be Unix variants with no drive letter. 
+ 
+ After parsing, the following pieces of information are kept in a struct.
+@@ -74,12 +74,13 @@ The re-write rules (unparsing) are given the above three pieces
+ of info + the current platform + the root mount point (if any).
+ The conversion rules are as follows.
+ 
+-  Platform  | No Input Driv       | Input Drive
++  Platform  | No Input Drive      | Input Drive
+ ----------------------------------------------------
+ NCPD_NIX    | <path>              | /<drive>/path
+ NCPD_CYGWIN | /<path>             | /cygdrive/<drive>/<path>
+ NCPD_WIN    | <mountpoint>/<path> | <drive>:<path>
+ NCPD_MSYS   | <mountpoint>/<path> | <drive>:<path>
++NCPD_MINGW  | <mountpoint>/<path> | <drive>:<path>
+ 
+ Notes:
+ 1. MINGW without MSYS is treated like WIN.
+diff --git a/libdispatch/daux.c b/libdispatch/daux.c
+index 728fb59b20..0d8ce6fe84 100644
+--- a/libdispatch/daux.c
++++ b/libdispatch/daux.c
+@@ -30,6 +30,7 @@ See COPYRIGHT for license information.
+ #include "nclog.h"
+ #include "ncrc.h"
+ #include "netcdf_filter.h"
++#include "ncpathmgr.h"
+ 
+ struct NCAUX_FIELD {
+     char* name;
+@@ -979,7 +980,7 @@ ncaux_plugin_path_parse(const char* pathlist0, char sep, NCPluginList* dirs)
+     char* p;
+     size_t count;
+     size_t plen;
+-    char seps[3] = "\0\0\0"; /* will contain all allowable separators */
++    char seps[2] = "\0\0"; /* will contain all allowable separators */
+ 
+     if(dirs == NULL) {stat = NC_EINVAL; goto done;}
+ 
+@@ -987,8 +988,13 @@ ncaux_plugin_path_parse(const char* pathlist0, char sep, NCPluginList* dirs)
+ 
+     /* If a separator is specified, use it, otherwise search for ';' or ':' */
+     seps[0] = sep;
+-    if(sep == '\0') {seps[0] = ';'; seps[1] = ':';}
+-
++    if(sep == 0) {
++	if(NCgetlocalpathkind() == NCPD_WIN
++	    || NCgetlocalpathkind() == NCPD_MSYS)
++	   seps[0] = ';';
++	else
++	    seps[0] = ':';
++    }
+     plen = strlen(pathlist0); /* assert plen > 0 */
+     if((path = malloc(plen+1+1))==NULL) {stat = NC_ENOMEM; goto done;}
+     memcpy(path,pathlist0,plen);
+diff --git a/libdispatch/dpathmgr.c b/libdispatch/dpathmgr.c
+index 4e0a5fd631..7f61858a6b 100644
+--- a/libdispatch/dpathmgr.c
++++ b/libdispatch/dpathmgr.c
+@@ -104,11 +104,11 @@ static struct MountPoint {
+     char drive;
+ } mountpoint;
+ 
+-/* Pick the target kind for testing */
+-static int testkind = 0;
++/* Pick the platform kind for testing */
++static int platform = 0;
+ 
+ static int parsepath(const char* inpath, struct Path* path);
+-static int unparsepath(struct Path* p, char** pathp, int target);
++static int unparsepath(struct Path* p, char** pathp, int platform);
+ static int getwdpath(void);
+ static void clearPath(struct Path* path);
+ static void pathinit(void);
+@@ -136,7 +136,7 @@ NCpathcvt(const char* inpath)
+     char* tmp1 = NULL;
+     char* result = NULL;
+     struct Path inparsed = empty;
+-    int target = NCgetlocalpathkind();
++    int platform= NCgetlocalpathkind();
+ 
+     if(inpath == NULL) goto done; /* defensive driving */
+ 
+@@ -152,7 +152,7 @@ NCpathcvt(const char* inpath)
+     if(pathdebug > 0)
+         fprintf(stderr,">>> NCpathcvt: inparsed=%s\n",printPATH(&inparsed));
+ 
+-    if((stat = unparsepath(&inparsed,&result,target)))
++    if((stat = unparsepath(&inparsed,&result,platform)))
+         {REPORT(stat,"NCpathcvt: unparsepath"); goto done;}
+ 
+ done:
+@@ -268,7 +268,7 @@ NCpathcvt_test(const char* inpath, int ukind, int udrive)
+ 
+     mountpoint.drive = (char)udrive;
+     mountpoint.defined = (mountpoint.drive || nulllen(mountpoint.prefix) > 0);
+-    testkind = ukind;
++    platform = ukind;
+     result = NCpathcvt(inpath);
+     mountpoint = old;
+     return result;
+@@ -801,6 +801,7 @@ parsepath(const char* inpath, struct Path* path)
+     char* tmp1 = NULL;
+     size_t len;
+     char* p;
++    int platform = NCgetlocalpathkind();
+ 
+     assert(path);
+     memset(path,0,sizeof(struct Path));
+@@ -871,13 +872,17 @@ parsepath(const char* inpath, struct Path* path)
+ 	    {stat = NC_ENOMEM; goto done;}
+ 	path->kind = NCPD_WIN; /* Might be MINGW */
+     }
+-#if 0
+-    /* X. look for MSYS2 path /D/... */
+-    else if(len >= 2
++    /* The /D/x/y/z MSYS paths cause much parsing confusion.
++       So only use it if the current platform is windows of mingw.
++       Otherwise use windows paths
++    */
++    /* X. look for MSYS path /D/... */
++    else if((platform== NCPD_WIN || platform == NCPD_MSYS)
++        && len >= 2
+ 	&& (tmp1[0] == '/')
+ 	&& strchr(windrive,tmp1[1]) != NULL
+ 	&& (tmp1[2] == '/' || tmp1[2] == '\0')) {
+-	/* Assume this is an MSYS2 path */
++	/* Assume this is an MSYS path */
+ 	path->drive = tmp1[1];
+ 	/* Remainder */
+ 	if(tmp1[2] == '\0')
+@@ -888,7 +893,6 @@ parsepath(const char* inpath, struct Path* path)
+ 	    {stat = NC_ENOMEM; goto done;}
+ 	path->kind = NCPD_MSYS;
+     }
+-#endif
+     /* 5. look for *nix* path; note this includes MSYS2 paths as well */
+     else if(len >= 1 && tmp1[0] == '/') {
+ 	/* Assume this is a *nix path */
+@@ -908,7 +912,7 @@ parsepath(const char* inpath, struct Path* path)
+ }
+ 
+ static int
+-unparsepath(struct Path* xp, char** pathp, int target)
++unparsepath(struct Path* xp, char** pathp, int platform)
+ {
+     int stat = NC_NOERR;
+     size_t len;
+@@ -922,7 +926,7 @@ unparsepath(struct Path* xp, char** pathp, int target)
+     if(xp->kind == NCPD_REL) {
+ 	/* Pass thru relative paths, but with proper slashes */
+ 	if((path = strdup(xp->path))==NULL) stat = NC_ENOMEM;
+-	if(target == NCPD_WIN || target == NCPD_MSYS) {
++	if(platform == NCPD_WIN || platform == NCPD_MSYS) {
+ 	    char* p;
+             for(p=path;*p;p++) {if(*p == '/') *p = '\\';} /* back slash*/
+ 	}
+@@ -930,12 +934,12 @@ unparsepath(struct Path* xp, char** pathp, int target)
+     }
+ 
+     /* We need a two level switch with an arm
+-       for every pair of (xp->kind,target)
++       for every pair of (xp->kind,platform)
+     */
+ 
+ #define CASE(k,t) case ((k)*10+(t))
+ 
+-    switch (xp->kind*10 + target) {
++    switch (xp->kind*10 + platform) {
+     CASE(NCPD_NIX,NCPD_NIX):
+ 	assert(xp->drive == 0);
+ 	len = nulllen(xp->path)+1;
+@@ -993,13 +997,20 @@ unparsepath(struct Path* xp, char** pathp, int target)
+     CASE(NCPD_CYGWIN,NCPD_NIX):
+         len = nulllen(xp->path);
+         if(xp->drive != 0)
+-	    len += (cdlen + 2); /* /cygdrive/D */
+-	len++;
++	    len += (cdlen + 1); /* strlen("/cygdrive/D") */
++	len++; /* nul term */
+         if((path = (char*)malloc(len))==NULL)
+ 	    {stat = NCTHROW(NC_ENOMEM); goto done;}
+ 	path[0] = '\0';
+ 	if(xp->drive != 0) {
++	    /* There is no good/standard way to map a windows
++               drive letter to a *nix* path.*/
++#if 0
+             strlcat(path,"/cygdrive/",len);
++#else
++	    /* so, just use "/D" where D is the drive letter */
++	    strlcat(path,"/",len);
++#endif
+ 	    sdrive[0] = xp->drive; sdrive[1] = '\0';
+             strlcat(path,sdrive,len);
+ 	}
+@@ -1110,7 +1121,7 @@ unparsepath(struct Path* xp, char** pathp, int target)
+     }
+ 
+     if(pathdebug > 0)
+-	fprintf(stderr,">>> unparse: target=%s xp=%s path=|%s|\n",NCgetkindname(target),printPATH(xp),path);
++	fprintf(stderr,">>> unparse: platform=%s xp=%s path=|%s|\n",NCgetkindname(platform),printPATH(xp),path);
+ 
+ exit:
+     if(pathp) {*pathp = path; path = NULL;}
+@@ -1169,7 +1180,7 @@ int
+ NCgetlocalpathkind(void)
+ {
+     int kind = NCPD_UNKNOWN;
+-    if(testkind) return testkind;
++    if(platform) return platform;
+ #ifdef __CYGWIN__
+ 	kind = NCPD_CYGWIN;
+ #elif defined _MSC_VER /* not _WIN32 */
+diff --git a/libdispatch/dplugins.c b/libdispatch/dplugins.c
+index ab4f1cc08d..9179f6ecd9 100644
+--- a/libdispatch/dplugins.c
++++ b/libdispatch/dplugins.c
+@@ -1,10 +1,11 @@
+-/**************************************************/
+-/* Global state plugin path implementation */
+-
+ /*
+  * Copyright 2018, University Corporation for Atmospheric Research
+  * See netcdf/COPYRIGHT file for copying and redistribution conditions.
+  */
++
++/**************************************************/
++/* Global state plugin path implementation */
++
+ /**
+  * @file
+  * Functions for working with plugins. 
+@@ -35,15 +36,12 @@ Unified plugin related code
+ 
+ /* list of environment variables to check for plugin roots */
+ #define PLUGIN_ENV "HDF5_PLUGIN_PATH"
+-#define PLUGIN_DIR_UNIX "/usr/local/hdf5/plugin"
+-#define PLUGIN_DIR_WIN "%s/hdf5/lib/plugin"
+-#define WIN32_ROOT_ENV "ALLUSERSPROFILE"
+ 
+ /* Control path verification */
+ #define PLUGINPATHVERIFY "NC_PLUGIN_PATH_VERIFY"
+ 
+ /*Forward*/
+-static int builddefault(NCPluginList* dirs);
++static int buildinitialpluginpath(NCPluginList* dirs);
+ 
+ static int NC_plugin_path_initialized = 0;
+ static int NC_plugin_path_verify = 1;
+@@ -74,15 +72,9 @@ nc_plugin_path_initialize(void)
+     gs = NC_getglobalstate();
+ 
+    /**
+-    * When the netcdf-c library initializes itself, it chooses an initial
+-    * global plugin path using the following rules, which are those used
+-    * by the HDF5 library:
+-    * 1. If HDF5_PLUGIN_PATH environment variable is defined,
+-    * then its value is used as the initial plugin path.
+-    * 2. If HDF5_PLUGIN_PATH is not defined, then the initial plugin path is either:
+-    *     /usr/local/hdf5/plugin -- for Linux/Unix/Cygwin,
+-    *     %ALLUSERSPROFILE%/hdf5/lib/plugin -- for Windows/Mingw.
+-    * This initial global plugin path will be propagated to HDF5 and NCZarr.
++    * When the netcdf-c library initializes itself (at runtime), it chooses an
++    * initial global plugin path using the following rules, which are those used
++    * by the HDF5 library, except as modified for plugin install (which HDF5 does not support).
+     */
+ 
+     /* Initialize the implementations */
+@@ -93,15 +85,9 @@ nc_plugin_path_initialize(void)
+     if((stat = NC4_hdf5_plugin_path_initialize())) goto done;
+ #endif
+ 
+-#ifdef USE_HDF5
+-    /* Case (a,b): Get the initial HDF5 plugin path set */
+-    if((stat = NC4_hdf5_plugin_path_get(&dirs))) goto done;
+-    if(dirs.ndirs > 0) hdf5found = 1;
+-#endif /*USE_HDF5*/
+-
+-    if(!hdf5found) { /* Case: (c) HDF5 not enabled or otherwise empty */
+-        if((stat = builddefault(&dirs))) goto done; /* Construct a default */
+-    }
++    /* Compute the initial global plugin path */
++    assert(dirs.ndirs == 0 && dirs.dirs == NULL);
++    if((stat = buildinitialpluginpath(&dirs))) goto done; /* Construct a default */
+ 
+     /* Sync to the actual implementations */
+ #ifdef USE_HDF5
+@@ -114,9 +100,17 @@ nc_plugin_path_initialize(void)
+     /* Set the global plugin dirs sequence */
+     assert(gs->pluginpaths == NULL);
+     gs->pluginpaths = nclistnew();
+-    nclistsetlength(gs->pluginpaths,dirs.ndirs);
+-    memcpy(((char**)gs->pluginpaths->content),dirs.dirs,dirs.ndirs*sizeof(char*));
++    if(dirs.ndirs > 0) {
++	size_t i;
++	char** dst;
++        nclistsetlength(gs->pluginpaths,dirs.ndirs);
++	dst = (char**)nclistcontents(gs->pluginpaths);
++	assert(dst != NULL);
++	for(i=0;i<dirs.ndirs;i++)
++	    dst[i] = strdup(dirs.dirs[i]);
++    }
+ done:
++    ncaux_plugin_path_clear(&dirs);
+     return NCTHROW(stat);
+ }
+ 
+@@ -219,7 +213,7 @@ nc_plugin_path_get(NCPluginList* dirs)
+     if(gs->pluginpaths == NULL) gs->pluginpaths = nclistnew(); /* suspenders and belt */
+     if(dirs == NULL) goto done;
+     dirs->ndirs = nclistlength(gs->pluginpaths);
+-    if(dirs->dirs == NULL) {
++    if(dirs->ndirs > 0 && dirs->dirs == NULL) {
+ 	if((dirs->dirs = (char**)calloc(dirs->ndirs,sizeof(char*)))==NULL)
+ 	    {stat = NC_ENOMEM; goto done;}
+     }
+@@ -240,6 +234,7 @@ nc_plugin_path_get(NCPluginList* dirs)
+ 		assert(strcmp(dirs->dirs[i],l5.dirs[i])==0);
+ 		nullfree(l5.dirs[i]);
+ 	    }
++	    nullfree(l5.dirs);
+ 	}
+ #endif /*NETCDF_ENABLE_HDF5*/
+ #ifdef NETCDF_ENABLE_NCZARR_FILTERS
+@@ -252,6 +247,7 @@ nc_plugin_path_get(NCPluginList* dirs)
+ 		assert(strcmp(dirs->dirs[i],lz.dirs[i])==0);
+ 		nullfree(lz.dirs[i]);
+ 	    }
++	    nullfree(lz.dirs);
+         }
+ #endif /*NETCDF_ENABLE_NCZARR_FILTERS*/
+     }
+@@ -301,41 +297,42 @@ nc_plugin_path_set(NCPluginList* dirs)
+     return NCTHROW(stat);
+ }
+ 
+-/* Setup the plugin path default */
++/**
++ * When the netcdf-c library initializes itself (at runtime), it chooses an
++ * initial global plugin path using the following rules, which are those used
++ * by the HDF5 library, except as modified for plugin install (which HDF5 does not support).
++ *
++ * Note: In the following, PLATFORMPATH is:
++ * -- /usr/local/lhdf5/lib/plugin if platform is *nix*
++ * -- %ALLUSERSPROFILE%/hdf5/lib/plugin if platform is Windows or Mingw
++ * and in the following, PLATFORMSEP is:
++ * -- ":" if platform is *nix*
++ * -- ";" if platform is Windows or Mingw
++ * and
++ *     NETCDF_PLUGIN_SEARCH_PATH is the value constructed at build-time (see configure.ac)
++ *
++ * Table showing the computation of the initial global plugin path
++ * =================================================
++ * | HDF5_PLUGIN_PATH | Initial global plugin path |
++ * =================================================
++ * | undefined        | NETCDF_PLUGIN_SEARCH_PATH  |
++ * -------------------------------------------------
++ * | <path1;...pathn> | <path1;...pathn>           |
++ * -------------------------------------------------
++ */
+ static int
+-builddefault(NCPluginList* dirs)
++buildinitialpluginpath(NCPluginList* dirs)
+ {
+     int stat = NC_NOERR;
+-    char* hdf5defaultpluginpath = NULL;
+-    const char* pluginroots = NULL;
+-    size_t i;
+-#ifdef _WIN32
+-    const char* win32_root;
+-    char dfalt[4096];
+-#endif
+-
++    const char* hdf5path = NULL;
+     /* Find the plugin directory root(s) */
+-    pluginroots = getenv(PLUGIN_ENV); /* Usually HDF5_PLUGIN_PATH */
+-    if(pluginroots != NULL) {
+-	if((stat = ncaux_plugin_path_parse(pluginroots,'\0',dirs))) goto done;
+-    } else {
+-#ifdef _WIN32
+-	win32_root = getenv(WIN32_ROOT_ENV);
+-	if(win32_root != NULL && strlen(win32_root) > 0) {
+-	    snprintf(dfalt,sizeof(dfalt),PLUGIN_DIR_WIN,win32_root);
+-	    hdf5defaultpluginpath = strdup(dfalt);
+-	}
+-#else /*!_WIN32*/
+-        hdf5defaultpluginpath = strdup(PLUGIN_DIR_UNIX);
+-#endif
+-        /* Use the default as the only value in the default list */
+-        if(hdf5defaultpluginpath != NULL) {
+-	    ncaux_plugin_path_clear(dirs); /* make sure it is empty */
+-            if((stat=ncaux_plugin_path_append(dirs,hdf5defaultpluginpath)))
+-		goto done;
+-	}
++    hdf5path = getenv(PLUGIN_ENV); /* HDF5_PLUGIN_PATH */
++    if(hdf5path == NULL) {
++	/* Use NETCDF_PLUGIN_SEARCH_PATH */
++	hdf5path = NETCDF_PLUGIN_SEARCH_PATH;
+     }
++    if((stat = ncaux_plugin_path_parse(hdf5path,'\0',dirs))) goto done;
++
+ done:
+-    nullfree(hdf5defaultpluginpath);
+     return stat;
+ }
+diff --git a/libnczarr/CMakeLists.txt b/libnczarr/CMakeLists.txt
+index 4a8dcb96d2..c460e1d76e 100644
+--- a/libnczarr/CMakeLists.txt
++++ b/libnczarr/CMakeLists.txt
+@@ -69,6 +69,10 @@ if (USE_HDF5)
+     target_link_libraries(nczarr PRIVATE HDF5::HDF5)
+ endif(USE_HDF5)
+ 
++if(NETCDF_ENABLE_NCZARR_ZIP)
++   target_include_directories(nczarr PRIVATE ${Zip_INCLUDE_DIRS})
++endif(NETCDF_ENABLE_NCZARR_ZIP)
++
+ if(STATUS_PARALLEL)
+     target_link_libraries(nczarr PUBLIC MPI::MPI_C)
+ endif(STATUS_PARALLEL)
+diff --git a/libnetcdf.settings.in b/libnetcdf.settings.in
+index 4aac31c1c9..a9fae8d1b7 100644
+--- a/libnetcdf.settings.in
++++ b/libnetcdf.settings.in
+@@ -9,7 +9,6 @@ Configured On:		@CONFIG_DATE@
+ Host System:		@host_cpu@-@host_vendor@-@host_os@
+ Build Directory: 	@abs_top_builddir@
+ Install Prefix:         @prefix@
+-Plugin Install Prefix:  @PLUGIN_INSTALL_DIR_SETTING@
+ 
+ # Compiling Options
+ -----------------
+@@ -53,6 +52,7 @@ Relaxed Boundary Check:	@RELAX_COORD_BOUND@
+ 
+ Plugins Enabled:        @HAS_PLUGINS@
+ Plugin Install Dir:     @NETCDF_PLUGIN_INSTALL_DIR@
++Plugin Search Path:     @NETCDF_PLUGIN_SEARCH_PATH@
+ 
+ Quantization:		@HAS_QUANTIZE@
+ Logging:     		@HAS_LOGGING@
+diff --git a/ncdump/echon.c b/ncdump/echon.c
+index 46c5931f50..a81b93baed 100644
+--- a/ncdump/echon.c
++++ b/ncdump/echon.c
+@@ -32,7 +32,8 @@ main(int argc, char** argv)
+ {
+     int i;
+     int len;
+-    char* result = NULL;
++    char* input = NULL;
++    char* output = NULL;
+     int noeol = 1; /* Default to -n vs -N */
+     int escape = 1; /* Ditto */
+     char* p = NULL;
+@@ -42,16 +43,18 @@ main(int argc, char** argv)
+     NCstdbinary(); /* avoid \r\n for windows */
+ 
+     opterr = 1;
+-    while ((c = getopt(argc, argv,"enEN")) != EOF) {
++    while ((c = getopt(argc, argv,"enxNX")) != EOF) {
+ 	switch(c) {
+-	case 'e': escape = 1; break;
++	case 'e': goto nomoreargs;
++	case 'x': escape = 1; break;
+ 	case 'n': noeol = 1; break;
+-	case 'E': escape = 0; break;
++	case 'X': escape = 0; break;
+ 	case 'N': noeol = 0; break;
+ 	case '?': default: break; /* ignore */
+ 	}
+     }    
+ 
++nomoreargs:
+     /* leave non-flag args */
+     argc -= optind;
+     argv += optind;
+@@ -59,17 +62,20 @@ main(int argc, char** argv)
+     /* Compute the max possible length of output */
+     for(len=0,i=0;i<argc;i++) len += (int)strlen(argv[i]);
+     len += (argc - 1); /* inter-arg spacing */
+-    result = (char*)malloc((size_t)len+1+1); /* +1 for nul term +1 for '\n' */
+-    assert(result != NULL);
+-    result[0] = '\0';
++    input = (char*)calloc(1,(size_t)len+1+1); /* +1 for nul term +1 for '\n' */
++    assert(input != NULL);
++    input[0] = '\0';
+     /* Concat all the arguments with  ' ' between them */   
+     for(i=0;i<argc;i++) {
+-	if(i > 0) strcat(result," ");
+-	strcat(result,argv[i]);
++	if(i > 0) strcat(input," ");
++	strcat(input,argv[i]);
+     }
+-    /* Optionally de-escape the result */
+-    if(escape) {
+-	for(p=result,q=result;*p;) {
++    output = (char*)calloc(1,(size_t)len+1+1); /* +1 for nul term +1 for '\n' */
++    assert(output != NULL);
++    output[0] = '\0';
++    /* Optionally de-escape the input */
++    for(p=input,q=output;*p;) {
++        if(escape) {
+ 	    switch (*p) {
+ 	    default: *q++ = *p; break;
+ 	    case '\\':
+@@ -87,13 +93,14 @@ main(int argc, char** argv)
+ 		break;
+ 	    }
+ 	    p++;
+-	}
+-    } else
+-	*q++ = *p++;
++        } else
++	    *q++ = *p++;
++    }
+     if(!noeol) *p++ = '\n';
+     *p = '\0';
+-    fputs(result,stdout);
++    fputs(output,stdout);
+     fflush(stdout);
+-    free(result);
++    free(input);
++    free(output);
+     return 0;
+ }
+diff --git a/ncdump/ncpathcvt.c b/ncdump/ncpathcvt.c
+index 43443e39f1..b0ae196eca 100644
+--- a/ncdump/ncpathcvt.c
++++ b/ncdump/ncpathcvt.c
+@@ -26,20 +26,24 @@
+ #endif
+ 
+ #include "netcdf.h"
++#include "netcdf_filter.h"
++#include "netcdf_aux.h"
+ #include "ncpathmgr.h"
++#include "ncbytes.h"
+ 
+ static const char* USAGE =
+-"ncpathcvt [-c|-C|-m|-u|-w] [-h] [-e] [-F] [-d <driveletter>] [-B<char>] [-k] [-p] PATH\n"
++"ncpathcvt [-c|-m|-u|-w] [-e] [-h] [-k] [-p] [-x] [-F] [-D <driveletter>] [-B<char>] [-S<char>] PATH\n"
+ "Options\n"
+ "  -h help"
+ "  -e add backslash escapes to '\' and ' '\n"
+-"  -d <driveletter> use driveletter when needed; defaults to 'c'\n"
+ "  -B <char> convert occurrences of <char> to blank\n"
++"  -D <driveletter> use driveletter when needed; defaults to 'c'\n"
+ "  -F convert occurrences of '\\' to '/'"
++"  -S <char> use <char> as path separator when parsing;\n"
++"     currently limited to ';' or ':' but defaults to ';'\n"
+ "Output type options:\n"
+ "  -c convert to Cygwin form of path\n"
+-"  -C return canonical form of path\n"
+-"  -m convert to MSYS form of path\n"
++"  -m convert to MSYS form of path: currently an alias for -w\n"
+ "  -u convert to Unix form of path\n"
+ "  -w convert to Windows form of path\n"
+ "Other options:\n"
+@@ -56,10 +60,10 @@ struct Options {
+     int escapes;
+     int drive;
+     int debug;
+-    int canon;
+     int blank;
+     int slash;
+     int pathkind;
++    int sep;
+ } cvtoptions;
+ 
+ static char* escape(const char* path);
+@@ -186,37 +190,66 @@ printpathkind(const char* path)
+     exit(0);
+ }
+ 
++int
++processdir(const char* indir, char** cvtdirp)
++{
++    char* cvtdir = NULL;
++
++    if(cvtoptions.target == NCPD_UNKNOWN) {
++        cvtdir = NCpathcvt(indir);
++    } else {
++        cvtdir = NCpathcvt_test(indir,cvtoptions.target,(char)cvtoptions.drive);
++    }
++
++    if(cvtdir && cvtoptions.escapes) {
++	char* dir = cvtdir; cvtdir = NULL;
++        cvtdir = escape(dir);
++	free(dir);
++    }
++    if(cvtdir && cvtoptions.slash) {
++	char* dir = cvtdir; cvtdir = NULL;
++        cvtdir = slash(dir);
++	free(dir);
++    }
++
++    if(cvtdirp) {*cvtdirp = cvtdir; cvtdir = NULL;}
++
++    if(cvtdir) free(cvtdir);
++    return 0;
++}
++
+ int
+ main(int argc, char** argv)
+ {
+     int c;
+-    char* cvtpath = NULL;
+-    char* inpath, *canon = NULL;
+-
++    char* inpath  = NULL;
++    NCPluginList indirs = {0,NULL};
++    NCbytes* outpath = ncbytesnew();
++    int stat = NC_NOERR;
++    size_t i;
++    
+     memset((void*)&cvtoptions,0,sizeof(cvtoptions));
+     cvtoptions.drive = 'c';
++    cvtoptions.sep = ';';
+ 
+-    while ((c = getopt(argc, argv, "B:CFcD:d:ehkmpuwX")) != EOF) {
++    while ((c = getopt(argc, argv, "B:D:FS:Xchkmpuwx")) != EOF) {
+ 	switch(c) {
+ 	case 'c': cvtoptions.target = NCPD_CYGWIN; break;
+-	case 'd': cvtoptions.drive = optarg[0]; break;
+-	case 'e': cvtoptions.escapes = 1; break;
+ 	case 'h': usage(NULL); break;
+ 	case 'k': printlocalkind(); break;
+-	case 'm': cvtoptions.target = NCPD_MSYS; break;
++	case 'm': cvtoptions.target = NCPD_WIN; break; /* Aliased */
+ 	case 'p': cvtoptions.pathkind = 1; break;
+ 	case 'u': cvtoptions.target = NCPD_NIX; break;
+ 	case 'w': cvtoptions.target = NCPD_WIN; break;
++	case 'x': cvtoptions.escapes = 1; break;
+ 	case 'B':
+ 	    cvtoptions.blank = optarg[0];
+ 	    if(cvtoptions.blank < ' ' || cvtoptions.blank == '\177')
+ 		usage("Bad -B argument");
+ 	    break;
+-	case 'C': cvtoptions.canon = 1; break;
++	case 'D': cvtoptions.drive = optarg[0]; break;
+ 	case 'F': cvtoptions.slash = 1; break;
+-	case 'D':
+-	    sscanf(optarg,"%d",&cvtoptions.debug);
+-	    break;
++	case 'S': cvtoptions.sep = optarg[0]; break;
+ 	case 'X': printenv(); break;
+ 	case '?':
+ 	   usage("unknown option");
+@@ -252,33 +285,22 @@ main(int argc, char** argv)
+ 	goto done;
+     }
+ 
+-    /* Canonicalize */
+-    if(NCpathcanonical(inpath,&canon))
+-       usage("Could not convert to canonical form");
+-
+-    if(cvtoptions.canon) {
+-	cvtpath = canon; canon = NULL;
+-    } else if(cvtoptions.target == NCPD_UNKNOWN) {
+-        cvtpath = NCpathcvt(canon);
+-    } else {
+-        cvtpath = NCpathcvt_test(canon,cvtoptions.target,(char)cvtoptions.drive);
++    /* Break using the path separator */
++    if((stat = ncaux_plugin_path_parse(inpath,cvtoptions.sep,&indirs)))
++	{usage(nc_strerror(stat));}
++    for(i=0;i<indirs.ndirs;i++) {
++	char* outdir = NULL;
++	if((stat = processdir(indirs.dirs[i],&outdir))) 
++	    {usage(nc_strerror(stat));}
++	if(i > 0) ncbytesappend(outpath,cvtoptions.sep);
++	ncbytescat(outpath,outdir);
++	nullfree(outdir);
+     }
++    printf("%s",ncbytescontents(outpath));
+ 
+-    if(cvtpath && cvtoptions.escapes) {
+-	char* path = cvtpath; cvtpath = NULL;
+-        cvtpath = escape(path);
+-	free(path);
+-    }
+-    if(cvtpath && cvtoptions.slash) {
+-	char* path = cvtpath; cvtpath = NULL;
+-        cvtpath = slash(path);
+-	free(path);
+-    }
+-    printf("%s",cvtpath);
+ done:
+-    if(canon) free(canon);
+     if(inpath) free(inpath);
+-    if(cvtpath) free(cvtpath);
++    ncaux_plugin_path_clear(&indirs);
++    ncbytesfree(outpath);
+     return 0;
+ }
+-
+diff --git a/ncdump/ref_pathcvt.txt b/ncdump/ref_pathcvt.txt
+index c6d2fb7dea..fe44339047 100644
+--- a/ncdump/ref_pathcvt.txt
++++ b/ncdump/ref_pathcvt.txt
+@@ -1,45 +1,39 @@
+ path: -u: |/xxx/x/y| => |/xxx/x/y|
+ path: -c: |/xxx/x/y| => |/cygdrive/c/xxx/x/y|
+-path: -m: |/xxx/x/y| => |/xxx/x/y|
+ path: -w: |/xxx/x/y| => |c:\\xxx\\x\\y|
+-path: -C: |/xxx/x/y| => |/xxx/x/y|
+ path: -u: |d:/x/y| => |/d/x/y|
+ path: -c: |d:/x/y| => |/cygdrive/d/x/y|
+-path: -m: |d:/x/y| => |/d/x/y|
+ path: -w: |d:/x/y| => |d:\\x\\y|
+-path: -C: |d:/x/y| => |/cygdrive/d/x/y|
+ path: -u: |/cygdrive/d/x/y| => |/d/x/y|
+ path: -c: |/cygdrive/d/x/y| => |/cygdrive/d/x/y|
+-path: -m: |/cygdrive/d/x/y| => |/d/x/y|
+ path: -w: |/cygdrive/d/x/y| => |d:\\x\\y|
+-path: -C: |/cygdrive/d/x/y| => |/cygdrive/d/x/y|
+ path: -u: |/d/x/y| => |/d/x/y|
+-path: -c: |/d/x/y| => |/cygdrive/d/x/y|
+-path: -m: |/d/x/y| => |/d/x/y|
++path: -c: |/d/x/y| => |/cygdrive/c/d/x/y|
+ path: -w: |/d/x/y| => |d:\\x\\y|
+-path: -C: |/d/x/y| => |/cygdrive/d/x/y|
+ path: -u: |/cygdrive/d| => |/d|
+ path: -c: |/cygdrive/d| => |/cygdrive/d|
+-path: -m: |/cygdrive/d| => |/d|
+ path: -w: |/cygdrive/d| => |d:|
+-path: -C: |/cygdrive/d| => |/cygdrive/d|
+ path: -u: |/d| => |/d|
+-path: -c: |/d| => |/cygdrive/d|
+-path: -m: |/d| => |/d|
++path: -c: |/d| => |/cygdrive/c/d|
+ path: -w: |/d| => |d:|
+-path: -C: |/d| => |/cygdrive/d|
+ path: -u: |/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn| => |/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn|
+ path: -c: |/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn| => |/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn|
+-path: -m: |/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn| => |/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn|
+ path: -w: |/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn| => |d:\\git\\netcdf-c\\dap4_test\\test_anon_dim.2.syn|
+-path: -C: |/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn| => |/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn|
+ path: -u: |d:\x\y| => |/d/x/y|
+ path: -c: |d:\x\y| => |/cygdrive/d/x/y|
+-path: -m: |d:\x\y| => |/d/x/y|
+ path: -w: |d:\x\y| => |d:\\x\\y|
+-path: -C: |d:\x\y| => |/cygdrive/d/x/y|
+-path: -u: |d:\x\y w\z| => |/d/x/y\ w/z|
+-path: -c: |d:\x\y w\z| => |/cygdrive/d/x/y\ w/z|
+-path: -m: |d:\x\y w\z| => |/d/x/y\ w/z|
+-path: -w: |d:\x\y w\z| => |d:\\x\\y\ w\\z|
+-path: -C: |d:\x\y w\z| => |/cygdrive/d/x/y\ w/z|
++path: -u: |d:\x\y@w\z| => |/d/x/y\ w/z|
++path: -c: |d:\x\y@w\z| => |/cygdrive/d/x/y\ w/z|
++path: -w: |d:\x\y@w\z| => |d:\\x\\y\ w\\z|
++path: -u: |/xxx/x/y;/cygdrive/d/x/y| => |/xxx/x/y;/d/x/y|
++path: -c: |/xxx/x/y;/cygdrive/d/x/y| => |/cygdrive/c/xxx/x/y;/cygdrive/d/x/y|
++path: -w: |/xxx/x/y;/cygdrive/d/x/y| => |c:\\xxx\\x\\y;d:\\x\\y|
++path: -u: |/d/x/y;/cygdrive/d| => |/d/x/y;/d|
++path: -c: |/d/x/y;/cygdrive/d| => |/cygdrive/c/d/x/y;/cygdrive/d|
++path: -w: |/d/x/y;/cygdrive/d| => |d:\\x\\y;d:|
++path: -u: |cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn;d:\x\y| => |cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn;/d/x/y|
++path: -c: |cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn;d:\x\y| => |cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn;/cygdrive/d/x/y|
++path: -w: |cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn;d:\x\y| => |cygdrive\\d\\git\\netcdf-c\\dap4_test\\test_anon_dim.2.syn;d:\\x\\y|
++path: -u: |d:\x\y@w\z| => |/d/x/y\ w/z|
++path: -c: |d:\x\y@w\z| => |/cygdrive/d/x/y\ w/z|
++path: -w: |d:\x\y@w\z| => |d:\\x\\y\ w\\z|
+diff --git a/ncdump/testpathcvt.sh b/ncdump/testpathcvt.sh
+index 5debdadae4..a1b651985b 100755
+--- a/ncdump/testpathcvt.sh
++++ b/ncdump/testpathcvt.sh
+@@ -9,39 +9,58 @@ set -e
+ export MSYS2_ARG_CONV_EXCL='*'
+ 
+ # We need to find the drive letter, if any
+-DL=`${NCPATHCVT} -c -e / | sed -e 's|/cygdrive/\([a-zA-Z]\)/.*|\1|'`
++DL=`${NCPATHCVT} -c -x / | sed -e 's|/cygdrive/\([a-zA-Z]\)/.*|\1|'`
+ if test "x$DL" != x ; then
+   # Lower case drive letter
+-  DLL=`echon "$DL" | tr '[:upper:]' '[:lower:]'`
+-  DL="-d $DLL"
++  DLL=`echon -e "$DL" | tr '[:upper:]' '[:lower:]'`
++  DL="-D $DLL"
+ fi
+ 
+-
+-testcase1() {
++testcaseD() {
+ T="$1"
+ P="$2"
++# Fixup for shell handling of '\'
++PX=`echon -n "$P" | sed -e 's/\\\\\\\\/\\\\/g'`
++echon -e "path: $T: |$P| => |" >>tmp_pathcvt.txt
++${NCPATHCVT} -B"@" ${DL} "$T" -x "$PX" >>tmp_pathcvt.txt
++echo "|" >> tmp_pathcvt.txt
++}
+ 
+-echon "path: $T: |$P| => |" >>tmp_pathcvt.txt
+-${NCPATHCVT} -B"@" ${DL} "$T" -e "$P" >>tmp_pathcvt.txt
++testcaseP() {
++T="$1"
++P="$2"
++# Fixup for shell handling of '\'
++PX=`echon -n "$P" | sed -e 's/\\\\\\\\/\\\\/g'`
++echon -e "path: $T: |$P| => |" >>tmp_pathcvt.txt
++${NCPATHCVT} -S';' -B"@" ${DL} "$T" -x "$PX" >>tmp_pathcvt.txt
+ echo "|" >> tmp_pathcvt.txt
+ }
+ 
+-testcase() {
+-    testcase1 "-u" "$1"
+-    testcase1 "-c" "$1"
+-    testcase1 "-m" "$1"
+-    testcase1 "-w" "$1"
+-    testcase1 "-C" "$1"
++# Note that -m is not tested as it is currently an alias for -w
++testcase1() {
++    testcaseD "-u" "$1"
++    testcaseD "-c" "$1"
++    testcaseD "-w" "$1"
++}
++
++testcase2() {
++    testcaseP "-u" "$1"
++    testcaseP "-c" "$1"
++    testcaseP "-w" "$1"
+ }
+ 
+ rm -f tmp_pathcvt.txt
+ 
+ # '@' will get translated to embedded blank
+-PATHS="/xxx/x/y d:/x/y /cygdrive/d/x/y /d/x/y /cygdrive/d /d /cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn d:\\x\\y d:\\x\\y@w\\z"
+-for p in $PATHS ; do
+-testcase $p
++TESTPATHS1="/xxx/x/y d:/x/y /cygdrive/d/x/y /d/x/y /cygdrive/d /d /cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn d:\\\\x\\\\y d:\\\\x\\\\y@w\\\\z"
++for p in $TESTPATHS1 ; do
++testcase1 "$p"
++done
++
++TESTPATHS2="/xxx/x/y;/cygdrive/d/x/y /d/x/y;/cygdrive/d cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn;d:\\\\x\\\\y d:\\\\x\\\\y@w\\\\z"
++for p in $TESTPATHS2 ; do
++testcase2 "$p"
+ done
+-exit
+ 
+ diff -w ${srcdir}/ref_pathcvt.txt ./tmp_pathcvt.txt
+ 
+diff --git a/oc2/dap.y b/oc2/dap.y
+index 0305015429..11bb9db353 100644
+--- a/oc2/dap.y
++++ b/oc2/dap.y
+@@ -245,29 +245,29 @@ errorprog : /*empty*/ {$$=null;} | SCAN_PROG    '=' WORD_WORD ';' {$$=$3;}
+ */
+ name:
+           WORD_WORD      {$$=dapdecode(parsestate->lexstate,$1);}
+-	| SCAN_ALIAS     {$$=strdup($1);}
+-	| SCAN_ARRAY     {$$=strdup($1);}
+-	| SCAN_ATTR      {$$=strdup($1);}
+-	| SCAN_BYTE      {$$=strdup($1);}
+-	| SCAN_DATASET   {$$=strdup($1);}
+-	| SCAN_DATA      {$$=strdup($1);}
+-	| SCAN_ERROR     {$$=strdup($1);}
+-	| SCAN_FLOAT32   {$$=strdup($1);}
+-	| SCAN_FLOAT64   {$$=strdup($1);}
+-	| SCAN_GRID      {$$=strdup($1);}
+-	| SCAN_INT16     {$$=strdup($1);}
+-	| SCAN_INT32     {$$=strdup($1);}
+-	| SCAN_MAPS      {$$=strdup($1);}
+-	| SCAN_SEQUENCE  {$$=strdup($1);}
+-	| SCAN_STRING    {$$=strdup($1);}
+-	| SCAN_STRUCTURE {$$=strdup($1);}
+-	| SCAN_UINT16    {$$=strdup($1);}
+-	| SCAN_UINT32    {$$=strdup($1);}
+-	| SCAN_URL       {$$=strdup($1);}
+-	| SCAN_CODE      {$$=strdup($1);}
+-	| SCAN_MESSAGE   {$$=strdup($1);}
+-	| SCAN_PROG      {$$=strdup($1);}
+-	| SCAN_PTYPE     {$$=strdup($1);}
++ 	| SCAN_ALIAS     {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_ARRAY     {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_ATTR      {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_BYTE      {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_DATASET   {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_DATA      {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_ERROR     {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_FLOAT32   {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_FLOAT64   {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_GRID      {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_INT16     {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_INT32     {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_MAPS      {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_SEQUENCE  {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_STRING    {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_STRUCTURE {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_UINT16    {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_UINT32    {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_URL       {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_CODE      {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_MESSAGE   {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_PROG      {$$=dapdecode(parsestate->lexstate,$1);}
++	| SCAN_PTYPE     {$$=dapdecode(parsestate->lexstate,$1);}
+ 	;
+ 
+ %%
+diff --git a/oc2/dapy.c b/oc2/dapy.c
+index 0569194036..ec27df86fa 100644
+--- a/oc2/dapy.c
++++ b/oc2/dapy.c
+@@ -2048,139 +2048,139 @@ YYSTYPE yylval YY_INITIAL_VALUE (= yyval_default);
+ 
+   case 84: /* name: SCAN_ALIAS  */
+ #line 248 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2053 "dapy.c"
+     break;
+ 
+   case 85: /* name: SCAN_ARRAY  */
+ #line 249 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2059 "dapy.c"
+     break;
+ 
+   case 86: /* name: SCAN_ATTR  */
+ #line 250 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2065 "dapy.c"
+     break;
+ 
+   case 87: /* name: SCAN_BYTE  */
+ #line 251 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2071 "dapy.c"
+     break;
+ 
+   case 88: /* name: SCAN_DATASET  */
+ #line 252 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2077 "dapy.c"
+     break;
+ 
+   case 89: /* name: SCAN_DATA  */
+ #line 253 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2083 "dapy.c"
+     break;
+ 
+   case 90: /* name: SCAN_ERROR  */
+ #line 254 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2089 "dapy.c"
+     break;
+ 
+   case 91: /* name: SCAN_FLOAT32  */
+ #line 255 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2095 "dapy.c"
+     break;
+ 
+   case 92: /* name: SCAN_FLOAT64  */
+ #line 256 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2101 "dapy.c"
+     break;
+ 
+   case 93: /* name: SCAN_GRID  */
+ #line 257 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2107 "dapy.c"
+     break;
+ 
+   case 94: /* name: SCAN_INT16  */
+ #line 258 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2113 "dapy.c"
+     break;
+ 
+   case 95: /* name: SCAN_INT32  */
+ #line 259 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2119 "dapy.c"
+     break;
+ 
+   case 96: /* name: SCAN_MAPS  */
+ #line 260 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2125 "dapy.c"
+     break;
+ 
+   case 97: /* name: SCAN_SEQUENCE  */
+ #line 261 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2131 "dapy.c"
+     break;
+ 
+   case 98: /* name: SCAN_STRING  */
+ #line 262 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2137 "dapy.c"
+     break;
+ 
+   case 99: /* name: SCAN_STRUCTURE  */
+ #line 263 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2143 "dapy.c"
+     break;
+ 
+   case 100: /* name: SCAN_UINT16  */
+ #line 264 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2149 "dapy.c"
+     break;
+ 
+   case 101: /* name: SCAN_UINT32  */
+ #line 265 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2155 "dapy.c"
+     break;
+ 
+   case 102: /* name: SCAN_URL  */
+ #line 266 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2161 "dapy.c"
+     break;
+ 
+   case 103: /* name: SCAN_CODE  */
+ #line 267 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2167 "dapy.c"
+     break;
+ 
+   case 104: /* name: SCAN_MESSAGE  */
+ #line 268 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2173 "dapy.c"
+     break;
+ 
+   case 105: /* name: SCAN_PROG  */
+ #line 269 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2179 "dapy.c"
+     break;
+ 
+   case 106: /* name: SCAN_PTYPE  */
+ #line 270 "dap.y"
+-                         {yyval=strdup(yyvsp[0]);}
++                         {yyval=dapdecode(parsestate->lexstate,yyvsp[0]);}
+ #line 2185 "dapy.c"
+     break;
+ 
+diff --git a/oc2/ocinternal.c b/oc2/ocinternal.c
+index 681a010105..99d9607b83 100644
+--- a/oc2/ocinternal.c
++++ b/oc2/ocinternal.c
+@@ -86,6 +86,9 @@ ocinternalinitialize(void)
+     /* Compute some xdr related flags */
+     xxdr_init();
+ 
++    if(getenv("OCDEBUG") != NULL)
++        ocdebug = atoi(getenv("OCDEBUG"));
++
+     return OCTHROW(stat);
+ }
+ 
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 7c32d9c634..fb12653636 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -127,7 +127,7 @@ macro(installplugin PLUG)
+   install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/${INSTALLED_PLUGIN_LIB} DESTINATION ${NETCDF_PLUGIN_INSTALL_DIR})
+ endmacro()
+ 
+-install(DIRECTORY DESTINATION ${PLUGIN_INSTALL_DIR})
++install(DIRECTORY DESTINATION ${NETCDF_PLUGIN_INSTALL_DIR})
+ if(Bzip2_FOUND OR Bz2_FOUND)
+   installplugin(h5bzip2)
+ endif()
+@@ -136,20 +136,6 @@ if(Zstd_FOUND)
+ endif()
+ if(Blosc_FOUND)
+   installplugin(h5blosc)
+-endif()
+-if(NETCDF_ENABLE_NCZARR)
+-  installplugin(h5fletcher32)
+-  installplugin(h5shuffle)
+-  installplugin(h5deflate)
+-  installplugin(zhdf5filters)
+-  installplugin(zstdfilters)
+-  if(Szip_FOUND)
+-    installplugin(h5szip)
+-  endif()
+-endif()
+-
+-endif(ENABLE_PLUGIN_INSTALL)
+-
+ endif(NETCDF_ENABLE_PLUGINS)
+ 
+ # Copy some test files from current source dir to out-of-tree build dir.
+@@ -157,3 +143,6 @@ file(COPY ${COPY_FILES} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/)
+ if(MSVC)
+   file(COPY ${COPY_FILES} DESTINATION ${RUNTIME_OUTPUT_DIRECTORY}/)
+ endif()
++
++endif(ENABLE_PLUGIN_INSTALL)
++endif(NETCDF_ENABLE_PLUGINS)
+diff --git a/plugins/Makefile.am b/plugins/Makefile.am
+index b92e3095b5..752ecd3242 100644
+--- a/plugins/Makefile.am
++++ b/plugins/Makefile.am
+@@ -18,7 +18,7 @@ RPATH = -rpath $(abs_top_builddir)/.libs
+ 
+ # This is where the plugins are to be installed
+ if ENABLE_PLUGIN_DIR
+-  plugindir = @PLUGIN_INSTALL_DIR@
++  plugindir = @NETCDF_PLUGIN_INSTALL_DIR@
+ else
+   plugindir = ${ALTPLUGINDIR}
+   AM_LDFLAGS += ${RPATH}
+diff --git a/test_common.in b/test_common.in
+index b5873fbd0c..5a3d1c29e9 100644
+--- a/test_common.in
++++ b/test_common.in
+@@ -11,11 +11,12 @@ export TEST_COMMON_SH=1
+ 
+ # Define various global constants
+ 
+-# Define location of execution
++# Define various build and install paths
+ abs_top_srcdir=@abs_top_srcdir@
+ abs_top_builddir=@abs_top_builddir@
+ TOPSRCDIR="${abs_top_srcdir}"
+ TOPBUILDDIR="${abs_top_builddir}"
++
+ FP_ISCMAKE=@ISCMAKE@
+ FP_ISMSVC=@ISMSVC@
+   FP_WINVERMAJOR=@WINVERMAJOR@
+@@ -35,7 +36,6 @@ FEATURE_PARALLEL=@HAS_PARALLEL@
+ # Define selected features of the build
+ FEATURE_HDF5=@HAS_HDF5@
+ FEATURE_FILTERTESTS=@DO_FILTER_TESTS@
+-FEATURE_PLUGIN_INSTALL_DIR=@PLUGIN_INSTALL_DIR@
+ FEATURE_BYTERANGE=@HAS_BYTERANGE@
+ FEATURE_ROS3=@HAS_HDF5_ROS3@
+ FEATURE_S3_AWS=@HAS_S3_AWS@
+@@ -46,6 +46,9 @@ FEATURE_S3TESTS=@NETCDF_ENABLE_S3_TESTING@
+ FEATURE_NCZARR_ZIP=@HAS_NCZARR_ZIP@
+ FEATURE_LARGE_TESTS=@DO_LARGE_TESTS@
+ 
++FEATURE_PLUGIN_INSTALL_DIR="@NETCDF_PLUGIN_INSTALL_DIR@"
++FEATURE_PLUGIN_SEARCH_PATH="@NETCDF_PLUGIN_SEARCH_PATH@"
++
+ # Thredds-test server is currently disabled
+ #FEATURE_THREDDSTEST=1
+ 
+diff --git a/unit_test/Makefile.am b/unit_test/Makefile.am
+index 828852a83e..102bb156f9 100644
+--- a/unit_test/Makefile.am
++++ b/unit_test/Makefile.am
+@@ -8,9 +8,9 @@
+ 
+ # Dennis Heimbigner 8/27/2024
+ 
+-SH_LOG_DRIVER = $(SHELL) $(top_srcdir)/test-driver-verbose
+-sh_LOG_DRIVER = $(SHELL) $(top_srcdir)/test-driver-verbose
+-LOG_DRIVER = $(SHELL) $(top_srcdir)/test-driver-verbose
++#SH_LOG_DRIVER = $(SHELL) $(top_srcdir)/test-driver-verbose
++#sh_LOG_DRIVER = $(SHELL) $(top_srcdir)/test-driver-verbose
++#LOG_DRIVER = $(SHELL) $(top_srcdir)/test-driver-verbose
+ #TESTS_ENVIRONMENT = export SETX=1;
+ 
+ # Put together AM_CPPFLAGS and AM_LDFLAGS.
+diff --git a/unit_test/ncpluginpath.c b/unit_test/ncpluginpath.c
+index ad21b4be80..6c2bd4d550 100644
+--- a/unit_test/ncpluginpath.c
++++ b/unit_test/ncpluginpath.c
+@@ -115,7 +115,7 @@ getfrom(int formatx, char** textp)
+     if((stat = ncaux_plugin_path_tostring(&dirs,';',&text))) goto done;
+     *textp = text; text = NULL;
+ done:
+-    nullfree(text);
++    if(text != NULL) free(text);
+     ncaux_plugin_path_clear(&dirs);
+     return stat;
+ }
+@@ -158,7 +158,7 @@ main(int argc, char** argv)
+     }
+     printf("%s",text); /* suppress trailing eol */
+ done:
+-    nullfree(text);
++    if(text != NULL) free(text);
+     nc_finalize();
+     return (stat?1:0);
+ }
+diff --git a/unit_test/run_dfaltpluginpath.sh b/unit_test/run_dfaltpluginpath.sh
+index d6a80a9f76..45f6d29bf9 100755
+--- a/unit_test/run_dfaltpluginpath.sh
++++ b/unit_test/run_dfaltpluginpath.sh
+@@ -5,38 +5,69 @@
+ if test "x$srcdir" = x ; then srcdir=`pwd`; fi 
+ . ../test_common.sh
+ 
+-set -x
+-
+ #CMD="valgrind --leak-check=full"
+ 
+-TESTHPP=`${execdir}/../ncdump/ncpathcvt -C "/tmp;${HOME}"`
+-DFALTWIN=`${execdir}/../ncdump/ncpathcvt -C "C:\\ProgramData\hdf5\\lib\\plugin"`
+-DFALTNIX=`${execdir}/../ncdump/ncpathcvt -C "/usr/local/hdf5/lib/plugin"`
++if test "x$FP_MSVC" = x && test "x$FP_ISMINGW" = x ; then
++FEATURE_PLUGIN_SEARCH_PATH=`echon "${FEATURE_PLUGIN_SEARCH_PATH}" | tr ':' ';'`
++fi
++
++TESTHPPWIN=`${execdir}/../ncdump/ncpathcvt -S';' -w "/tmp;${HOME}"`
++TESTHPPNIX=`${execdir}/../ncdump/ncpathcvt -S';' -u "/tmp;${HOME}"`
++#DFALTWIN=`${execdir}/../ncdump/ncpathcvt -S';' -w "C:\\ProgramData\hdf5\\lib\\plugin"`
++#DFALTNIX=`${execdir}/../ncdump/ncpathcvt -S';' -u "/usr/local/hdf5/lib/plugin"`
++DFALTWIN=`${execdir}/../ncdump/ncpathcvt -S';' -w "${FEATURE_PLUGIN_SEARCH_PATH}"`
++DFALTNIX=`${execdir}/../ncdump/ncpathcvt -S';' -u "${FEATURE_PLUGIN_SEARCH_PATH}"`
+ 
+ FAIL=
+ 
+ # Test with no HDF5_PLUGIN_PATH
++testnohpp() {
+ unset HDF5_PLUGIN_PATH
+ NOHPP1=`${execdir}/ncpluginpath -f global`
+-NOHPP1=`${execdir}/../ncdump/ncpathcvt -C "$NOHPP1"`
+-if test "x$NOHPP1" = "x$DFALTNIX" || test "x$NOHPP1" = "x$DFALTWIN" ; then
+-echo "***PASS: default plugin path = |$NOHPP1|"
++if test "x$ISMSVC" = x && test "x$ISMINGW" = x ; then
++    NOHPP1=`${execdir}/../ncdump/ncpathcvt -S';' -u "$NOHPP1"`
++    BASELINE="$DFALTNIX"
++else
++    NOHPP1=`${execdir}/../ncdump/ncpathcvt -S';' -w "$NOHPP1"`
++    BASELINE="$DFALTWIN"
++fi
++if test "x$NOHPP1" = "x$BASELINE"; then TF=yes ; else TF=no; fi
++echo "** compare: $NOHPP1 :: $BASELINE == $TF"
++if test "$TF" = yes ; then
++  echo "***PASS: default plugin path = |$NOHPP1|"
+ else
+-FAIL=1
+-echo "***FAIL: default plugin path = |$NOHPP1|"
++  FAIL=1
++  echo "***FAIL: default plugin path = |$NOHPP1|"
+ fi
++}
+ 
+ # Test with given HDF5_PLUGIN_PATH
++testhpp() {
+ unset HDF5_PLUGIN_PATH
+-export HDF5_PLUGIN_PATH="$TESTHPP"
+-HPP1=`${execdir}/ncpluginpath -f global`
+-HPP1=`${execdir}/../ncdump/ncpathcvt -C "$HPP1"`
+-if test "x$HPP1" = "x$TESTHPP" ; then
+-echo "***PASS: default plugin path: |$HPP1| HDF5_PLUGIN_PATH=|$HDF5_PLUGIN_PATH|"
++if test "x$ISMSVC" = x && test "x$ISMINGW" = x ; then
++    export HDF5_PLUGIN_PATH="$TESTHPPNIX"
++    HPP1=`${execdir}/ncpluginpath -f global`
++    HPP1=`${execdir}/../ncdump/ncpathcvt -S';' -u "$HPP1"`
++    BASELINE="$TESTHPPNIX"
++else
++    export HDF5_PLUGIN_PATH="$TESTHPPWIN"
++    HPP1=`${execdir}/ncpluginpath -f global`
++    HPP1=`${execdir}/../ncdump/ncpathcvt -S';' -w "$HPP1"`
++    BASELINE="$TESTHPPWIN"
++fi
++unset TF
++if test "x$HPP1" = "x$BASELINE"; then TF=yes ; else TF=no; fi
++echo "** compare: $HPP1 :: $BASELINE == $TF"
++if test "$TF" = yes ; then
++  echo "***PASS: default plugin path: |$HPP1| HDF5_PLUGIN_PATH=|$HDF5_PLUGIN_PATH|"
+ else
+-FAIL=1
+-echo "***FAIL: default plugin path: |$HPP1| HDF5_PLUGIN_PATH=|$HDF5_PLUGIN_PATH|"
++  FAIL=1
++  echo "***FAIL: default plugin path: |$HPP1| HDF5_PLUGIN_PATH=|$HDF5_PLUGIN_PATH|"
+ fi
++}
++
++testnohpp
++testhpp
+ 
+ if test "x$FAIL" != x ; then exit 1; fi
+ exit 0
+diff --git a/unit_test/test_pathcvt.c b/unit_test/test_pathcvt.c
+index b0230f53b3..7c4243c8ca 100644
+--- a/unit_test/test_pathcvt.c
++++ b/unit_test/test_pathcvt.c
+@@ -13,7 +13,7 @@ Test the NCpathcvt
+ #include "netcdf.h"
+ #include "ncpathmgr.h"
+ 
+-#undef DEBUG
++#define DEBUG
+ 
+ #define NKINDS 4
+ static const int kinds[NKINDS] = {NCPD_NIX,NCPD_MSYS,NCPD_CYGWIN,NCPD_WIN};
+@@ -44,31 +44,31 @@ static Test PATHTESTS[] = {
+ 	 "d:\\x\\y"		/*NCPD_WIN*/
+ 	}},
+ {"/cygdrive/d/x/y",{
+-	 "/cygdrive/d/x/y",	/*NCPD_LINUX*/
++	"/d/x/y",		/*NCPD_LINUX*/
+ 	"d:\\x\\y",		/*NCPD_MSYS*/
+ 	"/cygdrive/d/x/y",	/*NCPD_CYGWIN*/
+ 	 "d:\\x\\y"		/*NCPD_WIN*/
+ 	}},
+ {"/d/x/y",{
+ 	 "/d/x/y",		/*NCPD_LINUX*/
+-	"c:\\d\\x\\y",		/*NCPD_MSYS*/
++	"d:\\x\\y",		/*NCPD_MSYS*/
+ 	 "/cygdrive/c/d/x/y",	/*NCPD_CYGWIN*/
+-	 "c:\\d\\x\\y"		/*NCPD_WIN*/
++	 "d:\\x\\y"		/*NCPD_WIN*/
+ 	}},
+ {"/cygdrive/d",{
+-	 "/cygdrive/d",		/*NCPD_LINUX*/
++	 "/d",			/*NCPD_LINUX*/
+ 	"d:",			/*NCPD_MSYS*/
+ 	 "/cygdrive/d",		/*NCPD_CYGWIN*/
+ 	 "d:"			/*NCPD_WIN*/
+ 	}},
+ {"/d", {
+ 	"/d",			/*NCPD_LINUX*/
+-	"c:\\d",		/*NCPD_MSYS*/
++	"d:",			/*NCPD_MSYS*/
+ 	 "/cygdrive/c/d",	/*NCPD_CYGWIN*/
+-	 "c:\\d"		/*NCPD_WIN*/
++	 "d:"			/*NCPD_WIN*/
+ 	}},
+ {"/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn",{
+-    "/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn",	/*NCPD_LINUX*/
++    "/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn",		/*NCPD_LINUX*/
+     "d:\\git\\netcdf-c\\dap4_test\\test_anon_dim.2.syn",	/*NCPD_MSYS*/
+     "/cygdrive/d/git/netcdf-c/dap4_test/test_anon_dim.2.syn",	/*NCPD_CYGWIN*/
+     "d:\\git\\netcdf-c\\dap4_test\\test_anon_dim.2.syn"		/*NCPD_WIN*/

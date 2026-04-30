@@ -1,0 +1,115 @@
+From b0c431de3f04e5e97cff0ec917dd457696efd43e Mon Sep 17 00:00:00 2001
+From: Tom de Vries <tdevries@suse.de>
+Date: Thu, 18 Apr 2024 17:01:09 +0200
+Subject: [PATCH] [gdb/testsuite] Use allocator_may_return_null=1 in two
+ test-cases
+
+Simon reported [1] that recent commit 06e967dbc9b ("[gdb/python] Throw
+MemoryError in inferior.read_memory if malloc fails") introduced
+AddressSanitizer allocation-size-too-big errors in the two test-cases
+affected by this commit.
+
+Fix this by suppressing the error in the two test-cases using
+allocator_may_return_null=1.
+
+Tested on aarch64-linux.
+
+Approved-By: Tom Tromey <tom@tromey.com>
+
+[1] https://sourceware.org/pipermail/gdb-patches/2024-April/208171.html
+---
+ gdb/testsuite/gdb.dap/memory.exp         | 11 +++++++++--
+ gdb/testsuite/gdb.python/py-inferior.exp | 10 +++++++++-
+ gdb/testsuite/lib/gdb.exp                | 18 +++++++++++++++---
+ 3 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/gdb/testsuite/gdb.dap/memory.exp b/gdb/testsuite/gdb.dap/memory.exp
+index 4e2e361289a..7082706e11c 100644
+--- a/gdb/testsuite/gdb.dap/memory.exp
++++ b/gdb/testsuite/gdb.dap/memory.exp
+@@ -25,8 +25,15 @@ if {[build_executable ${testfile}.exp $testfile] == -1} {
+     return
+ }
+ 
+-if {[dap_initialize] == ""} {
+-    return
++save_vars { env(ASAN_OPTIONS) } {
++    # The request readMemory with count 18446744073709551615 triggers address
++    # sanitizer.  Suppress the error, leaving us with just this warning:
++    #   WARNING: AddressSanitizer failed to allocate 0xffffffffffffffff bytes
++    set_sanitizer ASAN_OPTIONS allocator_may_return_null 1
++
++    if {[dap_initialize] == ""} {
++	return
++    }
+ }
+ 
+ set line [gdb_get_line_number "BREAK"]
+diff --git a/gdb/testsuite/gdb.python/py-inferior.exp b/gdb/testsuite/gdb.python/py-inferior.exp
+index 4c19e259159..e74fbfd050d 100644
+--- a/gdb/testsuite/gdb.python/py-inferior.exp
++++ b/gdb/testsuite/gdb.python/py-inferior.exp
+@@ -27,7 +27,15 @@ if { [gdb_compile_pthreads ${srcdir}/${subdir}/${srcfile} ${binfile} executable
+ }
+ 
+ # Start with a fresh gdb.
+-clean_restart ${testfile}
++save_vars { env(ASAN_OPTIONS) } {
++    # The call to gdb.selected_inferior().read_memory (0, 0xffffffffffffffff)
++    # triggers address sanitizer.  Suppress the error, leaving us with just
++    # this warning:
++    #   WARNING: AddressSanitizer failed to allocate 0xffffffffffffffff bytes
++    set_sanitizer ASAN_OPTIONS allocator_may_return_null 1
++
++    clean_restart ${testfile}
++}
+ 
+ switch [get_endianness] {
+     little { set python_pack_char "<" }
+diff --git a/gdb/testsuite/lib/gdb.exp b/gdb/testsuite/lib/gdb.exp
+index d48ea37c0cc..ddee928d510 100644
+--- a/gdb/testsuite/lib/gdb.exp
++++ b/gdb/testsuite/lib/gdb.exp
+@@ -45,9 +45,9 @@ proc cond_wrap { cond wrap body } {
+     }
+ }
+ 
+-# Add VAR_ID=VAL to ENV_VAR, unless ENV_VAR already contains a VAR_ID setting.
++# Helper function for set_sanitizer/set_sanitizer_default.
+ 
+-proc set_sanitizer_default { env_var var_id val } {
++proc set_sanitizer_1 { env_var var_id val default} {
+     global env
+ 
+     if { ![info exists env($env_var) ]
+@@ -57,7 +57,7 @@ proc set_sanitizer_default { env_var var_id val } {
+ 	return
+     }
+ 
+-    if { [regexp $var_id= $env($env_var)] } {
++    if { $default && [regexp $var_id= $env($env_var)] } {
+ 	# Don't set var_id.  It's already set by the user, leave as is.
+ 	# Note that we could probably get the same result by unconditionally
+ 	# prepending it, but this way is less likely to cause confusion.
+@@ -68,6 +68,18 @@ proc set_sanitizer_default { env_var var_id val } {
+     append env($env_var) : $var_id=$val
+ }
+ 
++# Add VAR_ID=VAL to ENV_VAR.
++
++proc set_sanitizer { env_var var_id val } {
++    set_sanitizer_1 $env_var $var_id $val 0
++}
++
++# Add VAR_ID=VAL to ENV_VAR, unless ENV_VAR already contains a VAR_ID setting.
++
++proc set_sanitizer_default { env_var var_id val } {
++    set_sanitizer_1 $env_var $var_id $val 1
++}
++
+ set_sanitizer_default TSAN_OPTIONS suppressions \
+     $srcdir/../tsan-suppressions.txt
+ 
+-- 
+GitLab
+

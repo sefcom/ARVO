@@ -1,0 +1,139 @@
+From 081513f003b661c0d9e4ec70d9e6c7b126386644 Mon Sep 17 00:00:00 2001
+From: Mark Raasveldt <mark.raasveldt@gmail.com>
+Date: Fri, 10 Mar 2023 17:27:50 +0100
+Subject: [PATCH] Fix various oss-fuzz issues
+
+---
+ src/catalog/dependency_list.cpp                            | 3 +--
+ src/common/string_util.cpp                                 | 5 ++++-
+ src/function/aggregate/holistic/approximate_quantile.cpp   | 7 +++++--
+ src/function/table/checkpoint.cpp                          | 6 +++++-
+ ...uzz-testcase-minimized-parse_fuzz_test-5455194230226944 | 1 +
+ ...uzz-testcase-minimized-parse_fuzz_test-5717171654492160 | 1 +
+ ...uzz-testcase-minimized-parse_fuzz_test-5869382900514816 | 1 +
+ ...uzz-testcase-minimized-parse_fuzz_test-6048141818593280 | 1 +
+ ...uzz-testcase-minimized-parse_fuzz_test-6186839351623680 | 1 +
+ 9 files changed, 20 insertions(+), 6 deletions(-)
+ create mode 100644 test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5455194230226944
+ create mode 100644 test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5717171654492160
+ create mode 100644 test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5869382900514816
+ create mode 100644 test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-6048141818593280
+ create mode 100644 test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-6186839351623680
+
+diff --git a/src/catalog/dependency_list.cpp b/src/catalog/dependency_list.cpp
+index 4edd7c419cc1..0aac67b022bf 100644
+--- a/src/catalog/dependency_list.cpp
++++ b/src/catalog/dependency_list.cpp
+@@ -11,7 +11,7 @@ void DependencyList::AddDependency(CatalogEntry *entry) {
+ }
+ 
+ void DependencyList::VerifyDependencies(Catalog *catalog, const string &name) {
+-	for(auto &dep : set) {
++	for (auto &dep : set) {
+ 		if (dep->catalog != catalog) {
+ 			throw DependencyException(
+ 			    "Error adding dependency for object \"%s\" - dependency \"%s\" is in catalog "
+@@ -21,5 +21,4 @@ void DependencyList::VerifyDependencies(Catalog *catalog, const string &name) {
+ 	}
+ }
+ 
+-
+ } // namespace duckdb
+diff --git a/src/common/string_util.cpp b/src/common/string_util.cpp
+index ba7b26017272..a373ae65d583 100644
+--- a/src/common/string_util.cpp
++++ b/src/common/string_util.cpp
+@@ -191,11 +191,14 @@ vector<string> StringUtil::Split(const string &input, const string &split) {
+ 
+ 		// Push the substring [last, next) on to splits
+ 		string substr = input.substr(last, next - last);
+-		if (substr.empty() == false) {
++		if (!substr.empty()) {
+ 			splits.push_back(substr);
+ 		}
+ 		last = next + split_len;
+ 	}
++	if (splits.empty()) {
++		splits.push_back(split);
++	}
+ 	return splits;
+ }
+ 
+diff --git a/src/function/aggregate/holistic/approximate_quantile.cpp b/src/function/aggregate/holistic/approximate_quantile.cpp
+index 22e84727a4c1..ad93125b6523 100644
+--- a/src/function/aggregate/holistic/approximate_quantile.cpp
++++ b/src/function/aggregate/holistic/approximate_quantile.cpp
+@@ -70,11 +70,14 @@ struct ApproxQuantileOperation {
+ 
+ 	template <class INPUT_TYPE, class STATE, class OP>
+ 	static void Operation(STATE *state, AggregateInputData &, INPUT_TYPE *data, ValidityMask &mask, idx_t idx) {
++		auto val = Cast::template Operation<INPUT_TYPE, SAVE_TYPE>(data[idx]);
++		if (!Value::DoubleIsFinite(val)) {
++			return;
++		}
+ 		if (!state->h) {
+ 			state->h = new duckdb_tdigest::TDigest(100);
+ 		}
+-
+-		state->h->add(Cast::template Operation<INPUT_TYPE, SAVE_TYPE>(data[idx]));
++		state->h->add(val);
+ 		state->pos++;
+ 	}
+ 
+diff --git a/src/function/table/checkpoint.cpp b/src/function/table/checkpoint.cpp
+index 2fba07534405..2fb71f8fea38 100644
+--- a/src/function/table/checkpoint.cpp
++++ b/src/function/table/checkpoint.cpp
+@@ -32,7 +32,11 @@ static unique_ptr<FunctionData> CheckpointBind(ClientContext &context, TableFunc
+ 	AttachedDatabase *db;
+ 	auto &db_manager = DatabaseManager::Get(context);
+ 	if (!input.inputs.empty()) {
+-		db = db_manager.GetDatabase(context, StringValue::Get(input.inputs[0]));
++		auto &db_name = StringValue::Get(input.inputs[0]);
++		db = db_manager.GetDatabase(context, db_name);
++		if (!db) {
++			throw BinderException("Database \"%s\" not found", db_name);
++		}
+ 	} else {
+ 		db = db_manager.GetDatabase(context, DatabaseManager::GetDefaultDatabase(context));
+ 	}
+diff --git a/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5455194230226944 b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5455194230226944
+new file mode 100644
+index 000000000000..4403cdf0f65e
+--- /dev/null
++++ b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5455194230226944
+@@ -0,0 +1 @@
++install'.'
+\ No newline at end of file
+diff --git a/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5717171654492160 b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5717171654492160
+new file mode 100644
+index 000000000000..091e42e18606
+--- /dev/null
++++ b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5717171654492160
+@@ -0,0 +1 @@
++checkpoint l
+\ No newline at end of file
+diff --git a/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5869382900514816 b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5869382900514816
+new file mode 100644
+index 000000000000..5e67edb1591d
+--- /dev/null
++++ b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-5869382900514816
+@@ -0,0 +1 @@
++summarize select 6E844%1
+\ No newline at end of file
+diff --git a/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-6048141818593280 b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-6048141818593280
+new file mode 100644
+index 000000000000..cf912c8fceef
+--- /dev/null
++++ b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-6048141818593280
+@@ -0,0 +1 @@
++reset ÿ
+\ No newline at end of file
+diff --git a/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-6186839351623680 b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-6186839351623680
+new file mode 100644
+index 000000000000..6f26c42abc32
+--- /dev/null
++++ b/test/ossfuzz/cases/clusterfuzz-testcase-minimized-parse_fuzz_test-6186839351623680
+@@ -0,0 +1 @@
++install''
+\ No newline at end of file

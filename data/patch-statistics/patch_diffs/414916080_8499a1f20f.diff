@@ -1,0 +1,51 @@
+From 449f061f1514e6aa55538a5ee6bd0a35938a789f Mon Sep 17 00:00:00 2001
+From: Aurelien David <aurelien.david@telecom-paristech.fr>
+Date: Mon, 5 May 2025 13:58:43 +0200
+Subject: [PATCH] add size check in m2tsdmx_declare_pid() + null guard in
+ naludmx_hevc_set_parall_type()
+
+ossfuzz issues 414916080 + 414916079
+---
+ src/filters/dmx_m2ts.c     | 6 ++++--
+ src/filters/reframe_nalu.c | 4 ++--
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/src/filters/dmx_m2ts.c b/src/filters/dmx_m2ts.c
+index c4d43da2fb..0a49cd6dfe 100644
+--- a/src/filters/dmx_m2ts.c
++++ b/src/filters/dmx_m2ts.c
+@@ -558,8 +558,10 @@ static void m2tsdmx_declare_pid(GF_M2TSDmxCtx *ctx, GF_M2TS_PES *stream, GF_ESD
+ 			u32 dsi_len = gf_bs_read_u32(bs);
+ 			if (dsi_len) {
+ 				u32 pos = (u32) gf_bs_get_position(bs);
+-				gf_filter_pid_set_property(opid, GF_PROP_PID_DECODER_CONFIG, &PROP_DATA(stream->gpac_meta_dsi+pos, dsi_len) );
+-				gf_bs_skip_bytes(bs, dsi_len);
++				if (pos < stream->gpac_meta_dsi_size && dsi_len < stream->gpac_meta_dsi_size-pos) {
++					gf_filter_pid_set_property(opid, GF_PROP_PID_DECODER_CONFIG, &PROP_DATA(stream->gpac_meta_dsi+pos, dsi_len) );
++					gf_bs_skip_bytes(bs, dsi_len);
++				}
+ 			} else {
+ 				gf_filter_pid_set_property(opid, GF_PROP_PID_DECODER_CONFIG, NULL);
+ 			}
+diff --git a/src/filters/reframe_nalu.c b/src/filters/reframe_nalu.c
+index 569e34acc1..758cee04f2 100644
+--- a/src/filters/reframe_nalu.c
++++ b/src/filters/reframe_nalu.c
+@@ -882,7 +882,7 @@ static void naludmx_hevc_set_parall_type(GF_NALUDmxCtx *ctx, GF_HEVCConfig *hevc
+ 
+ 	GF_SAFEALLOC(hvc_state, HEVCState);
+ 	if (!hvc_state) return;
+-	
++
+ 	hvc_state->sps_active_idx = -1;
+ 
+ 	use_tiles = 0;
+@@ -2562,7 +2562,7 @@ static s32 naludmx_parse_nal_hevc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool
+ 		if (ctx->hevc_state->sei.has_3d_ref_disp_info) {
+ 			naludmx_queue_param_set(ctx, data, size, GF_HEVC_NALU_SEI_PREFIX, 0, temporal_id, layer_id);
+ 		}
+-		if (ctx->hevc_state->sei.alternative_transfer_characteristics) {
++		if (ctx->hevc_state->sei.alternative_transfer_characteristics && ctx->opid) {
+ 			gf_filter_pid_set_property(ctx->opid, GF_PROP_PID_COLR_TRANSFER_ALT, & PROP_UINT(ctx->hevc_state->sei.alternative_transfer_characteristics) );
+ 		}
+ 		if (!ctx->nosei) {

@@ -1,0 +1,101 @@
+From aa45c12402dfd638f2e0ff7c2957c0512a3595a9 Mon Sep 17 00:00:00 2001
+From: mwish <maplewish117@gmail.com>
+Date: Fri, 4 Jul 2025 22:31:31 +0800
+Subject: [PATCH] GH-46988: [C++][Parquet] Fix FLBA DecodeArrow multiply
+ overflow (#46991)
+
+### Rationale for this change
+
+See: https://github.com/apache/arrow/issues/46988
+
+Note that it's an old problem, not a new problem
+
+### What changes are included in this PR?
+
+Add `checkPageOverflow`
+
+### Are these changes tested?
+
+By arrow-testing file
+
+### Are there any user-facing changes?
+
+No, just a minor bugfix
+* GitHub Issue: #46988
+
+Authored-by: mwish <maplewish117@gmail.com>
+Signed-off-by: mwish <maplewish117@gmail.com>
+---
+ cpp/src/parquet/decoder.cc | 23 +++++++++++------------
+ testing                    |  2 +-
+ 2 files changed, 12 insertions(+), 13 deletions(-)
+
+diff --git a/cpp/src/parquet/decoder.cc b/cpp/src/parquet/decoder.cc
+index 3bcdc55d8e9..57a2316bf41 100644
+--- a/cpp/src/parquet/decoder.cc
++++ b/cpp/src/parquet/decoder.cc
+@@ -260,6 +260,13 @@ auto DispatchArrowBinaryHelper(typename EncodingTraits<DType>::Accumulator* acc,
+   }
+ }
+ 
++void CheckPageLargeEnough(int64_t remaining_bytes, int32_t value_width,
++                          int64_t num_values) {
++  if (remaining_bytes < value_width * num_values) {
++    ParquetException::EofException();
++  }
++}
++
+ // Internal decoder class hierarchy
+ 
+ class DecoderImpl : virtual public Decoder {
+@@ -385,9 +392,7 @@ int PlainDecoder<DType>::DecodeArrow(
+ 
+   constexpr int value_size = static_cast<int>(sizeof(value_type));
+   int values_decoded = num_values - null_count;
+-  if (ARROW_PREDICT_FALSE(this->len_ < value_size * values_decoded)) {
+-    ParquetException::EofException();
+-  }
++  CheckPageLargeEnough(this->len_, value_size, values_decoded);
+ 
+   const uint8_t* data = this->data_;
+ 
+@@ -419,9 +424,7 @@ int PlainDecoder<DType>::DecodeArrow(
+ 
+   constexpr int value_size = static_cast<int>(sizeof(value_type));
+   int values_decoded = num_values - null_count;
+-  if (ARROW_PREDICT_FALSE(this->len_ < value_size * values_decoded)) {
+-    ParquetException::EofException();
+-  }
++  CheckPageLargeEnough(this->len_, value_size, values_decoded);
+ 
+   const uint8_t* data = this->data_;
+ 
+@@ -659,9 +662,7 @@ inline int PlainDecoder<FLBAType>::DecodeArrow(
+     typename EncodingTraits<FLBAType>::Accumulator* builder) {
+   const int byte_width = this->type_length_;
+   const int values_decoded = num_values - null_count;
+-  if (ARROW_PREDICT_FALSE(len_ < byte_width * values_decoded)) {
+-    ParquetException::EofException();
+-  }
++  CheckPageLargeEnough(len_, byte_width, values_decoded);
+ 
+   PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
+ 
+@@ -691,9 +692,7 @@ inline int PlainDecoder<FLBAType>::DecodeArrow(
+     typename EncodingTraits<FLBAType>::DictAccumulator* builder) {
+   const int byte_width = this->type_length_;
+   const int values_decoded = num_values - null_count;
+-  if (ARROW_PREDICT_FALSE(len_ < byte_width * values_decoded)) {
+-    ParquetException::EofException();
+-  }
++  CheckPageLargeEnough(len_, byte_width, values_decoded);
+ 
+   PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
+   PARQUET_THROW_NOT_OK(
+diff --git a/testing b/testing
+index 7b94287bd0e..fbf6b703dc9 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit 7b94287bd0ed7436aaf6a5fda60eda002f6d9d1c
++Subproject commit fbf6b703dc93d17d75fa3664c5aa2c7873ebaf06

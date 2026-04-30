@@ -1,0 +1,58 @@
+From 1c906b07a4d3a3b70f255fda2348d507ec123df8 Mon Sep 17 00:00:00 2001
+From: Linus Groh <mail@linusgroh.de>
+Date: Sun, 6 Jun 2021 23:25:33 +0100
+Subject: [PATCH] LibJS: Add length parameter to Array::create()
+
+This is now a bit closer to the spec's 10.4.2.2 ArrayCreate - it will
+throw a RangeError if the requested length exceeds 2^32 - 1, so anyone
+passing in a custom value (defaults to zero for same behaviour as
+before) will need an exception check at the call site.
+---
+ Userland/Libraries/LibJS/Runtime/Array.cpp | 13 +++++++++++--
+ Userland/Libraries/LibJS/Runtime/Array.h   |  2 +-
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/Userland/Libraries/LibJS/Runtime/Array.cpp b/Userland/Libraries/LibJS/Runtime/Array.cpp
+index 1fc8a899546f8e..d8ab3b42363938 100644
+--- a/Userland/Libraries/LibJS/Runtime/Array.cpp
++++ b/Userland/Libraries/LibJS/Runtime/Array.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (c) 2020, Andreas Kling <kling@serenityos.org>
++ * Copyright (c) 2020-2021, Linus Groh <linusg@serenityos.org>
+  *
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+@@ -11,9 +12,17 @@
+ 
+ namespace JS {
+ 
+-Array* Array::create(GlobalObject& global_object)
++// 10.4.2.2 ArrayCreate, https://tc39.es/ecma262/#sec-arraycreate
++Array* Array::create(GlobalObject& global_object, size_t length)
+ {
+-    return global_object.heap().allocate<Array>(global_object, *global_object.array_prototype());
++    if (length > NumericLimits<u32>::max()) {
++        auto& vm = global_object.vm();
++        vm.throw_exception<RangeError>(global_object, ErrorType::InvalidLength, "array");
++        return nullptr;
++    }
++    auto* array = global_object.heap().allocate<Array>(global_object, *global_object.array_prototype());
++    array->indexed_properties().set_array_like_size(length);
++    return array;
+ }
+ 
+ // 7.3.17 CreateArrayFromList, https://tc39.es/ecma262/#sec-createarrayfromlist
+diff --git a/Userland/Libraries/LibJS/Runtime/Array.h b/Userland/Libraries/LibJS/Runtime/Array.h
+index 58b4b19c8b61e7..ea204a02bb83ae 100644
+--- a/Userland/Libraries/LibJS/Runtime/Array.h
++++ b/Userland/Libraries/LibJS/Runtime/Array.h
+@@ -14,7 +14,7 @@ class Array : public Object {
+     JS_OBJECT(Array, Object);
+ 
+ public:
+-    static Array* create(GlobalObject&);
++    static Array* create(GlobalObject&, size_t length = 0);
+     static Array* create_from(GlobalObject&, const Vector<Value>&);
+ 
+     explicit Array(Object& prototype);

@@ -1,0 +1,89 @@
+From b60638452a5c74d94f3d08910e4e1037be28b1f7 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Sun, 14 May 2017 02:26:41 +0000
+Subject: [PATCH] Internal libtiff: resync with CVS. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=1563. Credit to
+ OSS-Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@38299 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ autotest/gcore/data/packbits-not-enough-data.tif | Bin 0 -> 1086 bytes
+ autotest/gcore/tiff_read.py                      |  15 +++++++++++++++
+ gdal/frmts/gtiff/libtiff/tif_packbits.c          |   8 +++++++-
+ 3 files changed, 22 insertions(+), 1 deletion(-)
+ create mode 100644 autotest/gcore/data/packbits-not-enough-data.tif
+
+diff --git a/autotest/gcore/data/packbits-not-enough-data.tif b/autotest/gcore/data/packbits-not-enough-data.tif
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b02ae3c6ece9227829833110d18131143bb065a
+GIT binary patch
+literal 1086
+zcmebD)MDUb009;T21aHEMj%U(p@D%B%4XzXU=U<v0gGD!<(Q%3tPKko7}yyYJUug0
+zb5a=Aw=**+0Hs&SV*(8GJ%M%tbu%>BKM1f;;cPq5wEs}^59tGJ3|jji_J5!K_eTJO
+z%cJ#&I$h>7^&U_D=ppcdS-I=Lj0HbgOy}!19#S*{y7D{2Z$6NXc2EZ~xiLyD!n7Rf
+zbVHy@A()qdY*9vLOtr`&KyNeD0j&`vKQP*91+a!Pvg0w?IKu1b(#a9ZK%dGvvbTKi
+zv<vzpG3CaRU(siqLbawm%KxU@u$;N_W{$xH-G=onTce+;2CQJ>)R*6{_fbRlQ7}^l
+zgM`QqA1)>#c*;=#ngvTaAT}a$+(SIw+~R{A!>w3>;;>Z23}ka5q6L)rKo}l7U><2n
+zkXC`-PGqQq+z(ERGzi;QjF12US|J7vHBhz{hbHnFKyfKXR<IgSE^Y(5MH<9cU|{G2
+zvSkn<&7gtA)?{R^X9DU4hC71;P@D(EW?+~G)S>~zY5Dnj3?-RqATbXh1`7QL0|o{F
+D%})0V
+
+literal 0
+HcmV?d00001
+
+diff --git a/autotest/gcore/tiff_read.py b/autotest/gcore/tiff_read.py
+index f4499cf51aaa..8045e8828a33 100755
+--- a/autotest/gcore/tiff_read.py
++++ b/autotest/gcore/tiff_read.py
+@@ -3105,6 +3105,20 @@ def tiff_read_corrupted_deflate_singlestrip():
+ 
+     return 'success'
+ 
++###############################################################################
++# Test fix for https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=1563
++
++def tiff_read_packbits_not_enough_data():
++
++    if not check_libtiff_internal_or_greater(4,0,8):
++        return 'skip'
++
++    with gdaltest.error_handler():
++        ds = gdal.Open('data/packbits-not-enough-data.tif')
++        ds.GetRasterBand(1).Checksum()
++
++    return 'success'
++
+ ###############################################################################
+ 
+ for item in init_list:
+@@ -3211,6 +3225,7 @@ def tiff_read_corrupted_deflate_singlestrip():
+ gdaltest_list.append( (tiff_read_many_blocks) )
+ gdaltest_list.append( (tiff_read_uint33) )
+ gdaltest_list.append( (tiff_read_corrupted_deflate_singlestrip) )
++gdaltest_list.append( (tiff_read_packbits_not_enough_data) )
+ 
+ gdaltest_list.append( (tiff_read_online_1) )
+ gdaltest_list.append( (tiff_read_online_2) )
+diff --git a/gdal/frmts/gtiff/libtiff/tif_packbits.c b/gdal/frmts/gtiff/libtiff/tif_packbits.c
+index 0495e688a6be..18904b01370d 100644
+--- a/gdal/frmts/gtiff/libtiff/tif_packbits.c
++++ b/gdal/frmts/gtiff/libtiff/tif_packbits.c
+@@ -1,4 +1,4 @@
+-/* $Id: tif_packbits.c,v 1.25 2017-01-11 20:33:35 erouault Exp $ */
++/* $Id: tif_packbits.c,v 1.26 2017-05-14 02:26:07 erouault Exp $ */
+ 
+ /*
+  * Copyright (c) 1988-1997 Sam Leffler
+@@ -244,6 +244,12 @@ PackBitsDecode(TIFF* tif, uint8* op, tmsize_t occ, uint16 s)
+ 				    (unsigned long) ((tmsize_t)n - occ));
+ 				n = (long)occ;
+ 			}
++			if( cc == 0 )
++			{
++				TIFFWarningExt(tif->tif_clientdata, module,
++					       "Terminating PackBitsDecode due to lack of data.");
++				break;
++			}
+ 			occ -= n;
+ 			b = *bp++;
+ 			cc--;

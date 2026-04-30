@@ -1,0 +1,152 @@
+From f3f6b7bceb629bc4b6f1dea3e45b44dc3f8674af Mon Sep 17 00:00:00 2001
+From: Marti Maria <marti.maria@littlecms.com>
+Date: Fri, 26 Aug 2022 00:08:39 +0200
+Subject: [PATCH] Add some validations
+
+Makes no sense to accept profiles with absurd version numbers. That would keep fuzzers busy for a while.
+---
+ include/lcms2.h |  2 +-
+ src/cmsio0.c    | 35 +++++++++++++++++++++++++++++++++++
+ src/cmsvirt.c   | 14 +++++++-------
+ 3 files changed, 43 insertions(+), 8 deletions(-)
+
+diff --git a/include/lcms2.h b/include/lcms2.h
+index c72135a51..331a16ffe 100644
+--- a/include/lcms2.h
++++ b/include/lcms2.h
+@@ -152,7 +152,7 @@ typedef double               cmsFloat64Number;
+ #endif
+ 
+ // Handle "register" keyword
+-#if defined(CMS_NO_REGISTER_KEYWORD) 
++#if defined(CMS_NO_REGISTER_KEYWORD)
+ #  define CMSREGISTER
+ #else
+ #  define CMSREGISTER register
+diff --git a/src/cmsio0.c b/src/cmsio0.c
+index 9c07aa18a..821b8694b 100644
+--- a/src/cmsio0.c
++++ b/src/cmsio0.c
+@@ -531,6 +531,9 @@ cmsHPROFILE CMSEXPORT cmsCreateProfilePlaceholder(cmsContext ContextID)
+     // Set default version
+     Icc ->Version =  0x02100000;
+     
++    // Set default device class
++    Icc->DeviceClass = cmsSigDisplayClass;
++
+     // Set creation date/time
+     if (!_cmsGetTime(&Icc->Created))
+         goto Error;
+@@ -735,6 +738,28 @@ cmsUInt32Number _validatedVersion(cmsUInt32Number DWord)
+     return DWord;
+ }
+ 
++// Check device class
++static 
++cmsBool validDeviceClass(cmsProfileClassSignature cl)
++{
++    switch (cl)
++    {
++    case 0: // We allow zero because older lcms versions defaulted to that.
++    case cmsSigInputClass:
++    case cmsSigDisplayClass:
++    case cmsSigOutputClass:
++    case cmsSigLinkClass:
++    case cmsSigAbstractClass:
++    case cmsSigColorSpaceClass:
++    case cmsSigNamedColorClass:
++        return TRUE;
++
++    default:
++        return FALSE;
++    }
++
++}
++
+ // Read profile header and validate it
+ cmsBool _cmsReadHeader(_cmsICCPROFILE* Icc)
+ {
+@@ -771,6 +796,16 @@ cmsBool _cmsReadHeader(_cmsICCPROFILE* Icc)
+     _cmsAdjustEndianess64(&Icc -> attributes, &Header.attributes);
+     Icc -> Version         = _cmsAdjustEndianess32(_validatedVersion(Header.version));
+ 
++    if (Icc->Version > 0x5000000) {
++        cmsSignalError(Icc->ContextID, cmsERROR_UNKNOWN_EXTENSION, "Unsupported profile version '0x%x'", Icc->Version);
++        return FALSE;
++    }
++
++    if (!validDeviceClass(Icc->DeviceClass)) {
++        cmsSignalError(Icc->ContextID, cmsERROR_UNKNOWN_EXTENSION, "Unsupported device class '0x%x'", Icc->DeviceClass);
++        return FALSE;
++    }
++
+     // Get size as reported in header
+     HeaderSize = _cmsAdjustEndianess32(Header.size);
+ 
+diff --git a/src/cmsvirt.c b/src/cmsvirt.c
+index bffb88ec1..4900a8374 100644
+--- a/src/cmsvirt.c
++++ b/src/cmsvirt.c
+@@ -114,7 +114,7 @@ cmsHPROFILE CMSEXPORT cmsCreateRGBProfileTHR(cmsContext ContextID,
+     if (!hICC)                          // can't allocate
+         return NULL;
+ 
+-    cmsSetProfileVersion(hICC, 4.3);
++    cmsSetProfileVersion(hICC, 4.4);
+ 
+     cmsSetDeviceClass(hICC,      cmsSigDisplayClass);
+     cmsSetColorSpace(hICC,       cmsSigRgbData);
+@@ -235,7 +235,7 @@ cmsHPROFILE CMSEXPORT cmsCreateGrayProfileTHR(cmsContext ContextID,
+     if (!hICC)                          // can't allocate
+         return NULL;
+ 
+-    cmsSetProfileVersion(hICC, 4.3);
++    cmsSetProfileVersion(hICC, 4.4);
+ 
+     cmsSetDeviceClass(hICC,      cmsSigDisplayClass);
+     cmsSetColorSpace(hICC,       cmsSigGrayData);
+@@ -297,7 +297,7 @@ cmsHPROFILE CMSEXPORT cmsCreateLinearizationDeviceLinkTHR(cmsContext ContextID,
+     if (!hICC)
+         return NULL;
+ 
+-    cmsSetProfileVersion(hICC, 4.3);
++    cmsSetProfileVersion(hICC, 4.4);
+ 
+     cmsSetDeviceClass(hICC,      cmsSigLinkClass);
+     cmsSetColorSpace(hICC,       ColorSpace);
+@@ -416,7 +416,7 @@ cmsHPROFILE CMSEXPORT cmsCreateInkLimitingDeviceLinkTHR(cmsContext ContextID,
+     if (!hICC)                          // can't allocate
+         return NULL;
+ 
+-    cmsSetProfileVersion(hICC, 4.3);
++    cmsSetProfileVersion(hICC, 4.4);
+ 
+     cmsSetDeviceClass(hICC,      cmsSigLinkClass);
+     cmsSetColorSpace(hICC,       ColorSpace);
+@@ -526,7 +526,7 @@ cmsHPROFILE CMSEXPORT cmsCreateLab4ProfileTHR(cmsContext ContextID, const cmsCIE
+     hProfile = cmsCreateRGBProfileTHR(ContextID, WhitePoint == NULL ? cmsD50_xyY() : WhitePoint, NULL, NULL);
+     if (hProfile == NULL) return NULL;
+ 
+-    cmsSetProfileVersion(hProfile, 4.3);
++    cmsSetProfileVersion(hProfile, 4.4);
+ 
+     cmsSetDeviceClass(hProfile, cmsSigAbstractClass);
+     cmsSetColorSpace(hProfile,  cmsSigLabData);
+@@ -572,7 +572,7 @@ cmsHPROFILE CMSEXPORT cmsCreateXYZProfileTHR(cmsContext ContextID)
+     hProfile = cmsCreateRGBProfileTHR(ContextID, cmsD50_xyY(), NULL, NULL);
+     if (hProfile == NULL) return NULL;
+ 
+-    cmsSetProfileVersion(hProfile, 4.3);
++    cmsSetProfileVersion(hProfile, 4.4);
+ 
+     cmsSetDeviceClass(hProfile, cmsSigAbstractClass);
+     cmsSetColorSpace(hProfile,  cmsSigXYZData);
+@@ -839,7 +839,7 @@ cmsHPROFILE CMSEXPORT cmsCreateNULLProfileTHR(cmsContext ContextID)
+     if (!hProfile)                          // can't allocate
+         return NULL;
+ 
+-    cmsSetProfileVersion(hProfile, 4.3);
++    cmsSetProfileVersion(hProfile, 4.4);
+ 
+     if (!SetTextTags(hProfile, L"NULL profile built-in")) goto Error;
+ 

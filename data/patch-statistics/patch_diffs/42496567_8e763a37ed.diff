@@ -1,0 +1,384 @@
+From bd5af353d9a6d8f936d59c2fda57cf7eb14c48f5 Mon Sep 17 00:00:00 2001
+From: Joachim Metz <joachim.metz@gmail.com>
+Date: Sat, 1 May 2021 08:36:06 +0200
+Subject: [PATCH 1/4] fix_oob_read8
+
+---
+ tsk/fs/hfs.c            | 28 ++++++++++++++++-------
+ tsk/fs/hfs_dent.c       |  2 +-
+ tsk/fs/hfs_unicompare.c | 50 ++++++++++++++++++++++++++++++++---------
+ tsk/fs/tsk_hfs.h        |  4 ++--
+ 4 files changed, 63 insertions(+), 21 deletions(-)
+
+diff --git a/tsk/fs/hfs.c b/tsk/fs/hfs.c
+index e3221152b7..8ac63b016d 100644
+--- a/tsk/fs/hfs.c
++++ b/tsk/fs/hfs.c
+@@ -707,11 +707,17 @@ hfs_ext_find_extent_record_attr(HFS_INFO * hfs, uint32_t cnid,
+  */
+ int
+ hfs_cat_compare_keys(HFS_INFO * hfs, const hfs_btree_key_cat * key1,
+-    const hfs_btree_key_cat * key2)
++    int keylen1, const hfs_btree_key_cat * key2)
+ {
+     TSK_FS_INFO *fs = (TSK_FS_INFO *) & (hfs->fs_info);
+     uint32_t cnid1, cnid2;
+ 
++    if (keylen1 < 6) {
++        // Note that it would be better to return an error value here
++        // but the current function interface does not support this
++        // Also see issue #2365
++        return -1;
++    }
+     cnid1 = tsk_getu32(fs->endian, key1->parent_cnid);
+     cnid2 = tsk_getu32(fs->endian, key2->parent_cnid);
+ 
+@@ -720,7 +726,7 @@ hfs_cat_compare_keys(HFS_INFO * hfs, const hfs_btree_key_cat * key1,
+     if (cnid1 > cnid2)
+         return 1;
+ 
+-    return hfs_unicode_compare(hfs, &key1->name, &key2->name);
++    return hfs_unicode_compare(hfs, &key1->name, keylen1 - 6, &key2->name);
+ }
+ 
+ 
+@@ -890,7 +896,7 @@ hfs_cat_traverse(HFS_INFO * hfs,
+ 
+                 /* save the info from this record unless it is too big */
+                 retval =
+-                    a_cb(hfs, HFS_BT_NODE_TYPE_IDX, key,
++                    a_cb(hfs, HFS_BT_NODE_TYPE_IDX, key, keylen,
+                     cur_off + rec_off, ptr);
+                 if (retval == HFS_BTREE_CB_ERR) {
+                     tsk_error_set_errno(TSK_ERR_FS_GENFS);
+@@ -1012,7 +1018,7 @@ hfs_cat_traverse(HFS_INFO * hfs,
+                 //                rec_cnid = tsk_getu32(fs->endian, key->file_id);
+ 
+                 retval =
+-                    a_cb(hfs, HFS_BT_NODE_TYPE_LEAF, key,
++                    a_cb(hfs, HFS_BT_NODE_TYPE_LEAF, key, keylen,
+                     cur_off + rec_off, ptr);
+                 if (retval == HFS_BTREE_CB_LEAF_STOP) {
+                     is_done = 1;
+@@ -1058,7 +1064,7 @@ typedef struct {
+ 
+ static uint8_t
+ hfs_cat_get_record_offset_cb(HFS_INFO * hfs, int8_t level_type,
+-    const hfs_btree_key_cat * cur_key,
++    const hfs_btree_key_cat * cur_key, int cur_keylen,
+     TSK_OFF_T key_off, void *ptr)
+ {
+     HFS_CAT_GET_RECORD_OFFSET_DATA *offset_data = (HFS_CAT_GET_RECORD_OFFSET_DATA *)ptr;
+@@ -1073,14 +1079,14 @@ hfs_cat_get_record_offset_cb(HFS_INFO * hfs, int8_t level_type,
+             tsk_getu32(hfs->fs_info.endian, cur_key->parent_cnid));
+ 
+     if (level_type == HFS_BT_NODE_TYPE_IDX) {
+-        int diff = hfs_cat_compare_keys(hfs, cur_key, targ_key);
++        int diff = hfs_cat_compare_keys(hfs, cur_key, cur_keylen, targ_key);
+         if (diff < 0)
+             return HFS_BTREE_CB_IDX_LT;
+         else
+             return HFS_BTREE_CB_IDX_EQGT;
+     }
+     else {
+-        int diff = hfs_cat_compare_keys(hfs, cur_key, targ_key);
++        int diff = hfs_cat_compare_keys(hfs, cur_key, cur_keylen, targ_key);
+ 
+         // see if this record is for our file or if we passed the interesting entries
+         if (diff < 0) {
+@@ -1653,9 +1659,15 @@ hfs_cat_file_lookup(HFS_INFO * hfs, TSK_INUM_T inum, HFS_ENTRY * entry,
+ 
+ static uint8_t
+ hfs_find_highest_inum_cb(HFS_INFO * hfs, int8_t level_type,
+-    const hfs_btree_key_cat * cur_key,
++    const hfs_btree_key_cat * cur_key, int cur_keylen,
+     TSK_OFF_T key_off, void *ptr)
+ {
++    if (cur_keylen < 6) {
++        // Note that it would be better to return an error value here
++        // but the current function interface does not support this
++        // Also see issue #2365
++        return -1;
++    }
+     // NOTE: This assumes that the biggest inum is the last one that we
+     // see.  the traverse method does not currently promise that as part of
+     // its callback "contract".
+diff --git a/tsk/fs/hfs_dent.c b/tsk/fs/hfs_dent.c
+index e4cebf8a43..495588642e 100644
+--- a/tsk/fs/hfs_dent.c
++++ b/tsk/fs/hfs_dent.c
+@@ -198,7 +198,7 @@ typedef struct {
+ 
+ static uint8_t
+ hfs_dir_open_meta_cb(HFS_INFO * hfs, int8_t level_type,
+-    const hfs_btree_key_cat * cur_key,
++    const hfs_btree_key_cat * cur_key, int cur_keylen,
+     TSK_OFF_T key_off, void *ptr)
+ {
+     HFS_DIR_OPEN_META_INFO *info = (HFS_DIR_OPEN_META_INFO *) ptr;
+diff --git a/tsk/fs/hfs_unicompare.c b/tsk/fs/hfs_unicompare.c
+index 752486af07..91d528b883 100644
+--- a/tsk/fs/hfs_unicompare.c
++++ b/tsk/fs/hfs_unicompare.c
+@@ -109,7 +109,7 @@
+ #include "tsk_hfs.h"
+ 
+ static int hfs_unicode_compare_int(uint16_t endian,
+-    const hfs_uni_str * uni1, const hfs_uni_str * uni2);
++    const hfs_uni_str * uni1, int uni1_len, const hfs_uni_str * uni2);
+ 
+ 
+ /**
+@@ -124,18 +124,31 @@ static int hfs_unicode_compare_int(uint16_t endian,
+  */
+ int
+ hfs_unicode_compare(HFS_INFO * hfs, const hfs_uni_str * uni1,
+-    const hfs_uni_str * uni2)
++    int uni1_len, const hfs_uni_str * uni2)
+ {
+     if (hfs->is_case_sensitive) {
+         uint16_t l1, l2;
+         const uint8_t *s1, *s2;
+         uint16_t c1, c2;
+ 
++        if (uni1_len < 2) {
++            // Note that it would be better to return an error value here
++            // but the current function interface does not support this
++            // Also see issue #2365
++            return -1;
++        }
+         l1 = tsk_getu16(hfs->fs_info.endian, uni1->length);
+         l2 = tsk_getu16(hfs->fs_info.endian, uni2->length);
+         s1 = uni1->unicode;
+         s2 = uni2->unicode;
+ 
++        // Note that l1 contains number of UTF-16 "characters" and uni1_len number of bytes.
++        if (l1 > (uni1_len - 2) / 2) {
++            // Note that it would be better to return an error value here
++            // but the current function interface does not support this
++            // Also see issue #2365
++            return -1;
++        }
+         while (1) {
+             if ((l1 == 0) && (l2 == 0))
+                 return 0;
+@@ -157,7 +170,7 @@ hfs_unicode_compare(HFS_INFO * hfs, const hfs_uni_str * uni1,
+         return 0;
+     }
+     else
+-        return hfs_unicode_compare_int(hfs->fs_info.endian, uni1, uni2);
++        return hfs_unicode_compare_int(hfs->fs_info.endian, uni1, uni1_len, uni2);
+ }
+ 
+ extern uint16_t gLowerCaseTable[];
+@@ -169,17 +182,34 @@ extern uint16_t gLowerCaseTable[];
+  */
+ static int
+ hfs_unicode_compare_int(uint16_t endian, const hfs_uni_str * uni1,
+-    const hfs_uni_str * uni2)
++    int uni1_len, const hfs_uni_str * uni2)
+ {
+     uint16_t c1, c2;
+     uint16_t temp;
+     uint16_t *lowerCaseTable;
+-
+-    const uint8_t *str1 = uni1->unicode;
+-    const uint8_t *str2 = uni2->unicode;
+-    uint16_t length1 = tsk_getu16(endian, uni1->length);
+-    uint16_t length2 = tsk_getu16(endian, uni2->length);
+-
++    const uint8_t *str1 = NULL;
++    const uint8_t *str2 = NULL;
++    uint16_t length1 = 0;
++    uint16_t length2 = 0;
++
++    if (uni1_len < 2) {
++        // Note that it would be better to return an error value here
++        // but the current function interface does not support this
++        // Also see issue #2365
++        return -1;
++    }
++    str1 = uni1->unicode;
++    str2 = uni2->unicode;
++    length1 = tsk_getu16(endian, uni1->length);
++    length2 = tsk_getu16(endian, uni2->length);
++
++    // Note that length1 contains number of UTF-16 "characters" and uni1_len number of bytes.
++    if (length1 > (uni1_len - 2) / 2) {
++        // Note that it would be better to return an error value here
++        // but the current function interface does not support this
++        // Also see issue #2365
++        return -1;
++    }
+     lowerCaseTable = gLowerCaseTable;
+ 
+     while (1) {
+diff --git a/tsk/fs/tsk_hfs.h b/tsk/fs/tsk_hfs.h
+index 7becb2ab35..4437b1c5ac 100644
+--- a/tsk/fs/tsk_hfs.h
++++ b/tsk/fs/tsk_hfs.h
+@@ -734,7 +734,7 @@ extern uint8_t hfs_UTF16toUTF8(TSK_FS_INFO *, uint8_t *, int, char *, int,
+     uint32_t);
+ 
+ extern int hfs_unicode_compare(HFS_INFO *, const hfs_uni_str *,
+-    const hfs_uni_str *);
++    int, const hfs_uni_str *);
+ extern uint16_t hfs_get_idxkeylen(HFS_INFO * hfs, uint16_t keylen,
+     const hfs_btree_header_record * header);
+ 
+@@ -765,7 +765,7 @@ extern char hfs_is_hard_link(TSK_FS_INFO * fs, TSK_INUM_T inum);
+  * @param ptr Pointer to data that was passed into parent
+  */
+ typedef uint8_t(*TSK_HFS_BTREE_CB) (HFS_INFO *, int8_t level_type,
+-    const hfs_btree_key_cat * cur_key,
++    const hfs_btree_key_cat * cur_key, int cur_keylen,
+     TSK_OFF_T key_off, void *ptr);
+ // return values for callback
+ #define HFS_BTREE_CB_IDX_LT     1       // current key is less than target (keeps looking in node)
+
+From f75b7d33c10539b428462f0a746b8b6fe5e50b22 Mon Sep 17 00:00:00 2001
+From: Joachim Metz <joachim.metz@gmail.com>
+Date: Fri, 18 Jun 2021 16:02:04 +0200
+Subject: [PATCH 2/4] Fix OOB read in hfs_ext_find_extent_record_attr
+
+---
+ tsk/fs/hfs.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tsk/fs/hfs.c b/tsk/fs/hfs.c
+index e3221152b7..fe56fa2cac 100644
+--- a/tsk/fs/hfs.c
++++ b/tsk/fs/hfs.c
+@@ -512,7 +512,7 @@ hfs_ext_find_extent_record_attr(HFS_INFO * hfs, uint32_t cnid,
+                     int keylen =
+                         2 + hfs_get_idxkeylen(hfs, tsk_getu16(fs->endian,
+                             key->key_len), &(hfs->extents_header));
+-                    if (rec_off + keylen > nodesize) {
++                    if ((nodesize < 4) || (keylen > nodesize - 4) || (rec_off >= nodesize - 4 - keylen)) {
+                         tsk_error_set_errno(TSK_ERR_FS_GENFS);
+                         tsk_error_set_errstr
+                             ("hfs_ext_find_extent_record_attr: offset and keylenth of record %d in index node %d too large (%d vs %"
+
+From 6bac602fc47bd668fb0b8c14ce64c073ecc2de63 Mon Sep 17 00:00:00 2001
+From: Joachim Metz <joachim.metz@gmail.com>
+Date: Fri, 18 Jun 2021 13:52:41 +0200
+Subject: [PATCH 3/4] fix_oob_read13
+
+---
+ tsk/fs/hfs.c      |  8 ++++----
+ tsk/fs/hfs_dent.c | 14 +++++++++++++-
+ tsk/fs/tsk_hfs.h  |  2 +-
+ 3 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/tsk/fs/hfs.c b/tsk/fs/hfs.c
+index 8ac63b016d..95d178031b 100644
+--- a/tsk/fs/hfs.c
++++ b/tsk/fs/hfs.c
+@@ -896,7 +896,7 @@ hfs_cat_traverse(HFS_INFO * hfs,
+ 
+                 /* save the info from this record unless it is too big */
+                 retval =
+-                    a_cb(hfs, HFS_BT_NODE_TYPE_IDX, key, keylen,
++                    a_cb(hfs, HFS_BT_NODE_TYPE_IDX, key, keylen, nodesize,
+                     cur_off + rec_off, ptr);
+                 if (retval == HFS_BTREE_CB_ERR) {
+                     tsk_error_set_errno(TSK_ERR_FS_GENFS);
+@@ -1018,7 +1018,7 @@ hfs_cat_traverse(HFS_INFO * hfs,
+                 //                rec_cnid = tsk_getu32(fs->endian, key->file_id);
+ 
+                 retval =
+-                    a_cb(hfs, HFS_BT_NODE_TYPE_LEAF, key, keylen,
++                    a_cb(hfs, HFS_BT_NODE_TYPE_LEAF, key, keylen, nodesize,
+                     cur_off + rec_off, ptr);
+                 if (retval == HFS_BTREE_CB_LEAF_STOP) {
+                     is_done = 1;
+@@ -1064,7 +1064,7 @@ typedef struct {
+ 
+ static uint8_t
+ hfs_cat_get_record_offset_cb(HFS_INFO * hfs, int8_t level_type,
+-    const hfs_btree_key_cat * cur_key, int cur_keylen,
++    const hfs_btree_key_cat * cur_key, int cur_keylen, size_t node_size,
+     TSK_OFF_T key_off, void *ptr)
+ {
+     HFS_CAT_GET_RECORD_OFFSET_DATA *offset_data = (HFS_CAT_GET_RECORD_OFFSET_DATA *)ptr;
+@@ -1659,7 +1659,7 @@ hfs_cat_file_lookup(HFS_INFO * hfs, TSK_INUM_T inum, HFS_ENTRY * entry,
+ 
+ static uint8_t
+ hfs_find_highest_inum_cb(HFS_INFO * hfs, int8_t level_type,
+-    const hfs_btree_key_cat * cur_key, int cur_keylen,
++    const hfs_btree_key_cat * cur_key, int cur_keylen, size_t node_size,
+     TSK_OFF_T key_off, void *ptr)
+ {
+     if (cur_keylen < 6) {
+diff --git a/tsk/fs/hfs_dent.c b/tsk/fs/hfs_dent.c
+index 495588642e..b88627e53c 100644
+--- a/tsk/fs/hfs_dent.c
++++ b/tsk/fs/hfs_dent.c
+@@ -198,7 +198,7 @@ typedef struct {
+ 
+ static uint8_t
+ hfs_dir_open_meta_cb(HFS_INFO * hfs, int8_t level_type,
+-    const hfs_btree_key_cat * cur_key, int cur_keylen,
++    const hfs_btree_key_cat * cur_key, int cur_keylen, size_t nodesize,
+     TSK_OFF_T key_off, void *ptr)
+ {
+     HFS_DIR_OPEN_META_INFO *info = (HFS_DIR_OPEN_META_INFO *) ptr;
+@@ -233,7 +233,19 @@ hfs_dir_open_meta_cb(HFS_INFO * hfs, int8_t level_type,
+                 cur_key->parent_cnid) > info->cnid) {
+             return HFS_BTREE_CB_LEAF_STOP;
+         }
++	// Need at least 2 bytes for key_len
++        if (cur_keylen < 2) {
++            tsk_error_set_errno(TSK_ERR_FS_GENFS);
++            tsk_error_set_errstr("hfs_dir_open_meta: cur_keylen value out of bounds");
++            return HFS_BTREE_CB_ERR;
++        }
+         rec_off2 = 2 + tsk_getu16(hfs->fs_info.endian, cur_key->key_len);
++
++        if ((nodesize < 2) || (rec_off2 >= nodesize - 2)) {
++            tsk_error_set_errno(TSK_ERR_FS_GENFS);
++            tsk_error_set_errstr("hfs_dir_open_meta: nodesize value out of bounds");
++            return HFS_BTREE_CB_ERR;
++        }
+         rec_type = tsk_getu16(hfs->fs_info.endian, &rec_buf[rec_off2]);
+ 
+         // Catalog entry is for a file
+diff --git a/tsk/fs/tsk_hfs.h b/tsk/fs/tsk_hfs.h
+index 4437b1c5ac..2530e0cfe3 100644
+--- a/tsk/fs/tsk_hfs.h
++++ b/tsk/fs/tsk_hfs.h
+@@ -765,7 +765,7 @@ extern char hfs_is_hard_link(TSK_FS_INFO * fs, TSK_INUM_T inum);
+  * @param ptr Pointer to data that was passed into parent
+  */
+ typedef uint8_t(*TSK_HFS_BTREE_CB) (HFS_INFO *, int8_t level_type,
+-    const hfs_btree_key_cat * cur_key, int cur_keylen,
++    const hfs_btree_key_cat * cur_key, int cur_keylen, size_t node_size,
+     TSK_OFF_T key_off, void *ptr);
+ // return values for callback
+ #define HFS_BTREE_CB_IDX_LT     1       // current key is less than target (keeps looking in node)
+
+From beb68f543261a28ee25b945bb79d39213decd2cd Mon Sep 17 00:00:00 2001
+From: Joachim Metz <joachim.metz@gmail.com>
+Date: Fri, 18 Jun 2021 16:34:18 +0200
+Subject: [PATCH 4/4] Fixed OOB reads in hfs_dir_open_meta_cb
+
+---
+ tsk/fs/hfs_dent.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/tsk/fs/hfs_dent.c b/tsk/fs/hfs_dent.c
+index b88627e53c..54460f14bf 100644
+--- a/tsk/fs/hfs_dent.c
++++ b/tsk/fs/hfs_dent.c
+@@ -295,6 +295,11 @@ hfs_dir_open_meta_cb(HFS_INFO * hfs, int8_t level_type,
+ 
+         /* This is a normal file in the folder */
+         else if (rec_type == HFS_FILE_RECORD) {
++            if ((nodesize < sizeof(hfs_file)) || (rec_off2 >= nodesize - sizeof(hfs_file))) {
++                tsk_error_set_errno(TSK_ERR_FS_GENFS);
++                tsk_error_set_errstr("hfs_dir_open_meta: nodesize value out of bounds");
++                return HFS_BTREE_CB_ERR;
++            }
+             hfs_file *file = (hfs_file *) & rec_buf[rec_off2];
+             // This could be a hard link.  We need to test this CNID, and follow it if necessary.
+             unsigned char is_err;

@@ -1,0 +1,95 @@
+From 59ac0f6876270b8fc7508be94297ab7d94aac470 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Mon, 22 May 2017 15:27:41 +0000
+Subject: [PATCH] DGN: workaround CLang index-out-of-bound UBSAN warning
+ regarding extended arrays. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=1782. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@38604 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/ogr/ogrsf_frmts/dgn/dgnlib.h     |  5 ++++-
+ gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp  | 10 ++++++----
+ gdal/ogr/ogrsf_frmts/dgn/dgnwrite.cpp |  4 ++--
+ 3 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/gdal/ogr/ogrsf_frmts/dgn/dgnlib.h b/gdal/ogr/ogrsf_frmts/dgn/dgnlib.h
+index b625f62f38be..af751ee69dd1 100644
+--- a/gdal/ogr/ogrsf_frmts/dgn/dgnlib.h
++++ b/gdal/ogr/ogrsf_frmts/dgn/dgnlib.h
+@@ -121,7 +121,10 @@ typedef struct {
+   DGNElemCore   core;
+ 
+   int           num_vertices;  /*!< Number of vertices in "vertices" */
+-  DGNPoint      vertices[2];   /*!< Array of two or more vertices */
++  DGNPoint      vertices[1];   /*!< Array of two or more vertices */
++                               // Note: We set [1] to please clang UBSAN
++                               // regarding structures that are extended at
++                               // malloc time
+ 
+ } DGNElemMultiPoint;
+ 
+diff --git a/gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp b/gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp
+index 8c4e97c8e464..4cb3444251f6 100644
+--- a/gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp
++++ b/gdal/ogr/ogrsf_frmts/dgn/dgnread.cpp
+@@ -426,7 +426,7 @@ static DGNElemCore *DGNProcessElement( DGNInfo *psDGN, int nType, int nLevel )
+       case DGNT_LINE:
+       {
+           DGNElemMultiPoint *psLine = static_cast<DGNElemMultiPoint *>(
+-              CPLCalloc(sizeof(DGNElemMultiPoint), 1));
++              CPLCalloc(sizeof(DGNElemMultiPoint) + sizeof(DGNPoint), 1));
+           psElement = (DGNElemCore *) psLine;
+           psElement->stype = DGNST_MULTIPOINT;
+           DGNParseCore( psDGN, psElement );
+@@ -495,7 +495,7 @@ static DGNElemCore *DGNProcessElement( DGNInfo *psDGN, int nType, int nLevel )
+               return NULL;
+           }
+           DGNElemMultiPoint *psLine = static_cast<DGNElemMultiPoint *>(
+-              CPLCalloc(sizeof(DGNElemMultiPoint)+(count-2)*sizeof(DGNPoint),
++              CPLCalloc(sizeof(DGNElemMultiPoint)+(count-1)*sizeof(DGNPoint),
+                         1));
+           psElement = (DGNElemCore *) psLine;
+           psElement->stype = DGNST_MULTIPOINT;
+@@ -532,8 +532,9 @@ static DGNElemCore *DGNProcessElement( DGNInfo *psDGN, int nType, int nLevel )
+                     }
+               }
+           }
+-          psLine->num_vertices = count;
+-          for( int i = 0; i < psLine->num_vertices; i++ )
++          for( int i = 0; i < count &&
++                          (( psDGN->dimension == 3 ) ? 46 : 42) +
++                                i*pntsize + 4 <= psDGN->nElemBytes; i++ )
+           {
+               psLine->vertices[i].x =
+                   DGN_INT32( psDGN->abyElem + 38 + i*pntsize );
+@@ -550,6 +551,7 @@ static DGNElemCore *DGNProcessElement( DGNInfo *psDGN, int nType, int nLevel )
+                 psLine->vertices[i].y += dy / 32767.0;
+               }
+               DGNTransformPoint( psDGN, psLine->vertices + i );
++              psLine->num_vertices = i+1;
+           }
+       }
+       break;
+diff --git a/gdal/ogr/ogrsf_frmts/dgn/dgnwrite.cpp b/gdal/ogr/ogrsf_frmts/dgn/dgnwrite.cpp
+index 1ed8e265e26f..11b7cef07c59 100644
+--- a/gdal/ogr/ogrsf_frmts/dgn/dgnwrite.cpp
++++ b/gdal/ogr/ogrsf_frmts/dgn/dgnwrite.cpp
+@@ -466,7 +466,7 @@ DGNElemCore *DGNCloneElement( CPL_UNUSED DGNHandle hDGNSrc,
+         DGNElemMultiPoint *psSrcMP = (DGNElemMultiPoint *) psSrcElement;
+ 
+         const size_t nSize = sizeof(DGNElemMultiPoint)
+-            + sizeof(DGNPoint) * (psSrcMP->num_vertices-2);
++            + sizeof(DGNPoint) * (psSrcMP->num_vertices-1);
+ 
+         DGNElemMultiPoint *psMP =
+             static_cast<DGNElemMultiPoint *>(CPLMalloc( nSize ));
+@@ -881,7 +881,7 @@ DGNElemCore *DGNCreateMultiPointElem( DGNHandle hDGN, int nType,
+ /* -------------------------------------------------------------------- */
+     DGNElemMultiPoint *psMP = static_cast<DGNElemMultiPoint *>(
+         CPLCalloc( sizeof(DGNElemMultiPoint)
+-                   + sizeof(DGNPoint) * (nPointCount-2), 1 ));
++                   + sizeof(DGNPoint) * (nPointCount-1), 1 ));
+     DGNElemCore *psCore = &(psMP->core);
+ 
+     DGNInitializeElemCore( hDGN, psCore );

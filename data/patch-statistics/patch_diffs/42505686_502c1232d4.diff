@@ -1,0 +1,378 @@
+From 73425813c1b6286fd589fcf0ef9335e8240137a9 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Fri, 9 Dec 2022 17:58:58 +1030
+Subject: [PATCH] PR28306, segfault in _bfd_mips_elf_reloc_unshuffle
+
+Access to section data during relocation processing should be bounds
+checked, as it is in bfd_perform_relocation.  bfd_perform_relocation
+does these checks after any special_function is called.  So a reloc
+special_function needs to do its own bounds checking before accessing
+section data.  This patch adds many such checks to the mips backend.
+
+Checking mips relocs is not without some difficulty.  See the comment
+in _bfd_mips_reloc_offset_in_range.  In a multitple reloc sequence
+applied to the same location, relocs that may appear somewhere other
+than the last one of the sequence need to be treated specially since
+they apply to the addend for the next relocation rather than the
+section contents.  If the addend is in the section then it needs to be
+checked but not when the addend is in the reloc.  check_inplace
+handles this situation.  _bfd_mips_reloc_offset_in_range with
+check_shuffle handles the case where contents are shuffled before
+applying the relocation.
+
+	PR 28306
+	* elf32-mips.c (_bfd_mips_elf32_gprel16_reloc): Check reloc
+	address using _bfd_mips_reloc_offset_in_range.
+	(gprel32_with_gp, mips16_gprel_reloc): Likewise.
+	* elf64-mips.c (mips_elf64_gprel32_reloc): Likewise.
+	(mips16_gprel_reloc): Likewise.
+	* elfn32-mips.c (mips16_gprel_reloc): Likewise.
+	(gprel32_with_gp): Check reloc address using
+	bfd_reloc_offset_in_range.
+	* elfxx-mips.h (enum reloc_check): Define.
+	(_bfd_mips_reloc_offset_in_range): Declare.
+	* elfxx-mips.c (needs_shuffle): New function.
+	(_bfd_mips_elf_reloc_unshuffle, _bfd_mips_elf_reloc_shuffle): Use it.
+	(_bfd_mips_reloc_offset_in_range): New function.
+	(_bfd_mips_elf_gprel16_with_gp): Move reloc address checks to
+	partial_inplace handling.  Use bfd_reloc_offset_in_range.
+	(_bfd_mips_elf_lo16_reloc): Check reloc address using
+	bfd_reloc_offset_in_range.
+	(_bfd_mips_elf_generic_reloc): Check reloc address using
+	_bfd_mips_reloc_offset_in_range.
+	(mips_elf_calculate_relocation): Check reloc address before calling
+	mips_elf_nullify_got_load.
+	(_bfd_mips_elf_check_relocs): Likewise.
+	(mips_elf_read_rel_addend): Add sec param, check reloc address
+	before reading.  Adjust callers.
+	(mips_elf_add_lo16_rel_addend): Add sec param, adjust callers.
+---
+ bfd/elf32-mips.c  | 11 ++++++-
+ bfd/elf64-mips.c  |  7 +++-
+ bfd/elfn32-mips.c |  7 +++-
+ bfd/elfxx-mips.c  | 84 ++++++++++++++++++++++++++++++++++++-----------
+ bfd/elfxx-mips.h  |  9 +++++
+ 5 files changed, 96 insertions(+), 22 deletions(-)
+
+diff --git a/bfd/elf32-mips.c b/bfd/elf32-mips.c
+index 3f92df6ee11..be28d1a3b1c 100644
+--- a/bfd/elf32-mips.c
++++ b/bfd/elf32-mips.c
+@@ -1790,6 +1790,10 @@ _bfd_mips_elf32_gprel16_reloc (bfd *abfd, arelent *reloc_entry,
+   if (ret != bfd_reloc_ok)
+     return ret;
+ 
++  if (!_bfd_mips_reloc_offset_in_range (abfd, input_section, reloc_entry,
++					check_shuffle))
++    return bfd_reloc_outofrange;
++
+   location = (bfd_byte *) data + reloc_entry->address;
+   _bfd_mips_elf_reloc_unshuffle (abfd, reloc_entry->howto->type, false,
+ 				 location);
+@@ -1857,7 +1861,8 @@ gprel32_with_gp (bfd *abfd, asymbol *symbol, arelent *reloc_entry,
+   relocation += symbol->section->output_section->vma;
+   relocation += symbol->section->output_offset;
+ 
+-  if (reloc_entry->address > bfd_get_section_limit (abfd, input_section))
++  if (!_bfd_mips_reloc_offset_in_range (abfd, input_section, reloc_entry,
++					check_inplace))
+     return bfd_reloc_outofrange;
+ 
+   /* Set val to the offset into the section or symbol.  */
+@@ -1956,6 +1961,10 @@ mips16_gprel_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+   if (ret != bfd_reloc_ok)
+     return ret;
+ 
++  if (!_bfd_mips_reloc_offset_in_range (abfd, input_section, reloc_entry,
++					check_shuffle))
++    return bfd_reloc_outofrange;
++
+   location = (bfd_byte *) data + reloc_entry->address;
+   _bfd_mips_elf_reloc_unshuffle (abfd, reloc_entry->howto->type, false,
+ 				 location);
+diff --git a/bfd/elf64-mips.c b/bfd/elf64-mips.c
+index e3ee0b99d97..419d9bc6dbd 100644
+--- a/bfd/elf64-mips.c
++++ b/bfd/elf64-mips.c
+@@ -3580,7 +3580,8 @@ mips_elf64_gprel32_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+   relocation += symbol->section->output_section->vma;
+   relocation += symbol->section->output_offset;
+ 
+-  if (reloc_entry->address > bfd_get_section_limit (abfd, input_section))
++  if (!_bfd_mips_reloc_offset_in_range (abfd, input_section, reloc_entry,
++					check_inplace))
+     return bfd_reloc_outofrange;
+ 
+   /* Set val to the offset into the section or symbol.  */
+@@ -3661,6 +3662,10 @@ mips16_gprel_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+   if (ret != bfd_reloc_ok)
+     return ret;
+ 
++  if (!_bfd_mips_reloc_offset_in_range (abfd, input_section, reloc_entry,
++					check_shuffle))
++    return bfd_reloc_outofrange;
++
+   location = (bfd_byte *) data + reloc_entry->address;
+   _bfd_mips_elf_reloc_unshuffle (abfd, reloc_entry->howto->type, false,
+ 				 location);
+diff --git a/bfd/elfn32-mips.c b/bfd/elfn32-mips.c
+index ac604eda5ea..d222d1a5d15 100644
+--- a/bfd/elfn32-mips.c
++++ b/bfd/elfn32-mips.c
+@@ -3411,7 +3411,8 @@ gprel32_with_gp (bfd *abfd, asymbol *symbol, arelent *reloc_entry,
+   relocation += symbol->section->output_section->vma;
+   relocation += symbol->section->output_offset;
+ 
+-  if (reloc_entry->address > bfd_get_section_limit (abfd, input_section))
++  if (!bfd_reloc_offset_in_range (reloc_entry->howto, abfd, input_section,
++				  reloc_entry->address))
+     return bfd_reloc_outofrange;
+ 
+   if (reloc_entry->howto->src_mask == 0)
+@@ -3491,6 +3492,10 @@ mips16_gprel_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+   if (ret != bfd_reloc_ok)
+     return ret;
+ 
++  if (!_bfd_mips_reloc_offset_in_range (abfd, input_section, reloc_entry,
++					check_shuffle))
++    return bfd_reloc_outofrange;
++
+   location = (bfd_byte *) data + reloc_entry->address;
+   _bfd_mips_elf_reloc_unshuffle (abfd, reloc_entry->howto->type, false,
+ 				 location);
+diff --git a/bfd/elfxx-mips.c b/bfd/elfxx-mips.c
+index 932167c15c6..618fb43540c 100644
+--- a/bfd/elfxx-mips.c
++++ b/bfd/elfxx-mips.c
+@@ -2346,13 +2346,19 @@ tls_gottprel_reloc_p (unsigned int r_type)
+ 	  || r_type == R_MICROMIPS_TLS_GOTTPREL);
+ }
+ 
++static inline bool
++needs_shuffle (int r_type)
++{
++  return mips16_reloc_p (r_type) || micromips_reloc_shuffle_p (r_type);
++}
++
+ void
+ _bfd_mips_elf_reloc_unshuffle (bfd *abfd, int r_type,
+ 			       bool jal_shuffle, bfd_byte *data)
+ {
+   bfd_vma first, second, val;
+ 
+-  if (!mips16_reloc_p (r_type) && !micromips_reloc_shuffle_p (r_type))
++  if (!needs_shuffle (r_type))
+     return;
+ 
+   /* Pick up the first and second halfwords of the instruction.  */
+@@ -2375,7 +2381,7 @@ _bfd_mips_elf_reloc_shuffle (bfd *abfd, int r_type,
+ {
+   bfd_vma first, second, val;
+ 
+-  if (!mips16_reloc_p (r_type) && !micromips_reloc_shuffle_p (r_type))
++  if (!needs_shuffle (r_type))
+     return;
+ 
+   val = bfd_get_32 (abfd, data);
+@@ -2399,6 +2405,32 @@ _bfd_mips_elf_reloc_shuffle (bfd *abfd, int r_type,
+   bfd_put_16 (abfd, first, data);
+ }
+ 
++/* Perform reloc offset checking.
++   We can only use bfd_reloc_offset_in_range, which takes into account
++   the size of the field being relocated, when section contents will
++   be accessed because mips object files may use relocations that seem
++   to access beyond section limits.
++   gas/testsuite/gas/mips/dla-reloc.s is an example that puts
++   R_MIPS_SUB, a 64-bit relocation, on the last instruction in the
++   section.  The R_MIPS_SUB applies to the addend for the next reloc
++   rather than the section contents.
++
++   CHECK is CHECK_STD for the standard bfd_reloc_offset_in_range check,
++   CHECK_INPLACE to only check partial_inplace relocs, and
++   CHECK_SHUFFLE to only check relocs that shuffle/unshuffle.  */
++
++bool
++_bfd_mips_reloc_offset_in_range (bfd *abfd, asection *input_section,
++				 arelent *reloc_entry, enum reloc_check check)
++{
++  if (check == check_inplace && !reloc_entry->howto->partial_inplace)
++    return true;
++  if (check == check_shuffle && !needs_shuffle (reloc_entry->howto->type))
++    return true;
++  return bfd_reloc_offset_in_range (reloc_entry->howto, abfd,
++				    input_section, reloc_entry->address);
++}
++
+ bfd_reloc_status_type
+ _bfd_mips_elf_gprel16_with_gp (bfd *abfd, asymbol *symbol,
+ 			       arelent *reloc_entry, asection *input_section,
+@@ -2416,9 +2448,6 @@ _bfd_mips_elf_gprel16_with_gp (bfd *abfd, asymbol *symbol,
+   relocation += symbol->section->output_section->vma;
+   relocation += symbol->section->output_offset;
+ 
+-  if (reloc_entry->address > bfd_get_section_limit (abfd, input_section))
+-    return bfd_reloc_outofrange;
+-
+   /* Set val to the offset into the section or symbol.  */
+   val = reloc_entry->addend;
+ 
+@@ -2433,6 +2462,10 @@ _bfd_mips_elf_gprel16_with_gp (bfd *abfd, asymbol *symbol,
+ 
+   if (reloc_entry->howto->partial_inplace)
+     {
++      if (!bfd_reloc_offset_in_range (reloc_entry->howto, abfd, input_section,
++				      reloc_entry->address))
++	return bfd_reloc_outofrange;
++
+       status = _bfd_relocate_contents (reloc_entry->howto, abfd, val,
+ 				       (bfd_byte *) data
+ 				       + reloc_entry->address);
+@@ -2534,7 +2567,8 @@ _bfd_mips_elf_lo16_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+   bfd_vma vallo;
+   bfd_byte *location = (bfd_byte *) data + reloc_entry->address;
+ 
+-  if (reloc_entry->address > bfd_get_section_limit (abfd, input_section))
++  if (!bfd_reloc_offset_in_range (reloc_entry->howto, abfd, input_section,
++				  reloc_entry->address))
+     return bfd_reloc_outofrange;
+ 
+   _bfd_mips_elf_reloc_unshuffle (abfd, reloc_entry->howto->type, false,
+@@ -2597,7 +2631,9 @@ _bfd_mips_elf_generic_reloc (bfd *abfd ATTRIBUTE_UNUSED, arelent *reloc_entry,
+ 
+   relocatable = (output_bfd != NULL);
+ 
+-  if (reloc_entry->address > bfd_get_section_limit (abfd, input_section))
++  if (!_bfd_mips_reloc_offset_in_range (abfd, input_section, reloc_entry,
++					(relocatable
++					 ? check_inplace : check_std)))
+     return bfd_reloc_outofrange;
+ 
+   /* Build up the field adjustment in VAL.  */
+@@ -5819,6 +5855,8 @@ mips_elf_calculate_relocation (bfd *abfd, bfd *input_bfd,
+     case R_MICROMIPS_CALL_LO16:
+       if (resolved_to_zero
+ 	  && !bfd_link_relocatable (info)
++	  && bfd_reloc_offset_in_range (howto, input_bfd, input_section,
++					relocation->r_offset)
+ 	  && mips_elf_nullify_got_load (input_bfd, contents,
+ 					relocation, howto, true))
+ 	return bfd_reloc_continue;
+@@ -8142,7 +8180,8 @@ mips_elf_rel_relocation_p (bfd *abfd, asection *sec,
+    of the section that REL is against.  */
+ 
+ static bfd_vma
+-mips_elf_read_rel_addend (bfd *abfd, const Elf_Internal_Rela *rel,
++mips_elf_read_rel_addend (bfd *abfd, asection *sec,
++			  const Elf_Internal_Rela *rel,
+ 			  reloc_howto_type *howto, bfd_byte *contents)
+ {
+   bfd_byte *location;
+@@ -8150,6 +8189,9 @@ mips_elf_read_rel_addend (bfd *abfd, const Elf_Internal_Rela *rel,
+   bfd_vma addend;
+   bfd_vma bytes;
+ 
++  if (!bfd_reloc_offset_in_range (howto, abfd, sec, rel->r_offset))
++    return 0;
++
+   r_type = ELF_R_TYPE (abfd, rel->r_info);
+   location = contents + rel->r_offset;
+ 
+@@ -8176,6 +8218,7 @@ mips_elf_read_rel_addend (bfd *abfd, const Elf_Internal_Rela *rel,
+ 
+ static bool
+ mips_elf_add_lo16_rel_addend (bfd *abfd,
++			      asection *sec,
+ 			      const Elf_Internal_Rela *rel,
+ 			      const Elf_Internal_Rela *relend,
+ 			      bfd_byte *contents, bfd_vma *addend)
+@@ -8218,7 +8261,8 @@ mips_elf_add_lo16_rel_addend (bfd *abfd,
+ 
+   /* Obtain the addend kept there.  */
+   lo16_howto = MIPS_ELF_RTYPE_TO_HOWTO (abfd, lo16_type, false);
+-  l = mips_elf_read_rel_addend (abfd, lo16_relocation, lo16_howto, contents);
++  l = mips_elf_read_rel_addend (abfd, sec, lo16_relocation, lo16_howto,
++				contents);
+ 
+   l <<= lo16_howto->rightshift;
+   l = _bfd_mips_elf_sign_extend (l, 16);
+@@ -8685,11 +8729,12 @@ _bfd_mips_elf_check_relocs (bfd *abfd, struct bfd_link_info *info,
+ 
+ 	      rel_reloc = mips_elf_rel_relocation_p (abfd, sec, relocs, rel);
+ 	      howto = MIPS_ELF_RTYPE_TO_HOWTO (abfd, r_type, !rel_reloc);
+-
+-	      if (!mips_elf_nullify_got_load (abfd, contents, rel, howto,
+-					      false))
+-		if (!mips_elf_define_absolute_zero (abfd, info, htab, r_type))
+-		  return false;
++	      if (bfd_reloc_offset_in_range (howto, abfd, sec, rel->r_offset))
++		if (!mips_elf_nullify_got_load (abfd, contents, rel, howto,
++						false))
++		  if (!mips_elf_define_absolute_zero (abfd, info, htab,
++						      r_type))
++		    return false;
+ 	    }
+ 
+ 	  /* Fall through.  */
+@@ -8903,10 +8948,10 @@ _bfd_mips_elf_check_relocs (bfd *abfd, struct bfd_link_info *info,
+ 		  if (!mips_elf_get_section_contents (abfd, sec, &contents))
+ 		    return false;
+ 		  howto = MIPS_ELF_RTYPE_TO_HOWTO (abfd, r_type, false);
+-		  addend = mips_elf_read_rel_addend (abfd, rel,
++		  addend = mips_elf_read_rel_addend (abfd, sec, rel,
+ 						     howto, contents);
+ 		  if (got16_reloc_p (r_type))
+-		    mips_elf_add_lo16_rel_addend (abfd, rel, rel_end,
++		    mips_elf_add_lo16_rel_addend (abfd, sec, rel, rel_end,
+ 						  contents, &addend);
+ 		  else
+ 		    addend <<= howto->rightshift;
+@@ -10423,14 +10468,15 @@ _bfd_mips_elf_relocate_section (bfd *output_bfd, struct bfd_link_info *info,
+ 					 relocs, rel))
+ 	    {
+ 	      rela_relocation_p = false;
+-	      addend = mips_elf_read_rel_addend (input_bfd, rel,
+-						 howto, contents);
++	      addend = mips_elf_read_rel_addend (input_bfd, input_section,
++						 rel, howto, contents);
+ 	      if (hi16_reloc_p (r_type)
+ 		  || (got16_reloc_p (r_type)
+ 		      && mips_elf_local_relocation_p (input_bfd, rel,
+ 						      local_sections)))
+ 		{
+-		  if (!mips_elf_add_lo16_rel_addend (input_bfd, rel, relend,
++		  if (!mips_elf_add_lo16_rel_addend (input_bfd, input_section,
++						     rel, relend,
+ 						     contents, &addend))
+ 		    {
+ 		      if (h)
+diff --git a/bfd/elfxx-mips.h b/bfd/elfxx-mips.h
+index af6d14c6ce3..6b22fdab3ae 100644
+--- a/bfd/elfxx-mips.h
++++ b/bfd/elfxx-mips.h
+@@ -22,6 +22,13 @@
+ #include "elf/internal.h"
+ #include "elf/mips.h"
+ 
++enum reloc_check
++{
++  check_std,
++  check_inplace,
++  check_shuffle
++};
++
+ extern bool _bfd_mips_elf_mkobject
+   (bfd *);
+ extern bool _bfd_mips_elf_new_section_hook
+@@ -129,6 +136,8 @@ extern void _bfd_mips_elf_reloc_unshuffle
+   (bfd *, int, bool, bfd_byte *);
+ extern void _bfd_mips_elf_reloc_shuffle
+   (bfd *, int, bool, bfd_byte *);
++extern bool _bfd_mips_reloc_offset_in_range
++  (bfd *, asection *, arelent *, enum reloc_check);
+ extern bfd_reloc_status_type _bfd_mips_elf_gprel16_with_gp
+   (bfd *, asymbol *, arelent *, asection *, bool, void *, bfd_vma);
+ extern bfd_reloc_status_type _bfd_mips_elf32_gprel16_reloc
+-- 
+GitLab
+

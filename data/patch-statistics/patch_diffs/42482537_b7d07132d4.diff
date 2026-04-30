@@ -1,0 +1,103 @@
+From fe90ae8a9f54e4fe8b9089fed48b0e1818414f57 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Fri, 20 Mar 2020 10:51:14 +1030
+Subject: [PATCH] NDS32 disassembly of odd sized sections
+
+	* nds32-dis.c (print_insn_nds32): Remove unnecessary casts.
+	Initialize parts of buffer not written when handling a possible
+	2-byte insn at end of section.  Don't attempt decoding of such
+	an insn by the 4-byte machinery.
+---
+ opcodes/ChangeLog   |  7 +++++++
+ opcodes/nds32-dis.c | 24 +++++++++++++++---------
+ 2 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/opcodes/ChangeLog b/opcodes/ChangeLog
+index 98f5d54bb3e..2d6af2b5a0c 100644
+--- a/opcodes/ChangeLog
++++ b/opcodes/ChangeLog
+@@ -1,3 +1,10 @@
++2020-03-20  Alan Modra  <amodra@gmail.com>
++
++	* nds32-dis.c (print_insn_nds32): Remove unnecessary casts.
++	Initialize parts of buffer not written when handling a possible
++	2-byte insn at end of section.  Don't attempt decoding of such
++	an insn by the 4-byte machinery.
++
+ 2020-03-20  Alan Modra  <amodra@gmail.com>
+ 
+ 	* ppc-dis.c (print_insn_powerpc): Only clear needed bytes of
+diff --git a/opcodes/nds32-dis.c b/opcodes/nds32-dis.c
+index c5874ffb4ac..35e4ba02917 100644
+--- a/opcodes/nds32-dis.c
++++ b/opcodes/nds32-dis.c
+@@ -985,7 +985,7 @@ print_insn_nds32 (bfd_vma pc, disassemble_info *info)
+   int is_data = FALSE;
+   bfd_boolean found = FALSE;
+   struct nds32_private_data *private_data;
+-  unsigned int size = 16;
++  unsigned int size;
+   enum map_type mapping_type = MAP_CODE;
+ 
+   if (info->private_data == NULL)
+@@ -1063,6 +1063,7 @@ print_insn_nds32 (bfd_vma pc, disassemble_info *info)
+ 
+       /* Fix corner case: there is no next mapping symbol,
+ 	 let mapping type decides size */
++      size = 16;
+       if (last_symbol_index + 1 >= info->symtab_size)
+ 	{
+ 	  if (mapping_type == MAP_DATA0)
+@@ -1096,7 +1097,7 @@ print_insn_nds32 (bfd_vma pc, disassemble_info *info)
+ 	size = (pc & 1) ? 1 : 2;
+ 
+       /* Read bytes from BFD.  */
+-      info->read_memory_func (pc, (bfd_byte *) buf_data, size, info);
++      info->read_memory_func (pc, buf_data, size, info);
+       given = 0;
+       given1 = 0;
+       /* Start assembling data.  */
+@@ -1153,16 +1154,20 @@ print_insn_nds32 (bfd_vma pc, disassemble_info *info)
+       return size;
+     }
+ 
+-  status = info->read_memory_func (pc, (bfd_byte *) buf, 4, info);
++  size = 4;
++  status = info->read_memory_func (pc, buf, 4, info);
+   if (status)
+     {
+       /* For the last 16-bit instruction.  */
+-      status = info->read_memory_func (pc, (bfd_byte *) buf, 2, info);
++      size = 2;
++      status = info->read_memory_func (pc, buf, 2, info);
+       if (status)
+ 	{
+-	  (*info->memory_error_func)(status, pc, info);
++	  (*info->memory_error_func) (status, pc, info);
+ 	  return -1;
+ 	}
++      buf[2] = 0;
++      buf[3] = 0;
+     }
+ 
+   insn = bfd_getb32 (buf);
+@@ -1174,11 +1179,12 @@ print_insn_nds32 (bfd_vma pc, disassemble_info *info)
+     }
+ 
+   /* 32-bit instructions.  */
++  if (size == 4)
++    print_insn32 (pc, info, insn, NDS32_PARSE_INSN32);
+   else
+-    {
+-      print_insn32 (pc, info, insn, NDS32_PARSE_INSN32);
+-      return 4;
+-    }
++    info->fprintf_func (info->stream,
++			_("insufficient data to decode instruction"));
++  return 4;
+ }
+ 
+ /* Ignore disassembling unnecessary name.  */
+-- 
+GitLab
+

@@ -1,0 +1,45 @@
+From 97e10070e25d414c68bbb25d0a2e7bfed7bc2c2c Mon Sep 17 00:00:00 2001
+From: Evgenii Kliuchnikov <eustas@google.com>
+Date: Wed, 9 Jun 2021 06:41:12 +0000
+Subject: [PATCH] Fix use of undefined value in 2x upsampling.
+
+Nultiplication by 0 does not save from mixing-in undefined values,
+because NaN is toxic. Added special "unlikely" case for the tail
+of input in case X-repeat is in action (only 2x upsampling, and
+vector size >4).
+---
+ lib/jxl/dec_upsample.cc | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/lib/jxl/dec_upsample.cc b/lib/jxl/dec_upsample.cc
+index 76c5000f9cb..4a6f64e52c4 100644
+--- a/lib/jxl/dec_upsample.cc
++++ b/lib/jxl/dec_upsample.cc
+@@ -68,7 +68,8 @@ void Upsample(const ImageF& src, const Rect& src_rect, ImageF* dst,
+   constexpr const size_t M = 2 * Upsampler::filter_radius() + 1;
+   constexpr const size_t M2 = M / 2;
+   JXL_DASSERT(src_rect.x0() >= M2);
+-  JXL_DASSERT(src_rect.x0() + src_rect.xsize() + M2 <= src.xsize());
++  const size_t src_x_limit = src_rect.x0() + src_rect.xsize() + M2;
++  JXL_DASSERT(src_x_limit <= src.xsize());
+   JXL_ASSERT(DivCeil(dst_rect.xsize(), N) <= src_rect.xsize());
+   // TODO(eustas): add proper (src|dst) ysize check that accounts for mirroring.
+ 
+@@ -188,6 +189,17 @@ void Upsample(const ImageF& src, const Rect& src_rect, ImageF* dst,
+       for (size_t iy = 0; iy < M; iy++) {
+         memcpy(in + MX * iy, src_rows[iy] + xbase, MX * sizeof(float));
+       }
++      if (x_repeat > 1) {
++        // Even if filter coeffs contain 0 at "undefined" values, the result
++        // might be undefined, because NaN will poison the sum.
++        if (JXL_UNLIKELY(xbase + MX > src_x_limit)) {
++          for (size_t iy = 0; iy < M; iy++) {
++            for (size_t ix = src_x_limit - xbase; ix < MX; ++ix) {
++              in[MX * iy + ix] = 0.0f;
++            }
++          }
++        }
++      }
+       constexpr size_t U = 4;  // Unroll factor.
+       constexpr size_t tail = num_coeffs & ~(U - 1);
+       constexpr size_t tail_length = num_coeffs - tail;

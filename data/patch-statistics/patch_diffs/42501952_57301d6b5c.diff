@@ -1,0 +1,355 @@
+From 6f7a57eaa0ef872af87ee3333a4a0fa1bfb607ce Mon Sep 17 00:00:00 2001
+From: Todd Hansen <32498632+thansen24@users.noreply.github.com>
+Date: Wed, 15 Sep 2021 16:57:29 -0500
+Subject: [PATCH] [C#] Using 'global::' as qualifying_start_ within
+ BaseGenerator (#6767)
+
+* Update idl_gen_csharp.cpp
+
+Change csharp generator to use "global::" for it's qualifying_start_ to disambiguate namespaces
+
+* regenerate testing files
+
+regenerate testing files
+
+* Missed TableInC.cs
+
+updated with global prefix
+
+* Remove "global::" from qualifying_start_ for csharp generator
+
+* C# global alias
+
+* Tests and docs for --cs-global-alias
+
+Add tests for --cs-global-alias to demonstrate use case for why it's needed.
+
+Add documentation to Compiler.md
+
+* Add also to help text
+
+Add also to help text
+---
+ docs/source/Compiler.md                       |  6 +-
+ include/flatbuffers/idl.h                     |  2 +
+ src/flatc.cpp                                 |  3 +
+ src/idl_gen_csharp.cpp                        |  2 +-
+ .../FlatBuffers.Core.Test.csproj              |  9 +++
+ .../FlatBuffers.Test/FlatBuffers.Test.csproj  | 10 +++
+ tests/generate_code.bat                       |  3 +
+ tests/generate_code.sh                        |  3 +
+ .../nested_namespace_test1.fbs                |  3 +
+ .../nested_namespace_test1_generated.cs       | 21 ++++++
+ .../nested_namespace_test2.fbs                |  3 +
+ .../nested_namespace_test2_generated.cs       | 19 ++++++
+ .../nested_namespace_test3.fbs                |  7 ++
+ .../nested_namespace_test3_generated.cs       | 65 +++++++++++++++++++
+ 14 files changed, 153 insertions(+), 3 deletions(-)
+ create mode 100644 tests/nested_namespace_test/nested_namespace_test1.fbs
+ create mode 100644 tests/nested_namespace_test/nested_namespace_test1_generated.cs
+ create mode 100644 tests/nested_namespace_test/nested_namespace_test2.fbs
+ create mode 100644 tests/nested_namespace_test/nested_namespace_test2_generated.cs
+ create mode 100644 tests/nested_namespace_test/nested_namespace_test3.fbs
+ create mode 100644 tests/nested_namespace_test/nested_namespace_test3_generated.cs
+
+diff --git a/docs/source/Compiler.md b/docs/source/Compiler.md
+index 0d2d51ff73a..249ecdded45 100644
+--- a/docs/source/Compiler.md
++++ b/docs/source/Compiler.md
+@@ -79,7 +79,7 @@ Additional options:
+ -   `--allow-non-utf8` : Pass non-UTF-8 input through parser and emit nonstandard
+     \x escapes in JSON. (Default is to raise parse error on non-UTF-8 input.)
+ 
+--  `--natural-utf8` : Output strings with UTF-8 as human-readable strings.
++-   `--natural-utf8` : Output strings with UTF-8 as human-readable strings.
+      By default, UTF-8 characters are printed as \uXXXX escapes."
+ 
+ -   `--defaults-json` : Output fields whose value is equal to the default value
+@@ -216,7 +216,9 @@ Additional options:
+ -   `--flexbuffers` : Used with "binary" and "json" options, it generates
+      data using schema-less FlexBuffers.
+ 
+--    `--no-warnings` : Inhibit all warning messages.
++-   `--no-warnings` : Inhibit all warning messages.
++
++-   `--cs-global-alias` : Prepend `global::` to all user generated csharp classes and structs.
+ 
+ NOTE: short-form options for generators are deprecated, use the long form
+ whenever possible.
+diff --git a/include/flatbuffers/idl.h b/include/flatbuffers/idl.h
+index 9224a90a44b..48280493999 100644
+--- a/include/flatbuffers/idl.h
++++ b/include/flatbuffers/idl.h
+@@ -594,6 +594,7 @@ struct IDLOptions {
+   std::string filename_extension;
+   bool no_warnings;
+   std::string project_root;
++  bool cs_global_alias;
+ 
+   // Possible options for the more general generator below.
+   enum Language {
+@@ -679,6 +680,7 @@ struct IDLOptions {
+         filename_extension(),
+         no_warnings(false),
+         project_root(""),
++        cs_global_alias(false),
+         mini_reflect(IDLOptions::kNone),
+         require_explicit_ids(false),
+         lang_to_generate(0),
+diff --git a/src/flatc.cpp b/src/flatc.cpp
+index 3016abecaeb..1505783c3d0 100644
+--- a/src/flatc.cpp
++++ b/src/flatc.cpp
+@@ -179,6 +179,7 @@ std::string FlatCompiler::GetUsageString(const char *program_name) const {
+     "  --flexbuffers          Used with \"binary\" and \"json\" options, it generates\n"
+     "                         data using schema-less FlexBuffers.\n"
+     "  --no-warnings          Inhibit all warning messages.\n"
++    "  --cs-global-alias      Prepend \"global::\" to all user generated csharp classes and structs.\n"
+     "FILEs may be schemas (must end in .fbs), binary schemas (must end in .bfbs),\n"
+     "or JSON files (conforming to preceding schema). FILEs after the -- must be\n"
+     "binary flatbuffer format files.\n"
+@@ -391,6 +392,8 @@ int FlatCompiler::Compile(int argc, const char **argv) {
+         opts.cpp_std = arg.substr(std::string("--cpp-std=").size());
+       } else if (arg == "--cpp-static-reflection") {
+         opts.cpp_static_reflection = true;
++      } else if (arg == "--cs-global-alias") {
++        opts.cs_global_alias = true;
+       } else {
+         for (size_t i = 0; i < params_.num_generators; ++i) {
+           if (arg == params_.generators[i].generator_opt_long ||
+diff --git a/src/idl_gen_csharp.cpp b/src/idl_gen_csharp.cpp
+index f23d9f07fb6..d481a1920ec 100644
+--- a/src/idl_gen_csharp.cpp
++++ b/src/idl_gen_csharp.cpp
+@@ -48,7 +48,7 @@ class CSharpGenerator : public BaseGenerator {
+  public:
+   CSharpGenerator(const Parser &parser, const std::string &path,
+                   const std::string &file_name)
+-      : BaseGenerator(parser, path, file_name, "", ".", "cs"),
++      : BaseGenerator(parser, path, file_name, parser.opts.cs_global_alias ? "global::" : "", ".", "cs"),
+         cur_name_space_(nullptr) {
+     // clang-format off
+ 
+diff --git a/tests/FlatBuffers.Test/FlatBuffers.Core.Test.csproj b/tests/FlatBuffers.Test/FlatBuffers.Core.Test.csproj
+index d22adf7bc74..813616e9a9b 100644
+--- a/tests/FlatBuffers.Test/FlatBuffers.Core.Test.csproj
++++ b/tests/FlatBuffers.Test/FlatBuffers.Core.Test.csproj
+@@ -149,6 +149,15 @@
+     <Compile Include="..\KeywordTest\KeywordsInUnion.cs">
+       <Link>KeywordTest\KeywordsInUnion.cs</Link>
+     </Compile>
++    <Compile Include="..\nested_namespace_test\nested_namespace_test1_generated.cs">
++      <Link>nested_namespace_test\nested_namespace_test1_generated.cs</Link>
++    </Compile>
++    <Compile Include="..\nested_namespace_test\nested_namespace_test2_generated.cs">
++      <Link>nested_namespace_test\nested_namespace_test2_generated.cs</Link>
++    </Compile>
++    <Compile Include="..\nested_namespace_test\nested_namespace_test3_generated.cs">
++      <Link>nested_namespace_test\nested_namespace_test3_generated.cs</Link>
++    </Compile>
+   </ItemGroup>
+ 
+   <ItemGroup>
+diff --git a/tests/FlatBuffers.Test/FlatBuffers.Test.csproj b/tests/FlatBuffers.Test/FlatBuffers.Test.csproj
+index c5e3ea0fdef..73afe023cd1 100644
+--- a/tests/FlatBuffers.Test/FlatBuffers.Test.csproj
++++ b/tests/FlatBuffers.Test/FlatBuffers.Test.csproj
+@@ -180,6 +180,16 @@
+     <Compile Include="..\KeywordTest\KeywordsInUnion.cs">
+       <Link>KeywordTest\KeywordsInUnion.cs</Link>
+     </Compile>
++    <Compile Include="..\nested_namespace_test\nested_namespace_test1_generated.cs">
++      <Link>nested_namespace_test\nested_namespace_test1_generated.cs</Link>
++    </Compile>
++    <Compile Include="..\nested_namespace_test\nested_namespace_test2_generated.cs">
++      <Link>nested_namespace_test\nested_namespace_test2_generated.cs</Link>
++    </Compile>
++    <Compile Include="..\nested_namespace_test\nested_namespace_test3_generated.cs">
++      <Link>nested_namespace_test\nested_namespace_test3_generated.cs</Link>
++    </Compile>
++  </ItemGroup>
+     <Compile Include="Assert.cs" />
+     <Compile Include="ByteBufferTests.cs" />
+     <Compile Include="FlatBufferBuilderTests.cs" />
+diff --git a/tests/generate_code.bat b/tests/generate_code.bat
+index bee552bbce0..10cce2e0f07 100644
+--- a/tests/generate_code.bat
++++ b/tests/generate_code.bat
+@@ -74,6 +74,9 @@ set TEST_NOINCL_FLAGS=%TEST_BASE_FLAGS% --no-includes
+ @rem Generate the keywords tests
+ ..\%buildtype%\flatc.exe --csharp --scoped-enums %TEST_BASE_FLAGS% %TEST_CS_FLAGS% keyword_test.fbs || goto FAIL
+ 
++@rem Generate the nested namespace tests
++..\%buildtype%\flatc.exe --csharp --cs-global-alias --gen-onefile %TEST_BASE_FLAGS% %TEST_CS_FLAGS% -o nested_namespace_test nested_namespace_test/nested_namespace_test1.fbs nested_namespace_test/nested_namespace_test2.fbs nested_namespace_test/nested_namespace_test3.fbs || goto FAIL
++
+ if NOT "%MONSTER_EXTRA%"=="skip" (
+   @echo Generate MosterExtra
+   ..\%buildtype%\flatc.exe --cpp --java --csharp %TEST_NOINCL_FLAGS% %TEST_CPP_FLAGS% %TEST_CS_FLAGS% monster_extra.fbs monsterdata_extra.json || goto FAIL
+diff --git a/tests/generate_code.sh b/tests/generate_code.sh
+index b7a442b79b1..ccb262bb47f 100755
+--- a/tests/generate_code.sh
++++ b/tests/generate_code.sh
+@@ -77,6 +77,9 @@ $TEST_NOINCL_FLAGS $TEST_CPP_FLAGS $TEST_CS_FLAGS $TEST_TS_FLAGS -o namespace_te
+ ../flatc --csharp $TEST_BASE_FLAGS $TEST_CS_FLAGS ./keyword_test.fbs
+ ../flatc --rust $TEST_RUST_FLAGS -o keyword_test ./keyword_test.fbs
+ 
++# Generate the keywords tests
++../flatc --csharp --cs-global-alias --gen-onefile $TEST_BASE_FLAGS $TEST_CS_FLAGS -o nested_namespace_test nested_namespace_test/nested_namespace_test1.fbs nested_namespace_test/nested_namespace_test2.fbs nested_namespace_test/nested_namespace_test3.fbs
++
+ working_dir=`pwd`
+ cd FlatBuffers.Test.Swift/Tests/FlatBuffers.Test.SwiftTests
+ $working_dir/../flatc --bfbs-filenames $working_dir --swift --grpc $TEST_NOINCL_FLAGS $TEST_CPP_FLAGS $TEST_CS_FLAGS -I ${working_dir}/include_test ${working_dir}/monster_test.fbs
+diff --git a/tests/nested_namespace_test/nested_namespace_test1.fbs b/tests/nested_namespace_test/nested_namespace_test1.fbs
+new file mode 100644
+index 00000000000..1b438473453
+--- /dev/null
++++ b/tests/nested_namespace_test/nested_namespace_test1.fbs
+@@ -0,0 +1,3 @@
++namespace NamespaceB;
++
++enum Color:byte { Red, Green, Blue }
+diff --git a/tests/nested_namespace_test/nested_namespace_test1_generated.cs b/tests/nested_namespace_test/nested_namespace_test1_generated.cs
+new file mode 100644
+index 00000000000..e42e96a9531
+--- /dev/null
++++ b/tests/nested_namespace_test/nested_namespace_test1_generated.cs
+@@ -0,0 +1,21 @@
++// <auto-generated>
++//  automatically generated by the FlatBuffers compiler, do not modify
++// </auto-generated>
++
++namespace NamespaceB
++{
++
++using global::System;
++using global::System.Collections.Generic;
++using global::FlatBuffers;
++
++[Newtonsoft.Json.JsonConverter(typeof(Newtonsoft.Json.Converters.StringEnumConverter))]
++public enum Color : sbyte
++{
++  Red = 0,
++  Green = 1,
++  Blue = 2,
++};
++
++
++}
+diff --git a/tests/nested_namespace_test/nested_namespace_test2.fbs b/tests/nested_namespace_test/nested_namespace_test2.fbs
+new file mode 100644
+index 00000000000..f2e04c3fb95
+--- /dev/null
++++ b/tests/nested_namespace_test/nested_namespace_test2.fbs
+@@ -0,0 +1,3 @@
++namespace NamespaceA.NamespaceB;
++
++enum Color:byte { Purple }
+diff --git a/tests/nested_namespace_test/nested_namespace_test2_generated.cs b/tests/nested_namespace_test/nested_namespace_test2_generated.cs
+new file mode 100644
+index 00000000000..cdc1b09f5b1
+--- /dev/null
++++ b/tests/nested_namespace_test/nested_namespace_test2_generated.cs
+@@ -0,0 +1,19 @@
++// <auto-generated>
++//  automatically generated by the FlatBuffers compiler, do not modify
++// </auto-generated>
++
++namespace NamespaceA.NamespaceB
++{
++
++using global::System;
++using global::System.Collections.Generic;
++using global::FlatBuffers;
++
++[Newtonsoft.Json.JsonConverter(typeof(Newtonsoft.Json.Converters.StringEnumConverter))]
++public enum Color : sbyte
++{
++  Purple = 0,
++};
++
++
++}
+diff --git a/tests/nested_namespace_test/nested_namespace_test3.fbs b/tests/nested_namespace_test/nested_namespace_test3.fbs
+new file mode 100644
+index 00000000000..2672ace7e79
+--- /dev/null
++++ b/tests/nested_namespace_test/nested_namespace_test3.fbs
+@@ -0,0 +1,7 @@
++include "nested_namespace_test1.fbs";
++
++namespace NamespaceA.NamespaceB;
++
++table ColorTestTable {
++  color:NamespaceB.Color = Blue;
++}
+diff --git a/tests/nested_namespace_test/nested_namespace_test3_generated.cs b/tests/nested_namespace_test/nested_namespace_test3_generated.cs
+new file mode 100644
+index 00000000000..f2f37789de4
+--- /dev/null
++++ b/tests/nested_namespace_test/nested_namespace_test3_generated.cs
+@@ -0,0 +1,65 @@
++// <auto-generated>
++//  automatically generated by the FlatBuffers compiler, do not modify
++// </auto-generated>
++
++namespace NamespaceA.NamespaceB
++{
++
++using global::System;
++using global::System.Collections.Generic;
++using global::FlatBuffers;
++
++public struct ColorTestTable : IFlatbufferObject
++{
++  private Table __p;
++  public ByteBuffer ByteBuffer { get { return __p.bb; } }
++  public static void ValidateVersion() { FlatBufferConstants.FLATBUFFERS_2_0_0(); }
++  public static ColorTestTable GetRootAsColorTestTable(ByteBuffer _bb) { return GetRootAsColorTestTable(_bb, new ColorTestTable()); }
++  public static ColorTestTable GetRootAsColorTestTable(ByteBuffer _bb, ColorTestTable obj) { return (obj.__assign(_bb.GetInt(_bb.Position) + _bb.Position, _bb)); }
++  public void __init(int _i, ByteBuffer _bb) { __p = new Table(_i, _bb); }
++  public ColorTestTable __assign(int _i, ByteBuffer _bb) { __init(_i, _bb); return this; }
++
++  public global::NamespaceB.Color Color { get { int o = __p.__offset(4); return o != 0 ? (global::NamespaceB.Color)__p.bb.GetSbyte(o + __p.bb_pos) : global::NamespaceB.Color.Blue; } }
++  public bool MutateColor(global::NamespaceB.Color color) { int o = __p.__offset(4); if (o != 0) { __p.bb.PutSbyte(o + __p.bb_pos, (sbyte)color); return true; } else { return false; } }
++
++  public static Offset<global::NamespaceA.NamespaceB.ColorTestTable> CreateColorTestTable(FlatBufferBuilder builder,
++      global::NamespaceB.Color color = global::NamespaceB.Color.Blue) {
++    builder.StartTable(1);
++    ColorTestTable.AddColor(builder, color);
++    return ColorTestTable.EndColorTestTable(builder);
++  }
++
++  public static void StartColorTestTable(FlatBufferBuilder builder) { builder.StartTable(1); }
++  public static void AddColor(FlatBufferBuilder builder, global::NamespaceB.Color color) { builder.AddSbyte(0, (sbyte)color, 2); }
++  public static Offset<global::NamespaceA.NamespaceB.ColorTestTable> EndColorTestTable(FlatBufferBuilder builder) {
++    int o = builder.EndTable();
++    return new Offset<global::NamespaceA.NamespaceB.ColorTestTable>(o);
++  }
++  public ColorTestTableT UnPack() {
++    var _o = new ColorTestTableT();
++    this.UnPackTo(_o);
++    return _o;
++  }
++  public void UnPackTo(ColorTestTableT _o) {
++    _o.Color = this.Color;
++  }
++  public static Offset<global::NamespaceA.NamespaceB.ColorTestTable> Pack(FlatBufferBuilder builder, ColorTestTableT _o) {
++    if (_o == null) return default(Offset<global::NamespaceA.NamespaceB.ColorTestTable>);
++    return CreateColorTestTable(
++      builder,
++      _o.Color);
++  }
++}
++
++public class ColorTestTableT
++{
++  [Newtonsoft.Json.JsonProperty("color")]
++  public global::NamespaceB.Color Color { get; set; }
++
++  public ColorTestTableT() {
++    this.Color = global::NamespaceB.Color.Blue;
++  }
++}
++
++
++}

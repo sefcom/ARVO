@@ -1,0 +1,49 @@
+From c7ca521bc85b57d41d3ad4963c13fc0100481084 Mon Sep 17 00:00:00 2001
+From: DRC <information@libjpeg-turbo.org>
+Date: Sat, 28 Nov 2020 06:38:27 -0600
+Subject: [PATCH] Fix uninitialized read in decompress_smooth_data()
+
+Regression introduced by 42825b68d570fb07fe820ac62ad91017e61e9a25
+
+Referring to the discussion in #459, the OSS-Fuzz test case
+https://github.com/libjpeg-turbo/libjpeg-turbo/files/5597075/clusterfuzz-testcase-minimized-pngsave_buffer_fuzzer-5728375846731776.txt
+created a situation in which
+  cinfo->output_iMCU_row > cinfo->master->last_good_iMCU_row
+but
+  cinfo->input_scan_number == 1
+thus causing decompress_smooth_data() to read from
+prev_coef_bits_latch[], which was uninitialized.  I was unable to create
+the same situation with a real JPEG image.
+---
+ ChangeLog.md | 4 ++++
+ jdcoefct.c   | 2 ++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/ChangeLog.md b/ChangeLog.md
+index 9084bee0f..d312f27fe 100644
+--- a/ChangeLog.md
++++ b/ChangeLog.md
+@@ -7,6 +7,10 @@
+ decompress certain progressive JPEG images with one or more component planes of
+ width 8 or less caused a buffer overrun.
+ 
++2. Fixed a regression introduced by 2.1 beta1[6(b)] whereby attempting to
++decompress a specially-crafted malformed progressive JPEG image caused the
++block smoothing algorithm to read from uninitialized memory.
++
+ 
+ 2.0.90 (2.1 beta1)
+ ==================
+diff --git a/jdcoefct.c b/jdcoefct.c
+index a3c6d4e8c..15e6cded6 100644
+--- a/jdcoefct.c
++++ b/jdcoefct.c
+@@ -406,6 +406,8 @@ smoothing_ok(j_decompress_ptr cinfo)
+     for (coefi = 1; coefi < SAVED_COEFS; coefi++) {
+       if (cinfo->input_scan_number > 1)
+         prev_coef_bits_latch[coefi] = prev_coef_bits[coefi];
++      else
++        prev_coef_bits_latch[coefi] = -1;
+       coef_bits_latch[coefi] = coef_bits[coefi];
+       if (coef_bits[coefi] != 0)
+         smoothing_useful = TRUE;

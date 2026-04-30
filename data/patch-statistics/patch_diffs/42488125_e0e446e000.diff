@@ -1,0 +1,157 @@
+From de2f5cf0213ffb575c5b1381e39a2660cde13fba Mon Sep 17 00:00:00 2001
+From: "Max Vollmer (Microsoft Havok)"
+ <60260460+ms-maxvollmer@users.noreply.github.com>
+Date: Fri, 13 Aug 2021 16:14:28 +0100
+Subject: [PATCH 1/2] Crash fixes
+
+---
+ code/AssetLib/FBX/FBXParser.cpp       | 24 ++++++++----------------
+ code/AssetLib/glTF2/glTF2Asset.inl    |  2 +-
+ code/AssetLib/glTF2/glTF2Importer.cpp |  6 ++++++
+ 3 files changed, 15 insertions(+), 17 deletions(-)
+
+diff --git a/code/AssetLib/FBX/FBXParser.cpp b/code/AssetLib/FBX/FBXParser.cpp
+index 37cf83cf93..61e53c2d01 100644
+--- a/code/AssetLib/FBX/FBXParser.cpp
++++ b/code/AssetLib/FBX/FBXParser.cpp
+@@ -642,8 +642,7 @@ void ParseVectorDataArray(std::vector<aiVector3D>& out, const Element& el)
+ 
+         ai_assert(data == end);
+         uint64_t dataToRead = static_cast<uint64_t>(count) * (type == 'd' ? 8 : 4);
+-        ai_assert(buff.size() == dataToRead);
+-        if (dataToRead > buff.size()) {
++        if (dataToRead != buff.size()) {
+             ParseError("Invalid read size (binary)",&el);
+         }
+ 
+@@ -733,8 +732,7 @@ void ParseVectorDataArray(std::vector<aiColor4D>& out, const Element& el)
+ 
+         ai_assert(data == end);
+         uint64_t dataToRead = static_cast<uint64_t>(count) * (type == 'd' ? 8 : 4);
+-        ai_assert(buff.size() == dataToRead);
+-        if (dataToRead > buff.size()) {
++        if (dataToRead != buff.size()) {
+             ParseError("Invalid read size (binary)",&el);
+         }
+ 
+@@ -816,8 +814,7 @@ void ParseVectorDataArray(std::vector<aiVector2D>& out, const Element& el)
+ 
+         ai_assert(data == end);
+         uint64_t dataToRead = static_cast<uint64_t>(count) * (type == 'd' ? 8 : 4);
+-        ai_assert(buff.size() == dataToRead);
+-        if (dataToRead > buff.size()) {
++        if (dataToRead != buff.size()) {
+             ParseError("Invalid read size (binary)",&el);
+         }
+ 
+@@ -892,8 +889,7 @@ void ParseVectorDataArray(std::vector<int>& out, const Element& el)
+ 
+         ai_assert(data == end);
+         uint64_t dataToRead = static_cast<uint64_t>(count) * 4;
+-        ai_assert(buff.size() == dataToRead);
+-        if (dataToRead > buff.size()) {
++        if (dataToRead != buff.size()) {
+             ParseError("Invalid read size (binary)",&el);
+         }
+ 
+@@ -954,8 +950,7 @@ void ParseVectorDataArray(std::vector<float>& out, const Element& el)
+ 
+         ai_assert(data == end);
+         uint64_t dataToRead = static_cast<uint64_t>(count) * (type == 'd' ? 8 : 4);
+-        ai_assert(buff.size() == dataToRead);
+-        if (dataToRead > buff.size()) {
++        if (dataToRead != buff.size()) {
+             ParseError("Invalid read size (binary)",&el);
+         }
+ 
+@@ -1019,8 +1014,7 @@ void ParseVectorDataArray(std::vector<unsigned int>& out, const Element& el)
+ 
+         ai_assert(data == end);
+         uint64_t dataToRead = static_cast<uint64_t>(count) * 4;
+-        ai_assert(buff.size() == dataToRead);
+-        if (dataToRead > buff.size()) {
++        if (dataToRead != buff.size()) {
+             ParseError("Invalid read size (binary)",&el);
+         }
+ 
+@@ -1088,8 +1082,7 @@ void ParseVectorDataArray(std::vector<uint64_t>& out, const Element& el)
+ 
+         ai_assert(data == end);
+         uint64_t dataToRead = static_cast<uint64_t>(count) * 8;
+-        ai_assert(buff.size() == dataToRead);
+-        if (dataToRead > buff.size()) {
++        if (dataToRead != buff.size()) {
+             ParseError("Invalid read size (binary)",&el);
+         }
+ 
+@@ -1150,8 +1143,7 @@ void ParseVectorDataArray(std::vector<int64_t>& out, const Element& el)
+ 
+         ai_assert(data == end);
+         uint64_t dataToRead = static_cast<uint64_t>(count) * 8;
+-        ai_assert(buff.size() == dataToRead);
+-        if (dataToRead > buff.size()) {
++        if (dataToRead != buff.size()) {
+             ParseError("Invalid read size (binary)",&el);
+         }
+ 
+diff --git a/code/AssetLib/glTF2/glTF2Asset.inl b/code/AssetLib/glTF2/glTF2Asset.inl
+index d5f5b5cd0b..9f793d7c09 100644
+--- a/code/AssetLib/glTF2/glTF2Asset.inl
++++ b/code/AssetLib/glTF2/glTF2Asset.inl
+@@ -1522,7 +1522,7 @@ inline bool GetAttribTargetVector(Mesh::Primitive &p, const int targetIndex, con
+ 
+ inline void Mesh::Read(Value &pJSON_Object, Asset &pAsset_Root) {
+     Value *curName = FindMember(pJSON_Object, "name");
+-    if (nullptr != curName) {
++    if (nullptr != curName && curName->IsString()) {
+         name = curName->GetString();
+     }
+ 
+diff --git a/code/AssetLib/glTF2/glTF2Importer.cpp b/code/AssetLib/glTF2/glTF2Importer.cpp
+index 921aaad9e5..a4f3f0ba14 100644
+--- a/code/AssetLib/glTF2/glTF2Importer.cpp
++++ b/code/AssetLib/glTF2/glTF2Importer.cpp
+@@ -1336,6 +1336,12 @@ std::unordered_map<unsigned int, AnimationSamplers> GatherSamplers(Animation &an
+             continue;
+         }
+ 
++        auto& animsampler = anim.samplers[channel.sampler];
++        if (animsampler.input->count != animsampler.output->count) {
++            ASSIMP_LOG_WARN("Animation ", anim.name, ": Sampler input size ", animsampler.input->count, " doesn't match output size ", animsampler.output->count);
++            continue;
++        }
++
+         const unsigned int node_index = channel.target.node.GetIndex();
+ 
+         AnimationSamplers &sampler = samplers[node_index];
+
+From c1e830cf3b62de1f0fcc7ec14dcd374392e2e393 Mon Sep 17 00:00:00 2001
+From: "Max Vollmer (Microsoft Havok)"
+ <60260460+ms-maxvollmer@users.noreply.github.com>
+Date: Fri, 13 Aug 2021 17:46:10 +0100
+Subject: [PATCH 2/2] The GLTF2 specs aren't very specific about the
+ restrictions of the number of keyframes in sampler input and output. It seems
+ logical that they should be the same, but there is an official sample model
+ from Khronos where output has more keyframes. I thus assume that the GLTF2
+ standard allows more keyframes in output, but not in input. Fixed the check
+ accordingly.
+
+---
+ code/AssetLib/glTF2/glTF2Importer.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/code/AssetLib/glTF2/glTF2Importer.cpp b/code/AssetLib/glTF2/glTF2Importer.cpp
+index a4f3f0ba14..7a781ba043 100644
+--- a/code/AssetLib/glTF2/glTF2Importer.cpp
++++ b/code/AssetLib/glTF2/glTF2Importer.cpp
+@@ -1337,8 +1337,8 @@ std::unordered_map<unsigned int, AnimationSamplers> GatherSamplers(Animation &an
+         }
+ 
+         auto& animsampler = anim.samplers[channel.sampler];
+-        if (animsampler.input->count != animsampler.output->count) {
+-            ASSIMP_LOG_WARN("Animation ", anim.name, ": Sampler input size ", animsampler.input->count, " doesn't match output size ", animsampler.output->count);
++        if (animsampler.input->count > animsampler.output->count) {
++            ASSIMP_LOG_WARN("Animation ", anim.name, ": Number of keyframes in sampler input ", animsampler.input->count, " exceeds number of keyframes in sampler output ", animsampler.output->count);
+             continue;
+         }
+ 

@@ -1,0 +1,124 @@
+From 7b5ba2afc759b7a44f6776a53030b494c6d985c3 Mon Sep 17 00:00:00 2001
+From: Dan Bloomberg <dan.bloomberg@gmail.com>
+Date: Fri, 29 May 2020 13:22:12 -0700
+Subject: [PATCH] Issue 22764 in oss-fuzz: uninit value in
+ numaCrossingByThreshold(). * may be related to issue 22760: illegal read in
+ pixAverageRasterScans(). * In readbarcode.c, make sure each pix is large
+ enough.  Fix bug in   pixAverageRasterScans(), that could lead to illegal
+ addressing. * Added numa size checking; if n < 2 there will not be any
+ crossings. * In binexpand.c, remove unnecessary warning.
+
+---
+ src/binexpand.c   |  2 --
+ src/numafunc2.c   |  8 +++++++-
+ src/readbarcode.c | 16 +++++++++++++---
+ 3 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/src/binexpand.c b/src/binexpand.c
+index c7a8c1a1e..3c67297a0 100644
+--- a/src/binexpand.c
++++ b/src/binexpand.c
+@@ -198,8 +198,6 @@ PIX       *pixd;
+             lined = datad + 8 * i * wpld;
+             for (j = 0; j < sqbits; j++) {
+                 sval = GET_DATA_QBIT(lines, j);
+-                if (sval > 15)
+-                    L_WARNING("sval = %d; should be < 16\n", procName, sval);
+                 lined[j] = tab8[sval];
+             }
+             for (k = 1; k < 8; k++)
+diff --git a/src/numafunc2.c b/src/numafunc2.c
+index 9673d3b0a..f6673035b 100644
+--- a/src/numafunc2.c
++++ b/src/numafunc2.c
+@@ -2757,7 +2757,7 @@ NUMA      *nat;
+  * \param[in]    estthresh    estimated pixel threshold for crossing:
+  *                            e.g., for images, white <--> black; typ. ~120
+  * \param[out]   pbestthresh  robust estimate of threshold to use
+- * \return  0 if OK, 1 on error
++ * \return  0 if OK, 1 on error or warning
+  *
+  * <pre>
+  * Notes:
+@@ -2772,6 +2772,7 @@ NUMA      *nat;
+  *         in the center of this stable plateau of crossings.
+  *         This can then be used with numaCrossingsByThreshold()
+  *         to get a good estimate of crossing locations.
++ *     (3) If the count of nay is less than 2, a warning is issued.
+  * </pre>
+  */
+ l_ok
+@@ -2792,6 +2793,10 @@ NUMA      *nat, *nac;
+     *pbestthresh = 0.0;
+     if (!nay)
+         return ERROR_INT("nay not defined", procName, 1);
++    if (numaGetCount(nay) < 2) {
++        L_WARNING("nay count < 2; no threshold crossing\n", procName);
++        return 1;
++    }
+ 
+         /* Compute the number of crossings for different thresholds */
+     nat = numaCreate(41);
+@@ -2901,6 +2906,7 @@ NUMA      *nad;
+         return (NUMA *)ERROR_PTR("nax and nay sizes differ", procName, NULL);
+ 
+     nad = numaCreate(0);
++    if (n < 2) return nad;
+     numaGetFValue(nay, 0, &yval1);
+     numaGetParameters(nay, &startx, &delx);
+     if (nax)
+diff --git a/src/readbarcode.c b/src/readbarcode.c
+index 3b10865bc..cbfe89101 100644
+--- a/src/readbarcode.c
++++ b/src/readbarcode.c
+@@ -93,6 +93,10 @@ static const l_int32  MAX_SPACE_WIDTH = 19;  /* was 15 */
+ static const l_int32  MAX_NOISE_WIDTH = 50;  /* smaller than barcode width */
+ static const l_int32  MAX_NOISE_HEIGHT = 30;  /* smaller than barcode height */
+ 
++    /* Minimum barcode image size */
++static const l_int32  MIN_BC_WIDTH = 100;
++static const l_int32  MIN_BC_HEIGHT = 50;
++
+     /* Static functions */
+ static PIX *pixGenerateBarcodeMask(PIX *pixs, l_int32 maxspace,
+                                    l_int32 nwidth, l_int32 nheight);
+@@ -263,7 +267,7 @@ pixReadBarcodes(PIXA     *pixa,
+ {
+ char      *barstr, *data;
+ char       emptystring[] = "";
+-l_int32    i, j, n, nbars, ival;
++l_int32    w, h, i, j, n, nbars, ival;
+ NUMA      *na;
+ PIX       *pixt;
+ SARRAY    *saw, *sad;
+@@ -284,6 +288,11 @@ SARRAY    *saw, *sad;
+     for (i = 0; i < n; i++) {
+             /* Extract the widths of the lines in each barcode */
+         pixt = pixaGetPix(pixa, i, L_CLONE);
++        pixGetDimensions(pixt, &w, &h, NULL);
++        if (w < MIN_BC_WIDTH || h < MIN_BC_HEIGHT) {
++            L_ERROR("pix is too small: w = %d, h = %d\n", procName, w, h);
++            continue;
++        }
+         na = pixReadBarcodeWidths(pixt, method, debugflag);
+         pixDestroy(&pixt);
+         if (!na) {
+@@ -729,7 +738,8 @@ NUMA      *nas, *nax, *nay, *nad;
+         return (NUMA *)ERROR_PTR("pixs undefined or not 8 bpp", procName, NULL);
+ 
+         /* Scan pixels horizontally and average results */
+-    nas = pixAverageRasterScans(pixs, 51);
++    if ((nas = pixAverageRasterScans(pixs, 50)) == NULL)
++        return (NUMA *)ERROR_PTR("nas not made", procName, NULL);
+ 
+         /* Interpolate to get 4x the number of values */
+     w = pixGetWidth(pixs);
+@@ -785,7 +795,7 @@ NUMA       *nad;
+         return (NUMA *)ERROR_PTR("pixs undefined or not 8 bpp", procName, NULL);
+ 
+     pixGetDimensions(pixs, &w, &h, NULL);
+-    if (nscans <= h) {
++    if (nscans > h) {
+         first = 0;
+         last = h - 1;
+         nscans = h;

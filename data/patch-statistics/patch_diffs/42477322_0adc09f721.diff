@@ -1,0 +1,222 @@
+diff --git a/common/arm/impeg2_format_conv.s b/common/arm/impeg2_format_conv.s
+index c07edda..bd9a81a 100644
+--- a/common/arm/impeg2_format_conv.s
++++ b/common/arm/impeg2_format_conv.s
+@@ -170,9 +170,11 @@
+     ldr             r3, [sp, #24]       @// Load pu1_dest_uv from stack
+ 
+     ldr             r4, [sp, #28]       @// Load u2_height from stack
++    add             r4, r4, 1
+ 
+     ldr             r5, [sp, #32]       @// Load u2_width from stack
+-
++    add             r5, r5, 1
++    bic             r5, r5, #1
+ 
+     ldr             r7, [sp, #40]       @// Load u2_strideu from stack
+ 
+@@ -332,9 +334,11 @@
+     ldr             r3, [sp, #24]       @// Load pu1_dest_uv from stack
+ 
+     ldr             r4, [sp, #28]       @// Load u2_height from stack
++    add             r4, r4, 1
+ 
+     ldr             r5, [sp, #32]       @// Load u2_width from stack
+-
++    add             r5, r5, 1
++    bic             r5, r5, #1
+ 
+     ldr             r7, [sp, #40]       @// Load u2_strideu from stack
+ 
+diff --git a/common/armv8/impeg2_format_conv.s b/common/armv8/impeg2_format_conv.s
+index 48baf04..ec76e29 100644
+--- a/common/armv8/impeg2_format_conv.s
++++ b/common/armv8/impeg2_format_conv.s
+@@ -185,6 +185,10 @@
+ 
+     ldr             w8, [sp, #104]      //// Load u2_dest_stride_uv from stack
+     sxtw            x8, w8
++    add             x6, x6, 1
++    bic             x6, x6, #1
++
++    add             x9, x9, 1
+ 
+     sub             x7, x7, x6, lsr #1  //// Source increment
+ 
+@@ -359,6 +363,11 @@
+     ldr             w8, [sp, #104]      //// Load u2_dest_stride_uv from stack
+     sxtw            x8, w8
+ 
++    add             x6, x6, 1
++    bic             x6, x6, #1
++
++    add             x9, x9, 1
++
+     sub             x7, x7, x6, lsr #1  //// Source increment
+ 
+     sub             x8, x8, x6          //// Destination increment
+diff --git a/common/ideint.c b/common/ideint.c
+index 24e4e72..af6d15e 100644
+--- a/common/ideint.c
++++ b/common/ideint.c
+@@ -206,7 +206,7 @@
+ 
+     for(i = 0; i < num_comp; i++)
+     {
+-        UWORD8 *pu1_prv, *pu1_out;
++        UWORD8 *pu1_prv = NULL, *pu1_out;
+         UWORD8 *pu1_top, *pu1_bot, *pu1_dst;
+         WORD32 cur_strd, out_strd, dst_strd;
+ 
+@@ -255,14 +255,16 @@
+         {
+             disable_cac_sad = 1;
+         }
+-
+         for(row = comp_row_start; row < comp_row_end; row++)
+         {
+             pu1_out = ps_out_frm->apu1_buf[i];
+             pu1_out += (ps_out_frm->ai4_strd[i] * row << 3);
+ 
+-            pu1_prv = ps_prv_fld->apu1_buf[i];
+-            pu1_prv += (ps_prv_fld->ai4_strd[i] * row << 2);
++            if(0 == disable_cac_sad)
++            {
++                pu1_prv = ps_prv_fld->apu1_buf[i];
++                pu1_prv += (ps_prv_fld->ai4_strd[i] * row << 2);
++            }
+ 
+             if(ps_ctxt->s_params.i4_cur_fld_top)
+             {
+@@ -408,7 +410,10 @@
+                         memcpy(pu1_out + j * out_strd, au1_dst + j * BLK_WD, blk_wd);
+                     }
+                 }
+-                pu1_prv += 8;
++                if(NULL != pu1_prv)
++                {
++                    pu1_prv += 8;
++                }
+                 pu1_top += 8;
+                 pu1_bot += 8;
+                 pu1_out += 8;
+diff --git a/common/impeg2_format_conv.c b/common/impeg2_format_conv.c
+index ec0bcfb..b4d62cc 100644
+--- a/common/impeg2_format_conv.c
++++ b/common/impeg2_format_conv.c
+@@ -321,7 +321,7 @@
+     pu1_src_u = pu1_u;
+     pu1_src_v = pu1_v;
+     pu1_dst = pu1_dest_uv ;
+-
++    u4_width = ((u4_width + 1) >> 1) << 1;
+     u4_height = (u4_height + 1) >> 1;
+     u2_width_uv = (u4_width + 1) >> 1;
+     for(i = 0; i < u4_height ; i++)
+@@ -379,7 +379,7 @@
+     pu1_src_u = pu1_u;
+     pu1_src_v = pu1_v;
+     pu1_dst = pu1_dest_uv ;
+-
++    u4_width = ((u4_width + 1) >> 1) << 1;
+     u4_height = (u4_height + 1) >> 1;
+     u2_width_uv = (u4_width + 1) >> 1;
+     for(i = 0; i < u4_height ; i++)
+diff --git a/decoder/impeg2d_api_main.c b/decoder/impeg2d_api_main.c
+index e0b67cb..4e6dfef 100644
+--- a/decoder/impeg2d_api_main.c
++++ b/decoder/impeg2d_api_main.c
+@@ -1500,10 +1500,8 @@
+     if(u1_chroma_format == IV_YUV_420P)
+     {
+         p_buf_size[0] = (pic_wd * pic_ht);
+-        p_buf_size[1] = (pic_wd * pic_ht)
+-                        >> 2;
+-        p_buf_size[2] = (pic_wd * pic_ht)
+-                        >> 2;
++        p_buf_size[1] = ((pic_wd + 1) >> 1) * ((pic_ht + 1) >> 1);
++        p_buf_size[2] = ((pic_wd + 1) >> 1) * ((pic_ht + 1) >> 1);
+     }
+     else if(u1_chroma_format == IV_YUV_422ILE)
+     {
+@@ -1523,11 +1521,9 @@
+                     || (u1_chroma_format == IV_YUV_420SP_VU))
+     {
+         p_buf_size[0] = (pic_wd * pic_ht);
+-        p_buf_size[1] = (pic_wd * pic_ht)
+-                        >> 1;
++        p_buf_size[1] = ((pic_wd + 1) >> 1) * ((pic_ht + 1) >> 1) * 2;
+         p_buf_size[2] = 0;
+     }
+-
+     return u4_min_num_out_bufs;
+ }
+ 
+@@ -3330,20 +3326,20 @@
+                 ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_y_strd = ps_dec_state->u4_frm_buf_stride;
+                 ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_y_ht = ps_dec_state->u2_vertical_size;
+ 
+-                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_wd = ps_dec_state->u2_horizontal_size >> 1;
+-                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_strd = ps_dec_state->u4_frm_buf_stride >> 1;
+-                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_ht = ps_dec_state->u2_vertical_size >> 1;
++                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_wd = (ps_dec_state->u2_horizontal_size + 1) >> 1;
++                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_strd = (ps_dec_state->u4_frm_buf_stride + 1) >> 1;
++                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_ht = (ps_dec_state->u2_vertical_size + 1) >> 1;
+ 
+-                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_wd = ps_dec_state->u2_horizontal_size >> 1;
+-                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_strd = ps_dec_state->u4_frm_buf_stride >> 1;
+-                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_ht = ps_dec_state->u2_vertical_size >> 1;
++                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_wd = (ps_dec_state->u2_horizontal_size + 1) >> 1;
++                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_strd = (ps_dec_state->u4_frm_buf_stride + 1) >> 1;
++                ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_ht = (ps_dec_state->u2_vertical_size + 1) >> 1;
+                 ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_size = sizeof(ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf);
+ 
+                 switch(ps_dec_state->i4_chromaFormat)
+                 {
+                     case IV_YUV_420SP_UV:
+                     case IV_YUV_420SP_VU:
+-                        ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_wd = ps_dec_state->u2_horizontal_size;
++                        ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_wd = (((ps_dec_state->u2_horizontal_size + 1) >> 1) << 1);
+                         ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_strd = ps_dec_state->u4_frm_buf_stride;
+                     break;
+                     case IV_YUV_422ILE:
+@@ -3418,20 +3414,20 @@
+             ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_y_strd = ps_dec_state->u4_frm_buf_stride;
+             ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_y_ht = ps_dec_state->u2_vertical_size;
+ 
+-            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_wd = ps_dec_state->u2_horizontal_size >> 1;
+-            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_strd = ps_dec_state->u4_frm_buf_stride >> 1;
+-            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_ht = ps_dec_state->u2_vertical_size >> 1;
++            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_wd = (ps_dec_state->u2_horizontal_size + 1) >> 1;
++            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_strd = (ps_dec_state->u4_frm_buf_stride + 1) >> 1;
++            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_ht = (ps_dec_state->u2_vertical_size + 1) >> 1;
+ 
+-            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_wd = ps_dec_state->u2_horizontal_size >> 1;
+-            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_strd = ps_dec_state->u4_frm_buf_stride >> 1;
+-            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_ht = ps_dec_state->u2_vertical_size >> 1;
++            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_wd = (ps_dec_state->u2_horizontal_size + 1) >> 1;
++            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_strd = (ps_dec_state->u4_frm_buf_stride + 1) >> 1;
++            ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_v_ht = (ps_dec_state->u2_vertical_size + 1) >> 1;
+             ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_size = sizeof(ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf);
+ 
+             switch(ps_dec_state->i4_chromaFormat)
+             {
+                 case IV_YUV_420SP_UV:
+                 case IV_YUV_420SP_VU:
+-                    ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_wd = ps_dec_state->u2_horizontal_size;
++                    ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_wd = (((ps_dec_state->u2_horizontal_size + 1) >> 1) << 1);
+                     ps_dec_op->s_ivd_video_decode_op_t.s_disp_frm_buf.u4_u_strd = ps_dec_state->u4_frm_buf_stride;
+                 break;
+                 case IV_YUV_422ILE:
+diff --git a/decoder/impeg2d_dec_hdr.c b/decoder/impeg2d_dec_hdr.c
+index b60f488..3c974a5 100644
+--- a/decoder/impeg2d_dec_hdr.c
++++ b/decoder/impeg2d_dec_hdr.c
+@@ -1253,6 +1253,7 @@
+     ps_dec_thd->ps_func_forw_or_back = ps_dec->ps_func_forw_or_back;
+     ps_dec_thd->pv_deinterlacer_ctxt = ps_dec->pv_deinterlacer_ctxt;
+     ps_dec_thd->ps_deint_pic = ps_dec->ps_deint_pic;
++    ps_dec_thd->pu1_deint_fmt_buf = ps_dec->pu1_deint_fmt_buf;
+ 
+     return 0;
+ }

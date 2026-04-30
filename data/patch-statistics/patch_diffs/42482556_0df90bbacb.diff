@@ -1,0 +1,192 @@
+From 44c3f765e5a42790ae2e7577ff0a96fab809fc4a Mon Sep 17 00:00:00 2001
+From: tbeu <tbeu@users.noreply.github.com>
+Date: Fri, 6 Dec 2019 22:21:56 +0100
+Subject: [PATCH] Delete strdup_printf and remove strdup_vprintf from API
+
+---
+ src/io.c    | 20 ++------------------
+ src/mat.c   | 18 +++++++-----------
+ src/mat4.c  |  5 ++++-
+ src/mat5.c  |  2 +-
+ src/mat73.c |  2 +-
+ src/matio.h |  2 --
+ 6 files changed, 15 insertions(+), 34 deletions(-)
+
+diff --git a/src/io.c b/src/io.c
+index e2e959b1..73da41c4 100644
+--- a/src/io.c
++++ b/src/io.c
+@@ -46,6 +46,7 @@
+ 
+ static void (*logfunc)(int log_level, char *message ) = NULL;
+ static const char *progname = NULL;
++static char *strdup_vprintf(const char *format, va_list ap) MATIO_FORMATATTR_VPRINTF;
+ 
+ /** @brief Allocates and prints to a new string
+  *
+@@ -54,7 +55,7 @@ static const char *progname = NULL;
+  * @param ap variable argument list
+  * @return Newly allocated string with format printed to it
+  */
+-char *
++static char *
+ strdup_vprintf(const char* format, va_list ap)
+ {
+     va_list ap2;
+@@ -73,23 +74,6 @@ strdup_vprintf(const char* format, va_list ap)
+     return buffer;
+ }
+ 
+-/** @brief Allocates and prints to a new string using printf format
+- *
+- * @ingroup mat_util
+- * @param format format string
+- * @return Pointer to resulting string, or NULL if there was an error
+- */
+-char *
+-strdup_printf(const char* format, ...)
+-{
+-    char* buffer;
+-    va_list ap;
+-    va_start(ap, format);
+-    buffer = strdup_vprintf(format, ap);
+-    va_end(ap);
+-    return buffer;
+-}
+-
+ #if defined(_WIN32) && defined(_MSC_VER)
+ /** @brief Convert from narrow UTF-8 string to wide string
+  *
+diff --git a/src/mat.c b/src/mat.c
+index e62a9d27..3ff7f2ad 100644
+--- a/src/mat.c
++++ b/src/mat.c
+@@ -485,7 +485,7 @@ Mat_Open(const char *matname,int mode)
+     if ( NULL == mat )
+         return mat;
+ 
+-    mat->filename = strdup_printf("%s",matname);
++    mat->filename = strdup(matname);
+     mat->mode = mode;
+ 
+     if ( mat->version == 0x0200 ) {
+@@ -659,8 +659,7 @@ Mat_GetDir(mat_t *mat, size_t *n)
+                 matvar = Mat_VarReadNextInfo(mat);
+                 if ( NULL != matvar ) {
+                     if ( NULL != matvar->name ) {
+-                        mat->dir[i++] = strdup_printf("%s",
+-                            matvar->name);
++                        mat->dir[i++] = strdup(matvar->name);
+                     }
+                     Mat_VarFree(matvar);
+                 } else {
+@@ -691,8 +690,7 @@ Mat_GetDir(mat_t *mat, size_t *n)
+                         }
+                         if ( NULL != dir ) {
+                             mat->dir = dir;
+-                            mat->dir[mat->num_datasets++] =
+-                                strdup_printf("%s", matvar->name);
++                            mat->dir[mat->num_datasets++] = strdup(matvar->name);
+                         } else {
+                             Mat_Critical("Couldn't allocate memory for the directory");
+                             break;
+@@ -924,7 +922,7 @@ Mat_VarCreate(const char *name,enum matio_classes class_type,
+     matvar->isGlobal    = opt & MAT_F_GLOBAL;
+     matvar->isLogical   = opt & MAT_F_LOGICAL;
+     if ( name )
+-        matvar->name = strdup_printf("%s",name);
++        matvar->name = strdup(name);
+     matvar->rank = rank;
+     matvar->dims = (size_t*)malloc(matvar->rank*sizeof(*matvar->dims));
+     for ( j = 0; j < matvar->rank; j++ ) {
+@@ -1210,7 +1208,7 @@ Mat_VarDelete(mat_t *mat, const char *name)
+             Mat_Close(tmp);
+ 
+             if ( 0 == err ) {
+-                char *new_name = strdup_printf("%s",mat->filename);
++                char *new_name = strdup(mat->filename);
+ #if defined(MAT73) && MAT73
+                 if ( mat_file_ver == MAT_FT_MAT73 ) {
+                     if ( mat->refs_id > -1 )
+@@ -2618,8 +2616,7 @@ Mat_VarWrite(mat_t *mat,matvar_t *matvar,enum matio_compression compress)
+         if ( NULL != dir ) {
+             mat->dir = dir;
+             if ( NULL != matvar->name ) {
+-                mat->dir[mat->num_datasets++] =
+-                    strdup_printf("%s", matvar->name);
++                mat->dir[mat->num_datasets++] = strdup(matvar->name);
+             } else {
+                 mat->dir[mat->num_datasets++] = NULL;
+             }
+@@ -2686,8 +2683,7 @@ Mat_VarWriteAppend(mat_t *mat,matvar_t *matvar,enum matio_compression compress,i
+             if ( NULL != dir ) {
+                 mat->dir = dir;
+                 if ( NULL != matvar->name ) {
+-                    mat->dir[mat->num_datasets++] =
+-                        strdup_printf("%s", matvar->name);
++                    mat->dir[mat->num_datasets++] = strdup(matvar->name);
+                 } else {
+                     mat->dir[mat->num_datasets++] = NULL;
+                 }
+diff --git a/src/mat4.c b/src/mat4.c
+index 28a1bcfc..10556cc3 100644
+--- a/src/mat4.c
++++ b/src/mat4.c
+@@ -36,6 +36,9 @@
+ #if defined(__GLIBC__)
+ #include <endian.h>
+ #endif
++#if defined(_MSC_VER) || defined(__MINGW32__)
++#   define strdup _strdup
++#endif
+ #include "matio_private.h"
+ #include "mat4.h"
+ 
+@@ -77,7 +80,7 @@ Mat_Create4(const char* matname)
+     mat->fp            = fp;
+     mat->header        = NULL;
+     mat->subsys_offset = NULL;
+-    mat->filename      = strdup_printf("%s",matname);
++    mat->filename      = strdup(matname);
+     mat->version       = MAT_FT_MAT4;
+     mat->byteswap      = 0;
+     mat->mode          = 0;
+diff --git a/src/mat5.c b/src/mat5.c
+index 41907c15..140cd6c7 100644
+--- a/src/mat5.c
++++ b/src/mat5.c
+@@ -587,7 +587,7 @@ Mat_Create5(const char *matname,const char *hdr_str)
+ 
+     t = time(NULL);
+     mat->fp       = fp;
+-    mat->filename = strdup_printf("%s",matname);
++    mat->filename = strdup(matname);
+     mat->mode     = MAT_ACC_RDWR;
+     mat->byteswap = 0;
+     mat->header   = (char*)malloc(128*sizeof(char));
+diff --git a/src/mat73.c b/src/mat73.c
+index 478ab708..23af499e 100644
+--- a/src/mat73.c
++++ b/src/mat73.c
+@@ -2264,7 +2264,7 @@ Mat_Create73(const char *matname,const char *hdr_str)
+     mat->dir           = NULL;
+ 
+     t = time(NULL);
+-    mat->filename = strdup_printf("%s",matname);
++    mat->filename = strdup(matname);
+     mat->mode     = MAT_ACC_RDWR;
+     mat->byteswap = 0;
+     mat->header   = (char*)malloc(128*sizeof(char));
+diff --git a/src/matio.h b/src/matio.h
+index 1d965b33..5d8e1f39 100644
+--- a/src/matio.h
++++ b/src/matio.h
+@@ -231,8 +231,6 @@ typedef struct mat_sparse_t {
+ EXTERN void Mat_GetLibraryVersion(int *major,int *minor,int *release);
+ 
+ /* io.c */
+-EXTERN char  *strdup_vprintf(const char *format, va_list ap) MATIO_FORMATATTR_VPRINTF;
+-EXTERN char  *strdup_printf(const char *format, ...) MATIO_FORMATATTR_PRINTF1;
+ EXTERN int    Mat_SetVerbose(int verb, int s);
+ EXTERN int    Mat_SetDebug(int d);
+ EXTERN void   Mat_Critical(const char *format, ...) MATIO_FORMATATTR_PRINTF1;

@@ -1,0 +1,47 @@
+From 0b49a5de9ad4c3875e42ea223ff61de7d3e26963 Mon Sep 17 00:00:00 2001
+From: Bart Van Assche <bvanassche@acm.org>
+Date: Tue, 25 Feb 2025 09:20:34 -0800
+Subject: [PATCH] libsnmp: Fix a buffer overflow in setup_engineID()
+
+The following code triggers a buffer overflow if an oldEngineID has been
+specified that is shorter than 4 bytes:
+
+  if (localEngineIDType == ENGINEID_TYPE_NETSNMP_RND)
+    memcpy(bufp, &netsnmpoid, sizeof(netsnmpoid));   /* XXX Must be 4 bytes! */
+  else
+    memcpy(bufp, &enterpriseid, sizeof(enterpriseid)); /* XXX Must be 4 bytes! */
+
+Fix this by rejecting oldEngineID's shorter than four bytes.
+---
+ snmplib/snmpv3.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/snmplib/snmpv3.c b/snmplib/snmpv3.c
+index c1e8b3f183..cefd3d0cec 100644
+--- a/snmplib/snmpv3.c
++++ b/snmplib/snmpv3.c
+@@ -883,12 +883,23 @@ version_conf(const char *word, char *cptr)
+ void
+ oldengineID_conf(const char *word, char *cptr)
+ {
++    unsigned char *EngineID = NULL;
++    size_t         EngineIDLength = 0;
++
+     if (oldEngineID) {
+         free(oldEngineID);
+         oldEngineID = NULL;
+         oldEngineIDLength = 0;
+     }
+-    read_config_read_octet_string(cptr, &oldEngineID, &oldEngineIDLength);
++
++    read_config_read_octet_string(cptr, &EngineID, &EngineIDLength);
++    if (EngineIDLength < 4) {
++        config_perror("Invalid oldEngineID");
++        free(EngineID);
++        return;
++    }
++    oldEngineID = EngineID;
++    oldEngineIDLength = EngineIDLength;
+ }
+ 
+ /*

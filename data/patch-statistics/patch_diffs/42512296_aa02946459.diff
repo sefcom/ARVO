@@ -1,0 +1,82 @@
+From f1cc4b96a8df146f327d71cd8e8aee47ca8487fa Mon Sep 17 00:00:00 2001
+From: Cristy <urban-warrior@imagemagick.org>
+Date: Sat, 18 Jun 2022 17:00:29 -0400
+Subject: [PATCH] fix improper close when opening zipped file
+
+---
+ MagickCore/blob.c | 18 +++++++++++-------
+ coders/vicar.c    |  6 +++---
+ 2 files changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/MagickCore/blob.c b/MagickCore/blob.c
+index 950f297beb8..3cefeb482eb 100644
+--- a/MagickCore/blob.c
++++ b/MagickCore/blob.c
+@@ -3451,25 +3451,29 @@ MagickExport MagickBooleanType OpenBlob(const ImageInfo *image_info,
+             if (((int) magick[0] == 0x1F) && ((int) magick[1] == 0x8B) &&
+                 ((int) magick[2] == 0x08))
+               {
+-                blob_info->file_info.gzfile=gzopen_utf8(filename,"rb");
+-                if (blob_info->file_info.gzfile != (gzFile) NULL)
++                gzFile
++                  gzfile = gzopen_utf8(filename,"rb");
++
++                if (gzfile != (gzFile) NULL)
+                   {
+                     if (blob_info->file_info.file != (FILE *) NULL)
+                       (void) fclose(blob_info->file_info.file);
+-                    blob_info->file_info.file=(FILE *) NULL;
++                    blob_info->file_info.gzfile=gzfile;
+                     blob_info->type=ZipStream;
+                   }
+-               }
++              }
+ #endif
+ #if defined(MAGICKCORE_BZLIB_DELEGATE)
+             if (strncmp((char *) magick,"BZh",3) == 0)
+               {
+-                blob_info->file_info.bzfile=BZ2_bzopen(filename,"r");
+-                if (blob_info->file_info.bzfile != (BZFILE *) NULL)
++                BZFILE
++                  *bzfile = BZ2_bzopen(filename,"r");
++
++                if (bzfile != (BZFILE *) NULL)
+                   {
+                     if (blob_info->file_info.file != (FILE *) NULL)
+                       (void) fclose(blob_info->file_info.file);
+-                    blob_info->file_info.file=(FILE *) NULL;
++                    blob_info->file_info.bzfile=bzfile;
+                     blob_info->type=BZipStream;
+                   }
+               }
+diff --git a/coders/vicar.c b/coders/vicar.c
+index 3b025abd44e..b18701331b2 100644
+--- a/coders/vicar.c
++++ b/coders/vicar.c
+@@ -210,7 +210,7 @@ static Image *ReadVICARImage(const ImageInfo *image_info,
+   length=0;
+   image->columns=0;
+   image->rows=0;
+-  while ((isgraph((int) ((unsigned char) c) != 0)) &&
++  while ((isgraph((int) ((unsigned char) c)) != 0) &&
+          ((image->columns == 0) || (image->rows == 0)))
+   {
+     if (isalnum((int) ((unsigned char) c)) == MagickFalse)
+@@ -274,6 +274,8 @@ static Image *ReadVICARImage(const ImageInfo *image_info,
+         (void) FormatLocaleString(property,MagickPathExtent,"vicar:%s",keyword);
+         LocaleLower(property);
+         (void) SetImageProperty(image,property,value,exception);
++        if (LocaleCompare(keyword,"END") == 0)
++          break;
+         if (LocaleCompare(keyword,"LABEL_RECORDS") == 0)
+           length*=(ssize_t) StringToLong(value);
+         if (LocaleCompare(keyword,"LBLSIZE") == 0)
+@@ -284,8 +286,6 @@ static Image *ReadVICARImage(const ImageInfo *image_info,
+           image->rows=StringToUnsignedLong(value);
+         if (LocaleCompare(keyword,"NS") == 0)
+           image->columns=StringToUnsignedLong(value);
+-        if (LocaleCompare(keyword,"END") == 0)
+-          break;
+       }
+     while (isspace((int) ((unsigned char) c)) != 0)
+     {

@@ -1,0 +1,69 @@
+From 0b82f071157db9848f45dd8cf07ced05c8eb8022 Mon Sep 17 00:00:00 2001
+From: Paul Dreik <github@pauldreik.se>
+Date: Sun, 1 Nov 2020 18:27:21 +0100
+Subject: [PATCH] fix segfault in numberparsing #1273 (#1274)
+
+This was a read overflow.
+---
+ include/simdjson/generic/numberparsing.h |  5 ++++-
+ tests/ondemand/ondemand_basictests.cpp   | 17 ++++++++++++++++-
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/include/simdjson/generic/numberparsing.h b/include/simdjson/generic/numberparsing.h
+index 934e57e39b..098a90b0e4 100644
+--- a/include/simdjson/generic/numberparsing.h
++++ b/include/simdjson/generic/numberparsing.h
+@@ -42,6 +42,8 @@ simdjson_really_inline double to_double(uint64_t mantissa, uint64_t real_exponen
+ // We assume that power is in the [smallest_power,
+ // largest_power] interval: the caller is responsible for this check.
+ simdjson_really_inline bool compute_float_64(int64_t power, uint64_t i, bool negative, double &d) {
++  assert(power>=simdjson::internal::smallest_power);
++  assert(power<=simdjson::internal::largest_power);
+   // we start with a fast path
+   // It was described in
+   // Clinger WD. How to read floating point numbers accurately.
+@@ -734,11 +736,12 @@ simdjson_unused simdjson_really_inline simdjson_result<double> parse_double(cons
+     if (p-start_exp_digits == 0 || p-start_exp_digits > 19) { return NUMBER_ERROR; }
+ 
+     exponent += exp_neg ? 0-exp : exp;
+-    overflow = overflow || exponent < simdjson::internal::smallest_power || exponent > simdjson::internal::largest_power;
+   }
+ 
+   if (jsoncharutils::is_not_structural_or_whitespace(*p)) { return NUMBER_ERROR; }
+ 
++  overflow = overflow || exponent < simdjson::internal::smallest_power || exponent > simdjson::internal::largest_power;
++
+   //
+   // Assemble (or slow-parse) the float
+   //
+diff --git a/tests/ondemand/ondemand_basictests.cpp b/tests/ondemand/ondemand_basictests.cpp
+index 58766088e8..a7994b1301 100644
+--- a/tests/ondemand/ondemand_basictests.cpp
++++ b/tests/ondemand/ondemand_basictests.cpp
+@@ -326,10 +326,25 @@ namespace number_tests {
+     printf("Powers of 10 can be parsed.\n");
+     return true;
+   }
++
++  void github_issue_1273() {
++    padded_string bad(std::string_view("0.0300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000024000000000000000000000000000000000000000000000000000000000000122978293824"));
++    simdjson::builtin::ondemand::parser parser;
++    simdjson_unused auto blah=parser.iterate(bad);
++    double x;
++    simdjson_unused auto blah2=blah.get(x);
++  }
++
++  bool old_crashes() {
++    github_issue_1273();
++    return true;
++  }
++
+   bool run() {
+     return small_integers() &&
+            powers_of_two() &&
+-           powers_of_ten();
++           powers_of_ten() &&
++           old_crashes();
+   }
+ }
+ 

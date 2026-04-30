@@ -1,0 +1,1032 @@
+From 3d3f15a3d3a262adde3b2f2cdd5af40dfa4c9e53 Mon Sep 17 00:00:00 2001
+From: Larry Knox <lrknox@hdfgroup.org>
+Date: Thu, 4 Apr 2024 11:42:47 -0500
+Subject: [PATCH] Sync develop changes April 3 - April4 to hdf5_1_14 (#4324)
+
+* Remove VS ptable error from Known Problems (#4317)
+
+* Simply check for datatypes with unusual number of unused bits (#4309)
+
+Avoids potential undefined behavior in H5T_is_numeric_with_unusual_unused_bits
+
+* Fix issues with empty or uninitialized link names (#4322)
+
+Converts an assertion in H5G_loc_find into a normal error
+check that checks for empty link names
+
+Initializes H5O_link_t structure early in H5G__ent_to_link
+to avoid trying to free potentially uninitialized memory
+
+Checks for an empty link name after H5MM_strndup in
+H5G__ent_to_link
+
+Fixes GitHub #4307
+
+* Fix h5py testing failure due to invalid datatype IDs (#4321)
+
+Fixes an issue where invalid datatype IDs are passed to application conversion
+functions in the case where the top-level conversion function is a library-internal
+function that operates on a container-like datatype, but one or more of the
+base datatype members are converted with an application conversion function.
+
+* Revise _Float16 configure checks (#4323)
+
+Run configure checks with and without CFLAGS/CMAKE_C_FLAGS since some
+compilers work in one case while not working in the other case
+
+Sync CMake configure checks with Autotools
+---
+ config/cmake/ConfigureChecks.cmake |  34 +++-
+ config/cmake/ConversionTests.c     |   4 +-
+ configure.ac                       |  61 +++++-
+ release_docs/RELEASE.txt           |   3 -
+ src/H5Gent.c                       |  13 +-
+ src/H5Gloc.c                       |   5 +-
+ src/H5T.c                          |  44 ++---
+ src/H5Tconv.c                      | 156 ++++++++-------
+ test/dtypes.c                      | 295 +++++++++++++++++++++++++++++
+ 9 files changed, 497 insertions(+), 118 deletions(-)
+
+diff --git a/config/cmake/ConfigureChecks.cmake b/config/cmake/ConfigureChecks.cmake
+index 81633da8909..4d27d662a65 100644
+--- a/config/cmake/ConfigureChecks.cmake
++++ b/config/cmake/ConfigureChecks.cmake
+@@ -923,25 +923,30 @@ if (HDF5_ENABLE_NONSTANDARD_FEATURE_FLOAT16)
+       # compile a program that will generate these functions to check for _Float16
+       # support. If we fail to compile this program, we will simply disable
+       # _Float16 support for the time being.
++      H5ConversionTests (
++          ${HDF_PREFIX}_FLOAT16_CONVERSION_FUNCS_LINK
++          FALSE
++          "Checking if compiler can convert _Float16 type with casts"
++      )
+ 
+       # Some compilers, notably AppleClang on MacOS 12, will succeed in the
+-      # configure check below when optimization flags like -O3 are manually
++      # configure check above when optimization flags like -O3 are manually
+       # passed in CMAKE_C_FLAGS. However, the build will then fail when it
+       # reaches compilation of H5Tconv.c because of the issue mentioned above.
+-      # MacOS 13 appears to have fixed this, but, just to be sure, backup and
+-      # clear CMAKE_C_FLAGS before performing these configure checks.
++      # MacOS 13 appears to have fixed this, but, just to be sure, make sure
++      # the check also passes without the passed in CMAKE_C_FLAGS.
+       set (cmake_c_flags_backup "${CMAKE_C_FLAGS}")
+       set (CMAKE_C_FLAGS "")
+ 
+       H5ConversionTests (
+-          ${HDF_PREFIX}_FLOAT16_CONVERSION_FUNCS_LINK
++          ${HDF_PREFIX}_FLOAT16_CONVERSION_FUNCS_LINK_NO_FLAGS
+           FALSE
+-          "Checking if compiler can convert _Float16 type with casts"
++          "Checking if compiler can convert _Float16 type with casts (without CMAKE_C_FLAGS)"
+       )
+ 
+       set (CMAKE_C_FLAGS "${cmake_c_flags_backup}")
+ 
+-      if (${${HDF_PREFIX}_FLOAT16_CONVERSION_FUNCS_LINK})
++      if (${HDF_PREFIX}_FLOAT16_CONVERSION_FUNCS_LINK AND ${HDF_PREFIX}_FLOAT16_CONVERSION_FUNCS_LINK_NO_FLAGS)
+         # Finally, MacOS 13 appears to have a bug specifically when converting
+         # long double values to _Float16. Release builds of the dt_arith test
+         # would cause any assignments to a _Float16 variable to be elided,
+@@ -949,20 +954,25 @@ if (HDF5_ENABLE_NONSTANDARD_FEATURE_FLOAT16)
+         # simply chopping off all the bytes of the value except for the first 2.
+         # These tests pass on MacOS 14, so let's perform a quick test to check
+         # if the hardware conversion is done correctly.
++        H5ConversionTests (
++            ${HDF_PREFIX}_LDOUBLE_TO_FLOAT16_CORRECT
++            TRUE
++            "Checking if correctly converting long double to _Float16 values"
++        )
+ 
+-        # Backup and clear CMAKE_C_FLAGS before performing configure checks
++        # Backup and clear CMAKE_C_FLAGS before performing configure check again
+         set (cmake_c_flags_backup "${CMAKE_C_FLAGS}")
+         set (CMAKE_C_FLAGS "")
+ 
+         H5ConversionTests (
+-            ${HDF_PREFIX}_LDOUBLE_TO_FLOAT16_CORRECT
++            ${HDF_PREFIX}_LDOUBLE_TO_FLOAT16_CORRECT_NO_FLAGS
+             TRUE
+-            "Checking if correctly converting long double to _Float16 values"
++            "Checking if correctly converting long double to _Float16 values (without CMAKE_C_FLAGS)"
+         )
+ 
+         set (CMAKE_C_FLAGS "${cmake_c_flags_backup}")
+ 
+-        if (NOT ${${HDF_PREFIX}_LDOUBLE_TO_FLOAT16_CORRECT})
++        if (NOT ${HDF_PREFIX}_LDOUBLE_TO_FLOAT16_CORRECT OR NOT ${HDF_PREFIX}_LDOUBLE_TO_FLOAT16_CORRECT_NO_FLAGS)
+           message (VERBOSE "Conversions from long double to _Float16 appear to be incorrect. These will be emulated through a soft conversion function.")
+         endif ()
+ 
+@@ -985,3 +995,7 @@ else ()
+   unset (${HDF_PREFIX}_HAVE__FLOAT16 CACHE)
+   unset (${HDF_PREFIX}_LDOUBLE_TO_FLOAT16_CORRECT CACHE)
+ endif ()
++
++if (NOT ${HDF_PREFIX}_HAVE__FLOAT16)
++  set (HDF5_ENABLE_NONSTANDARD_FEATURE_FLOAT16 OFF CACHE BOOL "Enable support for _Float16 C datatype" FORCE)
++endif ()
+diff --git a/config/cmake/ConversionTests.c b/config/cmake/ConversionTests.c
+index 8e103bd3e97..b5d2af2ff38 100644
+--- a/config/cmake/ConversionTests.c
++++ b/config/cmake/ConversionTests.c
+@@ -286,7 +286,7 @@ int HDF_NO_UBSAN main(void)
+ 
+ #endif
+ 
+-#ifdef H5_FLOAT16_CONVERSION_FUNCS_LINK_TEST
++#if defined(H5_FLOAT16_CONVERSION_FUNCS_LINK_TEST) || defined(H5_FLOAT16_CONVERSION_FUNCS_LINK_NO_FLAGS_TEST)
+ 
+ #define __STDC_WANT_IEC_60559_TYPES_EXT__
+ 
+@@ -379,7 +379,7 @@ int HDF_NO_UBSAN main(void)
+ 
+ #endif
+ 
+-#ifdef H5_LDOUBLE_TO_FLOAT16_CORRECT_TEST
++#if defined(H5_LDOUBLE_TO_FLOAT16_CORRECT_TEST) || defined(H5_LDOUBLE_TO_FLOAT16_CORRECT_NO_FLAGS_TEST)
+ 
+ #define __STDC_WANT_IEC_60559_TYPES_EXT__
+ 
+diff --git a/configure.ac b/configure.ac
+index 4861bf9d976..1149e6aa2d3 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -674,11 +674,34 @@ if test "X$ENABLE_FLOAT16" = "Xyes"; then
+       AC_CACHE_VAL([hdf5_cv_float16_conversion_funcs_link],
+       [AC_RUN_IFELSE(
+           [AC_LANG_SOURCE([$TEST_SRC])],
+-          [hdf5_cv_float16_conversion_funcs_link=yes], [hdf5_cv_float16_conversion_funcs_link=no], [hdf5_cv_float16_conversion_funcs_link=no])])
++          [hdf5_cv_float16_conversion_funcs_link=yes],
++          [hdf5_cv_float16_conversion_funcs_link=no],
++          [hdf5_cv_float16_conversion_funcs_link=no])])
++      AC_MSG_RESULT(${hdf5_cv_float16_conversion_funcs_link})
++
++      # Some compilers, notably AppleClang on MacOS 12, will succeed in the
++      # configure check above when optimization flags like -O3 are manually
++      # passed in CFLAGS. However, the build will then fail when it reaches
++      # compilation of H5Tconv.c because of the issue mentioned above. MacOS
++      # 13 appears to have fixed this, but, just to be sure, make sure the
++      # check also passes without the passed in CFLAGS.
++      conftest_cflags_backup="$CFLAGS"
++      CFLAGS=""
++
++      AC_MSG_CHECKING([if compiler can correctly compile and run a test program which converts _Float16 to other types with casts (without CFLAGS)])
++      TEST_SRC="`(echo \"#define H5_FLOAT16_CONVERSION_FUNCS_LINK_NO_FLAGS_TEST 1\"; cat $srcdir/config/cmake/ConversionTests.c)`"
++      AC_CACHE_VAL([hdf5_cv_float16_conversion_funcs_link_no_flags],
++      [AC_RUN_IFELSE(
++          [AC_LANG_SOURCE([$TEST_SRC])],
++          [hdf5_cv_float16_conversion_funcs_link_no_flags=yes],
++          [hdf5_cv_float16_conversion_funcs_link_no_flags=no],
++          [hdf5_cv_float16_conversion_funcs_link_no_flags=no])])
++      AC_MSG_RESULT(${hdf5_cv_float16_conversion_funcs_link_no_flags})
+ 
+-      if test ${hdf5_cv_float16_conversion_funcs_link} = "yes"; then
+-        AC_MSG_RESULT([yes])
++      CFLAGS="$conftest_cflags_backup"
+ 
++      if test ${hdf5_cv_float16_conversion_funcs_link} = "yes" &&
++         test ${hdf5_cv_float16_conversion_funcs_link_no_flags} = "yes"; then
+         # Finally, MacOS 13 appears to have a bug specifically when converting
+         # long double values to _Float16. Release builds of the dt_arith test
+         # would cause any assignments to a _Float16 variable to be elided,
+@@ -694,15 +717,37 @@ if test "X$ENABLE_FLOAT16" = "Xyes"; then
+           AC_CACHE_VAL([hdf5_cv_ldouble_to_float16_correct],
+           [AC_RUN_IFELSE(
+               [AC_LANG_SOURCE([$TEST_SRC])],
+-              [hdf5_cv_ldouble_to_float16_correct=yes], [hdf5_cv_ldouble_to_float16_correct=no], [hdf5_cv_ldouble_to_float16_correct=yes])])
++              [hdf5_cv_ldouble_to_float16_correct=yes],
++              [hdf5_cv_ldouble_to_float16_correct=no],
++              [hdf5_cv_ldouble_to_float16_correct=yes])])
+         fi
++        AC_MSG_RESULT(${hdf5_cv_ldouble_to_float16_correct})
++
++        # Backup and clear CFLAGS before performing configure check again
++        conftest_cflags_backup="$CFLAGS"
++        CFLAGS=""
+ 
+-        if test ${hdf5_cv_ldouble_to_float16_correct} = "yes"; then
++        AC_MSG_CHECKING([if compiler can correctly convert long double values to _Float16 (without CFLAGS)])
++        TEST_SRC="`(echo \"#define H5_LDOUBLE_TO_FLOAT16_CORRECT_NO_FLAGS_TEST 1\"; cat $srcdir/config/cmake/ConversionTests.c)`"
++        if test ${ac_cv_sizeof_long_double} = 0; then
++          hdf5_cv_ldouble_to_float16_correct_no_flags=${hdf5_cv_ldouble_to_float16_correct_no_flags=no}
++        else
++          AC_CACHE_VAL([hdf5_cv_ldouble_to_float16_correct_no_flags],
++          [AC_RUN_IFELSE(
++              [AC_LANG_SOURCE([$TEST_SRC])],
++              [hdf5_cv_ldouble_to_float16_correct_no_flags=yes],
++              [hdf5_cv_ldouble_to_float16_correct_no_flags=no],
++              [hdf5_cv_ldouble_to_float16_correct_no_flags=yes])])
++        fi
++        AC_MSG_RESULT(${hdf5_cv_ldouble_to_float16_correct_no_flags})
++
++        CFLAGS="$conftest_cflags_backup"
++
++        if test ${hdf5_cv_ldouble_to_float16_correct} = "yes" &&
++           test ${hdf5_cv_ldouble_to_float16_correct_no_flags} = "yes"; then
+           AC_DEFINE([LDOUBLE_TO_FLOAT16_CORRECT], [1],
+             [Define if your system can convert long double to _Float16 values correctly.])
+-          AC_MSG_RESULT([yes])
+         else
+-          AC_MSG_RESULT([no])
+           AC_MSG_NOTICE([Conversions from long double to _Float16 appear to be incorrect. These will be emulated through a soft conversion function.])
+         fi
+ 
+@@ -714,8 +759,6 @@ if test "X$ENABLE_FLOAT16" = "Xyes"; then
+ 
+         # Define HAVE__FLOAT16 macro for H5pubconf.h if _Float16 is available.
+         AC_DEFINE([HAVE__FLOAT16], [1], [Determine if _Float16 is available])
+-      else
+-        AC_MSG_RESULT([no])
+       fi
+     fi
+ 
+diff --git a/release_docs/RELEASE.txt b/release_docs/RELEASE.txt
+index 50ac630f5c3..344ffc522c9 100644
+--- a/release_docs/RELEASE.txt
++++ b/release_docs/RELEASE.txt
+@@ -1106,9 +1106,6 @@ Known Problems
+     images, but since this is a collective operation, a deadlock is possible
+     if one or more processes do not participate.
+ 
+-    CPP ptable test fails on both VS2017 and VS2019 with Intel compiler, JIRA
+-    issue: HDFFV-10628.  This test will pass with VS2015 with Intel compiler.
+-
+     The subsetting option in ph5diff currently will fail and should be avoided.
+     The subsetting option works correctly in serial h5diff.
+ 
+diff --git a/src/H5Gent.c b/src/H5Gent.c
+index 40872a041cc..2d6ece74083 100644
+--- a/src/H5Gent.c
++++ b/src/H5Gent.c
+@@ -365,6 +365,13 @@ H5G__ent_to_link(const H5G_entry_t *ent, const H5HL_t *heap, H5O_link_t *lnk)
+     assert(heap);
+     assert(lnk);
+ 
++    /* Initialize structure and set (default) common info for link */
++    lnk->type         = H5L_TYPE_ERROR;
++    lnk->corder_valid = false; /* Creation order not valid for this link */
++    lnk->corder       = 0;
++    lnk->cset         = H5F_DEFAULT_CSET;
++    lnk->name         = NULL;
++
+     /* Get the size of the heap block */
+     block_size = H5HL_heap_get_size(heap);
+ 
+@@ -372,12 +379,10 @@ H5G__ent_to_link(const H5G_entry_t *ent, const H5HL_t *heap, H5O_link_t *lnk)
+     if (NULL == (name = (const char *)H5HL_offset_into(heap, ent->name_off)))
+         HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to get symbol table link name");
+ 
+-    /* Set (default) common info for link */
+-    lnk->cset         = H5F_DEFAULT_CSET;
+-    lnk->corder       = 0;
+-    lnk->corder_valid = false; /* Creation order not valid for this link */
+     if (NULL == (lnk->name = H5MM_strndup(name, (block_size - ent->name_off))))
+         HGOTO_ERROR(H5E_SYM, H5E_CANTGET, FAIL, "unable to duplicate link name");
++    if (!*lnk->name)
++        HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "invalid link name");
+ 
+     /* Object is a symbolic or hard link */
+     if (ent->type == H5G_CACHED_SLINK) {
+diff --git a/src/H5Gloc.c b/src/H5Gloc.c
+index d04c582d009..6e9d29845a0 100644
+--- a/src/H5Gloc.c
++++ b/src/H5Gloc.c
+@@ -410,9 +410,12 @@ H5G_loc_find(const H5G_loc_t *loc, const char *name, H5G_loc_t *obj_loc /*out*/)
+ 
+     /* Check args. */
+     assert(loc);
+-    assert(name && *name);
++    assert(name);
+     assert(obj_loc);
+ 
++    if (!*name)
++        HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "invalid object name");
++
+     /* Set up user data for locating object */
+     udata.loc = obj_loc;
+ 
+diff --git a/src/H5T.c b/src/H5T.c
+index cc37d2be3c5..11ef38bce7e 100644
+--- a/src/H5T.c
++++ b/src/H5T.c
+@@ -3393,6 +3393,7 @@ H5T__create(H5T_class_t type, size_t size)
+             /* Copy the default string datatype */
+             if (NULL == (dt = H5T_copy(origin_dt, H5T_COPY_TRANSIENT)))
+                 HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, NULL, "unable to copy");
++            dt->shared->type = type;
+ 
+             /* Modify the datatype */
+             if (H5T__set_size(dt, size) < 0)
+@@ -4577,6 +4578,8 @@ H5T_cmp(const H5T_t *dt1, const H5T_t *dt2, bool superset)
+             /*
+              * Compound data types...
+              */
++            if (dt1->shared->u.compnd.nmembs == 0 && dt2->shared->u.compnd.nmembs == 0)
++                HGOTO_DONE(0);
+             if (dt1->shared->u.compnd.nmembs < dt2->shared->u.compnd.nmembs)
+                 HGOTO_DONE(-1);
+             if (dt1->shared->u.compnd.nmembs > dt2->shared->u.compnd.nmembs)
+@@ -4619,11 +4622,13 @@ H5T_cmp(const H5T_t *dt1, const H5T_t *dt2, bool superset)
+ 
+ #ifdef H5T_DEBUG
+             /* I don't quite trust the code above yet :-)  --RPM */
+-            for (u = 0; u < dt1->shared->u.compnd.nmembs - 1; u++) {
+-                assert(strcmp(dt1->shared->u.compnd.memb[idx1[u]].name,
+-                              dt1->shared->u.compnd.memb[idx1[u + 1]].name));
+-                assert(strcmp(dt2->shared->u.compnd.memb[idx2[u]].name,
+-                              dt2->shared->u.compnd.memb[idx2[u + 1]].name));
++            if (dt1->shared->u.compnd.nmembs > 0) {
++                for (u = 0; u < dt1->shared->u.compnd.nmembs - 1; u++) {
++                    assert(strcmp(dt1->shared->u.compnd.memb[idx1[u]].name,
++                                  dt1->shared->u.compnd.memb[idx1[u + 1]].name));
++                    assert(strcmp(dt2->shared->u.compnd.memb[idx2[u]].name,
++                                  dt2->shared->u.compnd.memb[idx2[u + 1]].name));
++                }
+             }
+ #endif
+ 
+@@ -4659,6 +4664,8 @@ H5T_cmp(const H5T_t *dt1, const H5T_t *dt2, bool superset)
+             /*
+              * Enumeration data types...
+              */
++            if (dt1->shared->u.enumer.nmembs == 0 && dt2->shared->u.enumer.nmembs == 0)
++                HGOTO_DONE(0);
+ 
+             /* If we are doing a "superset" comparison, dt2 is allowed to have
+              * more members than dt1
+@@ -4716,9 +4723,13 @@ H5T_cmp(const H5T_t *dt1, const H5T_t *dt2, bool superset)
+ 
+ #ifdef H5T_DEBUG
+             /* I don't quite trust the code above yet :-)  --RPM */
+-            for (u = 0; u < dt1->shared->u.enumer.nmembs - 1; u++) {
+-                assert(strcmp(dt1->shared->u.enumer.name[idx1[u]], dt1->shared->u.enumer.name[idx1[u + 1]]));
+-                assert(strcmp(dt2->shared->u.enumer.name[idx2[u]], dt2->shared->u.enumer.name[idx2[u + 1]]));
++            if (dt1->shared->u.enumer.nmembs > 0) {
++                for (u = 0; u < dt1->shared->u.enumer.nmembs - 1; u++) {
++                    assert(
++                        strcmp(dt1->shared->u.enumer.name[idx1[u]], dt1->shared->u.enumer.name[idx1[u + 1]]));
++                    assert(
++                        strcmp(dt2->shared->u.enumer.name[idx2[u]], dt2->shared->u.enumer.name[idx2[u + 1]]));
++                }
+             }
+ #endif
+ 
+@@ -6784,24 +6795,13 @@ H5T_is_numeric_with_unusual_unused_bits(const H5T_t *dt)
+     /* Is the correct type? */
+     if (H5T_INTEGER == dt->shared->type || H5T_FLOAT == dt->shared->type ||
+         H5T_BITFIELD == dt->shared->type) {
+-#if LDBL_MANT_DIG == 106
+-        /* This currently won't work for the IBM long double type */
+-        if (H5T_FLOAT == dt->shared->type && dt->shared->size == 16 &&
+-            (dt->shared->u.atomic.prec == 64 || dt->shared->u.atomic.prec == 128))
+-            HGOTO_DONE(false);
+-#endif
+ 
+         /* Has unused bits? */
+-        if (dt->shared->u.atomic.prec < (dt->shared->size * 8)) {
+-            unsigned surround_bits =
+-                1U << (1 + H5VM_log2_gen((dt->shared->u.atomic.prec + dt->shared->u.atomic.offset) - 1));
+-
++        if (dt->shared->size > 1 && dt->shared->u.atomic.prec < (dt->shared->size * 8))
+             /* Unused bits are unusually large? */
+-            if (dt->shared->size > 1 && ((dt->shared->size * 8) > surround_bits))
+-                HGOTO_DONE(true);
+-        }
++            ret_value =
++                (dt->shared->size * 8) > (2 * (dt->shared->u.atomic.prec + dt->shared->u.atomic.offset));
+     }
+ 
+-done:
+     FUNC_LEAVE_NOAPI(ret_value)
+ } /* end H5T_is_numeric_with_unusual_unused_bits() */
+diff --git a/src/H5Tconv.c b/src/H5Tconv.c
+index 2e9184bcb62..3fa5ec807ff 100644
+--- a/src/H5Tconv.c
++++ b/src/H5Tconv.c
+@@ -1174,7 +1174,6 @@ typedef struct H5T_conv_struct_t {
+     H5T_path_t      **memb_path;   /*conversion path for each member    */
+     H5T_subset_info_t subset_info; /*info related to compound subsets   */
+     unsigned          src_nmembs;  /*needed by free function            */
+-    bool              need_ids;    /*whether we need IDs for the datatypes */
+ } H5T_conv_struct_t;
+ 
+ /* Conversion data for H5T__conv_enum() */
+@@ -2035,17 +2034,27 @@ H5T__conv_struct_free(H5T_conv_struct_t *priv)
+ 
+     for (unsigned i = 0; i < priv->src_nmembs; i++)
+         if (src2dst[i] >= 0) {
+-            if (priv->need_ids) {
++            if (src_memb_id[i] >= 0) {
+                 if (H5I_dec_ref(src_memb_id[i]) < 0)
+                     ret_value = FAIL; /* set return value, but keep going */
+-                if (H5I_dec_ref(dst_memb_id[src2dst[i]]) < 0)
+-                    ret_value = FAIL; /* set return value, but keep going */
++                src_memb_id[i] = H5I_INVALID_HID;
++                src_memb[i]    = NULL;
+             }
+             else {
+                 if (H5T_close(src_memb[i]) < 0)
+                     ret_value = FAIL; /* set return value, but keep going */
++                src_memb[i] = NULL;
++            }
++            if (dst_memb_id[src2dst[i]] >= 0) {
++                if (H5I_dec_ref(dst_memb_id[src2dst[i]]) < 0)
++                    ret_value = FAIL; /* set return value, but keep going */
++                dst_memb_id[src2dst[i]] = H5I_INVALID_HID;
++                dst_memb[src2dst[i]]    = NULL;
++            }
++            else {
+                 if (H5T_close(dst_memb[src2dst[i]]) < 0)
+                     ret_value = FAIL; /* set return value, but keep going */
++                dst_memb[src2dst[i]] = NULL;
+             }
+         } /* end if */
+ 
+@@ -2134,18 +2143,18 @@ H5T__conv_struct_init(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, co
+             HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL,
+                         "couldn't allocate destination compound member datatype array");
+ 
+-        priv->need_ids = (cdata->command == H5T_CONV_INIT && conv_ctx->u.init.cb_struct.func) ||
+-                         (cdata->command == H5T_CONV_CONV && conv_ctx->u.conv.cb_struct.func);
+-
+-        /* Only create IDs for compound member datatypes if we need to */
+-        if (priv->need_ids) {
+-            if (NULL == (priv->src_memb_id = (hid_t *)H5MM_malloc(src_nmembs * sizeof(hid_t))))
+-                HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL,
+-                            "couldn't allocate source compound member datatype ID array");
+-            if (NULL == (priv->dst_memb_id = (hid_t *)H5MM_malloc(dst_nmembs * sizeof(hid_t))))
+-                HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL,
+-                            "couldn't allocate destination compound member datatype ID array");
+-        }
++        /* Allocate and initialize arrays for datatype IDs */
++        if (NULL == (priv->src_memb_id = (hid_t *)H5MM_malloc(src_nmembs * sizeof(hid_t))))
++            HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL,
++                        "couldn't allocate source compound member datatype ID array");
++        for (i = 0; i < src_nmembs; i++)
++            priv->src_memb_id[i] = H5I_INVALID_HID;
++
++        if (NULL == (priv->dst_memb_id = (hid_t *)H5MM_malloc(dst_nmembs * sizeof(hid_t))))
++            HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL,
++                        "couldn't allocate destination compound member datatype ID array");
++        for (i = 0; i < dst_nmembs; i++)
++            priv->dst_memb_id[i] = H5I_INVALID_HID;
+ 
+         src2dst          = priv->src2dst;
+         priv->src_nmembs = src_nmembs;
+@@ -2177,31 +2186,16 @@ H5T__conv_struct_init(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, co
+             }     /* end for */
+             if (src2dst[i] >= 0) {
+                 H5T_t *type;
+-                hid_t  tid;
+ 
+                 if (NULL == (type = H5T_copy(src->shared->u.compnd.memb[i].type, H5T_COPY_ALL)))
+                     HGOTO_ERROR(H5E_DATATYPE, H5E_CANTCOPY, FAIL,
+                                 "can't copy source compound member datatype");
+                 priv->src_memb[i] = type;
+ 
+-                if (priv->need_ids) {
+-                    if ((tid = H5I_register(H5I_DATATYPE, type, false)) < 0)
+-                        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTREGISTER, FAIL,
+-                                    "can't register ID for source compound member datatype");
+-                    priv->src_memb_id[i] = tid;
+-                }
+-
+                 if (NULL == (type = H5T_copy(dst->shared->u.compnd.memb[src2dst[i]].type, H5T_COPY_ALL)))
+                     HGOTO_ERROR(H5E_DATATYPE, H5E_CANTCOPY, FAIL,
+                                 "can't copy destination compound member datatype");
+                 priv->dst_memb[src2dst[i]] = type;
+-
+-                if (priv->need_ids) {
+-                    if ((tid = H5I_register(H5I_DATATYPE, type, false)) < 0)
+-                        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTREGISTER, FAIL,
+-                                    "can't register ID for source compound member datatype");
+-                    priv->dst_memb_id[src2dst[i]] = tid;
+-                }
+             } /* end if */
+         }     /* end for */
+     }         /* end if */
+@@ -2224,16 +2218,47 @@ H5T__conv_struct_init(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, co
+ 
+     for (i = 0; i < src_nmembs; i++) {
+         if (src2dst[i] >= 0) {
+-            H5T_path_t *tpath = H5T_path_find(src->shared->u.compnd.memb[i].type,
+-                                              dst->shared->u.compnd.memb[src2dst[i]].type);
++            H5T_path_t *tpath;
++            bool        need_ids;
++
++            tpath = H5T_path_find(src->shared->u.compnd.memb[i].type,
++                                  dst->shared->u.compnd.memb[src2dst[i]].type);
+ 
+             if (NULL == (priv->memb_path[i] = tpath)) {
+                 H5T__conv_struct_free(priv);
+                 cdata->priv = NULL;
+                 HGOTO_ERROR(H5E_DATATYPE, H5E_UNSUPPORTED, FAIL, "unable to convert member datatype");
+             } /* end if */
+-        }     /* end if */
+-    }         /* end for */
++
++            /* Create IDs for the compound member datatypes if the conversion path uses
++             * an application conversion function or if a conversion exception function
++             * was provided.
++             */
++            need_ids = tpath->conv.is_app ||
++                       (cdata->command == H5T_CONV_INIT && conv_ctx->u.init.cb_struct.func) ||
++                       (cdata->command == H5T_CONV_CONV && conv_ctx->u.conv.cb_struct.func);
++
++            if (need_ids) {
++                hid_t tid;
++
++                if ((tid = H5I_register(H5I_DATATYPE, priv->src_memb[i], false)) < 0) {
++                    H5T__conv_struct_free(priv);
++                    cdata->priv = NULL;
++                    HGOTO_ERROR(H5E_DATATYPE, H5E_CANTREGISTER, FAIL,
++                                "can't register ID for source compound member datatype");
++                }
++                priv->src_memb_id[i] = tid;
++
++                if ((tid = H5I_register(H5I_DATATYPE, priv->dst_memb[src2dst[i]], false)) < 0) {
++                    H5T__conv_struct_free(priv);
++                    cdata->priv = NULL;
++                    HGOTO_ERROR(H5E_DATATYPE, H5E_CANTREGISTER, FAIL,
++                                "can't register ID for destination compound member datatype");
++                }
++                priv->dst_memb_id[src2dst[i]] = tid;
++            }
++        } /* end if */
++    }     /* end for */
+ 
+     /* The compound conversion functions need a background buffer */
+     cdata->need_bkg = H5T_BKG_YES;
+@@ -2468,11 +2493,9 @@ H5T__conv_struct(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, const H
+                     dst_memb = dst->shared->u.compnd.memb + src2dst[u];
+ 
+                     if (dst_memb->size <= src_memb->size) {
+-                        if (priv->need_ids) {
+-                            /* Update IDs in conversion context */
+-                            tmp_conv_ctx.u.conv.src_type_id = priv->src_memb_id[u];
+-                            tmp_conv_ctx.u.conv.dst_type_id = priv->dst_memb_id[src2dst[u]];
+-                        }
++                        /* Update IDs in conversion context */
++                        tmp_conv_ctx.u.conv.src_type_id = priv->src_memb_id[u];
++                        tmp_conv_ctx.u.conv.dst_type_id = priv->dst_memb_id[src2dst[u]];
+ 
+                         if (H5T_convert_with_ctx(priv->memb_path[u], priv->src_memb[u],
+                                                  priv->dst_memb[src2dst[u]], &tmp_conv_ctx, (size_t)1,
+@@ -2507,11 +2530,9 @@ H5T__conv_struct(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, const H
+                     dst_memb = dst->shared->u.compnd.memb + src2dst[i];
+ 
+                     if (dst_memb->size > src_memb->size) {
+-                        if (priv->need_ids) {
+-                            /* Update IDs in conversion context */
+-                            tmp_conv_ctx.u.conv.src_type_id = priv->src_memb_id[i];
+-                            tmp_conv_ctx.u.conv.dst_type_id = priv->dst_memb_id[src2dst[i]];
+-                        }
++                        /* Update IDs in conversion context */
++                        tmp_conv_ctx.u.conv.src_type_id = priv->src_memb_id[i];
++                        tmp_conv_ctx.u.conv.dst_type_id = priv->dst_memb_id[src2dst[i]];
+ 
+                         offset -= src_memb->size;
+                         if (H5T_convert_with_ctx(priv->memb_path[i], priv->src_memb[i],
+@@ -2701,6 +2722,8 @@ H5T__conv_struct_opt(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, con
+                 HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a datatype");
+             if (NULL == conv_ctx)
+                 HGOTO_ERROR(H5E_DATATYPE, H5E_BADVALUE, FAIL, "invalid datatype conversion context pointer");
++            if (!bkg)
++                HGOTO_ERROR(H5E_DATATYPE, H5E_BADVALUE, FAIL, "invalid background buffer pointer");
+ 
+             /* Initialize temporary conversion context */
+             tmp_conv_ctx = *conv_ctx;
+@@ -2711,7 +2734,7 @@ H5T__conv_struct_opt(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, con
+             priv = (H5T_conv_struct_t *)(cdata->priv);
+             assert(priv);
+             src2dst = priv->src2dst;
+-            assert(bkg && cdata->need_bkg);
++            assert(cdata->need_bkg);
+ 
+             /*
+              * Insure that members are sorted.
+@@ -2768,11 +2791,9 @@ H5T__conv_struct_opt(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, con
+                     dst_memb = dst->shared->u.compnd.memb + src2dst[u];
+ 
+                     if (dst_memb->size <= src_memb->size) {
+-                        if (priv->need_ids) {
+-                            /* Update IDs in conversion context */
+-                            tmp_conv_ctx.u.conv.src_type_id = priv->src_memb_id[u];
+-                            tmp_conv_ctx.u.conv.dst_type_id = priv->dst_memb_id[src2dst[u]];
+-                        }
++                        /* Update IDs in conversion context */
++                        tmp_conv_ctx.u.conv.src_type_id = priv->src_memb_id[u];
++                        tmp_conv_ctx.u.conv.dst_type_id = priv->dst_memb_id[src2dst[u]];
+ 
+                         xbuf = buf + src_memb->offset;
+                         xbkg = bkg + dst_memb->offset;
+@@ -2813,11 +2834,9 @@ H5T__conv_struct_opt(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, con
+                     dst_memb = dst->shared->u.compnd.memb + src2dst[i];
+ 
+                     if (dst_memb->size > src_memb->size) {
+-                        if (priv->need_ids) {
+-                            /* Update IDs in conversion context */
+-                            tmp_conv_ctx.u.conv.src_type_id = priv->src_memb_id[i];
+-                            tmp_conv_ctx.u.conv.dst_type_id = priv->dst_memb_id[src2dst[i]];
+-                        }
++                        /* Update IDs in conversion context */
++                        tmp_conv_ctx.u.conv.src_type_id = priv->src_memb_id[i];
++                        tmp_conv_ctx.u.conv.dst_type_id = priv->dst_memb_id[src2dst[i]];
+ 
+                         offset -= src_memb->size;
+                         xbuf = buf + offset;
+@@ -2938,9 +2957,6 @@ H5T__conv_enum_init(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, cons
+         size_t        dst_nmembs;
+         void         *tmp_realloc;
+ 
+-        if (0 == src->shared->u.enumer.nmembs)
+-            HGOTO_DONE(SUCCEED);
+-
+         /* Allocate everything we need to cache */
+         if (priv->src_copy && H5T_close(priv->src_copy) < 0)
+             HGOTO_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL, "unable to close copied source datatype");
+@@ -2952,6 +2968,10 @@ H5T__conv_enum_init(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, cons
+         if (NULL == (priv->dst_copy = H5T_copy(dst, H5T_COPY_ALL)))
+             HGOTO_ERROR(H5E_DATATYPE, H5E_CANTCOPY, FAIL, "unable to copy destination datatype");
+ 
++        /* Nothing more to do if enum has no members */
++        if (0 == src->shared->u.enumer.nmembs)
++            HGOTO_DONE(SUCCEED);
++
+         src_sh     = priv->src_copy->shared;
+         dst_sh     = priv->src_copy->shared;
+         src_nmembs = src_sh->u.enumer.nmembs;
+@@ -3468,7 +3488,6 @@ H5T__conv_vlen(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, const H5T
+     void                 *tmp_buf       = NULL;  /* Temporary background buffer          */
+     size_t                tmp_buf_size  = 0;     /* Size of temporary bkg buffer         */
+     bool                  nested        = false; /* Flag of nested VL case             */
+-    bool                  need_ids      = false; /* Whether we need IDs for the datatypes */
+     size_t                elmtno        = 0;     /* Element number counter               */
+     size_t                orig_d_stride = 0;     /* Original destination stride (used for error handling) */
+     size_t orig_nelmts = nelmts; /* Original # of elements to convert (used for error handling) */
+@@ -3524,8 +3543,6 @@ H5T__conv_vlen(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, const H5T
+             /* Initialize temporary conversion context */
+             tmp_conv_ctx = *conv_ctx;
+ 
+-            need_ids = (conv_ctx->u.conv.cb_struct.func != NULL);
+-
+             /* Initialize source & destination strides */
+             if (buf_stride) {
+                 assert(buf_stride >= src->shared->size);
+@@ -3573,7 +3590,11 @@ H5T__conv_vlen(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata, const H5T
+                     if (H5T_set_loc(tdst_cpy, dst->shared->u.vlen.file, dst->shared->u.vlen.loc) < 0)
+                         HGOTO_ERROR(H5E_DATATYPE, H5E_CANTSET, FAIL, "can't set datatype location");
+ 
+-                if (need_ids) {
++                /* Create IDs for the variable-length base datatypes if the conversion path
++                 * uses an application conversion function or if a conversion exception function
++                 * was provided.
++                 */
++                if (tpath->conv.is_app || conv_ctx->u.conv.cb_struct.func) {
+                     if ((tsrc_id = H5I_register(H5I_DATATYPE, tsrc_cpy, false)) < 0)
+                         HGOTO_ERROR(H5E_DATATYPE, H5E_CANTREGISTER, FAIL,
+                                     "unable to register ID for source base datatype");
+@@ -3917,7 +3938,6 @@ H5T__conv_array(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata,
+     uint8_t          *sp, *dp, *bp;                    /* Source, dest, and bkg traversal ptrs */
+     ssize_t           src_delta, dst_delta, bkg_delta; /* Source, dest, and bkg strides */
+     int               direction;                       /* Direction of traversal */
+-    bool              need_ids  = false;               /* Whether we need IDs for the datatypes */
+     herr_t            ret_value = SUCCEED;             /* Return value */
+ 
+     FUNC_ENTER_PACKAGE
+@@ -3989,8 +4009,6 @@ H5T__conv_array(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata,
+             /* Initialize temporary conversion context */
+             tmp_conv_ctx = *conv_ctx;
+ 
+-            need_ids = (conv_ctx->u.conv.cb_struct.func != NULL);
+-
+             /*
+              * Do we process the values from beginning to end or vice
+              * versa? Also, how many of the elements have the source and
+@@ -4029,7 +4047,11 @@ H5T__conv_array(const H5T_t *src, const H5T_t *dst, H5T_cdata_t *cdata,
+                     HGOTO_ERROR(H5E_DATATYPE, H5E_CANTCOPY, FAIL,
+                                 "unable to copy dst base type for conversion");
+ 
+-                if (need_ids) {
++                /* Create IDs for the array base datatypes if the conversion path uses an
++                 * application conversion function or if a conversion exception function
++                 * was provided.
++                 */
++                if (priv->tpath->conv.is_app || conv_ctx->u.conv.cb_struct.func) {
+                     if ((tsrc_id = H5I_register(H5I_DATATYPE, tsrc_cpy, false)) < 0)
+                         HGOTO_ERROR(H5E_DATATYPE, H5E_CANTREGISTER, FAIL,
+                                     "unable to register ID for source base datatype");
+diff --git a/test/dtypes.c b/test/dtypes.c
+index ea589583e65..a7a518e7e88 100644
+--- a/test/dtypes.c
++++ b/test/dtypes.c
+@@ -7629,6 +7629,299 @@ test_int_float_except(void)
+ #endif /* H5_SIZEOF_INT==4 && H5_SIZEOF_FLOAT==4 */
+ } /* end test_int_float_except() */
+ 
++/*-------------------------------------------------------------------------
++ * Function:    test_app_conv_ids_func
++ *
++ * Purpose:     Conversion function for test_app_conv_ids test that calls
++ *              H5Tget_class on the ID for the source and destination
++ *              datatypes to try to make sure they're valid.
++ *
++ * Return:      Non-negative on success/Negative on failure
++ *
++ *-------------------------------------------------------------------------
++ */
++static herr_t
++test_app_conv_ids_func(hid_t src_id, hid_t dst_id, H5T_cdata_t *cdata, size_t H5_ATTR_UNUSED nelmts,
++                       size_t H5_ATTR_UNUSED buf_stride, size_t H5_ATTR_UNUSED bkg_stride,
++                       void H5_ATTR_UNUSED *buf, void H5_ATTR_UNUSED *bkg, hid_t H5_ATTR_UNUSED dxpl)
++{
++    if (cdata->command == H5T_CONV_CONV) {
++        if (H5Tget_class(src_id) < 0)
++            return FAIL;
++        if (H5Tget_class(dst_id) < 0)
++            return FAIL;
++    }
++
++    return SUCCEED;
++}
++
++/*-------------------------------------------------------------------------
++ * Function:    test_app_conv_ids
++ *
++ * Purpose:     Tests that the IDs passed to an application conversion
++ *              function for different datatypes are valid.
++ *
++ * Return:      Success:        0
++ *              Failure:        number of errors
++ *
++ *-------------------------------------------------------------------------
++ */
++static int
++test_app_conv_ids(void)
++{
++    const size_t buf_size     = 1024; /* Must be big enough to hold element of largest datatype */
++    hsize_t      array_dims[] = {1};
++    hsize_t      dims[]       = {1};
++    hid_t        src_type_id  = H5I_INVALID_HID;
++    hid_t        dst_type_id  = H5I_INVALID_HID;
++    hid_t        space_id     = H5I_INVALID_HID;
++    hvl_t        vl_elem      = {0};
++    int          vl_int       = 0;
++    void        *conv_elem    = NULL;
++    void        *bkg_buf      = NULL;
++
++    TESTING("passing datatype IDs to application conversion function");
++
++    if (NULL == (conv_elem = malloc(buf_size)))
++        TEST_ERROR;
++    if (NULL == (bkg_buf = malloc(buf_size)))
++        TEST_ERROR;
++
++    vl_elem.len = 1;
++    vl_elem.p   = &vl_int;
++
++    for (int src_type = H5T_INTEGER; src_type < H5T_NCLASSES; src_type++) {
++        switch ((H5T_class_t)src_type) {
++            case H5T_BITFIELD:
++                if ((src_type_id = H5Tcopy(H5T_STD_B32LE)) < 0)
++                    TEST_ERROR;
++                break;
++            case H5T_REFERENCE:
++                if ((src_type_id = H5Tcopy(H5T_STD_REF)) < 0)
++                    TEST_ERROR;
++                break;
++            case H5T_ENUM:
++                if ((src_type_id = H5Tenum_create(H5T_NATIVE_INT)) < 0)
++                    TEST_ERROR;
++                break;
++            case H5T_VLEN:
++                if ((src_type_id = H5Tvlen_create(H5T_NATIVE_INT)) < 0)
++                    TEST_ERROR;
++                break;
++            case H5T_ARRAY:
++                if ((src_type_id = H5Tarray_create2(H5T_NATIVE_INT, 1, array_dims)) < 0)
++                    TEST_ERROR;
++                break;
++            case H5T_INTEGER:
++            case H5T_FLOAT:
++            case H5T_TIME:
++            case H5T_STRING:
++            case H5T_OPAQUE:
++            case H5T_COMPOUND:
++            default:
++                if ((src_type_id = H5Tcreate((H5T_class_t)src_type, buf_size / 2)) < 0)
++                    TEST_ERROR;
++                break;
++
++            case H5T_NO_CLASS:
++            case H5T_NCLASSES:
++                TEST_ERROR;
++        }
++
++        for (int dst_type = H5T_INTEGER; dst_type < H5T_NCLASSES; dst_type++) {
++            /* Use different datatype sizes for dest type so we don't convert with no-op function */
++            switch ((H5T_class_t)dst_type) {
++                case H5T_BITFIELD:
++                    if ((dst_type_id = H5Tcopy(H5T_STD_B64LE)) < 0)
++                        TEST_ERROR;
++                    break;
++                case H5T_REFERENCE:
++                    if ((dst_type_id = H5Tcopy(H5T_STD_REF)) < 0)
++                        TEST_ERROR;
++                    break;
++                case H5T_ENUM:
++                    if ((dst_type_id = H5Tenum_create(H5T_NATIVE_LONG)) < 0)
++                        TEST_ERROR;
++                    break;
++                case H5T_VLEN:
++                    if ((dst_type_id = H5Tvlen_create(H5T_NATIVE_LONG)) < 0)
++                        TEST_ERROR;
++                    break;
++                case H5T_ARRAY:
++                    if ((dst_type_id = H5Tarray_create2(H5T_NATIVE_LONG, 1, array_dims)) < 0)
++                        TEST_ERROR;
++                    break;
++                case H5T_INTEGER:
++                case H5T_FLOAT:
++                case H5T_TIME:
++                case H5T_STRING:
++                case H5T_OPAQUE:
++                case H5T_COMPOUND:
++                default:
++                    if ((dst_type_id = H5Tcreate((H5T_class_t)dst_type, buf_size / 4)) < 0)
++                        TEST_ERROR;
++                    break;
++
++                case H5T_NO_CLASS:
++                case H5T_NCLASSES:
++                    TEST_ERROR;
++            }
++
++            if (H5Tregister(H5T_PERS_SOFT, "app_conv_ids_func", src_type_id, dst_type_id,
++                            &test_app_conv_ids_func) < 0)
++                TEST_ERROR;
++
++            memset(conv_elem, 0, buf_size);
++
++            if (src_type == H5T_VLEN)
++                memcpy(conv_elem, &vl_elem, sizeof(hvl_t));
++
++            if (H5Tconvert(src_type_id, dst_type_id, 1, conv_elem, bkg_buf, H5P_DEFAULT) < 0)
++                TEST_ERROR;
++
++            if (H5Tunregister(H5T_PERS_SOFT, "app_conv_ids_func", src_type_id, dst_type_id,
++                              &test_app_conv_ids_func) < 0)
++                TEST_ERROR;
++
++            if (H5Tclose(dst_type_id) < 0)
++                TEST_ERROR;
++            dst_type_id = H5I_INVALID_HID;
++        }
++
++        if (H5Tclose(src_type_id) < 0)
++            TEST_ERROR;
++        src_type_id = H5I_INVALID_HID;
++    }
++
++    /* Reset library after type conversion path table was potentially modified */
++    h5_restore_err();
++    reset_hdf5();
++
++    /* Test with container-like datatypes where the conversion on the top-level type
++     * is performed with a library-internal conversion function, but conversions on
++     * the member types are performed with an application conversion function
++     */
++
++    if (H5Tregister(H5T_PERS_HARD, "app_conv_ids_func", H5T_NATIVE_INT, H5T_NATIVE_LONG,
++                    &test_app_conv_ids_func) < 0)
++        TEST_ERROR;
++
++    /*******************************
++     * Top-level compound datatype *
++     *******************************/
++    if ((src_type_id = H5Tcreate(H5T_COMPOUND, sizeof(int))) < 0)
++        TEST_ERROR;
++    if (H5Tinsert(src_type_id, "comp_mem", 0, H5T_NATIVE_INT) < 0)
++        TEST_ERROR;
++    if ((dst_type_id = H5Tcreate(H5T_COMPOUND, sizeof(long))) < 0)
++        TEST_ERROR;
++    if (H5Tinsert(dst_type_id, "comp_mem", 0, H5T_NATIVE_LONG) < 0)
++        TEST_ERROR;
++
++    memset(conv_elem, 0, buf_size);
++    if (H5Tconvert(src_type_id, dst_type_id, 1, conv_elem, bkg_buf, H5P_DEFAULT) < 0)
++        TEST_ERROR;
++
++    if (H5Tclose(src_type_id) < 0)
++        TEST_ERROR;
++    if (H5Tclose(dst_type_id) < 0)
++        TEST_ERROR;
++
++    /***************************
++     * Top-level enum datatype *
++     ***************************/
++    if ((src_type_id = H5Tenum_create(H5T_NATIVE_INT)) < 0)
++        TEST_ERROR;
++    if ((dst_type_id = H5Tenum_create(H5T_NATIVE_LONG)) < 0)
++        TEST_ERROR;
++
++    memset(conv_elem, 0, buf_size);
++    if (H5Tconvert(src_type_id, dst_type_id, 1, conv_elem, bkg_buf, H5P_DEFAULT) < 0)
++        TEST_ERROR;
++
++    if (H5Tclose(src_type_id) < 0)
++        TEST_ERROR;
++    if (H5Tclose(dst_type_id) < 0)
++        TEST_ERROR;
++
++    /**************************************
++     * Top-level variable-length datatype *
++     **************************************/
++    if ((src_type_id = H5Tvlen_create(H5T_NATIVE_INT)) < 0)
++        TEST_ERROR;
++    if ((dst_type_id = H5Tvlen_create(H5T_NATIVE_LONG)) < 0)
++        TEST_ERROR;
++
++    memset(conv_elem, 0, buf_size);
++    memcpy(conv_elem, &vl_elem, sizeof(hvl_t));
++    if (H5Tconvert(src_type_id, dst_type_id, 1, conv_elem, bkg_buf, H5P_DEFAULT) < 0)
++        TEST_ERROR;
++
++    if ((space_id = H5Screate_simple(1, dims, NULL)) < 0)
++        TEST_ERROR;
++    if (H5Treclaim(dst_type_id, space_id, H5P_DEFAULT, conv_elem) < 0)
++        TEST_ERROR;
++    if (H5Sclose(space_id) < 0)
++        TEST_ERROR;
++
++    if (H5Tclose(src_type_id) < 0)
++        TEST_ERROR;
++    if (H5Tclose(dst_type_id) < 0)
++        TEST_ERROR;
++
++    /****************************
++     * Top-level array datatype *
++     ****************************/
++    if ((src_type_id = H5Tarray_create2(H5T_NATIVE_INT, 1, array_dims)) < 0)
++        TEST_ERROR;
++    if ((dst_type_id = H5Tarray_create2(H5T_NATIVE_LONG, 1, array_dims)) < 0)
++        TEST_ERROR;
++
++    memset(conv_elem, 0, buf_size);
++    if (H5Tconvert(src_type_id, dst_type_id, 1, conv_elem, bkg_buf, H5P_DEFAULT) < 0)
++        TEST_ERROR;
++
++    if (H5Tclose(src_type_id) < 0)
++        TEST_ERROR;
++    if (H5Tclose(dst_type_id) < 0)
++        TEST_ERROR;
++
++    if (H5Tunregister(H5T_PERS_HARD, "app_conv_ids_func", H5T_NATIVE_INT, H5T_NATIVE_LONG,
++                      &test_app_conv_ids_func) < 0)
++        TEST_ERROR;
++
++    free(bkg_buf);
++    bkg_buf = NULL;
++    free(conv_elem);
++    conv_elem = NULL;
++
++    /* Reset library after type conversion path table was potentially modified */
++    h5_restore_err();
++    reset_hdf5();
++
++    PASSED();
++
++    return 0;
++
++error:
++    free(bkg_buf);
++    free(conv_elem);
++
++    H5E_BEGIN_TRY
++    {
++        H5Sclose(space_id);
++        H5Tclose(src_type_id);
++        H5Tclose(dst_type_id);
++    }
++    H5E_END_TRY
++
++    /* Reset library after type conversion path table was potentially modified */
++    h5_restore_err();
++    reset_hdf5();
++
++    return 1;
++} /* end test_app_conv_ids() */
++
+ /*-------------------------------------------------------------------------
+  * Function:    test_set_order
+  *
+@@ -9919,6 +10212,8 @@ main(void)
+         nerrors += test_utf_ascii_conv();
+     }
+ 
++    nerrors += test_app_conv_ids();
++
+     nerrors += test_versionbounds();
+ 
+     if (nerrors) {

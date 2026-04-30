@@ -1,0 +1,269 @@
+From 2de879aadb52c7d2f661c0067faa6b853330a9f1 Mon Sep 17 00:00:00 2001
+From: Dirk Farin <dirk.farin@gmail.com>
+Date: Tue, 9 Jul 2024 10:21:19 +0200
+Subject: [PATCH] error if read box version is not supported
+
+---
+ libheif/box.cc     | 80 ++++++++++++++++++++++++++++++++++++++++++++++
+ libheif/box.h      |  1 +
+ libheif/context.cc | 14 +++++---
+ 3 files changed, 91 insertions(+), 4 deletions(-)
+
+diff --git a/libheif/box.cc b/libheif/box.cc
+index 645dc4b27a..4aed5d46e6 100644
+--- a/libheif/box.cc
++++ b/libheif/box.cc
+@@ -1049,6 +1049,10 @@ Error Box_meta::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() != 0) {
++    return unsupported_version_error("meta");
++  }
++
+   /*
+   uint64_t boxSizeLimit;
+   if (get_box_size() == BoxHeader::size_until_end_of_file) {
+@@ -1073,10 +1077,25 @@ std::string Box_meta::dump(Indent& indent) const
+ }
+ 
+ 
++Error FullBox::unsupported_version_error(const char* box) const
++{
++  std::stringstream sstr;
++  sstr << box << " box data version " << ((int) m_version) << " is not implemented yet";
++
++  return {heif_error_Unsupported_feature,
++          heif_suberror_Unsupported_data_version,
++          sstr.str()};
++}
++
++
+ Error Box_hdlr::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() != 0) {
++    return unsupported_version_error("hdlr");
++  }
++
+   m_pre_defined = range.read32();
+   m_handler_type = range.read32();
+ 
+@@ -1125,6 +1144,11 @@ Error Box_pitm::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() > 1) {
++    return unsupported_version_error("pitm");
++  }
++
++
+   if (get_version() == 0) {
+     m_item_ID = range.read16();
+   }
+@@ -1179,6 +1203,10 @@ Error Box_iloc::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() > 2) {
++    return unsupported_version_error("iloc");
++  }
++
+   const int version = get_version();
+ 
+   uint16_t values4 = range.read16();
+@@ -1708,6 +1736,11 @@ Error Box_infe::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  // only versions 2,3 are required by HEIF
++  if (get_version() > 3) {
++    return unsupported_version_error("infe");
++  }
++
+   if (get_version() <= 1) {
+     m_item_ID = range.read16();
+     m_item_protection_index = range.read16();
+@@ -1855,6 +1888,10 @@ Error Box_iinf::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() > 1) {
++    return unsupported_version_error("iinf");
++  }
++
+   int nEntries_size = (get_version() > 0) ? 4 : 2;
+ 
+   uint32_t item_count;
+@@ -1966,6 +2003,10 @@ Error Box_pixi::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() != 0) {
++    return unsupported_version_error("pixi");
++  }
++
+   StreamReader::grow_status status;
+   uint8_t num_channels = range.read8();
+   status = range.wait_for_available_bytes(num_channels);
+@@ -2273,6 +2314,10 @@ Error Box_ispe::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() != 0) {
++    return unsupported_version_error("ispe");
++  }
++
+   m_image_width = range.read32();
+   m_image_height = range.read32();
+ 
+@@ -2321,6 +2366,12 @@ Error Box_ipma::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  // TODO: is there any specification of allowed values for the ipma version in the HEIF standards?
++
++  if (get_version() > 1) {
++    return unsupported_version_error("ipma");
++  }
++
+   uint32_t entry_cnt = range.read32();
+   for (uint32_t i = 0; i < entry_cnt && !range.error() && !range.eof(); i++) {
+     Entry entry;
+@@ -2503,6 +2554,10 @@ Error Box_auxC::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() != 0) {
++    return unsupported_version_error("auxC");
++  }
++
+   m_aux_type = range.read_string();
+ 
+   while (!range.eof()) {
+@@ -2790,6 +2845,10 @@ Error Box_iref::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() > 1) {
++    return unsupported_version_error("iref");
++  }
++
+   while (!range.eof()) {
+     Reference ref;
+ 
+@@ -3198,6 +3257,10 @@ Error Box_dref::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() != 0) {
++    return unsupported_version_error("dref");
++  }
++
+   uint32_t nEntities = range.read32();
+ 
+   /*
+@@ -3241,6 +3304,10 @@ Error Box_url::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() > 0) {
++    return unsupported_version_error("url");
++  }
++
+   m_location = range.read_string();
+ 
+   return range.get_error();
+@@ -3262,6 +3329,11 @@ std::string Box_url::dump(Indent& indent) const
+ Error Box_udes::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
++
++  if (get_version() > 0) {
++    return unsupported_version_error("udes");
++  }
++
+   m_lang = range.read_string();
+   m_name = range.read_string();
+   m_description = range.read_string();
+@@ -3347,6 +3419,10 @@ Error Box_cmin::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() > 0) {
++    return unsupported_version_error("cmin");
++  }
++
+   m_denominatorShift = (get_flags() & 0x1F00) >> 8;
+   uint32_t denominator = (1U << m_denominatorShift);
+ 
+@@ -3530,6 +3606,10 @@ Error Box_cmex::parse(BitstreamRange& range)
+ {
+   parse_full_box_header(range);
+ 
++  if (get_version() > 0) {
++    return unsupported_version_error("cmex");
++  }
++
+   m_matrix = ExtrinsicMatrix{};
+ 
+   if (get_flags() & pos_x_present) {
+diff --git a/libheif/box.h b/libheif/box.h
+index 61f736c797..2e88faac62 100644
+--- a/libheif/box.h
++++ b/libheif/box.h
+@@ -261,6 +261,7 @@ class FullBox : public Box
+ 
+   Error write_header(StreamWriter&, size_t total_size, bool data64bit = false) const override;
+ 
++  Error unsupported_version_error(const char* box) const;
+ 
+ private:
+   uint8_t m_version = 0;
+diff --git a/libheif/context.cc b/libheif/context.cc
+index 929a2b322b..ecb5e5f5ea 100644
+--- a/libheif/context.cc
++++ b/libheif/context.cc
+@@ -178,7 +178,13 @@ Error ImageGrid::parse(const std::vector<uint8_t>& data)
+   }
+ 
+   uint8_t version = data[0];
+-  (void) version; // version is unused
++  if (version != 0) {
++    std::stringstream sstr;
++    sstr << "Grid image version " << ((int)version) << " is not supported";
++    return {heif_error_Unsupported_feature,
++            heif_suberror_Unsupported_data_version,
++            sstr.str()};
++  }
+ 
+   uint8_t flags = data[1];
+   int field_size = ((flags & 1) ? 32 : 16);
+@@ -312,7 +318,7 @@ class ImageOverlay
+ Error ImageOverlay::parse(size_t num_images, const std::vector<uint8_t>& data)
+ {
+   Error eofError(heif_error_Invalid_input,
+-                 heif_suberror_Invalid_grid_data,
++                 heif_suberror_Invalid_overlay_data,
+                  "Overlay image data incomplete");
+ 
+   if (data.size() < 2 + 4 * 2) {
+@@ -320,8 +326,6 @@ Error ImageOverlay::parse(size_t num_images, const std::vector<uint8_t>& data)
+   }
+ 
+   m_version = data[0];
+-  m_flags = data[1];
+-
+   if (m_version != 0) {
+     std::stringstream sstr;
+     sstr << "Overlay image data version " << ((int) m_version) << " is not implemented yet";
+@@ -331,6 +335,8 @@ Error ImageOverlay::parse(size_t num_images, const std::vector<uint8_t>& data)
+             sstr.str()};
+   }
+ 
++  m_flags = data[1];
++
+   int field_len = ((m_flags & 1) ? 4 : 2);
+   int ptr = 2;
+ 

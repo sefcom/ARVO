@@ -1,0 +1,86 @@
+From e060fe93429b6da665a4d4210a49876b43223a17 Mon Sep 17 00:00:00 2001
+From: Liviu Chircu <liviu@opensips.org>
+Date: Tue, 7 Feb 2023 15:45:17 +0200
+Subject: [PATCH] parse_content_length(): Fix out-of-bounds read edge-case
+ (OSS-Fuzz)
+
+This patch fixes several off-by-one read overflows while parsing a bad
+Content-Length header.  Similar to a008e7c23, the error was mostly
+harmless, as the supplied buffer is typically much larger in the runtime
+usage of parse_msg().
+
+Severity: Low
+Fixes OSS-Fuzz#53397
+---
+ parser/parse_content.c    | 20 ++++++++++----------
+ parser/test/test_parser.c |  4 ++++
+ 2 files changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/parser/parse_content.c b/parser/parse_content.c
+index d8f945ba73b..d3704158cb0 100644
+--- a/parser/parse_content.c
++++ b/parser/parse_content.c
+@@ -227,18 +227,18 @@ char str_contenttype[50];
+ char* parse_content_length( char* buffer, char* end, int* length)
+ {
+ 	int number;
+-	char *p;
+-	int  size;
++	char *p, *numstart;
+ 
+ 	p = buffer;
+ 	/* search the beginning of the number */
+-	while ( p<end && (*p==' ' || *p=='\t' || (*p=='\r' && *(p+1)=='\n') ||
+-	(*p=='\n' && (*(p+1)==' '||*(p+1)=='\t')) ))
++	while ( p<end && (*p==' ' || *p=='\t'
++	              || (*p=='\r' && p+1<end && *(p+1)=='\n')
++	              || (*p=='\n' && p+1<end && (*(p+1)==' '||*(p+1)=='\t')) ))
+ 		p++;
+ 	if (p==end)
+ 		goto error;
+ 	/* parse the number */
+-	size = 0;
++	numstart = p;
+ 	number = 0;
+ 	while (p<end && *p>='0' && *p<='9') {
+ 		/* do not actually cause an integer overflow, as it is UB! --liviu */
+@@ -249,19 +249,19 @@ char* parse_content_length( char* buffer, char* end, int* length)
+ 		}
+ 
+ 		number = number*10 + ((*p)-'0');
+-		size ++;
+ 		p++;
+ 	}
+-	if (p==end || size==0)
++	if (p==end || p==numstart)
+ 		goto error;
++
+ 	/* now we should have only spaces at the end */
+-	while ( p<end && (*p==' ' || *p=='\t' ||
+-	(*p=='\n' && (*(p+1)==' '||*(p+1)=='\t')) ))
++	while ( p<end && (*p==' ' || *p=='\t'
++	              || (*p=='\n' && p+1<end && (*(p+1)==' '||*(p+1)=='\t')) ))
+ 		p++;
+ 	if (p==end)
+ 		goto error;
+ 	/* the header ends proper? */
+-	if ( (*(p++)!='\n') && (*(p-1)!='\r' || *(p++)!='\n' ) )
++	if ( (*(p++)!='\n') && (*(p-1)!='\r' || p==end || *(p++)!='\n' ) )
+ 		goto error;
+ 
+ 	*length = number;
+diff --git a/parser/test/test_parser.c b/parser/test/test_parser.c
+index 5726a3250e1..cfa8cbc48f8 100644
+--- a/parser/test/test_parser.c
++++ b/parser/test/test_parser.c
+@@ -171,6 +171,10 @@ static const struct tts {
+ 		/* test for read overflow on Content-Length parsing error (@end) */
+ 		"v D \xd7\r\xeeV:1\r\nl:5\r*",
+ 		-1,
++	}, {
++		/* test for read overflow during Content-Length ws trimming (@end) */
++		"abcde J    \x09:5\nL\x09:\x09\n",
++		-1,
+ 	},
+ };
+ 

@@ -1,0 +1,121 @@
+From c9267d665c30fa78023bd70b8e9c6f02450777e2 Mon Sep 17 00:00:00 2001
+From: Grzegorz Antoniak <ga@anadoxin.org>
+Date: Wed, 18 Dec 2019 19:28:12 +0100
+Subject: [PATCH] RAR5 reader: verify window size for multivolume archives
+
+RAR5 archives can contain files that span across multiple .rar files. If the
+archive contains a big file that doesn't fit to first .rar file, then this file
+is continued in another .rar file.
+
+In this case, the RAR compressor first emits the FILE base block for this big
+file in the first .rar file. Then, it finishes first .rar file, and creates the
+new .rar file. In this new file, it emits the continuation FILE block that
+marks start of the continuation data for the rest of the huge file.
+
+The problem was that the RAR5 reader didn't ignore the window size declaration
+when parsing through the continuation FILE base block. The malicious file could
+declare a different window size inside the continuation base block than was
+declared in the primary FILE base block in the previous volume. The window size
+from continuation block was applied, but the actual window buffer was not
+reallocated. This resulted in a potential SIGSEGV error, since bounary checks
+for accessing the window buffer were working incorrectly (the window size
+variable didn't match the actual window buffer size).
+
+The commit fixes the issue by ignoring the window size declaration in the
+continuation FILE base block when switching volumes.
+
+The commit also contains a test case and OSSFuzz sample #19509.
+---
+ Makefile.am                                      |  1 +
+ libarchive/archive_read_support_format_rar5.c    | 11 ++++++++---
+ libarchive/test/test_read_format_rar5.c          | 15 +++++++++++++++
+ ...format_rar5_different_winsize_on_merge.rar.uu | 16 ++++++++++++++++
+ 4 files changed, 40 insertions(+), 3 deletions(-)
+ create mode 100644 libarchive/test/test_read_format_rar5_different_winsize_on_merge.rar.uu
+
+diff --git a/Makefile.am b/Makefile.am
+index 6d864fb66..188c9fc7d 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -873,6 +873,7 @@ libarchive_test_EXTRA_DIST=\
+ 	libarchive/test/test_read_format_rar5_truncated_huff.rar.uu \
+ 	libarchive/test/test_read_format_rar5_win32.rar.uu \
+ 	libarchive/test/test_read_format_rar5_arm_filter_on_window_boundary.rar.uu \
++	libarchive/test/test_read_format_rar5_different_winsize_on_merge.rar.uu \
+ 	libarchive/test/test_read_format_raw.bufr.uu \
+ 	libarchive/test/test_read_format_raw.data.gz.uu \
+ 	libarchive/test/test_read_format_raw.data.Z.uu \
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index ec31bc79f..ce38b1fc9 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -63,6 +63,7 @@
+ 
+ #if defined DEBUG
+ #define DEBUG_CODE if(1)
++#define LOG(...) do { printf("rar5: " __VA_ARGS__); puts(""); } while(0)
+ #else
+ #define DEBUG_CODE if(0)
+ #endif
+@@ -1702,9 +1703,13 @@ static int process_head_file(struct archive_read* a, struct rar5* rar,
+ 		}
+ 	}
+ 
+-	/* Values up to 64M should fit into ssize_t on every
+-	 * architecture. */
+-	rar->cstate.window_size = (ssize_t) window_size;
++	/* If we're currently switching volumes, ignore the new definition of
++	 * window_size. */
++	if(rar->cstate.switch_multivolume == 0) {
++		/* Values up to 64M should fit into ssize_t on every
++		 * architecture. */
++		rar->cstate.window_size = (ssize_t) window_size;
++	}
+ 
+ 	if(rar->file.solid > 0 && rar->file.solid_window_size == 0) {
+ 		/* Solid files have to have the same window_size across
+diff --git a/libarchive/test/test_read_format_rar5.c b/libarchive/test/test_read_format_rar5.c
+index f44b55ae7..bb94d4e34 100644
+--- a/libarchive/test/test_read_format_rar5.c
++++ b/libarchive/test/test_read_format_rar5.c
+@@ -1241,3 +1241,18 @@ DEFINE_TEST(test_read_format_rar5_different_solid_window_size)
+ 
+ 	EPILOGUE();
+ }
++
++DEFINE_TEST(test_read_format_rar5_different_winsize_on_merge)
++{
++	char buf[4096];
++	PROLOGUE("test_read_format_rar5_different_winsize_on_merge.rar");
++
++	/* Return codes of those calls are ignored, because this sample file
++	 * is invalid. However, the unpacker shouldn't produce any SIGSEGV
++	 * errors during processing. */
++
++	(void) archive_read_next_header(a, &ae);
++	while(0 < archive_read_data(a, buf, sizeof(buf))) {}
++
++	EPILOGUE();
++}
+diff --git a/libarchive/test/test_read_format_rar5_different_winsize_on_merge.rar.uu b/libarchive/test/test_read_format_rar5_different_winsize_on_merge.rar.uu
+new file mode 100644
+index 000000000..85391fa4e
+--- /dev/null
++++ b/libarchive/test/test_read_format_rar5_different_winsize_on_merge.rar.uu
+@@ -0,0 +1,16 @@
++begin 644 test_read_format_rar5_different_winsize_on_merge.rar.uu
++M4F%R(1H'`0"-[P+2``+''QP,!`H``"0`N)$#`0(H$"<"``X`/3Q/`0"V````
++MQ@$````V`/^%02`H^B7&,NX``"F&AK%M-50O<WY2!P$`C>\"T@`"_[6U,1"U
++MM;6UM[BU45)A<K6UM;6UM+6U```\______?______________P`&80"-[P+2
++MT@`#TA________\`M,-:!`8``(0A_^\"TE)A<J$?Y@<!`(WO`BCZ)<8R[@``
++M*8:&L6TU5"]S?E('`0"-[P+2``+_M0`````````DM3$0M;6UM;>XM5%287*U
++MM;6UM;2UM0``//_____W______________\`!F$`C>\"TM(``](?________
++M`+3#6@0&D0,!`B@0)P(`#@`]/$\!`+8```#&`0```#8`_X5!("CZ)<8R[@``
++M*8:&L6TU5"]S?E(`````````````````````````````````````````````
++M````````````````````````````````````````````````````````````
++M``````````````````````````````````````````````````<!`(WO````
++M`````````````````````````````````````````````````````$``````
++M`````````````````````````````````#$S-S4V-#<`_P0$!`0G!`0$!`0$
++"!`0`
++`
++end

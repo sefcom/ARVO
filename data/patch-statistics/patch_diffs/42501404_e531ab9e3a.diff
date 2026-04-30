@@ -1,0 +1,60 @@
+From 3b49098069f85d9d725a7657dcd09df1ee38f25e Mon Sep 17 00:00:00 2001
+From: "Alan T. DeKok" <aland@freeradius.org>
+Date: Wed, 6 Oct 2021 16:47:21 -0400
+Subject: [PATCH] check for overflow before decoding anything
+
+---
+ src/protocols/tacacs/decode.c | 26 +++++++++++++++++---------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/src/protocols/tacacs/decode.c b/src/protocols/tacacs/decode.c
+index 26488c532755..4d0c4997c3b3 100644
+--- a/src/protocols/tacacs/decode.c
++++ b/src/protocols/tacacs/decode.c
+@@ -91,7 +91,21 @@ static int tacacs_decode_args(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_att
+ 	}
+ 
+ 	/*
+-	 *	Then, do the dirty job...
++	 *	Check for malformed packets before anything else.
++	 */
++	for (i = 0; i < arg_cnt; i++) {
++		if ((p + arg_list[i]) > end) {
++			fr_strerror_printf("'%s' argument %u length %u overflows the remaining data (%zu) in the packet",
++					   parent->name, i, arg_list[i], end - p);
++			return -1;
++		}
++
++		p += arg_list[i];
++	}
++	p = *data;
++
++	/*
++	 *	Then, do the dirty job of creating attributes.
+ 	 */
+ 	for (i = 0; i < arg_cnt; i++) {
+ 		uint8_t const *value, *name_end, *arg_end;
+@@ -100,12 +114,6 @@ static int tacacs_decode_args(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_att
+ 
+ 		if (arg_list[i] < 2) goto next; /* skip malformed */
+ 
+-		if (p + arg_list[i] > end) {
+-			fr_strerror_printf("'%s' argument %u length %u overflows the remaining data in the packet",
+-					   parent->name, i, arg_list[i]);
+-			return -1;
+-		}
+-
+ 		memcpy(buffer, p, arg_list[i]);
+ 		buffer[arg_list[i]] = '\0';
+ 
+@@ -186,8 +194,8 @@ static int tacacs_decode_field(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_at
+ 	fr_pair_t *vp;
+ 
+ 	if ((p + field_len) > end) {
+-		fr_strerror_printf("'%s' length %u overflows the remaining data in the packet",
+-				   da->name, field_len);
++		fr_strerror_printf("'%s' length %u overflows the remaining data (%zu) in the packet",
++				   da->name, field_len, p - end);
+ 		return -1;
+ 	}
+ 

@@ -1,0 +1,1940 @@
+From 19cacf672930cee20feaf1f3468e3d5ac3099ffd Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Mon, 3 Apr 2023 22:21:59 +0930
+Subject: [PATCH] Use bfd_alloc memory for read_debugging_info storage
+
+Trying to free malloc'd memory used by the stabs and coff debug info
+parsers is complicated, and traversing the trees generated requires a
+lot of code.  It's better to bfd_alloc the memory which allows it all
+to be freed without fuss when the bfd is closed.  In the process of
+doing this I reverted most of commit a6336913332.
+
+Some of the stabs handling code grows arrays of pointers with realloc,
+to deal with arbitrary numbers of fields, function args, etc.  The
+code still does that but copies over to bfd_alloc memory when
+finished.  The alternative is to parse twice, once to size, then again
+to populate the arrays.  I think that complication is unwarranted.
+
+Note that there is a greater than zero chance this patch breaks
+something, eg. that I missed an attempt to free obj_alloc memory.
+Also it seems there are no tests in the binutils testsuite aimed at
+exercising objdump --debugging.
+
+	* budbg.h (finish_stab, parse_stab): Update prototypes
+	* debug.c: Include bucomm.h.
+	(struct debug_handle): Add "abfd" field.
+	(debug_init): Add "abfd" param.  bfd_alloc handle.
+	(debug_xalloc, debug_xzalloc): New functions.  Use throughout
+	in place of xmalloc and memset.
+	(debug_start_source): Remove "name_used" param.
+	* debug.h (debug_init, debug_start_source): Update prototypes.
+	(debug_xalloc, debug_xzalloc): Declare.
+	* objcopy.c (copy_object): Don't free dhandle.
+	* objdump.c (dump_bfd): Likewise.
+	* rdcoff.c (coff_get_slot): Add dhandle arg.  debug_xzalloc
+	memory in place of xcalloc.  Update callers.
+	(parse_coff_struct_type): Don't leak on error return.  Copy
+	fields over to debug_xalloc memory.
+	(parse_coff_enum_type): Copy names and vals over the
+	debug_xalloc memory.
+	* rddbg.c (read_debugging_info): Adjust debug_init call.
+	Don't free dhandle.
+	(read_section_stabs_debugging_info): Don't free shandle.
+	Adjust parse_stab call.  Call finish_stab on error return.
+	(read_symbol_stabs_debugging_info): Similarly.
+	* stabs.c (savestring): Delete unnecessary forward declaration.
+	Add dhandle param.  debug_xalloc memory.  Update callers.
+	(start_stab): Delete unnecessary casts.
+	(finish_stab): Add "emit" param.  Free file_types, so_string,
+	and stabs handle.
+	(parse_stab): Delete string_used param.  Revert code dealing
+	with string_used.  Copy so_string passed to debug_set_filename
+	and stored as main_filename to debug_xalloc memory.  Similarly
+	for string passed to debug_start_source and push_bincl.  Copy
+	args to debug_xalloc memory.  Don't leak args.
+	(parse_stab_enum_type): Copy names and values to debug_xalloc
+	memory.  Don't free name.
+	(parse_stab_struct_type): Don't free fields.
+	(parse_stab_baseclasses): Delete unnecessary cast.
+	(parse_stab_struct_fields): Return debug_xalloc fields.
+	(parse_stab_cpp_abbrev): Use debug_xalloc for _vb$ type name.
+	(parse_stab_one_struct_field): Don't free name.
+	(parse_stab_members): Copy variants and methods to
+	debug_xalloc memory.  Don't free name or argtypes.
+	(parse_stab_argtypes): Use debug_xalloc memory for physname
+	and args.
+	(push_bincl): Add dhandle param.  Use debug_xalloc memory.
+	(stab_record_variable): Use debug_xalloc memory.
+	(stab_emit_pending_vars): Don't free var list.
+	(stab_find_slot): Add dhandle param.  Use debug_xzalloc
+	memory.  Update all callers.
+	(stab_find_tagged_type): Don't free name.  Use debug_xzalloc.
+	(stab_demangle_qualified): Don't free name.
+	(stab_demangle_template): Don't free s1.
+	(stab_demangle_args): Tidy pvarargs refs.  Copy *pargs on
+	success to debug_xalloc memory, free on failure.
+	(stab_demangle_fund_type): Don't free name.
+	(stab_demangle_v3_arglist): Copy args to debug_xalloc memory.
+	Don't free dt.
+---
+ binutils/budbg.h   |   4 +-
+ binutils/debug.c   | 150 +++++++++---------
+ binutils/debug.h   |   9 +-
+ binutils/objcopy.c |   5 +-
+ binutils/objdump.c |   2 -
+ binutils/rdcoff.c  |  37 +++--
+ binutils/rddbg.c   |  50 +++---
+ binutils/stabs.c   | 381 ++++++++++++++++++++++-----------------------
+ 8 files changed, 313 insertions(+), 325 deletions(-)
+
+diff --git a/binutils/budbg.h b/binutils/budbg.h
+index 4a93b4e29b4..697b4439099 100644
+--- a/binutils/budbg.h
++++ b/binutils/budbg.h
+@@ -36,10 +36,10 @@ extern bool print_debugging_info
+ 
+ extern void *start_stab (void *, bfd *, bool, asymbol **, long);
+ 
+-extern bool finish_stab (void *, void *);
++extern bool finish_stab (void *, void *, bool);
+ 
+ extern bool parse_stab
+-  (void *, void *, int, int, bfd_vma, const char *, bool *);
++  (void *, void *, int, int, bfd_vma, const char *);
+ 
+ extern bool write_stabs_in_sections_debugging_info
+   (bfd *, void *, bfd_byte **, bfd_size_type *, bfd_byte **, bfd_size_type *);
+diff --git a/binutils/debug.c b/binutils/debug.c
+index fd9a98ad01b..53b45879e00 100644
+--- a/binutils/debug.c
++++ b/binutils/debug.c
+@@ -31,6 +31,7 @@
+ #include "bfd.h"
+ #include "libiberty.h"
+ #include "filenames.h"
++#include "bucomm.h"
+ #include "debug.h"
+ 
+ /* Global information we keep for debugging.  A pointer to this
+@@ -38,6 +39,8 @@
+ 
+ struct debug_handle
+ {
++  /* The bfd where we objalloc memory.  */
++  bfd *abfd;
+   /* A linked list of compilation units.  */
+   struct debug_unit *units;
+   /* The current compilation unit.  */
+@@ -600,7 +603,7 @@ debug_error (const char *message)
+ /* Add an object to a namespace.  */
+ 
+ static struct debug_name *
+-debug_add_to_namespace (struct debug_handle *info ATTRIBUTE_UNUSED,
++debug_add_to_namespace (struct debug_handle *info,
+ 			struct debug_namespace **nsp, const char *name,
+ 			enum debug_object_kind kind,
+ 			enum debug_object_linkage linkage)
+@@ -608,8 +611,7 @@ debug_add_to_namespace (struct debug_handle *info ATTRIBUTE_UNUSED,
+   struct debug_name *n;
+   struct debug_namespace *ns;
+ 
+-  n = (struct debug_name *) xmalloc (sizeof *n);
+-  memset (n, 0, sizeof *n);
++  n = debug_xzalloc (info, sizeof (*n));
+ 
+   n->name = name;
+   n->kind = kind;
+@@ -618,8 +620,7 @@ debug_add_to_namespace (struct debug_handle *info ATTRIBUTE_UNUSED,
+   ns = *nsp;
+   if (ns == NULL)
+     {
+-      ns = (struct debug_namespace *) xmalloc (sizeof *ns);
+-      memset (ns, 0, sizeof *ns);
++      ns = debug_xzalloc (info, sizeof (*ns));
+ 
+       ns->tail = &ns->list;
+ 
+@@ -659,13 +660,30 @@ debug_add_to_current_namespace (struct debug_handle *info, const char *name,
+ /* Return a handle for debugging information.  */
+ 
+ void *
+-debug_init (void)
++debug_init (bfd *abfd)
+ {
+   struct debug_handle *ret;
+ 
+-  ret = (struct debug_handle *) xmalloc (sizeof *ret);
+-  memset (ret, 0, sizeof *ret);
+-  return (void *) ret;
++  ret = bfd_xalloc (abfd, sizeof (*ret));
++  memset (ret, 0, sizeof (*ret));
++  ret->abfd = abfd;
++  return ret;
++}
++
++void *
++debug_xalloc (void *handle, size_t size)
++{
++  struct debug_handle *info = (struct debug_handle *) handle;
++  return bfd_xalloc (info->abfd, size);
++}
++
++void *
++debug_xzalloc (void *handle, size_t size)
++{
++  struct debug_handle *info = (struct debug_handle *) handle;
++  void *mem = bfd_xalloc (info->abfd, size);
++  memset (mem, 0, size);
++  return mem;
+ }
+ 
+ /* Set the source filename.  This implicitly starts a new compilation
+@@ -681,13 +699,11 @@ debug_set_filename (void *handle, const char *name)
+   if (name == NULL)
+     name = "";
+ 
+-  nfile = (struct debug_file *) xmalloc (sizeof *nfile);
+-  memset (nfile, 0, sizeof *nfile);
++  nfile = debug_xzalloc (info, sizeof (*nfile));
+ 
+   nfile->filename = name;
+ 
+-  nunit = (struct debug_unit *) xmalloc (sizeof *nunit);
+-  memset (nunit, 0, sizeof *nunit);
++  nunit = debug_xzalloc (info, sizeof (*nunit));
+ 
+   nunit->files = nfile;
+   info->current_file = nfile;
+@@ -713,7 +729,7 @@ debug_set_filename (void *handle, const char *name)
+    include files in a single compilation unit.  */
+ 
+ bool
+-debug_start_source (void *handle, const char *name, bool *name_used)
++debug_start_source (void *handle, const char *name)
+ {
+   struct debug_handle *info = (struct debug_handle *) handle;
+   struct debug_file *f, **pf;
+@@ -736,11 +752,8 @@ debug_start_source (void *handle, const char *name, bool *name_used)
+ 	}
+     }
+ 
+-  f = (struct debug_file *) xmalloc (sizeof *f);
+-  memset (f, 0, sizeof *f);
+-
++  f = debug_xzalloc (info, sizeof (*f));
+   f->filename = name;
+-  *name_used = true;
+ 
+   for (pf = &info->current_file->next;
+        *pf != NULL;
+@@ -782,13 +795,11 @@ debug_record_function (void *handle, const char *name,
+       return false;
+     }
+ 
+-  f = (struct debug_function *) xmalloc (sizeof *f);
+-  memset (f, 0, sizeof *f);
++  f = debug_xzalloc (info, sizeof (*f));
+ 
+   f->return_type = return_type;
+ 
+-  b = (struct debug_block *) xmalloc (sizeof *b);
+-  memset (b, 0, sizeof *b);
++  b = debug_xzalloc (info, sizeof (*b));
+ 
+   b->start = addr;
+   b->end = (bfd_vma) -1;
+@@ -834,8 +845,7 @@ debug_record_parameter (void *handle, const char *name, debug_type type,
+       return false;
+     }
+ 
+-  p = (struct debug_parameter *) xmalloc (sizeof *p);
+-  memset (p, 0, sizeof *p);
++  p = debug_xzalloc (info, sizeof (*p));
+ 
+   p->name = name;
+   p->type = type;
+@@ -900,8 +910,7 @@ debug_start_block (void *handle, bfd_vma addr)
+       return false;
+     }
+ 
+-  b = (struct debug_block *) xmalloc (sizeof *b);
+-  memset (b, 0, sizeof *b);
++  b = debug_xzalloc (info, sizeof (*b));
+ 
+   b->parent = info->current_block;
+   b->start = addr;
+@@ -988,8 +997,7 @@ debug_record_line (void *handle, unsigned long lineno, bfd_vma addr)
+      it in the right place, and make it the new current_lineno
+      structure.  */
+ 
+-  l = (struct debug_lineno *) xmalloc (sizeof *l);
+-  memset (l, 0, sizeof *l);
++  l = debug_xzalloc (info, sizeof (*l));
+ 
+   l->file = info->current_file;
+   l->linenos[0] = lineno;
+@@ -1090,8 +1098,7 @@ debug_record_typed_const (void *handle, const char *name, debug_type type,
+   if (n == NULL)
+     return false;
+ 
+-  tc = (struct debug_typed_constant *) xmalloc (sizeof *tc);
+-  memset (tc, 0, sizeof *tc);
++  tc = debug_xzalloc (info, sizeof (*tc));
+ 
+   tc->type = type;
+   tc->val = val;
+@@ -1157,8 +1164,7 @@ debug_record_variable (void *handle, const char *name, debug_type type,
+   if (n == NULL)
+     return false;
+ 
+-  v = (struct debug_variable *) xmalloc (sizeof *v);
+-  memset (v, 0, sizeof *v);
++  v = debug_xzalloc (info, sizeof (*v));
+ 
+   v->kind = kind;
+   v->type = type;
+@@ -1172,13 +1178,12 @@ debug_record_variable (void *handle, const char *name, debug_type type,
+ /* Make a type with a given kind and size.  */
+ 
+ static struct debug_type_s *
+-debug_make_type (struct debug_handle *info ATTRIBUTE_UNUSED,
++debug_make_type (struct debug_handle *info,
+ 		 enum debug_type_kind kind, unsigned int size)
+ {
+   struct debug_type_s *t;
+ 
+-  t = (struct debug_type_s *) xmalloc (sizeof *t);
+-  memset (t, 0, sizeof *t);
++  t = debug_xzalloc (info, sizeof (*t));
+ 
+   t->kind = kind;
+   t->size = size;
+@@ -1200,8 +1205,7 @@ debug_make_indirect_type (void *handle, debug_type *slot, const char *tag)
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  i = (struct debug_indirect_type *) xmalloc (sizeof *i);
+-  memset (i, 0, sizeof *i);
++  i = debug_xzalloc (info, sizeof (*i));
+ 
+   i->slot = slot;
+   i->tag = tag;
+@@ -1289,8 +1293,7 @@ debug_make_struct_type (void *handle, bool structp, bfd_vma size,
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  c = (struct debug_class_type *) xmalloc (sizeof *c);
+-  memset (c, 0, sizeof *c);
++  c = debug_xzalloc (info, sizeof (*c));
+ 
+   c->fields = fields;
+ 
+@@ -1322,8 +1325,7 @@ debug_make_object_type (void *handle, bool structp, bfd_vma size,
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  c = (struct debug_class_type *) xmalloc (sizeof *c);
+-  memset (c, 0, sizeof *c);
++  c = debug_xzalloc (info, sizeof (*c));
+ 
+   c->fields = fields;
+   c->baseclasses = baseclasses;
+@@ -1353,8 +1355,7 @@ debug_make_enum_type (void *handle, const char **names,
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  e = (struct debug_enum_type *) xmalloc (sizeof *e);
+-  memset (e, 0, sizeof *e);
++  e = debug_xzalloc (info, sizeof (*e));
+ 
+   e->names = names;
+   e->values = values;
+@@ -1407,8 +1408,7 @@ debug_make_function_type (void *handle, debug_type type,
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  f = (struct debug_function_type *) xmalloc (sizeof *f);
+-  memset (f, 0, sizeof *f);
++  f = debug_xzalloc (info, sizeof (*f));
+ 
+   f->return_type = type;
+   f->arg_types = arg_types;
+@@ -1456,8 +1456,7 @@ debug_make_range_type (void *handle, debug_type type, bfd_signed_vma lower,
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  r = (struct debug_range_type *) xmalloc (sizeof *r);
+-  memset (r, 0, sizeof *r);
++  r = debug_xzalloc (info, sizeof (*r));
+ 
+   r->type = type;
+   r->lower = lower;
+@@ -1490,8 +1489,7 @@ debug_make_array_type (void *handle, debug_type element_type,
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  a = (struct debug_array_type *) xmalloc (sizeof *a);
+-  memset (a, 0, sizeof *a);
++  a = debug_xzalloc (info, sizeof (*a));
+ 
+   a->element_type = element_type;
+   a->range_type = range_type;
+@@ -1522,8 +1520,7 @@ debug_make_set_type (void *handle, debug_type type, bool bitstringp)
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  s = (struct debug_set_type *) xmalloc (sizeof *s);
+-  memset (s, 0, sizeof *s);
++  s = debug_xzalloc (info, sizeof (*s));
+ 
+   s->type = type;
+   s->bitstringp = bitstringp;
+@@ -1553,8 +1550,7 @@ debug_make_offset_type (void *handle, debug_type base_type,
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  o = (struct debug_offset_type *) xmalloc (sizeof *o);
+-  memset (o, 0, sizeof *o);
++  o = debug_xzalloc (info, sizeof (*o));
+ 
+   o->base_type = base_type;
+   o->target_type = target_type;
+@@ -1584,8 +1580,7 @@ debug_make_method_type (void *handle, debug_type return_type,
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  m = (struct debug_method_type *) xmalloc (sizeof *m);
+-  memset (m, 0, sizeof *m);
++  m = debug_xzalloc (info, sizeof (*m));
+ 
+   m->return_type = return_type;
+   m->domain_type = domain_type;
+@@ -1678,14 +1673,14 @@ debug_make_undefined_tagged_type (void *handle, const char *name,
+    argument is the visibility of the base class.  */
+ 
+ debug_baseclass
+-debug_make_baseclass (void *handle ATTRIBUTE_UNUSED, debug_type type,
++debug_make_baseclass (void *handle, debug_type type,
+ 		      bfd_vma bitpos, bool is_virtual,
+ 		      enum debug_visibility visibility)
+ {
++  struct debug_handle *info = (struct debug_handle *) handle;
+   struct debug_baseclass_s *b;
+ 
+-  b = (struct debug_baseclass_s *) xmalloc (sizeof *b);
+-  memset (b, 0, sizeof *b);
++  b = debug_xzalloc (info, sizeof (*b));
+ 
+   b->type = type;
+   b->bitpos = bitpos;
+@@ -1702,14 +1697,14 @@ debug_make_baseclass (void *handle ATTRIBUTE_UNUSED, debug_type type,
+    of the field.  */
+ 
+ debug_field
+-debug_make_field (void *handle ATTRIBUTE_UNUSED, const char *name,
++debug_make_field (void *handle, const char *name,
+ 		  debug_type type, bfd_vma bitpos, bfd_vma bitsize,
+ 		  enum debug_visibility visibility)
+ {
++  struct debug_handle *info = (struct debug_handle *) handle;
+   struct debug_field_s *f;
+ 
+-  f = (struct debug_field_s *) xmalloc (sizeof *f);
+-  memset (f, 0, sizeof *f);
++  f = debug_xzalloc (info, sizeof (*f));
+ 
+   f->name = name;
+   f->type = type;
+@@ -1728,14 +1723,14 @@ debug_make_field (void *handle ATTRIBUTE_UNUSED, const char *name,
+    member.  */
+ 
+ debug_field
+-debug_make_static_member (void *handle ATTRIBUTE_UNUSED, const char *name,
++debug_make_static_member (void *handle, const char *name,
+ 			  debug_type type, const char *physname,
+ 			  enum debug_visibility visibility)
+ {
++  struct debug_handle *info = (struct debug_handle *) handle;
+   struct debug_field_s *f;
+ 
+-  f = (struct debug_field_s *) xmalloc (sizeof *f);
+-  memset (f, 0, sizeof *f);
++  f = debug_xzalloc (info, sizeof (*f));
+ 
+   f->name = name;
+   f->type = type;
+@@ -1750,13 +1745,13 @@ debug_make_static_member (void *handle ATTRIBUTE_UNUSED, const char *name,
+    argument is a NULL terminated array of method variants.  */
+ 
+ debug_method
+-debug_make_method (void *handle ATTRIBUTE_UNUSED, const char *name,
++debug_make_method (void *handle, const char *name,
+ 		   debug_method_variant *variants)
+ {
++  struct debug_handle *info = (struct debug_handle *) handle;
+   struct debug_method_s *m;
+ 
+-  m = (struct debug_method_s *) xmalloc (sizeof *m);
+-  memset (m, 0, sizeof *m);
++  m = debug_xzalloc (info, sizeof (*m));
+ 
+   m->name = name;
+   m->variants = variants;
+@@ -1774,16 +1769,16 @@ debug_make_method (void *handle ATTRIBUTE_UNUSED, const char *name,
+    necessary?  Could we just use debug_make_const_type?  */
+ 
+ debug_method_variant
+-debug_make_method_variant (void *handle ATTRIBUTE_UNUSED,
++debug_make_method_variant (void *handle,
+ 			   const char *physname, debug_type type,
+ 			   enum debug_visibility visibility,
+ 			   bool constp, bool volatilep,
+ 			   bfd_vma voffset, debug_type context)
+ {
++  struct debug_handle *info = (struct debug_handle *) handle;
+   struct debug_method_variant_s *m;
+ 
+-  m = (struct debug_method_variant_s *) xmalloc (sizeof *m);
+-  memset (m, 0, sizeof *m);
++  m = debug_xzalloc (info, sizeof (*m));
+ 
+   m->physname = physname;
+   m->type = type;
+@@ -1801,15 +1796,15 @@ debug_make_method_variant (void *handle ATTRIBUTE_UNUSED,
+    since a static method can not also be virtual.  */
+ 
+ debug_method_variant
+-debug_make_static_method_variant (void *handle ATTRIBUTE_UNUSED,
++debug_make_static_method_variant (void *handle,
+ 				  const char *physname, debug_type type,
+ 				  enum debug_visibility visibility,
+ 				  bool constp, bool volatilep)
+ {
++  struct debug_handle *info = (struct debug_handle *) handle;
+   struct debug_method_variant_s *m;
+ 
+-  m = (struct debug_method_variant_s *) xmalloc (sizeof *m);
+-  memset (m, 0, sizeof *m);
++  m = debug_xzalloc (info, sizeof (*m));
+ 
+   m->physname = physname;
+   m->type = type;
+@@ -1845,8 +1840,7 @@ debug_name_type (void *handle, const char *name, debug_type type)
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  n = (struct debug_named_type *) xmalloc (sizeof *n);
+-  memset (n, 0, sizeof *n);
++  n = debug_xzalloc (info, sizeof (*n));
+ 
+   n->type = type;
+ 
+@@ -1898,8 +1892,7 @@ debug_tag_type (void *handle, const char *name, debug_type type)
+   if (t == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+-  n = (struct debug_named_type *) xmalloc (sizeof *n);
+-  memset (n, 0, sizeof *n);
++  n = debug_xzalloc (info, sizeof (*n));
+ 
+   n->type = type;
+ 
+@@ -2989,8 +2982,7 @@ debug_set_class_id (struct debug_handle *info, const char *tag,
+   ++info->class_id;
+   c->id = info->class_id;
+ 
+-  l = (struct debug_class_id *) xmalloc (sizeof *l);
+-  memset (l, 0, sizeof *l);
++  l = debug_xzalloc (info, sizeof (*l));
+ 
+   l->type = type;
+   l->tag = tag;
+diff --git a/binutils/debug.h b/binutils/debug.h
+index fd19c8bc8d4..d4998950b41 100644
+--- a/binutils/debug.h
++++ b/binutils/debug.h
+@@ -425,7 +425,12 @@ struct debug_write_fns
+ 
+ /* Return a debugging handle.  */
+ 
+-extern void *debug_init (void);
++extern void *debug_init (bfd *);
++
++/* Allocate bytes on the debug handle objalloc memory pool.  */
++
++extern void *debug_xalloc (void *, size_t);
++extern void *debug_xzalloc (void *, size_t);
+ 
+ /* Set the source filename.  This implicitly starts a new compilation
+    unit.  */
+@@ -435,7 +440,7 @@ extern bool debug_set_filename (void *, const char *);
+ /* Change source files to the given file name.  This is used for
+    include files in a single compilation unit.  */
+ 
+-extern bool debug_start_source (void *, const char *, bool *);
++extern bool debug_start_source (void *, const char *);
+ 
+ /* Record a function definition.  This implicitly starts a function
+    block.  The debug_type argument is the type of the return value.
+diff --git a/binutils/objcopy.c b/binutils/objcopy.c
+index 72585ea9ed7..957fb851432 100644
+--- a/binutils/objcopy.c
++++ b/binutils/objcopy.c
+@@ -3337,15 +3337,12 @@ copy_object (bfd *ibfd, bfd *obfd, const bfd_arch_info_type *input_arch)
+       symcount = filter_symbols (ibfd, obfd, osympp, isympp, symcount);
+     }
+ 
+-  if (convert_debugging && dhandle != NULL)
++  if (dhandle != NULL)
+     {
+       bool res;
+ 
+       res = write_debugging_info (obfd, dhandle, &symcount, &osympp);
+ 
+-      free (dhandle);
+-      dhandle = NULL; /* Paranoia...  */
+-
+       if (! res)
+ 	{
+ 	  status = 1;
+diff --git a/binutils/objdump.c b/binutils/objdump.c
+index 5dac13ba868..3f4399194ad 100644
+--- a/binutils/objdump.c
++++ b/binutils/objdump.c
+@@ -5698,8 +5698,6 @@ dump_bfd (bfd *abfd, bool is_mainfile)
+ 			 bfd_get_filename (abfd));
+ 	      exit_status = 1;
+ 	    }
+-
+-	  free (dhandle);
+ 	}
+       /* PR 6483: If there was no STABS debug info in the file, try
+ 	 DWARF instead.  */
+diff --git a/binutils/rdcoff.c b/binutils/rdcoff.c
+index 95b3c54cff8..17e89e87d74 100644
+--- a/binutils/rdcoff.c
++++ b/binutils/rdcoff.c
+@@ -84,7 +84,7 @@ static debug_type parse_coff_enum_type
+ /* Return the slot for a type.  */
+ 
+ static debug_type *
+-coff_get_slot (struct coff_types **types, long indx)
++coff_get_slot (void *dhandle, struct coff_types **types, long indx)
+ {
+   unsigned int base_index;
+ 
+@@ -96,7 +96,7 @@ coff_get_slot (struct coff_types **types, long indx)
+ 
+   if (*types == NULL || (*types)->base_index != base_index)
+     {
+-      struct coff_types *n = xcalloc (1, sizeof (*n));
++      struct coff_types *n = debug_xzalloc (dhandle, sizeof (*n));
+       n->next = *types;
+       n->base_index = base_index;
+       *types = n;
+@@ -182,7 +182,7 @@ parse_coff_type (bfd *abfd, struct coff_symbols *symbols,
+ 
+       /* This is a reference to an existing type.  FIXME: gdb checks
+ 	 that the class is not C_STRTAG, nor C_UNTAG, nor C_ENTAG.  */
+-      slot = coff_get_slot (types, pauxent->x_sym.x_tagndx.u32);
++      slot = coff_get_slot (dhandle, types, pauxent->x_sym.x_tagndx.u32);
+       if (*slot != DEBUG_TYPE_NULL)
+ 	return *slot;
+       else
+@@ -309,7 +309,7 @@ parse_coff_base_type (bfd *abfd, struct coff_symbols *symbols,
+   if (name != NULL)
+     ret = debug_name_type (dhandle, name, ret);
+ 
+-  debug_type *slot = coff_get_slot (types, coff_symno);
++  debug_type *slot = coff_get_slot (dhandle, types, coff_symno);
+   *slot = ret;
+ 
+   return ret;
+@@ -324,7 +324,7 @@ parse_coff_struct_type (bfd *abfd, struct coff_symbols *symbols,
+ {
+   long symend;
+   int alloc;
+-  debug_field *fields;
++  debug_field *fields, *xfields;
+   int count;
+   bool done;
+ 
+@@ -403,7 +403,10 @@ parse_coff_struct_type (bfd *abfd, struct coff_symbols *symbols,
+ 	  f = debug_make_field (dhandle, bfd_asymbol_name (sym), ftype,
+ 				bitpos, bitsize, DEBUG_VISIBILITY_PUBLIC);
+ 	  if (f == DEBUG_FIELD_NULL)
+-	    return DEBUG_TYPE_NULL;
++	    {
++	      free (fields);
++	      return DEBUG_TYPE_NULL;
++	    }
+ 
+ 	  if (count + 1 >= alloc)
+ 	    {
+@@ -418,10 +421,13 @@ parse_coff_struct_type (bfd *abfd, struct coff_symbols *symbols,
+     }
+ 
+   fields[count] = DEBUG_FIELD_NULL;
++  xfields = debug_xalloc (dhandle, (count + 1) * sizeof (*fields));
++  memcpy (xfields, fields, (count + 1) * sizeof (*fields));
++  free (fields);
+ 
+   return debug_make_struct_type (dhandle, ntype == T_STRUCT,
+ 				 pauxent->x_sym.x_misc.x_lnsz.x_size,
+-				 fields);
++				 xfields);
+ }
+ 
+ /* Parse an enum type.  */
+@@ -433,8 +439,8 @@ parse_coff_enum_type (bfd *abfd, struct coff_symbols *symbols,
+ {
+   long symend;
+   int alloc;
+-  const char **names;
+-  bfd_signed_vma *vals;
++  const char **names, **xnames;
++  bfd_signed_vma *vals, *xvals;
+   int count;
+   bool done;
+ 
+@@ -491,8 +497,15 @@ parse_coff_enum_type (bfd *abfd, struct coff_symbols *symbols,
+     }
+ 
+   names[count] = NULL;
+-
+-  return debug_make_enum_type (dhandle, names, vals);
++  vals[count] = 0;
++  xnames = debug_xalloc (dhandle, (count + 1) * sizeof (*names));
++  memcpy (xnames, names, (count + 1) * sizeof (*names));
++  free (names);
++  xvals = debug_xalloc (dhandle, (count + 1) * sizeof (*vals));
++  memcpy (xvals, vals, (count + 1) * sizeof (*vals));
++  free (vals);
++
++  return debug_make_enum_type (dhandle, xnames, xvals);
+ }
+ 
+ /* Handle a single COFF symbol.  */
+@@ -571,7 +584,7 @@ parse_coff_symbol (bfd *abfd ATTRIBUTE_UNUSED, struct coff_types **types,
+ 
+ 	/* Store the named type into the slot, so that references get
+            the name.  */
+-	slot = coff_get_slot (types, coff_symno);
++	slot = coff_get_slot (dhandle, types, coff_symno);
+ 	*slot = type;
+       }
+       break;
+diff --git a/binutils/rddbg.c b/binutils/rddbg.c
+index fb59f526979..944b4069f95 100644
+--- a/binutils/rddbg.c
++++ b/binutils/rddbg.c
+@@ -49,7 +49,7 @@ read_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+   void *dhandle;
+   bool found;
+ 
+-  dhandle = debug_init ();
++  dhandle = debug_init (abfd);
+   if (dhandle == NULL)
+     return NULL;
+ 
+@@ -81,7 +81,6 @@ read_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 	non_fatal (_("%s: no recognized debugging information"),
+ 		   bfd_get_filename (abfd));
+     err_exit:
+-      free (dhandle);
+       return NULL;
+     }
+ 
+@@ -107,6 +106,7 @@ read_section_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+     };
+   unsigned int i;
+   void *shandle;
++  bool ret = false;
+ 
+   *pfound = false;
+   shandle = NULL;
+@@ -133,8 +133,7 @@ read_section_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 	      fprintf (stderr, "%s: %s: %s\n",
+ 		       bfd_get_filename (abfd), names[i].secname,
+ 		       bfd_errmsg (bfd_get_error ()));
+-	      free (shandle);
+-	      return false;
++	      goto out;
+ 	    }
+ 
+ 	  if (!bfd_malloc_and_get_section (abfd, strsec, &strings))
+@@ -142,9 +141,8 @@ read_section_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 	      fprintf (stderr, "%s: %s: %s\n",
+ 		       bfd_get_filename (abfd), names[i].strsecname,
+ 		       bfd_errmsg (bfd_get_error ()));
+-	      free (shandle);
+ 	      free (stabs);
+-	      return false;
++	      goto out;
+ 	    }
+ 	  /* Zero terminate the strings table, just in case.  */
+ 	  strsize = bfd_section_size (strsec);
+@@ -157,7 +155,7 @@ read_section_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 		{
+ 		  free (strings);
+ 		  free (stabs);
+-		  return false;
++		  goto out;
+ 		}
+ 	    }
+ 
+@@ -194,7 +192,6 @@ read_section_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 		{
+ 		  size_t len;
+ 		  char *f, *s;
+-		  bool f_used;
+ 
+ 		  if (stroff + strx >= strsize)
+ 		    {
+@@ -239,25 +236,20 @@ read_section_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 		      free (f);
+ 		      f = s;
+ 		    }
+-		  if (!f)
+-		    f = xstrdup (s);
+ 
+ 		  save_stab (type, desc, value, s);
+ 
+-		  if (! parse_stab (dhandle, shandle, type, desc, value,
+-				    f, &f_used))
++		  if (!parse_stab (dhandle, shandle, type, desc, value, s))
+ 		    {
+ 		      stab_context ();
+ 		      free_saved_stabs ();
+ 		      free (f);
+-		      free (shandle);
+ 		      free (stabs);
+ 		      free (strings);
+-		      return false;
++		      goto out;
+ 		    }
+ 
+-		  if (!f_used)
+-		    free (f);
++		  free (f);
+ 		}
+ 	    }
+ 
+@@ -266,14 +258,16 @@ read_section_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 	  free (strings);
+ 	}
+     }
++  ret = true;
+ 
++ out:
+   if (shandle != NULL)
+     {
+-      if (! finish_stab (dhandle, shandle))
++      if (! finish_stab (dhandle, shandle, ret))
+ 	return false;
+     }
+ 
+-  return true;
++  return ret;
+ }
+ 
+ /* Read stabs in the symbol table.  */
+@@ -297,7 +291,6 @@ read_symbol_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 	{
+ 	  const char *s;
+ 	  char *f;
+-	  bool f_used;
+ 
+ 	  if (shandle == NULL)
+ 	    {
+@@ -310,7 +303,7 @@ read_symbol_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 
+ 	  s = i.name;
+ 	  if (s == NULL || strlen (s) < 1)
+-	    return false;
++	    break;
+ 	  f = NULL;
+ 
+ 	  while (strlen (s) > 0
+@@ -328,34 +321,31 @@ read_symbol_stabs_debugging_info (bfd *abfd, asymbol **syms, long symcount,
+ 	      f = n;
+ 	      s = n;
+ 	    }
+-	  if (!f)
+-	    f = xstrdup (s);
+ 
+ 	  save_stab (i.stab_type, i.stab_desc, i.value, s);
+ 
+-	  if (! parse_stab (dhandle, shandle, i.stab_type, i.stab_desc,
+-			    i.value, f, &f_used))
++	  if (!parse_stab (dhandle, shandle, i.stab_type, i.stab_desc,
++			   i.value, s))
+ 	    {
+ 	      stab_context ();
+ 	      free (f);
+-	      free_saved_stabs ();
+-	      return false;
++	      break;
+ 	    }
+ 
+-	  if (!f_used)
+-	    free (f);
++	  free (f);
+ 	}
+     }
++  bool ret = ps >= symend;
+ 
+   free_saved_stabs ();
+ 
+   if (shandle != NULL)
+     {
+-      if (! finish_stab (dhandle, shandle))
++      if (! finish_stab (dhandle, shandle, ret))
+ 	return false;
+     }
+ 
+-  return true;
++  return ret;
+ }
+ 
+ /* Record stabs strings, so that we can give some context for errors.  */
+diff --git a/binutils/stabs.c b/binutils/stabs.c
+index f5a76dda5cc..311b73b8418 100644
+--- a/binutils/stabs.c
++++ b/binutils/stabs.c
+@@ -146,8 +146,6 @@ struct stab_tag
+   debug_type type;
+ };
+ 
+-static char *savestring (const char *, int);
+-
+ static void bad_stab (const char *);
+ static void warn_stab (const char *, const char *);
+ static bool parse_stab_string
+@@ -192,14 +190,14 @@ static bool parse_stab_tilde_field
+    bool *, const char *);
+ static debug_type parse_stab_array_type
+   (void *, struct stab_handle *, const char **, bool, const char *);
+-static void push_bincl (struct stab_handle *, const char *, bfd_vma);
++static void push_bincl (void *, struct stab_handle *, const char *, bfd_vma);
+ static const char *pop_bincl (struct stab_handle *);
+ static bool find_excl (struct stab_handle *, const char *, bfd_vma);
+ static bool stab_record_variable
+   (void *, struct stab_handle *, const char *, debug_type,
+    enum debug_var_kind, bfd_vma);
+ static bool stab_emit_pending_vars (void *, struct stab_handle *);
+-static debug_type *stab_find_slot (struct stab_handle *, const int *);
++static debug_type *stab_find_slot (void *, struct stab_handle *, const int *);
+ static debug_type stab_find_type (void *, struct stab_handle *, const int *);
+ static bool stab_record_type
+   (void *, struct stab_handle *, const int *, debug_type);
+@@ -222,11 +220,11 @@ static int demangle_flags = DMGL_ANSI;
+ /* Save a string in memory.  */
+ 
+ static char *
+-savestring (const char *start, int len)
++savestring (void *dhandle, const char *start, size_t len)
+ {
+   char *ret;
+ 
+-  ret = (char *) xmalloc (len + 1);
++  ret = debug_xalloc (dhandle, len + 1);
+   memcpy (ret, start, len);
+   ret[len] = '\0';
+   return ret;
+@@ -372,62 +370,69 @@ start_stab (void *dhandle ATTRIBUTE_UNUSED, bfd *abfd, bool sections,
+ {
+   struct stab_handle *ret;
+ 
+-  ret = (struct stab_handle *) xmalloc (sizeof *ret);
+-  memset (ret, 0, sizeof *ret);
++  ret = xmalloc (sizeof (*ret));
++  memset (ret, 0, sizeof (*ret));
+   ret->abfd = abfd;
+   ret->sections = sections;
+   ret->syms = syms;
+   ret->symcount = symcount;
+   ret->files = 1;
+-  ret->file_types = (struct stab_types **) xmalloc (sizeof *ret->file_types);
++  ret->file_types = xmalloc (sizeof (*ret->file_types));
+   ret->file_types[0] = NULL;
+-  ret->function_end = (bfd_vma) -1;
+-  return (void *) ret;
++  ret->function_end = -1;
++  return ret;
+ }
+ 
+ /* When we have processed all the stabs information, we need to go
+    through and fill in all the undefined tags.  */
+ 
+ bool
+-finish_stab (void *dhandle, void *handle)
++finish_stab (void *dhandle, void *handle, bool emit)
+ {
+   struct stab_handle *info = (struct stab_handle *) handle;
+   struct stab_tag *st;
++  bool ret = true;
+ 
+-  if (info->within_function)
++  if (emit && info->within_function)
+     {
+       if (! stab_emit_pending_vars (dhandle, info)
+ 	  || ! debug_end_function (dhandle, info->function_end))
+-	return false;
+-      info->within_function = false;
+-      info->function_end = (bfd_vma) -1;
++	ret = false;
+     }
+ 
+-  for (st = info->tags; st != NULL; st = st->next)
+-    {
+-      enum debug_type_kind kind;
++  if (emit && ret)
++    for (st = info->tags; st != NULL; st = st->next)
++      {
++	enum debug_type_kind kind;
+ 
+-      kind = st->kind;
+-      if (kind == DEBUG_KIND_ILLEGAL)
+-	kind = DEBUG_KIND_STRUCT;
+-      st->slot = debug_make_undefined_tagged_type (dhandle, st->name, kind);
+-      if (st->slot == DEBUG_TYPE_NULL)
+-	return false;
+-    }
++	kind = st->kind;
++	if (kind == DEBUG_KIND_ILLEGAL)
++	  kind = DEBUG_KIND_STRUCT;
++	st->slot = debug_make_undefined_tagged_type (dhandle, st->name, kind);
++	if (st->slot == DEBUG_TYPE_NULL)
++	  {
++	    ret = false;
++	    break;
++	  }
++      }
+ 
+-  return true;
++  free (info->file_types);
++  free (info->so_string);
++  free (info);
++  return ret;
+ }
+ 
+ /* Handle a single stabs symbol.  */
+ 
+ bool
+ parse_stab (void *dhandle, void *handle, int type, int desc, bfd_vma value,
+-	    const char *string, bool *string_used)
++	    const char *string)
+ {
+   const char * string_end;
+   struct stab_handle *info = (struct stab_handle *) handle;
++  char *copy;
++  size_t len;
+ 
+-  *string_used = false;
+   /* gcc will emit two N_SO strings per compilation unit, one for the
+      directory name and one for the file name.  We just collect N_SO
+      strings as we see them, and start the new compilation unit when
+@@ -435,9 +440,15 @@ parse_stab (void *dhandle, void *handle, int type, int desc, bfd_vma value,
+   if (info->so_string != NULL
+       && (type != N_SO || *string == '\0' || value != info->so_value))
+     {
+-      if (! debug_set_filename (dhandle, info->so_string))
++      len = strlen (info->so_string) + 1;
++      copy = debug_xalloc (dhandle, len);
++      memcpy (copy, info->so_string, len);
++      if (! debug_set_filename (dhandle, copy))
+ 	return false;
+-      info->main_filename = info->so_string;
++      info->main_filename = copy;
++
++      free (info->so_string);
++      info->so_string = NULL;
+ 
+       info->gcc_compiled = 0;
+       info->n_opt_found = false;
+@@ -451,10 +462,8 @@ parse_stab (void *dhandle, void *handle, int type, int desc, bfd_vma value,
+ 	 can only free the file_types array, not the stab_types
+ 	 list entries due to the use of debug_make_indirect_type.  */
+       info->files = 1;
+-      info->file_types = ((struct stab_types **)
+-			  xrealloc (info->file_types, sizeof *info->file_types));
++      info->file_types = xrealloc (info->file_types, sizeof (*info->file_types));
+       info->file_types[0] = NULL;
+-      info->so_string = NULL;
+ 
+       /* Now process whatever type we just got.  */
+     }
+@@ -567,29 +576,27 @@ parse_stab (void *dhandle, void *handle, int type, int desc, bfd_vma value,
+ 
+     case N_SOL:
+       /* Start an include file.  */
+-      if (! debug_start_source (dhandle, string, string_used))
++      len = strlen (string) + 1;
++      copy = debug_xalloc (dhandle, len);
++      memcpy (copy, string, len);
++      if (! debug_start_source (dhandle, copy))
+ 	return false;
+       break;
+ 
+     case N_BINCL:
+       /* Start an include file which may be replaced.  */
+-      *string_used = true;
+-      push_bincl (info, string, value);
+-      if (! debug_start_source (dhandle, string, string_used))
++      len = strlen (string) + 1;
++      copy = debug_xalloc (dhandle, len);
++      memcpy (copy, string, len);
++      push_bincl (dhandle, info, copy, value);
++      if (! debug_start_source (dhandle, copy))
+ 	return false;
+       break;
+ 
+     case N_EINCL:
+       /* End an N_BINCL include.  */
+-      string = pop_bincl (info);
+-      if (! debug_start_source (dhandle, string, string_used))
+-	{
+-	  free ((char *) string);
+-	  return false;
+-	}
+-      if (!*string_used)
+-	free ((char *) string);
+-      *string_used = false;
++      if (! debug_start_source (dhandle, pop_bincl (info)))
++	return false;
+       break;
+ 
+     case N_EXCL:
+@@ -764,7 +771,7 @@ parse_stab_string (void *dhandle, struct stab_handle *info, int stabtype,
+       if (p == string || (string[0] == ' ' && p == string + 1))
+ 	name = NULL;
+       else
+-	name = savestring (string, p - string);
++	name = savestring (dhandle, string, p - string);
+     }
+ 
+   ++p;
+@@ -1233,7 +1240,7 @@ parse_stab_type (void *                dhandle,
+ 	 the stabs information records both i and j as having the same
+ 	 type.  This could be fixed by patching the compiler.  */
+       if (slotp != NULL && typenums[0] >= 0 && typenums[1] >= 0)
+-	*slotp = stab_find_slot (info, typenums);
++	*slotp = stab_find_slot (dhandle, info, typenums);
+ 
+       /* Type is being defined here.  */
+       /* Skip the '='.  */
+@@ -1518,7 +1525,7 @@ parse_stab_type (void *                dhandle,
+ 	{
+ 	  debug_type domain;
+ 	  debug_type return_type;
+-	  debug_type *args;
++	  debug_type *args, *xargs;
+ 	  unsigned int n;
+ 	  unsigned int alloc;
+ 	  bool varargs;
+@@ -1541,13 +1548,14 @@ parse_stab_type (void *                dhandle,
+ 	    return DEBUG_TYPE_NULL;
+ 
+ 	  alloc = 10;
+-	  args = (debug_type *) xmalloc (alloc * sizeof *args);
++	  args = xmalloc (alloc * sizeof (*args));
+ 	  n = 0;
+ 	  while (**pp != ';')
+ 	    {
+ 	      if (**pp != ',')
+ 		{
+ 		  bad_stab (orig);
++		  free (args);
+ 		  return DEBUG_TYPE_NULL;
+ 		}
+ 	      ++*pp;
+@@ -1555,14 +1563,16 @@ parse_stab_type (void *                dhandle,
+ 	      if (n + 1 >= alloc)
+ 		{
+ 		  alloc += 10;
+-		  args = ((debug_type *)
+-			  xrealloc (args, alloc * sizeof *args));
++		  args = xrealloc (args, alloc * sizeof (*args));
+ 		}
+ 
+ 	      args[n] = parse_stab_type (dhandle, info, (const char *) NULL,
+ 					 pp, (debug_type **) NULL, p_end);
+ 	      if (args[n] == DEBUG_TYPE_NULL)
+-		return DEBUG_TYPE_NULL;
++		{
++		  free (args);
++		  return DEBUG_TYPE_NULL;
++		}
+ 	      ++n;
+ 	    }
+ 	  ++*pp;
+@@ -1580,8 +1590,11 @@ parse_stab_type (void *                dhandle,
+ 	    }
+ 
+ 	  args[n] = DEBUG_TYPE_NULL;
++	  xargs = debug_xalloc (dhandle, (n + 1) * sizeof (*args));
++	  memcpy (xargs, args, (n + 1) * sizeof (*args));
++	  free (args);
+ 
+-	  dtype = debug_make_method_type (dhandle, return_type, domain, args,
++	  dtype = debug_make_method_type (dhandle, return_type, domain, xargs,
+ 					  varargs);
+ 	}
+       break;
+@@ -2008,8 +2021,8 @@ static debug_type
+ parse_stab_enum_type (void *dhandle, const char **pp, const char * p_end)
+ {
+   const char *orig;
+-  const char **names;
+-  bfd_signed_vma *values;
++  const char **names, **xnames;
++  bfd_signed_vma *values, *xvalues;
+   unsigned int n;
+   unsigned int alloc;
+ 
+@@ -2038,8 +2051,8 @@ parse_stab_enum_type (void *dhandle, const char **pp, const char * p_end)
+      The input syntax is NAME:VALUE,NAME:VALUE, and so on.
+      A semicolon or comma instead of a NAME means the end.  */
+   alloc = 10;
+-  names = (const char **) xmalloc (alloc * sizeof *names);
+-  values = (bfd_signed_vma *) xmalloc (alloc * sizeof *values);
++  names = xmalloc (alloc * sizeof (*names));
++  values = xmalloc (alloc * sizeof (*values));
+   n = 0;
+   while (**pp != '\0' && **pp != ';' && **pp != ',')
+     {
+@@ -2059,14 +2072,13 @@ parse_stab_enum_type (void *dhandle, const char **pp, const char * p_end)
+ 	  return DEBUG_TYPE_NULL;
+ 	}
+ 
+-      name = savestring (*pp, p - *pp);
++      name = savestring (dhandle, *pp, p - *pp);
+ 
+       *pp = p + 1;
+       val = (bfd_signed_vma) parse_number (pp, (bool *) NULL, p_end);
+       if (**pp != ',')
+ 	{
+ 	  bad_stab (orig);
+-	  free (name);
+ 	  free (names);
+ 	  free (values);
+ 	  return DEBUG_TYPE_NULL;
+@@ -2076,10 +2088,8 @@ parse_stab_enum_type (void *dhandle, const char **pp, const char * p_end)
+       if (n + 1 >= alloc)
+ 	{
+ 	  alloc += 10;
+-	  names = ((const char **)
+-		   xrealloc (names, alloc * sizeof *names));
+-	  values = ((bfd_signed_vma *)
+-		    xrealloc (values, alloc * sizeof *values));
++	  names = xrealloc (names, alloc * sizeof (*names));
++	  values = xrealloc (values, alloc * sizeof (*values));
+ 	}
+ 
+       names[n] = name;
+@@ -2089,11 +2099,17 @@ parse_stab_enum_type (void *dhandle, const char **pp, const char * p_end)
+ 
+   names[n] = NULL;
+   values[n] = 0;
++  xnames = debug_xalloc (dhandle, (n + 1) * sizeof (*names));
++  memcpy (xnames, names, (n + 1) * sizeof (*names));
++  free (names);
++  xvalues = debug_xalloc (dhandle, (n + 1) * sizeof (*names));
++  memcpy (xvalues, values, (n + 1) * sizeof (*names));
++  free (values);
+ 
+   if (**pp == ';')
+     ++*pp;
+ 
+-  return debug_make_enum_type (dhandle, names, values);
++  return debug_make_enum_type (dhandle, xnames, xvalues);
+ }
+ 
+ /* Read the description of a structure (or union type) and return an object
+@@ -2129,10 +2145,7 @@ parse_stab_struct_type (void *dhandle,
+       || ! parse_stab_members (dhandle, info, tagname, pp, typenums, &methods, p_end)
+       || ! parse_stab_tilde_field (dhandle, info, pp, typenums, &vptrbase,
+ 				   &ownvptr, p_end))
+-    {
+-      free (fields);
+-      return DEBUG_TYPE_NULL;
+-    }
++    return DEBUG_TYPE_NULL;
+ 
+   if (! statics
+       && baseclasses == NULL
+@@ -2202,7 +2215,7 @@ parse_stab_baseclasses (void *                dhandle,
+     }
+   ++*pp;
+ 
+-  classes = (debug_baseclass *) xmalloc ((c + 1) * sizeof (**retp));
++  classes = debug_xalloc (dhandle, (c + 1) * sizeof (*classes));
+ 
+   for (i = 0; i < c; i++)
+     {
+@@ -2313,7 +2326,7 @@ parse_stab_struct_fields (void *dhandle,
+ {
+   const char *orig;
+   const char *p;
+-  debug_field *fields;
++  debug_field *fields, *xfields;
+   unsigned int c;
+   unsigned int alloc;
+ 
+@@ -2326,7 +2339,7 @@ parse_stab_struct_fields (void *dhandle,
+ 
+   c = 0;
+   alloc = 10;
+-  fields = (debug_field *) xmalloc (alloc * sizeof *fields);
++  fields = xmalloc (alloc * sizeof (*fields));
+   while (**pp != ';')
+     {
+       /* FIXME: gdb checks os9k_stabs here.  */
+@@ -2337,8 +2350,7 @@ parse_stab_struct_fields (void *dhandle,
+       if (c + 1 >= alloc)
+ 	{
+ 	  alloc += 10;
+-	  fields = ((debug_field *)
+-		    xrealloc (fields, alloc * sizeof *fields));
++	  fields = xrealloc (fields, alloc * sizeof (*fields));
+ 	}
+ 
+       /* If it starts with CPLUS_MARKER it is a special abbreviation,
+@@ -2387,8 +2399,11 @@ parse_stab_struct_fields (void *dhandle,
+     }
+ 
+   fields[c] = DEBUG_FIELD_NULL;
++  xfields = debug_xalloc (dhandle, (c + 1) * sizeof (*fields));
++  memcpy (xfields, fields, (c + 1) * sizeof (*fields));
++  free (fields);
+ 
+-  *retp = fields;
++  *retp = xfields;
+ 
+   return true;
+ }
+@@ -2409,6 +2424,7 @@ parse_stab_cpp_abbrev (void *                dhandle,
+   const char *type_name;
+   debug_type type;
+   bfd_vma bitpos;
++  size_t len;
+ 
+   *retp = DEBUG_FIELD_NULL;
+ 
+@@ -2455,7 +2471,10 @@ parse_stab_cpp_abbrev (void *                dhandle,
+ 	  warn_stab (orig, _("unnamed $vb type"));
+ 	  type_name = "FOO";
+ 	}
+-      name = concat ("_vb$", type_name, (const char *) NULL);
++      len = strlen (type_name);
++      name = debug_xalloc (dhandle, len + sizeof ("_vb$"));
++      memcpy ((char *) name, "_vb$", sizeof ("_vb$") - 1);
++      memcpy ((char *) name + sizeof ("_vb$") - 1, type_name, len + 1);
+       break;
+     default:
+       warn_stab (orig, _("unrecognized C++ abbreviation"));
+@@ -2519,7 +2538,7 @@ parse_stab_one_struct_field (void *dhandle,
+ 
+   /* FIXME: gdb checks ARM_DEMANGLING here.  */
+ 
+-  name = savestring (*pp, p - *pp);
++  name = savestring (dhandle, *pp, p - *pp);
+ 
+   *pp = p + 1;
+ 
+@@ -2553,10 +2572,7 @@ parse_stab_one_struct_field (void *dhandle,
+   type = parse_stab_type (dhandle, info, (const char *) NULL, pp,
+ 			  (debug_type **) NULL, p_end);
+   if (type == DEBUG_TYPE_NULL)
+-    {
+-      free (name);
+-      return false;
+-    }
++    return false;
+ 
+   if (**pp == ':')
+     {
+@@ -2568,11 +2584,10 @@ parse_stab_one_struct_field (void *dhandle,
+       if (p == NULL)
+ 	{
+ 	  bad_stab (orig);
+-	  free (name);
+ 	  return false;
+ 	}
+ 
+-      varname = savestring (*pp, p - *pp);
++      varname = savestring (dhandle, *pp, p - *pp);
+ 
+       *pp = p + 1;
+ 
+@@ -2586,7 +2601,6 @@ parse_stab_one_struct_field (void *dhandle,
+   if (**pp != ',')
+     {
+       bad_stab (orig);
+-      free (name);
+       return false;
+     }
+   ++*pp;
+@@ -2595,7 +2609,6 @@ parse_stab_one_struct_field (void *dhandle,
+   if (**pp != ',')
+     {
+       bad_stab (orig);
+-      free (name);
+       return false;
+     }
+   ++*pp;
+@@ -2604,7 +2617,6 @@ parse_stab_one_struct_field (void *dhandle,
+   if (**pp != ';')
+     {
+       bad_stab (orig);
+-      free (name);
+       return false;
+     }
+   ++*pp;
+@@ -2657,11 +2669,11 @@ parse_stab_members (void *                dhandle,
+ 		    const char *          p_end)
+ {
+   const char *orig;
+-  debug_method *methods;
++  debug_method *methods, *xmethods;
+   unsigned int c;
+   unsigned int alloc;
+   char *name = NULL;
+-  debug_method_variant *variants = NULL;
++  debug_method_variant *variants = NULL, *xvariants;
+   char *argtypes = NULL;
+ 
+   *retp = NULL;
+@@ -2688,7 +2700,7 @@ parse_stab_members (void *                dhandle,
+       /* FIXME: Some systems use something other than '$' here.  */
+       if ((*pp)[0] != 'o' || (*pp)[1] != 'p' || (*pp)[2] != '$')
+ 	{
+-	  name = savestring (*pp, p - *pp);
++	  name = savestring (dhandle, *pp, p - *pp);
+ 	  *pp = p + 2;
+ 	}
+       else
+@@ -2707,13 +2719,12 @@ parse_stab_members (void *                dhandle,
+ 	      bad_stab (orig);
+ 	      goto fail;
+ 	    }
+-	  name = savestring (*pp, p - *pp);
++	  name = savestring (dhandle, *pp, p - *pp);
+ 	  *pp = p + 1;
+ 	}
+ 
+       allocvars = 10;
+-      variants = ((debug_method_variant *)
+-		  xmalloc (allocvars * sizeof *variants));
++      variants = xmalloc (allocvars * sizeof (*variants));
+       cvars = 0;
+ 
+       look_ahead_type = DEBUG_TYPE_NULL;
+@@ -2762,7 +2773,7 @@ parse_stab_members (void *                dhandle,
+ 	      && debug_get_parameter_types (dhandle, type, &varargs) == NULL)
+ 	    stub = true;
+ 
+-	  argtypes = savestring (*pp, p - *pp);
++	  argtypes = savestring (dhandle, *pp, p - *pp);
+ 	  *pp = p + 1;
+ 
+ 	  switch (**pp)
+@@ -2919,9 +2930,7 @@ parse_stab_members (void *                dhandle,
+ 	  if (cvars + 1 >= allocvars)
+ 	    {
+ 	      allocvars += 10;
+-	      variants = ((debug_method_variant *)
+-			  xrealloc (variants,
+-				    allocvars * sizeof *variants));
++	      variants = xrealloc (variants, allocvars * sizeof (*variants));
+ 	    }
+ 
+ 	  if (! staticp)
+@@ -2944,6 +2953,9 @@ parse_stab_members (void *                dhandle,
+       while (**pp != ';' && **pp != '\0');
+ 
+       variants[cvars] = DEBUG_METHOD_VARIANT_NULL;
++      xvariants = debug_xalloc (dhandle, (cvars + 1) * sizeof (*variants));
++      memcpy (xvariants, variants, (cvars + 1) * sizeof (*variants));
++      free (variants);
+ 
+       if (**pp != '\0')
+ 	++*pp;
+@@ -2951,26 +2963,30 @@ parse_stab_members (void *                dhandle,
+       if (c + 1 >= alloc)
+ 	{
+ 	  alloc += 10;
+-	  methods = ((debug_method *)
+-		     xrealloc (methods, alloc * sizeof *methods));
++	  methods = xrealloc (methods, alloc * sizeof (*methods));
+ 	}
+ 
+-      methods[c] = debug_make_method (dhandle, name, variants);
++      methods[c] = debug_make_method (dhandle, name, xvariants);
+ 
+       ++c;
+     }
+ 
++  xmethods = methods;
+   if (methods != NULL)
+-    methods[c] = DEBUG_METHOD_NULL;
++    {
++      methods[c] = DEBUG_METHOD_NULL;
++      xmethods = debug_xalloc (dhandle, (c + 1) * sizeof (*methods));
++      memcpy (xmethods, methods, (c + 1) * sizeof (*methods));
++      free (methods);
++    }
+ 
+-  *retp = methods;
++  *retp = xmethods;
+ 
+   return true;
+ 
+  fail:
+-  free (name);
+   free (variants);
+-  free (argtypes);
++  free (methods);
+   return false;
+ }
+ 
+@@ -3051,7 +3067,7 @@ parse_stab_argtypes (void *dhandle, struct stab_handle *info,
+ 	  return DEBUG_TYPE_NULL;
+ 	}
+ 
+-      physname = (char *) xmalloc (mangled_name_len);
++      physname = debug_xalloc (dhandle, mangled_name_len);
+       if (is_constructor)
+ 	physname[0] = '\0';
+       else
+@@ -3068,7 +3084,7 @@ parse_stab_argtypes (void *dhandle, struct stab_handle *info,
+ 
+   if (*argtypes == '\0' || is_destructor)
+     {
+-      args = (debug_type *) xmalloc (sizeof *args);
++      args = debug_xalloc (dhandle, sizeof (*args));
+       *args = NULL;
+       return debug_make_method_type (dhandle, return_type, class_type, args,
+ 				     false);
+@@ -3290,11 +3306,12 @@ struct bincl_file
+ /* Start a new N_BINCL file, pushing it onto the stack.  */
+ 
+ static void
+-push_bincl (struct stab_handle *info, const char *name, bfd_vma hash)
++push_bincl (void *dhandle, struct stab_handle *info, const char *name,
++	    bfd_vma hash)
+ {
+   struct bincl_file *n;
+ 
+-  n = (struct bincl_file *) xmalloc (sizeof *n);
++  n = debug_xalloc (dhandle, sizeof *n);
+   n->next = info->bincl_list;
+   n->next_stack = info->bincl_stack;
+   n->name = name;
+@@ -3305,10 +3322,8 @@ push_bincl (struct stab_handle *info, const char *name, bfd_vma hash)
+   info->bincl_stack = n;
+ 
+   ++info->files;
+-  info->file_types = ((struct stab_types **)
+-		      xrealloc (info->file_types,
+-				(info->files
+-				 * sizeof *info->file_types)));
++  info->file_types = xrealloc (info->file_types,
++			       info->files * sizeof (*info->file_types));
+   info->file_types[n->file] = NULL;
+ }
+ 
+@@ -3343,10 +3358,8 @@ find_excl (struct stab_handle *info, const char *name, bfd_vma hash)
+   struct bincl_file *l;
+ 
+   ++info->files;
+-  info->file_types = ((struct stab_types **)
+-		      xrealloc (info->file_types,
+-				(info->files
+-				 * sizeof *info->file_types)));
++  info->file_types = xrealloc (info->file_types,
++			       info->files * sizeof (*info->file_types));
+ 
+   for (l = info->bincl_list; l != NULL; l = l->next)
+     if (l->hash == hash && strcmp (l->name, name) == 0)
+@@ -3380,8 +3393,7 @@ stab_record_variable (void *dhandle, struct stab_handle *info,
+       || (info->gcc_compiled == 0 && info->n_opt_found))
+     return debug_record_variable (dhandle, name, type, kind, val);
+ 
+-  v = (struct stab_pending_var *) xmalloc (sizeof *v);
+-  memset (v, 0, sizeof *v);
++  v = debug_xzalloc (dhandle, sizeof (*v));
+ 
+   v->next = info->pending;
+   v->name = name;
+@@ -3404,14 +3416,10 @@ stab_emit_pending_vars (void *dhandle, struct stab_handle *info)
+   v = info->pending;
+   while (v != NULL)
+     {
+-      struct stab_pending_var *next;
+-
+       if (! debug_record_variable (dhandle, v->name, v->type, v->kind, v->val))
+ 	return false;
+ 
+-      next = v->next;
+-      free (v);
+-      v = next;
++      v = v->next;
+     }
+ 
+   info->pending = NULL;
+@@ -3422,7 +3430,7 @@ stab_emit_pending_vars (void *dhandle, struct stab_handle *info)
+ /* Find the slot for a type in the database.  */
+ 
+ static debug_type *
+-stab_find_slot (struct stab_handle *info, const int *typenums)
++stab_find_slot (void *dhandle, struct stab_handle *info, const int *typenums)
+ {
+   unsigned int filenum;
+   unsigned int tindex;
+@@ -3446,7 +3454,7 @@ stab_find_slot (struct stab_handle *info, const int *typenums)
+ 
+   if (*ps == NULL || (*ps)->base_index != base_index)
+     {
+-      struct stab_types *n = xcalloc (1, sizeof (*n));
++      struct stab_types *n = debug_xzalloc (dhandle, sizeof (*n));
+       n->next = *ps;
+       n->base_index = base_index;
+       *ps = n;
+@@ -3469,7 +3477,7 @@ stab_find_type (void *dhandle, struct stab_handle *info, const int *typenums)
+       return stab_xcoff_builtin_type (dhandle, info, typenums[1]);
+     }
+ 
+-  slot = stab_find_slot (info, typenums);
++  slot = stab_find_slot (dhandle, info, typenums);
+   if (slot == NULL)
+     return DEBUG_TYPE_NULL;
+ 
+@@ -3482,12 +3490,12 @@ stab_find_type (void *dhandle, struct stab_handle *info, const int *typenums)
+ /* Record that a given type number refers to a given type.  */
+ 
+ static bool
+-stab_record_type (void *dhandle ATTRIBUTE_UNUSED, struct stab_handle *info,
++stab_record_type (void *dhandle, struct stab_handle *info,
+ 		  const int *typenums, debug_type type)
+ {
+   debug_type *slot;
+ 
+-  slot = stab_find_slot (info, typenums);
++  slot = stab_find_slot (dhandle, info, typenums);
+   if (slot == NULL)
+     return false;
+ 
+@@ -3685,17 +3693,14 @@ stab_find_tagged_type (void *dhandle, struct stab_handle *info,
+   debug_type dtype;
+   struct stab_tag *st;
+ 
+-  name = savestring (p, len);
++  name = savestring (dhandle, p, len);
+ 
+   /* We pass DEBUG_KIND_ILLEGAL because we want all tags in the same
+      namespace.  This is right for C, and I don't know how to handle
+      other languages.  FIXME.  */
+   dtype = debug_find_tagged_type (dhandle, name, DEBUG_KIND_ILLEGAL);
+   if (dtype != DEBUG_TYPE_NULL)
+-    {
+-      free (name);
+-      return dtype;
+-    }
++    return dtype;
+ 
+   /* We need to allocate an entry on the undefined tag list.  */
+   for (st = info->tags; st != NULL; st = st->next)
+@@ -3705,14 +3710,12 @@ stab_find_tagged_type (void *dhandle, struct stab_handle *info,
+ 	{
+ 	  if (st->kind == DEBUG_KIND_ILLEGAL)
+ 	    st->kind = kind;
+-	  free (name);
+ 	  break;
+ 	}
+     }
+   if (st == NULL)
+     {
+-      st = (struct stab_tag *) xmalloc (sizeof *st);
+-      memset (st, 0, sizeof *st);
++      st = debug_xzalloc (dhandle, sizeof (*st));
+ 
+       st->next = info->tags;
+       st->name = name;
+@@ -3875,9 +3878,8 @@ stab_demangle_argtypes (void *dhandle, struct stab_handle *info,
+   minfo.args = NULL;
+   minfo.varargs = false;
+   minfo.typestring_alloc = 10;
+-  minfo.typestrings = ((struct stab_demangle_typestring *)
+-		       xmalloc (minfo.typestring_alloc
+-				* sizeof *minfo.typestrings));
++  minfo.typestrings
++    = xmalloc (minfo.typestring_alloc * sizeof (*minfo.typestrings));
+   minfo.typestring_count = 0;
+ 
+   /* cplus_demangle checks for special GNU mangled forms, but we can't
+@@ -3893,7 +3895,6 @@ stab_demangle_argtypes (void *dhandle, struct stab_handle *info,
+     }
+ 
+   free (minfo.typestrings);
+-  minfo.typestrings = NULL;
+ 
+   if (minfo.args == NULL)
+     fprintf (stderr, _("no argument types in mangled string\n"));
+@@ -4212,7 +4213,6 @@ stab_demangle_qualified (struct stab_demangle_info *minfo, const char **pp,
+ 	      context = stab_find_tagged_type (minfo->dhandle, minfo->info,
+ 					       name, strlen (name),
+ 					       DEBUG_KIND_CLASS);
+-	      free (name);
+ 	      if (context == DEBUG_TYPE_NULL)
+ 		return false;
+ 	    }
+@@ -4250,7 +4250,7 @@ stab_demangle_qualified (struct stab_demangle_info *minfo, const char **pp,
+                      not give us enough information to figure out the
+                      latter case.  */
+ 
+-		  name = savestring (*pp, len);
++		  name = savestring (minfo->dhandle, *pp, len);
+ 
+ 		  for (; *fields != DEBUG_FIELD_NULL; fields++)
+ 		    {
+@@ -4259,10 +4259,7 @@ stab_demangle_qualified (struct stab_demangle_info *minfo, const char **pp,
+ 
+ 		      ft = debug_get_field_type (minfo->dhandle, *fields);
+ 		      if (ft == NULL)
+-			{
+-			  free (name);
+-			  return false;
+-			}
++			return false;
+ 		      dn = debug_get_type_name (minfo->dhandle, ft);
+ 		      if (dn != NULL && strcmp (dn, name) == 0)
+ 			{
+@@ -4270,8 +4267,6 @@ stab_demangle_qualified (struct stab_demangle_info *minfo, const char **pp,
+ 			  break;
+ 			}
+ 		    }
+-
+-		  free (name);
+ 		}
+ 
+ 	      if (context == DEBUG_TYPE_NULL)
+@@ -4284,10 +4279,9 @@ stab_demangle_qualified (struct stab_demangle_info *minfo, const char **pp,
+ 		    {
+ 		      char *name;
+ 
+-		      name = savestring (*pp, len);
++		      name = savestring (minfo->dhandle, *pp, len);
+ 		      context = debug_find_named_type (minfo->dhandle,
+ 						       name);
+-		      free (name);
+ 		    }
+ 
+ 		  if (context == DEBUG_TYPE_NULL)
+@@ -4501,12 +4495,10 @@ stab_demangle_template (struct stab_demangle_info *minfo, const char **pp,
+       char *s1, *s2, *s3, *s4 = NULL;
+       char *from, *to;
+ 
+-      s1 = savestring (orig, *pp - orig);
++      s1 = savestring (minfo->dhandle, orig, *pp - orig);
+ 
+       s2 = concat ("NoSuchStrinG__", s1, (const char *) NULL);
+ 
+-      free (s1);
+-
+       s3 = cplus_demangle (s2, demangle_flags);
+ 
+       free (s2);
+@@ -4528,7 +4520,7 @@ stab_demangle_template (struct stab_demangle_info *minfo, const char **pp,
+ 	    || (from[1] == '>' && from > s3 && from[-1] == '>'))
+ 	  *to++ = *from;
+ 
+-      *pname = savestring (s3, to - s3);
++      *pname = savestring (minfo->dhandle, s3, to - s3);
+ 
+       free (s3);
+     }
+@@ -4576,10 +4568,9 @@ stab_demangle_args (struct stab_demangle_info *minfo, const char **pp,
+ 
+   alloc = 10;
+   if (pargs != NULL)
+-    {
+-      *pargs = (debug_type *) xmalloc (alloc * sizeof **pargs);
+-      *pvarargs = false;
+-    }
++    *pargs = xmalloc (alloc * sizeof (**pargs));
++  if (pvarargs != NULL)
++    *pvarargs = false;
+   count = 0;
+ 
+   while (**pp != '_' && **pp != '\0' && **pp != 'e')
+@@ -4597,50 +4588,56 @@ stab_demangle_args (struct stab_demangle_info *minfo, const char **pp,
+ 	  else
+ 	    {
+ 	      if (! stab_demangle_get_count (pp, &r))
+-		{
+-		  stab_bad_demangle (orig);
+-		  return false;
+-		}
++		goto bad;
+ 	    }
+ 
+-	  if (! stab_demangle_get_count (pp, &t))
+-	    {
+-	      stab_bad_demangle (orig);
+-	      return false;
+-	    }
++	  if (!stab_demangle_get_count (pp, &t)
++	      || t >= minfo->typestring_count)
++	    goto bad;
+ 
+-	  if (t >= minfo->typestring_count)
+-	    {
+-	      stab_bad_demangle (orig);
+-	      return false;
+-	    }
+ 	  while (r-- > 0)
+ 	    {
+ 	      const char *tem;
+ 
+ 	      tem = minfo->typestrings[t].typestring;
+ 	      if (! stab_demangle_arg (minfo, &tem, pargs, &count, &alloc))
+-		return false;
++		goto fail;
+ 	    }
+ 	}
+       else
+ 	{
+ 	  if (! stab_demangle_arg (minfo, pp, pargs, &count, &alloc))
+-	    return false;
++	    goto fail;
+ 	}
+     }
+ 
+   if (pargs != NULL)
+-    (*pargs)[count] = DEBUG_TYPE_NULL;
++    {
++      debug_type *xargs;
++      (*pargs)[count] = DEBUG_TYPE_NULL;
++       xargs = debug_xalloc (minfo->dhandle, (count + 1) * sizeof (*xargs));
++       memcpy (xargs, *pargs, (count + 1) * sizeof (*xargs));
++       free (*pargs);
++       *pargs = xargs;
++    }
+ 
+   if (**pp == 'e')
+     {
+-      if (pargs != NULL)
++      if (pvarargs != NULL)
+ 	*pvarargs = true;
+       ++*pp;
+     }
+-
+   return true;
++
++ bad:
++  stab_bad_demangle (orig);
++ fail:
++  if (pargs != NULL)
++    {
++      free (*pargs);
++      *pargs = NULL;
++    }
++  return false;
+ }
+ 
+ /* Demangle a single argument.  */
+@@ -4667,8 +4664,7 @@ stab_demangle_arg (struct stab_demangle_info *minfo, const char **pp,
+       if (*pcount + 1 >= *palloc)
+ 	{
+ 	  *palloc += 10;
+-	  *pargs = ((debug_type *)
+-		    xrealloc (*pargs, *palloc * sizeof **pargs));
++	  *pargs = xrealloc (*pargs, *palloc * sizeof (**pargs));
+ 	}
+       (*pargs)[*pcount] = type;
+       ++*pcount;
+@@ -5140,9 +5136,8 @@ stab_demangle_fund_type (struct stab_demangle_info *minfo, const char **pp,
+ 	  {
+ 	    char *name;
+ 
+-	    name = savestring (hold, *pp - hold);
++	    name = savestring (minfo->dhandle, hold, *pp - hold);
+ 	    *ptype = debug_find_named_type (minfo->dhandle, name);
+-	    free (name);
+ 	    if (*ptype == DEBUG_TYPE_NULL)
+ 	      {
+ 		/* FIXME: It is probably incorrect to assume that
+@@ -5169,7 +5164,6 @@ stab_demangle_fund_type (struct stab_demangle_info *minfo, const char **pp,
+ 	    *ptype = stab_find_tagged_type (minfo->dhandle, minfo->info,
+ 					    name, strlen (name),
+ 					    DEBUG_KIND_CLASS);
+-	    free (name);
+ 	    if (*ptype == DEBUG_TYPE_NULL)
+ 	      return false;
+ 	  }
+@@ -5201,10 +5195,9 @@ stab_demangle_remember_type (struct stab_demangle_info *minfo,
+   if (minfo->typestring_count >= minfo->typestring_alloc)
+     {
+       minfo->typestring_alloc += 10;
+-      minfo->typestrings = ((struct stab_demangle_typestring *)
+-			    xrealloc (minfo->typestrings,
+-				      (minfo->typestring_alloc
+-				       * sizeof *minfo->typestrings)));
++      minfo->typestrings
++	= xrealloc (minfo->typestrings,
++		    minfo->typestring_alloc * sizeof (*minfo->typestrings));
+     }
+ 
+   minfo->typestrings[minfo->typestring_count].typestring = p;
+@@ -5269,10 +5262,10 @@ stab_demangle_v3_arglist (void *dhandle, struct stab_handle *info,
+ {
+   struct demangle_component *dc;
+   unsigned int alloc, count;
+-  debug_type *pargs;
++  debug_type *pargs, *xargs;
+ 
+   alloc = 10;
+-  pargs = (debug_type *) xmalloc (alloc * sizeof *pargs);
++  pargs = xmalloc (alloc * sizeof (*pargs));
+   *pvarargs = false;
+ 
+   count = 0;
+@@ -5312,7 +5305,7 @@ stab_demangle_v3_arglist (void *dhandle, struct stab_handle *info,
+       if (count + 1 >= alloc)
+ 	{
+ 	  alloc += 10;
+-	  pargs = (debug_type *) xrealloc (pargs, alloc * sizeof *pargs);
++	  pargs = xrealloc (pargs, alloc * sizeof (*pargs));
+ 	}
+ 
+       pargs[count] = arg;
+@@ -5320,8 +5313,11 @@ stab_demangle_v3_arglist (void *dhandle, struct stab_handle *info,
+     }
+ 
+   pargs[count] = DEBUG_TYPE_NULL;
++  xargs = debug_xalloc (dhandle, (count + 1) * sizeof (*pargs));
++  memcpy (xargs, pargs, (count + 1) * sizeof (*pargs));
++  free (pargs);
+ 
+-  return pargs;
++  return xargs;
+ }
+ 
+ /* Convert a struct demangle_component tree describing an argument
+@@ -5473,10 +5469,7 @@ stab_demangle_v3_arg (void *dhandle, struct stab_handle *info,
+ 					  dc->u.s_binary.right,
+ 					  &varargs);
+ 	if (pargs == NULL)
+-	  {
+-	    free (dt);
+-	    return NULL;
+-	  }
++	  return NULL;
+ 
+ 	return debug_make_function_type (dhandle, dt, pargs, varargs);
+       }
+-- 
+GitLab
+

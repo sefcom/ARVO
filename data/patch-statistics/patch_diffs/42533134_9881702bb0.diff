@@ -1,0 +1,86 @@
+From 093e1359258c2465c611e50315fddcf20b7afc78 Mon Sep 17 00:00:00 2001
+From: Christian Mazakas <christian.mazakas@gmail.com>
+Date: Fri, 20 Dec 2024 11:11:31 -0800
+Subject: [PATCH] fix overflow bug when attempting to access match results
+
+---
+ include/boost/regex/v5/match_results.hpp |  4 ++++
+ include/boost/regex/v5/syntax_type.hpp   |  2 ++
+ test/Jamfile.v2                          |  1 +
+ test/regex_replace_overflow.cpp          | 29 ++++++++++++++++++++++++
+ 4 files changed, 36 insertions(+)
+ create mode 100644 test/regex_replace_overflow.cpp
+
+diff --git a/include/boost/regex/v5/match_results.hpp b/include/boost/regex/v5/match_results.hpp
+index b10585ca7..7e8721050 100644
+--- a/include/boost/regex/v5/match_results.hpp
++++ b/include/boost/regex/v5/match_results.hpp
+@@ -227,6 +227,10 @@ class match_results
+    {
+       if(m_is_singular && m_subs.empty())
+          raise_logic_error();
++      
++      if (sub >= INT_MAX - 2 )
++         return m_null;
++
+       sub += 2;
+       if(sub < (int)m_subs.size() && (sub >= 0))
+       {
+diff --git a/include/boost/regex/v5/syntax_type.hpp b/include/boost/regex/v5/syntax_type.hpp
+index af66ad73a..7824d2d39 100644
+--- a/include/boost/regex/v5/syntax_type.hpp
++++ b/include/boost/regex/v5/syntax_type.hpp
+@@ -19,6 +19,8 @@
+ #ifndef BOOST_REGEX_SYNTAX_TYPE_HPP
+ #define BOOST_REGEX_SYNTAX_TYPE_HPP
+ 
++#include <boost/regex/config.hpp>
++
+ namespace boost{
+ namespace regex_constants{
+ 
+diff --git a/test/Jamfile.v2 b/test/Jamfile.v2
+index 19f675fe6..3732c9990 100644
+--- a/test/Jamfile.v2
++++ b/test/Jamfile.v2
+@@ -138,4 +138,5 @@ run issue153.cpp : : : "<toolset>msvc:<linkflags>-STACK:2097152" ;
+ run issue227.cpp ;
+ run issue232.cpp ;
+ run lookbehind_recursion_stress_test.cpp ;
++run regex_replace_overflow.cpp ;
+ 
+diff --git a/test/regex_replace_overflow.cpp b/test/regex_replace_overflow.cpp
+new file mode 100644
+index 000000000..300b8d1b8
+--- /dev/null
++++ b/test/regex_replace_overflow.cpp
+@@ -0,0 +1,29 @@
++#include <boost/regex.hpp>
++
++#include <iostream>
++#include <iterator>
++#include <sstream>
++#include <string>
++
++#include <boost/core/lightweight_test.hpp>
++
++int main() {
++   std::string format_string = "$2$2147483647";
++   boost::regex e2("(<)|(>)|(&)|\\r");
++
++   std::string in = 
++      "#include <iostream>"
++      ""
++      "int main() { std::cout << \"Hello, world!\\n\"; }";
++
++   std::ostringstream t( std::ios::out | std::ios::binary );
++   std::ostream_iterator<char, char> oi( t );
++
++   boost::regex_replace(oi, in.begin(), in.end(), e2, format_string,
++                        boost::match_default | boost::format_all);
++
++   std::string s(t.str());
++
++   BOOST_TEST(!s.empty());
++   return boost::report_errors();
++}

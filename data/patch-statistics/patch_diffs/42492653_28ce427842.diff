@@ -1,0 +1,45 @@
+From 005ab51d33f1cf58ec0d62073dce3c4b35f4a8e8 Mon Sep 17 00:00:00 2001
+From: Sebastian Rasmussen <sebras@gmail.com>
+Date: Thu, 11 Mar 2021 01:28:18 +0100
+Subject: [PATCH] Bug 703659: Handle underflow of w/h in fz_paint_image_imp().
+
+Using the OSS-fuzz test case at one point when entering
+fz_paint_image_imp() scissor and bbox were beoth fz_empty_rect.
+This caused w to initially be FZ_MIN_INF_RECT and x to be
+FZ_MAX_INF_RECT. Later when subtracting x from w the code would
+end up underflowing (FZ_MIN_INF_RECT - FZ_MAX_INF_RECT == 128).
+A similar situation happened for h and y.
+
+There was a test to check whether w/h were < 0, but that is not
+enough because of the underflow. This commit changes the checks
+to w <= x and y <= h before their respective subtractions. This
+eliminates the underflow. Moreover the check for w < 0 and h < 0
+can also no longer happen and so can be removed.
+---
+ source/fitz/draw-affine.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/source/fitz/draw-affine.c b/source/fitz/draw-affine.c
+index 0b7ae46335..b667f754e5 100644
+--- a/source/fitz/draw-affine.c
++++ b/source/fitz/draw-affine.c
+@@ -3940,15 +3940,17 @@ fz_paint_image_imp(fz_context *ctx,
+ 		w = shape->x + shape->w;
+ 	if (group_alpha && group_alpha->x + group_alpha->w < w)
+ 		w = group_alpha->x + group_alpha->w;
++	if (w <= x)
++		return;
+ 	w -= x;
+ 	h = bbox.y1;
+ 	if (shape && shape->y + shape->h < h)
+ 		h = shape->y + shape->h;
+ 	if (group_alpha && group_alpha->y + group_alpha->h < h)
+ 		h = group_alpha->y + group_alpha->h;
+-	h -= y;
+-	if (w <= 0 || h <= 0)
++	if (h <= y)
+ 		return;
++	h -= y;
+ 
+ 	/* map from screen space (x,y) to image space (u,v) */
+ 	ctm = fz_pre_scale(ctm, 1.0f / img->w, 1.0f / img->h);

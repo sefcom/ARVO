@@ -1,0 +1,154 @@
+From 4364700c01bb55bc664106e6c8b997849ec69228 Mon Sep 17 00:00:00 2001
+From: John Safranek <john@wolfssl.com>
+Date: Fri, 16 Oct 2020 15:35:23 -0700
+Subject: [PATCH] DH Fix These changes fix several fuzz testing reports. (ZD
+ 11088 and ZD 11101) 1. In GetDhPublicKey(), the DH Pubkey is owned by the SSL
+ session. It    doesn't need to be in the check for weOwnDh before freeing.
+ There    could be a chance it leaks. 2. In GeneratePublicDh() and
+ GeneratePrivateDh(), the size of the    destination buffer should be stored
+ at the location pointed to by the    size pointer. Check that before writing
+ into the destination buffer. 3. Ensure the size of the private and public key
+ values are in the size    value before generating or getting the DH keys.
+
+---
+ src/internal.c        | 18 +++++++++++-------
+ wolfcrypt/src/dh.c    | 16 ++++++++++++++--
+ wolfcrypt/test/test.c | 14 ++++++++++++--
+ 3 files changed, 37 insertions(+), 11 deletions(-)
+
+diff --git a/src/internal.c b/src/internal.c
+index 8a5cc24e08c..c4464a3e25b 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -21164,11 +21164,12 @@ static int GetDhPublicKey(WOLFSSL* ssl, const byte* input, word32 size,
+             ssl->buffers.serverDH_G.buffer = NULL;
+         }
+ 
+-        if (ssl->buffers.serverDH_Pub.buffer) {
+-            XFREE(ssl->buffers.serverDH_Pub.buffer, ssl->heap,
+-                    DYNAMIC_TYPE_PUBLIC_KEY);
+-            ssl->buffers.serverDH_Pub.buffer = NULL;
+-        }
++    }
++
++    if (ssl->buffers.serverDH_Pub.buffer) {
++        XFREE(ssl->buffers.serverDH_Pub.buffer, ssl->heap,
++                DYNAMIC_TYPE_PUBLIC_KEY);
++        ssl->buffers.serverDH_Pub.buffer = NULL;
+     }
+ 
+     /* p */
+@@ -23219,10 +23220,9 @@ int SendClientKeyExchange(WOLFSSL* ssl)
+                     args->output += OPAQUE16_LEN;
+                     XMEMCPY(args->output, ssl->arrays->client_identity, esSz);
+                     args->output += esSz;
++                    args->length = args->encSz - esSz - OPAQUE16_LEN;
+                     args->encSz = esSz + OPAQUE16_LEN;
+ 
+-                    args->length = 0;
+-
+                     ret = AllocKey(ssl, DYNAMIC_TYPE_DH,
+                                             (void**)&ssl->buffers.serverDH_Key);
+                     if (ret != 0) {
+@@ -25161,6 +25161,8 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+                             if (ssl->buffers.serverDH_Pub.buffer == NULL) {
+                                 ERROR_OUT(MEMORY_E, exit_sske);
+                             }
++                            ssl->buffers.serverDH_Pub.length =
++                                ssl->buffers.serverDH_P.length + OPAQUE16_LEN;
+                         }
+ 
+                         if (ssl->buffers.serverDH_Priv.buffer == NULL) {
+@@ -25171,6 +25173,8 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+                             if (ssl->buffers.serverDH_Priv.buffer == NULL) {
+                                 ERROR_OUT(MEMORY_E, exit_sske);
+                             }
++                            ssl->buffers.serverDH_Priv.length =
++                                ssl->buffers.serverDH_P.length + OPAQUE16_LEN;
+                         }
+ 
+                         ssl->options.dhKeySz =
+diff --git a/wolfcrypt/src/dh.c b/wolfcrypt/src/dh.c
+index 7661ff2b9b0..efabd4edf95 100644
+--- a/wolfcrypt/src/dh.c
++++ b/wolfcrypt/src/dh.c
+@@ -1209,7 +1209,11 @@ static int GeneratePrivateDh(DhKey* key, WC_RNG* rng, byte* priv,
+             #endif
+         }
+ 
+-        ret = wc_RNG_GenerateBlock(rng, priv, sz);
++        if (sz > *privSz)
++            ret = WC_KEY_SIZE_E;
++
++        if (ret == 0)
++            ret = wc_RNG_GenerateBlock(rng, priv, sz);
+ 
+         if (ret == 0) {
+             priv[0] |= 0x0C;
+@@ -1241,6 +1245,7 @@ static int GeneratePublicDh(DhKey* key, byte* priv, word32 privSz,
+     mp_int y[1];
+ #endif
+ #endif
++    word32 binSz;
+ 
+ #ifdef WOLFSSL_HAVE_SP_DH
+ #ifndef WOLFSSL_SP_NO_2048
+@@ -1282,11 +1287,18 @@ static int GeneratePublicDh(DhKey* key, byte* priv, word32 privSz,
+     if (ret == 0 && mp_exptmod(&key->g, x, &key->p, y) != MP_OKAY)
+         ret = MP_EXPTMOD_E;
+ 
++    if (ret == 0) {
++        binSz = mp_unsigned_bin_size(y);
++        if (binSz > *pubSz) {
++            ret = WC_KEY_SIZE_E;
++        }
++    }
++
+     if (ret == 0 && mp_to_unsigned_bin(y, pub) != MP_OKAY)
+         ret = MP_TO_E;
+ 
+     if (ret == 0)
+-        *pubSz = mp_unsigned_bin_size(y);
++        *pubSz = binSz;
+ 
+     mp_clear(y);
+     mp_clear(x);
+diff --git a/wolfcrypt/test/test.c b/wolfcrypt/test/test.c
+index fee483566a2..8d390ec5f82 100644
+--- a/wolfcrypt/test/test.c
++++ b/wolfcrypt/test/test.c
+@@ -14642,6 +14642,11 @@ static int dh_test_ffdhe(WC_RNG *rng, const DhParams* params)
+         ERROR_OUT(-7835, done);
+ #endif
+ 
++    pubSz = FFDHE_KEY_SIZE;
++    pubSz2 = FFDHE_KEY_SIZE;
++    privSz = FFDHE_KEY_SIZE;
++    privSz2 = FFDHE_KEY_SIZE;
++
+     XMEMSET(key, 0, sizeof *key);
+     XMEMSET(key2, 0, sizeof *key2);
+ 
+@@ -14763,8 +14768,8 @@ static int dh_test(void)
+     byte *agree2 = (byte *)XMALLOC(DH_TEST_BUF_SIZE, HEAP_HINT, DYNAMIC_TYPE_TMP_BUFFER);
+ 
+     if ((tmp == NULL) || (priv == NULL) || (pub == NULL) ||
+-	(priv2 == NULL) || (pub2 == NULL) || (agree == NULL) ||
+-	(agree2 == NULL))
++        (priv2 == NULL) || (pub2 == NULL) || (agree == NULL) ||
++        (agree2 == NULL))
+         ERROR_OUT(-7960, done);
+ #else
+     DhKey  key_buf, *key = &key_buf;
+@@ -14810,6 +14815,11 @@ static int dh_test(void)
+     (void)tmp;
+     (void)bytes;
+ 
++    pubSz = DH_TEST_BUF_SIZE;
++    pubSz2 = DH_TEST_BUF_SIZE;
++    privSz = DH_TEST_BUF_SIZE;
++    privSz2 = DH_TEST_BUF_SIZE;
++
+     XMEMSET(&rng, 0, sizeof(rng));
+     /* Use API for coverage. */
+     ret = wc_InitDhKey(key);

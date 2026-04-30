@@ -1,0 +1,114 @@
+From ab32c18ec50921e2ab5cfccc24049f60cbcc0a77 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@spatialys.com>
+Date: Tue, 5 Jun 2018 13:25:15 +0200
+Subject: [PATCH] ERS: prevent infinite recursion. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=8744. Credit to OSS
+ Fuzz
+
+---
+ autotest/gdrivers/data/test_ers_recursive.tar | Bin 0 -> 3072 bytes
+ autotest/gdrivers/ers.py                      |  10 ++++++
+ gdal/frmts/ers/ersdataset.cpp                 |  29 ++++++++++++------
+ 3 files changed, 30 insertions(+), 9 deletions(-)
+ create mode 100644 autotest/gdrivers/data/test_ers_recursive.tar
+
+diff --git a/autotest/gdrivers/data/test_ers_recursive.tar b/autotest/gdrivers/data/test_ers_recursive.tar
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c2be6dad07c3144fa509f7db5c61a028e0247d0
+GIT binary patch
+literal 3072
+zcmeH}!A`?442E;=Q{)LICr#HAm%${E5TI=@5UJiYQ8JVm1aD8WwZlULPMH|0FG+v9
+zP8#cTN*HK_K8TD4(Z*vV;-KmZ_?TRvOAx9op)xhpCi<1q+6W05_q0#_63BWf1-_!&
+zi$^BE`H#GE4$_q+8<4KiHt6L9S8G?uB+ii*@6RYN<a9QtjkhZ-<je*_f8&;$K2+ZM
+z`{nK0VTh5cklW`=Y}@dFKIu%JSl4u6EYZ|8#o;cJat>$rANEKc|D&hynCp8I<3I9m
+z^e6w7iu`NPdf-1-J$T+j@;d&%G=PP-F0_`giF`A1`{-|>-#K`9*eR?L@O(oj;FUSe
+sJn^4<rNn<-SNz`Z{{xaM8sk5L4+=~<-2b`Dvd#ZC+_Wb-=fAqh2Y*7HCIA2c
+
+literal 0
+HcmV?d00001
+
+diff --git a/autotest/gdrivers/ers.py b/autotest/gdrivers/ers.py
+index 411fec334278..69d86d52b97c 100755
+--- a/autotest/gdrivers/ers.py
++++ b/autotest/gdrivers/ers.py
+@@ -369,6 +369,15 @@ def ers_10():
+ 
+     return 'success'
+ 
++###############################################################################
++# Test fix for https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=8744
++
++
++def ers_recursive_opening():
++    ds = gdal.Open('/vsitar/data/test_ers_recursive.tar/test.ers')
++    ds.GetFileList()
++    return 'success'
++
+ ###############################################################################
+ # Cleanup
+ 
+@@ -389,6 +398,7 @@ def ers_cleanup():
+     ers_8,
+     ers_9,
+     ers_10,
++    ers_recursive_opening,
+     ers_cleanup
+ ]
+ 
+diff --git a/gdal/frmts/ers/ersdataset.cpp b/gdal/frmts/ers/ersdataset.cpp
+index 95a9e062c856..442f7007e7f3 100644
+--- a/gdal/frmts/ers/ersdataset.cpp
++++ b/gdal/frmts/ers/ersdataset.cpp
+@@ -605,6 +605,9 @@ static double ERSDMS2Dec( const char *pszDMS )
+ char **ERSDataset::GetFileList()
+ 
+ {
++    static thread_local int nRecLevel = 0;
++    if( nRecLevel > 0 )
++        return nullptr;
+ 
+     // Main data file, etc.
+     char **papszFileList = GDALPamDataset::GetFileList();
+@@ -616,7 +619,9 @@ char **ERSDataset::GetFileList()
+     // If we have a dependent file, merge its list of files in.
+     if( poDepFile )
+     {
++        nRecLevel ++;
+         char **papszDepFiles = poDepFile->GetFileList();
++        nRecLevel --;
+         papszFileList =
+             CSLInsertStrings( papszFileList, -1, papszDepFiles );
+         CSLDestroy( papszDepFiles );
+@@ -949,17 +954,23 @@ GDALDataset *ERSDataset::Open( GDALOpenInfo * poOpenInfo )
+ /* -------------------------------------------------------------------- */
+     if( EQUAL(poHeader->Find("DataSetType",""),"Translated") )
+     {
+-        poDS->poDepFile = (GDALDataset *)
+-            GDALOpenShared( osDataFilePath, poOpenInfo->eAccess );
+-
+-        if( poDS->poDepFile != nullptr
+-            && poDS->poDepFile->GetRasterCount() >= nBands )
++        static thread_local int nRecLevel = 0;
++        if( nRecLevel == 0 )
+         {
+-            for( int iBand = 0; iBand < nBands; iBand++ )
++            nRecLevel ++;
++            poDS->poDepFile = (GDALDataset *)
++                GDALOpen( osDataFilePath, poOpenInfo->eAccess );
++            nRecLevel --;
++
++            if( poDS->poDepFile != nullptr
++                && poDS->poDepFile->GetRasterCount() >= nBands )
+             {
+-                // Assume pixel interleaved.
+-                poDS->SetBand( iBand+1,
+-                               poDS->poDepFile->GetRasterBand( iBand+1 ) );
++                for( int iBand = 0; iBand < nBands; iBand++ )
++                {
++                    // Assume pixel interleaved.
++                    poDS->SetBand( iBand+1,
++                                poDS->poDepFile->GetRasterBand( iBand+1 ) );
++                }
+             }
+         }
+     }

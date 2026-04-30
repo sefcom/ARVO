@@ -1,0 +1,157 @@
+From d448ce04f301fc4b423a60d0a9b62c6eae3629ed Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christoph=20Gr=C3=BCninger?= <foss@grueninger.de>
+Date: Wed, 1 May 2024 07:12:10 +0200
+Subject: [PATCH 1/3] Use static_cast instead of C-style casts
+
+Found by Cppcheck (cstyleCast)
+---
+ src/build_log.cc | 14 +++++++-------
+ src/hash_map.h   |  2 +-
+ 2 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/src/build_log.cc b/src/build_log.cc
+index 792d1a3e7e..52c7c84f85 100644
+--- a/src/build_log.cc
++++ b/src/build_log.cc
+@@ -68,7 +68,7 @@ uint64_t MurmurHash64A(const void* key, size_t len) {
+   const uint64_t m = BIG_CONSTANT(0xc6a4a7935bd1e995);
+   const int r = 47;
+   uint64_t h = seed ^ (len * m);
+-  const unsigned char* data = (const unsigned char*)key;
++  const unsigned char* data = static_cast<const unsigned char*>(key);
+   while (len >= 8) {
+     uint64_t k;
+     memcpy(&k, data, sizeof k);
+@@ -230,7 +230,7 @@ struct LineReader {
+       line_start_ = line_end_ + 1;
+     }
+ 
+-    line_end_ = (char*)memchr(line_start_, '\n', buf_end_ - line_start_);
++    line_end_ = static_cast<char*>(memchr(line_start_, '\n', buf_end_ - line_start_));
+     if (!line_end_) {
+       // No newline. Move rest of data to start of buffer, fill rest.
+       size_t already_consumed = line_start_ - buf_;
+@@ -240,7 +240,7 @@ struct LineReader {
+       size_t read = fread(buf_ + size_rest, 1, sizeof(buf_) - size_rest, file_);
+       buf_end_ = buf_ + size_rest + read;
+       line_start_ = buf_;
+-      line_end_ = (char*)memchr(line_start_, '\n', buf_end_ - line_start_);
++      line_end_ = static_cast<char*>(memchr(line_start_, '\n', buf_end_ - line_start_));
+     }
+ 
+     *line_start = line_start_;
+@@ -304,7 +304,7 @@ LoadStatus BuildLog::Load(const string& path, string* err) {
+     const char kFieldSeparator = '\t';
+ 
+     char* start = line_start;
+-    char* end = (char*)memchr(start, kFieldSeparator, line_end - start);
++    char* end = static_cast<char*>(memchr(start, kFieldSeparator, line_end - start));
+     if (!end)
+       continue;
+     *end = 0;
+@@ -315,21 +315,21 @@ LoadStatus BuildLog::Load(const string& path, string* err) {
+     start_time = atoi(start);
+     start = end + 1;
+ 
+-    end = (char*)memchr(start, kFieldSeparator, line_end - start);
++    end = static_cast<char*>(memchr(start, kFieldSeparator, line_end - start));
+     if (!end)
+       continue;
+     *end = 0;
+     end_time = atoi(start);
+     start = end + 1;
+ 
+-    end = (char*)memchr(start, kFieldSeparator, line_end - start);
++    end = static_cast<char*>(memchr(start, kFieldSeparator, line_end - start));
+     if (!end)
+       continue;
+     *end = 0;
+     mtime = strtoll(start, NULL, 10);
+     start = end + 1;
+ 
+-    end = (char*)memchr(start, kFieldSeparator, line_end - start);
++    end = static_cast<char*>(memchr(start, kFieldSeparator, line_end - start));
+     if (!end)
+       continue;
+     string output = string(start, end - start);
+diff --git a/src/hash_map.h b/src/hash_map.h
+index 435360984d..3f465338ac 100644
+--- a/src/hash_map.h
++++ b/src/hash_map.h
+@@ -27,7 +27,7 @@ unsigned int MurmurHash2(const void* key, size_t len) {
+   const unsigned int m = 0x5bd1e995;
+   const int r = 24;
+   unsigned int h = seed ^ len;
+-  const unsigned char* data = (const unsigned char*)key;
++  const unsigned char* data = static_cast<const unsigned char*>(key);
+   while (len >= 4) {
+     unsigned int k;
+     memcpy(&k, data, sizeof k);
+
+From cd7364e3e9fd4c8730921b65dfbddd030c570e6c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christoph=20Gr=C3=BCninger?= <foss@grueninger.de>
+Date: Wed, 1 May 2024 07:14:22 +0200
+Subject: [PATCH 2/3] Use const_cast instead of C-style casts
+
+Found by Cppcheck (cstyleCast)
+---
+ src/browse.cc   | 2 +-
+ src/deps_log.cc | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/browse.cc b/src/browse.cc
+index ac54207800..2956f896c4 100644
+--- a/src/browse.cc
++++ b/src/browse.cc
+@@ -59,7 +59,7 @@ void RunBrowsePython(State* state, const char* ninja_command,
+           command.push_back(argv[i]);
+       }
+       command.push_back(NULL);
+-      execvp(command[0], (char**)&command[0]);
++      execvp(command[0], const_cast<char**>(&command[0]));
+       if (errno == ENOENT) {
+         printf("ninja: %s is required for the browse tool\n", NINJA_PYTHON);
+       } else {
+diff --git a/src/deps_log.cc b/src/deps_log.cc
+index e32a7a98ad..b28736ad3d 100644
+--- a/src/deps_log.cc
++++ b/src/deps_log.cc
+@@ -60,7 +60,7 @@ bool DepsLog::OpenForWrite(const string& path, string* err) {
+ bool DepsLog::RecordDeps(Node* node, TimeStamp mtime,
+                          const vector<Node*>& nodes) {
+   return RecordDeps(node, mtime, nodes.size(),
+-                    nodes.empty() ? NULL : (Node**)&nodes.front());
++                    nodes.empty() ? NULL : const_cast<Node**>(&nodes.front()));
+ }
+ 
+ bool DepsLog::RecordDeps(Node* node, TimeStamp mtime,
+
+From db5c50e48da0c0fa165e3321b4cabf619e31cd69 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christoph=20Gr=C3=BCninger?= <foss@grueninger.de>
+Date: Thu, 2 May 2024 19:54:08 +0200
+Subject: [PATCH 3/3] Add cppcoreguidelines-pro-type-cstyle-cast to clang-tidy
+ config
+
+Prevents that someone re-introduces C-style casts.
+---
+ .clang-tidy | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/.clang-tidy b/.clang-tidy
+index e0afd47180..357f046094 100644
+--- a/.clang-tidy
++++ b/.clang-tidy
+@@ -6,6 +6,7 @@ Checks: '
+   ,readability-redundant-string-cstr,
+   ,readability-redundant-string-init,
+   ,readability-simplify-boolean-expr,
++  ,cppcoreguidelines-pro-type-cstyle-cast,
+ '
+ WarningsAsErrors: '
+   ,readability-avoid-const-params-in-decls,
+@@ -14,4 +15,5 @@ WarningsAsErrors: '
+   ,readability-redundant-string-cstr,
+   ,readability-redundant-string-init,
+   ,readability-simplify-boolean-expr,
++  ,cppcoreguidelines-pro-type-cstyle-cast,
+ '

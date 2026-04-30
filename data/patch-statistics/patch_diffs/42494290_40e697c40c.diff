@@ -1,0 +1,112 @@
+From 54fdafc75275f1848bcb4e79c0313b9a13a8b01b Mon Sep 17 00:00:00 2001
+From: Reini Urban <rurban@cpan.org>
+Date: Wed, 10 Mar 2021 21:01:22 +0100
+Subject: [PATCH] protect bit_utf8_to_TV src from overflow
+
+fuzzing in_json only, everywhere else the src is big enough.
+Fixes oss-fuzz issue 31878
+---
+ src/bits.c    | 9 +++++----
+ src/bits.h    | 2 +-
+ src/dwg_api.c | 4 ++--
+ src/in_json.c | 2 +-
+ src/objects.c | 2 +-
+ 5 files changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/src/bits.c b/src/bits.c
+index 609e64811a..b46b6d707d 100644
+--- a/src/bits.c
++++ b/src/bits.c
+@@ -2459,19 +2459,18 @@ bit_TU_to_utf8_len (const BITCODE_TU restrict wstr, const int len)
+ */
+ char *
+ bit_utf8_to_TV (char *restrict dest, const unsigned char *restrict src,
+-                const int destlen, const unsigned cquoted)
++                const int destlen, const int srclen, const unsigned cquoted)
+ {
+   unsigned char c;
+   unsigned char *s = (unsigned char *)src;
+   const char* endp = dest + destlen;
++  const unsigned char* ends = src + srclen;
+   char *d = dest;
+ 
+   while ((c = *s++))
+     {
+       if (dest >= endp)
+-        {
+-          return NULL;
+-        }
++        return NULL;
+       else if (cquoted && c == '\\' && dest+1 < endp &&
+           // skip \" to " and \\ to \.
+           (*s == '"' || *s == '\\' || *s == 'r' || *s == 'n'))
+@@ -2549,6 +2548,8 @@ bit_utf8_to_TV (char *restrict dest, const unsigned char *restrict src,
+           s++;
+           s++;
+         }
++      if (s >= ends)
++        break;
+       /* everything above 0xf0 exceeds ucs-2, 4-6 byte seqs */
+     }
+ 
+diff --git a/src/bits.h b/src/bits.h
+index 31be2c31e6..62f1f92d62 100644
+--- a/src/bits.h
++++ b/src/bits.h
+@@ -292,7 +292,7 @@ EXPORT char *bit_TU_to_utf8_len (const BITCODE_TU restrict wstr, const int len)
+     Returns NULL if not enough room in dest. */
+ EXPORT char *
+ bit_utf8_to_TV (char *restrict dest, const unsigned char *restrict src,
+-                const int len, const unsigned cquoted);
++                const int destlen, const int srclen, const unsigned cquoted);
+ 
+ /** Converts UTF-8 to UCS-2. Returns a copy.
+     Needed by dwg importers, writers (e.g. dxf2dwg)
+diff --git a/src/dwg_api.c b/src/dwg_api.c
+index 3e7a9e5a49..2df75c2e23 100644
+--- a/src/dwg_api.c
++++ b/src/dwg_api.c
+@@ -22145,7 +22145,7 @@ dwg_add_u8_input (Dwg_Data *restrict dwg, const char *restrict u8str)
+ #if 0
+       int size = 1024;
+       char *dest = malloc (size);
+-      char *tgt = bit_utf8_to_TV (dest, u8str, size, 0);
++      char *tgt = bit_utf8_to_TV (dest, u8str, size, strlen(u8str), 0);
+       if (!dest)
+         {
+           LOG_ERROR ("Out of memory");
+@@ -22160,7 +22160,7 @@ dwg_add_u8_input (Dwg_Data *restrict dwg, const char *restrict u8str)
+               return NULL;
+             }
+           dest = realloc (dest, size);
+-          tgt = bit_utf8_to_TV (dest, u8str, size, 0);
++          tgt = bit_utf8_to_TV (dest, u8str, size, strlen(u8str), 0);
+         }
+       return tgt;
+ #endif
+diff --git a/src/in_json.c b/src/in_json.c
+index c247d98d62..aafe3f8b48 100644
+--- a/src/in_json.c
++++ b/src/in_json.c
+@@ -353,7 +353,7 @@ json_string (Bit_Chain *restrict dat, jsmntokens_t *restrict tokens)
+       if (!key)
+         goto outofmemory;
+       dat->chain[t->end] = '\0';
+-      while (!bit_utf8_to_TV (key, &dat->chain[t->start], len, 1))
++      while (!bit_utf8_to_TV (key, &dat->chain[t->start], len, t->end - t->start, 1))
+         {
+           LOG_INSANE ("Not enough room in quoted string len=%d\n", len-8)
+           len += 8;
+diff --git a/src/objects.c b/src/objects.c
+index 3d21ce6863..68cf2e9902 100644
+--- a/src/objects.c
++++ b/src/objects.c
+@@ -92,7 +92,7 @@ inline
+ #endif
+ #endif
+ static unsigned int
+-hash (register const char *str, register size_t len)
++hash (register const char *str, register SIZE_TYPE len)
+ {
+   static const unsigned short asso_values[] =
+     {

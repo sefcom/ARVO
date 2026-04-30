@@ -1,0 +1,147 @@
+From 0fc73bffe881eb5c3d0e160697ac2de7c9d5dc34 Mon Sep 17 00:00:00 2001
+From: Roman <9205230+1ndahous3@users.noreply.github.com>
+Date: Fri, 8 Nov 2024 11:12:51 +0300
+Subject: [PATCH] Rework processing of ASN.1record length (unsized types,
+ strict checks) (#1616)
+
+---
+ Packet++/header/Asn1Codec.h                   |   4 +-
+ Packet++/src/Asn1Codec.cpp                    |  49 ++++++++++--------
+ .../crash-invalid-asn-record-len              | Bin 0 -> 305 bytes
+ 3 files changed, 29 insertions(+), 24 deletions(-)
+ create mode 100644 Tests/Fuzzers/RegressionTests/regression_samples/crash-invalid-asn-record-len
+
+diff --git a/Packet++/header/Asn1Codec.h b/Packet++/header/Asn1Codec.h
+index 7b5bffef97..57db3ae258 100644
+--- a/Packet++/header/Asn1Codec.h
++++ b/Packet++/header/Asn1Codec.h
+@@ -225,8 +225,8 @@ namespace pcpp
+ 		virtual void decodeValue(uint8_t* data, bool lazy) = 0;
+ 		virtual std::vector<uint8_t> encodeValue() const = 0;
+ 
+-		static Asn1Record* decodeTagAndCreateRecord(const uint8_t* data, size_t dataLen, int& tagLen);
+-		int decodeLength(const uint8_t* data, size_t dataLen);
++		static Asn1Record* decodeTagAndCreateRecord(const uint8_t* data, size_t dataLen, uint8_t& tagLen);
++		uint8_t decodeLength(const uint8_t* data, size_t dataLen);
+ 		void decodeValueIfNeeded();
+ 
+ 		uint8_t encodeTag();
+diff --git a/Packet++/src/Asn1Codec.cpp b/Packet++/src/Asn1Codec.cpp
+index f048bb06b1..277ef028c4 100644
+--- a/Packet++/src/Asn1Codec.cpp
++++ b/Packet++/src/Asn1Codec.cpp
+@@ -176,10 +176,10 @@ namespace pcpp
+ 
+ 	Asn1Record* Asn1Record::decodeInternal(const uint8_t* data, size_t dataLen, bool lazy)
+ 	{
+-		int tagLen;
++		uint8_t tagLen;
+ 		auto decodedRecord = decodeTagAndCreateRecord(data, dataLen, tagLen);
+ 
+-		int lengthLen;
++		uint8_t lengthLen;
+ 		try
+ 		{
+ 			lengthLen = decodedRecord->decodeLength(data + tagLen, dataLen - tagLen);
+@@ -190,14 +190,14 @@ namespace pcpp
+ 			throw;
+ 		}
+ 
+-		if (static_cast<int>(dataLen) - tagLen - lengthLen - static_cast<int>(decodedRecord->m_ValueLength) < 0)
++		decodedRecord->m_TotalLength = tagLen + lengthLen + decodedRecord->m_ValueLength;
++		if (decodedRecord->m_TotalLength < decodedRecord->m_ValueLength ||  // check for overflow
++		    decodedRecord->m_TotalLength > dataLen)
+ 		{
+ 			delete decodedRecord;
+ 			throw std::invalid_argument("Cannot decode ASN.1 record, data doesn't contain the entire record");
+ 		}
+ 
+-		decodedRecord->m_TotalLength = tagLen + lengthLen + decodedRecord->m_ValueLength;
+-
+ 		if (!lazy)
+ 		{
+ 			try
+@@ -228,7 +228,7 @@ namespace pcpp
+ 		return Asn1UniversalTagType::NotApplicable;
+ 	}
+ 
+-	Asn1Record* Asn1Record::decodeTagAndCreateRecord(const uint8_t* data, size_t dataLen, int& tagLen)
++	Asn1Record* Asn1Record::decodeTagAndCreateRecord(const uint8_t* data, size_t dataLen, uint8_t& tagLen)
+ 	{
+ 		if (dataLen < 1)
+ 		{
+@@ -360,7 +360,7 @@ namespace pcpp
+ 		return newRecord;
+ 	}
+ 
+-	int Asn1Record::decodeLength(const uint8_t* data, size_t dataLen)
++	uint8_t Asn1Record::decodeLength(const uint8_t* data, size_t dataLen)
+ 	{
+ 		if (dataLen < 1)
+ 		{
+@@ -370,30 +370,35 @@ namespace pcpp
+ 		// Check 8th bit
+ 		auto lengthForm = data[0] & 0x80;
+ 
+-		auto numberLengthBytes = 1;
+-
+ 		// Check if the tag is using more than one byte
+ 		// 8th bit at 0 means the length only uses one byte
+ 		// 8th bit at 1 means the length uses more than one byte. The number of bytes is encoded in the other 7 bits
+-		if (lengthForm != 0)
++		if (lengthForm == 0)
++		{
++			m_ValueLength = data[0];
++			return 1;
++		}
++
++		uint8_t actualLengthBytes = data[0] & 0x7F;
++		const uint8_t* actualLengthData = data + 1;
++
++		if (dataLen < static_cast<size_t>(actualLengthBytes) + 1)
++		{
++			throw std::invalid_argument("Cannot decode ASN.1 record length");
++		}
++
++		for (int i = 0; i < actualLengthBytes; i++)
+ 		{
+-			auto additionalLengthBytes = data[0] & 0x7F;
+-			if (static_cast<int>(dataLen) < additionalLengthBytes + 1)
++			size_t partialValueLength = m_ValueLength << 8;
++			if (partialValueLength < m_ValueLength)  // check for overflow
+ 			{
+ 				throw std::invalid_argument("Cannot decode ASN.1 record length");
+ 			}
+-			for (auto index = additionalLengthBytes; index > 0; --index)
+-			{
+-				m_ValueLength += data[index] * static_cast<int>(std::pow(256, (additionalLengthBytes - index)));
+-			}
+-			numberLengthBytes += additionalLengthBytes;
+-		}
+-		else
+-		{
+-			m_ValueLength = data[0];
++
++			m_ValueLength = partialValueLength | actualLengthData[i];
+ 		}
+ 
+-		return numberLengthBytes;
++		return 1 + actualLengthBytes;
+ 	}
+ 
+ 	void Asn1Record::decodeValueIfNeeded()
+diff --git a/Tests/Fuzzers/RegressionTests/regression_samples/crash-invalid-asn-record-len b/Tests/Fuzzers/RegressionTests/regression_samples/crash-invalid-asn-record-len
+new file mode 100644
+index 0000000000000000000000000000000000000000..497a75f5e90bc8ded4449c2699c676fd478fddb8
+GIT binary patch
+literal 305
+zcmca|c+)~A1{MYw`2U}Qff2}YW#diknZ?7v4CH{Ykuoz-^v&7@K$3&Om4V@F(gFtt
+zd$wsG)(9|dH4;pi({q8b^<Dh;|GeKXKMIi2{LX)3H;aK}X+sLb9!3T%vJ5-;n6EBM
+z|9Sq#5<T@Drq3$pTGuDqrsbAA`SNyYd)<fcw`IAVxiwRT7#I}JtT?msfc`;)1KJ04
+z4hSFMJRov_i(wAKTn2px(*r^bTtElr10AN%pv%CZmB+BZOgAGxH?=r9zqCX*C9fo1
+zFRu(CP*RkbSDcnwq?eqZ%fQOO3i2)k0~Zi-Fi0_oGe|H<GH^360fl)Pgct-^7+IKE
+O8Cj*-7}=Pa7?}Vh$y}QN
+
+literal 0
+HcmV?d00001
+

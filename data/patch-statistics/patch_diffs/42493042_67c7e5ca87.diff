@@ -1,0 +1,163 @@
+From a49c867b388ca74542ffd601398d405e107efee2 Mon Sep 17 00:00:00 2001
+From: Jacob Barthelmeh <jacob@wolfssl.com>
+Date: Thu, 11 Feb 2021 23:47:26 +0700
+Subject: [PATCH 1/4] increase test buffer size for updated pkcs7 bundle
+
+---
+ tests/api.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/api.c b/tests/api.c
+index 1824f865cab..619a52f9a8c 100644
+--- a/tests/api.c
++++ b/tests/api.c
+@@ -24759,7 +24759,7 @@ static void test_wc_PKCS7_DecodeCompressedData(void)
+     && !defined(NO_AES) && defined(HAVE_LIBZ)
+     PKCS7* pkcs7;
+     void*  heap = NULL;
+-    byte   out[3072];
++    byte   out[4096];
+     byte   *decompressed;
+     int    outSz, decompressedSz;
+ 
+
+From 7e72fafd4400ed636585c164c30f11b93f0590fe Mon Sep 17 00:00:00 2001
+From: Jacob Barthelmeh <jacob@wolfssl.com>
+Date: Fri, 12 Feb 2021 16:24:46 +0700
+Subject: [PATCH 2/4] do not turn on FP_64BIT by default on Aarch64
+
+---
+ wolfssl/wolfcrypt/tfm.h | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/wolfssl/wolfcrypt/tfm.h b/wolfssl/wolfcrypt/tfm.h
+index 78406bc38a1..5546b57bf30 100644
+--- a/wolfssl/wolfcrypt/tfm.h
++++ b/wolfssl/wolfcrypt/tfm.h
+@@ -70,11 +70,6 @@
+       #define TFM_X86_64
+    #endif
+ #endif
+-#if defined(__aarch64__)
+-    #if !defined(TFM_AARCH_64) && !defined(TFM_NO_ASM)
+-        #define TFM_AARCH_64
+-    #endif
+-#endif
+ #if defined(TFM_X86_64) || defined(TFM_AARCH_64)
+     #if !defined(FP_64BIT)
+        #define FP_64BIT
+
+From 1c852f60ab4c45c3301a8fc5def9fb01812bb1fc Mon Sep 17 00:00:00 2001
+From: Jacob Barthelmeh <jacob@wolfssl.com>
+Date: Fri, 12 Feb 2021 23:26:54 +0700
+Subject: [PATCH 3/4] fix for g++ build
+
+---
+ src/ssl.c   | 13 ++++++++-----
+ src/tls13.c | 12 ++++++------
+ tests/api.c |  2 +-
+ 3 files changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/src/ssl.c b/src/ssl.c
+index 314f1e8e20a..14a160dc229 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -11957,11 +11957,8 @@ int wolfSSL_export_keying_material(WOLFSSL *ssl,
+         const unsigned char *context, size_t contextLen,
+         int use_context)
+ {
+-    byte* seed = NULL;
+-    /* clientRandom + serverRandom
+-     * OR
+-     * clientRandom + serverRandom + ctx len encoding + ctx */
+-    word32 seedLen = !use_context ? SEED_LEN : SEED_LEN + 2 + (word32)contextLen;
++    byte*  seed = NULL;
++    word32 seedLen;
+     const struct ForbiddenLabels* fl;
+ 
+     WOLFSSL_ENTER("wolfSSL_export_keying_material");
+@@ -11972,6 +11969,12 @@ int wolfSSL_export_keying_material(WOLFSSL *ssl,
+         return WOLFSSL_FAILURE;
+     }
+ 
++    /* clientRandom + serverRandom
++     * OR
++     * clientRandom + serverRandom + ctx len encoding + ctx */
++    seedLen = !use_context ? (word32)SEED_LEN :
++                             (word32)SEED_LEN + 2 + (word32)contextLen;
++
+     if (ssl->options.saveArrays == 0 || ssl->arrays == NULL) {
+         WOLFSSL_MSG("To export keying material wolfSSL needs to keep handshake "
+                     "data. Call wolfSSL_KeepArrays before attempting to "
+diff --git a/src/tls13.c b/src/tls13.c
+index a108551bf4f..b2fd50f2fbf 100644
+--- a/src/tls13.c
++++ b/src/tls13.c
+@@ -777,24 +777,24 @@ int Tls13_Exporter(WOLFSSL* ssl, unsigned char *out, size_t outLen,
+     switch (ssl->specs.mac_algorithm) {
+         #ifndef NO_SHA256
+         case sha256_mac:
+-            hashType = WC_SHA256;
+-            hashLen = WC_SHA256_DIGEST_SIZE;
++            hashType  = WC_HASH_TYPE_SHA256;
++            hashLen   = WC_SHA256_DIGEST_SIZE;
+             emptyHash = emptySHA256Hash;
+             break;
+         #endif
+ 
+         #ifdef WOLFSSL_SHA384
+         case sha384_mac:
+-            hashType = WC_SHA384;
+-            hashLen = WC_SHA384_DIGEST_SIZE;
++            hashType  = WC_HASH_TYPE_SHA384;
++            hashLen   = WC_SHA384_DIGEST_SIZE;
+             emptyHash = emptySHA384Hash;
+             break;
+         #endif
+ 
+         #ifdef WOLFSSL_TLS13_SHA512
+         case sha512_mac:
+-            hashType = WC_SHA512;
+-            hashLen = WC_SHA512_DIGEST_SIZE;
++            hashType  = WC_HASH_TYPE_SHA512;
++            hashLen   = WC_SHA512_DIGEST_SIZE;
+             emptyHash = emptySHA512Hash;
+             break;
+         #endif
+diff --git a/tests/api.c b/tests/api.c
+index 619a52f9a8c..a103fdec63f 100644
+--- a/tests/api.c
++++ b/tests/api.c
+@@ -40234,7 +40234,7 @@ static void test_export_keying_material(void)
+ 
+     start_thread(test_server_nofail, &server_args, &serverThread);
+     wait_tcp_ready(&server_args);
+-    test_client_nofail(&client_args, test_export_keying_material_cb);
++    test_client_nofail(&client_args, (void*)test_export_keying_material_cb);
+     join_thread(serverThread);
+ 
+     AssertTrue(client_args.return_code);
+
+From bde1a2209a97a4ee78d328af033bb04e96c5e3b5 Mon Sep 17 00:00:00 2001
+From: Elms <jeff@wolfssl.com>
+Date: Fri, 12 Feb 2021 09:06:19 -0800
+Subject: [PATCH 4/4] tests: add include for `ecc.h` to fix compile error
+
+fix testsuite implicit definition of `wc_ecc_fp_free` with
+`./configure --enable-fpecc --enable-ecc --enable-stacksize`
+---
+ testsuite/testsuite.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/testsuite/testsuite.c b/testsuite/testsuite.c
+index c7809e63567..d390b5483fc 100644
+--- a/testsuite/testsuite.c
++++ b/testsuite/testsuite.c
+@@ -37,6 +37,7 @@
+ #include <wolfssl/openssl/ssl.h>
+ #endif
+ #include <wolfssl/wolfcrypt/sha256.h>
++#include <wolfssl/wolfcrypt/ecc.h>
+ 
+ #include <examples/echoclient/echoclient.h>
+ #include <examples/echoserver/echoserver.h>

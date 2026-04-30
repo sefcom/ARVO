@@ -1,0 +1,231 @@
+From 0e453ac3524100e7d78481d75e44ad3515dde0c1 Mon Sep 17 00:00:00 2001
+From: Vladimir Glavnyy <31897320+vglavnyy@users.noreply.github.com>
+Date: Fri, 12 Mar 2021 02:12:06 +0700
+Subject: [PATCH] [idl_parser] Add kTokenNumericConstant token (#6432)
+
+* [idl_parser] Add kTokenNumericConstant token
+
+This commit adds the new token for correct parsing of signed numeric constants.
+Before this expressions `-nan` or `-inf` were treated as kTokenStringConstant.
+This was ambiguous if a real string field parsed.
+For example, `{ "text_field" : -name }` was accepted by the parser as valid JSON object.
+
+Related oss-fuzz issue: 6200301176619008
+
+* Add additional positive tests fo 'inf' and 'nan' as identifiers
+
+* Rebase to HEAD
+
+* Move processing of signed constants to ParseSingleValue method.
+
+* Add missed `--cpp-static-reflection` (#6324) to pass CI
+
+* Remove `flatbuffers.pc` from repository to unblock CI (#6455).
+
+Probably the generated flatbuffers.pc should not be a part of repo.
+
+* Fix FieldIdentifierTest()
+---
+ src/idl_parser.cpp | 85 +++++++++++++++++++++++++---------------------
+ tests/test.cpp     | 36 ++++++++++++++++++++
+ 2 files changed, 83 insertions(+), 38 deletions(-)
+
+diff --git a/src/idl_parser.cpp b/src/idl_parser.cpp
+index 87b999d70b4..6faee4d3322 100644
+--- a/src/idl_parser.cpp
++++ b/src/idl_parser.cpp
+@@ -498,15 +498,19 @@ CheckedError Parser::Next() {
+         }
+         FLATBUFFERS_FALLTHROUGH();  // else fall thru
+       default:
+-        const auto has_sign = (c == '+') || (c == '-');
+-        // '-'/'+' and following identifier - can be a predefined constant like:
+-        // NAN, INF, PI, etc or it can be a function name like cos/sin/deg.
+-        if (IsIdentifierStart(c) || (has_sign && IsIdentifierStart(*cursor_))) {
++        if (IsIdentifierStart(c)) {
+           // Collect all chars of an identifier:
+           const char *start = cursor_ - 1;
+           while (IsIdentifierStart(*cursor_) || is_digit(*cursor_)) cursor_++;
+           attribute_.append(start, cursor_);
+-          token_ = has_sign ? kTokenStringConstant : kTokenIdentifier;
++          token_ = kTokenIdentifier;
++          return NoError();
++        }
++
++        const auto has_sign = (c == '+') || (c == '-');
++        if (has_sign && IsIdentifierStart(*cursor_)) {
++          // '-'/'+' and following identifier - it could be a predefined
++          // constant. Return the sign in token_, see ParseSingleValue.
+           return NoError();
+         }
+ 
+@@ -1852,56 +1856,61 @@ CheckedError Parser::ParseFunction(const std::string *name, Value &e) {
+ CheckedError Parser::TryTypedValue(const std::string *name, int dtoken,
+                                    bool check, Value &e, BaseType req,
+                                    bool *destmatch) {
+-  bool match = dtoken == token_;
+-  if (match) {
+-    FLATBUFFERS_ASSERT(*destmatch == false);
+-    *destmatch = true;
+-    e.constant = attribute_;
+-    // Check token match
+-    if (!check) {
+-      if (e.type.base_type == BASE_TYPE_NONE) {
+-        e.type.base_type = req;
+-      } else {
+-        return Error(
+-            std::string("type mismatch: expecting: ") +
+-            kTypeNames[e.type.base_type] + ", found: " + kTypeNames[req] +
+-            ", name: " + (name ? *name : "") + ", value: " + e.constant);
+-      }
+-    }
+-    // The exponent suffix of hexadecimal float-point number is mandatory.
+-    // A hex-integer constant is forbidden as an initializer of float number.
+-    if ((kTokenFloatConstant != dtoken) && IsFloat(e.type.base_type)) {
+-      const auto &s = e.constant;
+-      const auto k = s.find_first_of("0123456789.");
+-      if ((std::string::npos != k) && (s.length() > (k + 1)) &&
+-          (s[k] == '0' && is_alpha_char(s[k + 1], 'X')) &&
+-          (std::string::npos == s.find_first_of("pP", k + 2))) {
+-        return Error(
+-            "invalid number, the exponent suffix of hexadecimal "
+-            "floating-point literals is mandatory: \"" +
+-            s + "\"");
+-      }
++  FLATBUFFERS_ASSERT(*destmatch == false && dtoken == token_);
++  *destmatch = true;
++  e.constant = attribute_;
++  // Check token match
++  if (!check) {
++    if (e.type.base_type == BASE_TYPE_NONE) {
++      e.type.base_type = req;
++    } else {
++      return Error(std::string("type mismatch: expecting: ") +
++                   kTypeNames[e.type.base_type] +
++                   ", found: " + kTypeNames[req] +
++                   ", name: " + (name ? *name : "") + ", value: " + e.constant);
++    }
++  }
++  // The exponent suffix of hexadecimal float-point number is mandatory.
++  // A hex-integer constant is forbidden as an initializer of float number.
++  if ((kTokenFloatConstant != dtoken) && IsFloat(e.type.base_type)) {
++    const auto &s = e.constant;
++    const auto k = s.find_first_of("0123456789.");
++    if ((std::string::npos != k) && (s.length() > (k + 1)) &&
++        (s[k] == '0' && is_alpha_char(s[k + 1], 'X')) &&
++        (std::string::npos == s.find_first_of("pP", k + 2))) {
++      return Error(
++          "invalid number, the exponent suffix of hexadecimal "
++          "floating-point literals is mandatory: \"" +
++          s + "\"");
+     }
+-    NEXT();
+   }
++  NEXT();
+   return NoError();
+ }
+ 
+ CheckedError Parser::ParseSingleValue(const std::string *name, Value &e,
+                                       bool check_now) {
++  if (token_ == '+' || token_ == '-') {
++    const char sign = static_cast<char>(token_);
++    // Get an indentifier: NAN, INF, or function name like cos/sin/deg.
++    NEXT();
++    if (token_ != kTokenIdentifier) return Error("constant name expected");
++    attribute_.insert(0, 1, sign);
++  }
++
+   const auto in_type = e.type.base_type;
+   const auto is_tok_ident = (token_ == kTokenIdentifier);
+   const auto is_tok_string = (token_ == kTokenStringConstant);
+ 
+-  // First see if this could be a conversion function:
++  // First see if this could be a conversion function.
+   if (is_tok_ident && *cursor_ == '(') { return ParseFunction(name, e); }
+ 
+   // clang-format off
+   auto match = false;
+ 
+   #define IF_ECHECK_(force, dtoken, check, req)    \
+-    if (!match && ((check) || IsConstTrue(force))) \
+-    ECHECK(TryTypedValue(name, dtoken, check, e, req, &match))
++    if (!match && ((dtoken) == token_) && ((check) || IsConstTrue(force))) \
++      ECHECK(TryTypedValue(name, dtoken, check, e, req, &match))
+   #define TRY_ECHECK(dtoken, check, req) IF_ECHECK_(false, dtoken, check, req)
+   #define FORCE_ECHECK(dtoken, check, req) IF_ECHECK_(true, dtoken, check, req)
+   // clang-format on
+diff --git a/tests/test.cpp b/tests/test.cpp
+index f745bc7c384..ffd293dd95e 100644
+--- a/tests/test.cpp
++++ b/tests/test.cpp
+@@ -1694,6 +1694,9 @@ void ErrorTest() {
+   TestError("table X { y: [int] = [1]; }", "Expected `]`");
+   TestError("table X { y: [int] = [; }", "Expected `]`");
+   TestError("table X { y: [int] = \"\"; }", "type mismatch");
++  // An identifier can't start from sign (+|-)
++  TestError("table X { -Y: int; } root_type Y: {Y:1.0}", "identifier");
++  TestError("table X { +Y: int; } root_type Y: {Y:1.0}", "identifier");
+ }
+ 
+ template<typename T>
+@@ -2028,6 +2031,8 @@ void ValidFloatTest() {
+   TEST_EQ(std::isnan(TestValue<double>("{ y:nan }", "double")), true);
+   TEST_EQ(std::isnan(TestValue<float>("{ y:nan }", "float")), true);
+   TEST_EQ(std::isnan(TestValue<float>("{ y:\"nan\" }", "float")), true);
++  TEST_EQ(std::isnan(TestValue<float>("{ y:\"+nan\" }", "float")), true);
++  TEST_EQ(std::isnan(TestValue<float>("{ y:\"-nan\" }", "float")), true);
+   TEST_EQ(std::isnan(TestValue<float>("{ y:+nan }", "float")), true);
+   TEST_EQ(std::isnan(TestValue<float>("{ y:-nan }", "float")), true);
+   TEST_EQ(std::isnan(TestValue<float>(nullptr, "float=nan")), true);
+@@ -2035,6 +2040,8 @@ void ValidFloatTest() {
+   // check inf
+   TEST_EQ(TestValue<float>("{ y:inf }", "float"), infinity_f);
+   TEST_EQ(TestValue<float>("{ y:\"inf\" }", "float"), infinity_f);
++  TEST_EQ(TestValue<float>("{ y:\"-inf\" }", "float"), -infinity_f);
++  TEST_EQ(TestValue<float>("{ y:\"+inf\" }", "float"), infinity_f);
+   TEST_EQ(TestValue<float>("{ y:+inf }", "float"), infinity_f);
+   TEST_EQ(TestValue<float>("{ y:-inf }", "float"), -infinity_f);
+   TEST_EQ(TestValue<float>(nullptr, "float=inf"), infinity_f);
+@@ -3777,6 +3784,34 @@ void FieldIdentifierTest() {
+   // Positive tests for unions
+   TEST_EQ(true, Parser().Parse("union X{} table T{ u: X (id:1); }"));
+   TEST_EQ(true, Parser().Parse("union X{} table T{ u: X; }"));
++  // Test using 'inf' and 'nan' words both as identifiers and as default values.
++  TEST_EQ(true, Parser().Parse("table T{ nan: string; }"));
++  TEST_EQ(true, Parser().Parse("table T{ inf: string; }"));
++#if defined(FLATBUFFERS_HAS_NEW_STRTOD) && (FLATBUFFERS_HAS_NEW_STRTOD > 0)
++  TEST_EQ(true, Parser().Parse("table T{ inf: float = inf; }"));
++  TEST_EQ(true, Parser().Parse("table T{ nan: float = inf; }"));
++#endif
++}
++
++void ParseIncorrectMonsterJsonTest() {
++  std::string schemafile;
++  TEST_EQ(flatbuffers::LoadFile((test_data_path + "monster_test.bfbs").c_str(),
++                                true, &schemafile),
++          true);
++  flatbuffers::Parser parser;
++  flatbuffers::Verifier verifier(
++      reinterpret_cast<const uint8_t *>(schemafile.c_str()), schemafile.size());
++  TEST_EQ(reflection::VerifySchemaBuffer(verifier), true);
++  TEST_EQ(parser.Deserialize((const uint8_t *)schemafile.c_str(),
++                             schemafile.size()),
++          true);
++  TEST_EQ(parser.ParseJson("{name:\"monster\"}"), true);
++  TEST_EQ(parser.ParseJson(""), false);
++  TEST_EQ(parser.ParseJson("{name: 1}"), false);
++  TEST_EQ(parser.ParseJson("{name:+1}"), false);
++  TEST_EQ(parser.ParseJson("{name:-1}"), false);
++  TEST_EQ(parser.ParseJson("{name:-f}"), false);
++  TEST_EQ(parser.ParseJson("{name:+f}"), false);
+ }
+ 
+ int FlatBufferTests() {
+@@ -3873,6 +3908,7 @@ int FlatBufferTests() {
+   FixedLengthArrayConstructorTest();
+   FieldIdentifierTest();
+   StringVectorDefaultsTest();
++  ParseIncorrectMonsterJsonTest();
+   return 0;
+ }
+ 

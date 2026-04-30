@@ -1,0 +1,2526 @@
+diff --git a/gm/compositor_quads.cpp b/gm/compositor_quads.cpp
+index befdedf..69647e5 100644
+--- a/gm/compositor_quads.cpp
++++ b/gm/compositor_quads.cpp
+@@ -193,7 +193,28 @@
+     virtual void drawBanner(SkCanvas* canvas) = 0;
+ 
+     // Return draw count
+-    virtual int drawTiles(SkCanvas* canvas) {
++    virtual int drawTiles(SkCanvas* canvas, GrContext* context, GrRenderTargetContext* rtc) {
++        // TODO (michaelludwig) - once the quad APIs are in SkCanvas, drop these
++        // cached fields, which drawTile() needs
++        fContext = context;
++
++        SkBaseDevice* device = canvas->getDevice();
++        if (device->context()) {
++            // Pretty sure it's a SkGpuDevice since this is a run as a GPU GM, unfortunately we
++            // don't have RTTI for dynamic_cast
++            fDevice = static_cast<SkGpuDevice*>(device);
++        } else {
++            // This is either Viewer passing an SkPaintFilterCanvas (in which case we could get
++            // it's wrapped proxy to get the SkGpuDevice), or it is an SkColorSpaceXformCanvas
++            // that doesn't expose any access to original device. Unfortunately without RTTI
++            // there is no way to distinguish these cases so just avoid drawing. Once the API
++            // is in SkCanvas, this is a non-issue. Code that works for viewer can be uncommented
++            // to test locally (and must add ClipTileRenderer as a friend in SkPaintFilterCanvas)
++            // SkPaintFilterCanvas* filteredCanvas = static_cast<SkPaintFilterCanvas*>(canvas);
++            // fDevice = static_cast<SkGpuDevice*>(filteredCanvas->proxy()->getDevice());
++            return 0;
++        }
++
+         // All three lines in a list
+         SkPoint lines[6];
+         clipping_line_segment(kClipP1, kClipP2, lines);
+@@ -227,6 +248,10 @@
+     }
+ 
+ protected:
++    // Remembered for convenience in drawTile, set by drawTiles()
++    GrContext* fContext;
++    SkGpuDevice* fDevice;
++
+     SkCanvas::QuadAAFlags maskToFlags(const bool edgeAA[4]) const {
+         unsigned flags = (edgeAA[0] * SkCanvas::kTop_QuadAAFlag) |
+                          (edgeAA[1] * SkCanvas::kRight_QuadAAFlag) |
+@@ -374,6 +399,7 @@
+                 // The "new" edges are the edges that connect between the two split points or
+                 // between a split point and the chosen s2 point. Otherwise the edge remains aligned
+                 // with the original shape, so should preserve the AA setting.
++                // if ((p == s2 || p >= kS0) && (np == s2 || np >= kS0)) {
+                 if ((p >= kS0 && (np == s2 || np >= kS0)) ||
+                     ((np >= kS0) && (p == s2 || p >= kS0))) {
+                     // New edge
+@@ -395,7 +421,7 @@
+ 
+ static constexpr int kMatrixCount = 5;
+ 
+-class CompositorGM : public skiagm::GM {
++class CompositorGM : public skiagm::GpuGM {
+ public:
+     CompositorGM(const char* name, sk_sp<ClipTileRenderer> renderer)
+             : fName(name) {
+@@ -428,7 +454,7 @@
+         this->configureMatrices();
+     }
+ 
+-    void onDraw(SkCanvas* canvas) override {
++    void onDraw(GrContext* ctx, GrRenderTargetContext* rtc, SkCanvas* canvas) override {
+         static constexpr SkScalar kGap = 40.f;
+         static constexpr SkScalar kBannerWidth = 120.f;
+         static constexpr SkScalar kOffset = 15.f;
+@@ -449,7 +475,7 @@
+                 draw_clipping_boundaries(canvas, fMatrices[i]);
+ 
+                 canvas->concat(fMatrices[i]);
+-                drawCounts[j] += fRenderers[j]->drawTiles(canvas);
++                drawCounts[j] += fRenderers[j]->drawTiles(canvas, ctx, rtc);
+ 
+                 canvas->restore();
+                 // And advance to the next row
+@@ -556,8 +582,8 @@
+         c.fA = c.fA * (1 - alpha) + alpha;
+ 
+         SkCanvas::QuadAAFlags aaFlags = fEnableAAOverride ? fAAOverride : this->maskToFlags(edgeAA);
+-        canvas->experimental_DrawEdgeAAQuad(
+-                rect, clip, aaFlags, c.toSkColor(), SkBlendMode::kSrcOver);
++        fDevice->tmp_drawEdgeAAQuad(
++                rect, clip, clip ? 4 : 0, aaFlags, c.toSkColor(), SkBlendMode::kSrcOver);
+         return 1;
+     }
+ 
+@@ -602,8 +628,8 @@
+ 
+     int drawTile(SkCanvas* canvas, const SkRect& rect, const SkPoint clip[4], const bool edgeAA[4],
+                   int tileID, int quadID) override {
+-        canvas->experimental_DrawEdgeAAQuad(rect, clip, this->maskToFlags(edgeAA),
+-                                            fColor.toSkColor(), SkBlendMode::kSrcOver);
++        fDevice->tmp_drawEdgeAAQuad(rect, clip, clip ? 4 : 0, this->maskToFlags(edgeAA),
++                                    fColor.toSkColor(), SkBlendMode::kSrcOver);
+         return 1;
+     }
+ 
+@@ -675,9 +701,9 @@
+                 std::move(maskFilter), paintAlpha, resetAfterEachQuad, transformCount));
+     }
+ 
+-    int drawTiles(SkCanvas* canvas) override {
++    int drawTiles(SkCanvas* canvas, GrContext* ctx, GrRenderTargetContext* rtc) override {
+         SkASSERT(fImage); // initImage should be called before any drawing
+-        int draws = this->INHERITED::drawTiles(canvas);
++        int draws = this->INHERITED::drawTiles(canvas, ctx, rtc);
+         // Push the last tile set
+         draws += this->drawAndReset(canvas);
+         return draws;
+@@ -686,21 +712,21 @@
+     int drawTile(SkCanvas* canvas, const SkRect& rect, const SkPoint clip[4], const bool edgeAA[4],
+                   int tileID, int quadID) override {
+         // Now don't actually draw the tile, accumulate it in the growing entry set
+-        bool hasClip = false;
++        int clipCount = 0;
+         if (clip) {
+             // Record the four points into fDstClips
++            clipCount = 4;
+             fDstClips.push_back_n(4, clip);
+-            hasClip = true;
+         }
+ 
+-        int matrixIdx = -1;
++        int preViewIdx = -1;
+         if (!fResetEachQuad && fTransformBatchCount > 0) {
+             // Handle transform batching. This works by capturing the CTM of the first tile draw,
+             // and then calculate the difference between that and future CTMs for later tiles.
+-            if (fPreViewMatrices.count() == 0) {
++            if (fPreViewXforms.count() == 0) {
+                 fBaseCTM = canvas->getTotalMatrix();
+-                fPreViewMatrices.push_back(SkMatrix::I());
+-                matrixIdx = 0;
++                fPreViewXforms.push_back(SkMatrix::I());
++                preViewIdx = 0;
+             } else {
+                 // Calculate matrix s.t. getTotalMatrix() = fBaseCTM * M
+                 SkMatrix invBase;
+@@ -708,11 +734,11 @@
+                     SkDebugf("Cannot invert CTM, transform batching will not be correct.\n");
+                 } else {
+                     SkMatrix preView = SkMatrix::Concat(invBase, canvas->getTotalMatrix());
+-                    if (preView != fPreViewMatrices[fPreViewMatrices.count() - 1]) {
++                    if (preView != fPreViewXforms[fPreViewXforms.count() - 1]) {
+                         // Add the new matrix
+-                        fPreViewMatrices.push_back(preView);
++                        fPreViewXforms.push_back(preView);
+                     } // else re-use the last matrix
+-                    matrixIdx = fPreViewMatrices.count() - 1;
++                    preViewIdx = fPreViewXforms.count() - 1;
+                 }
+             }
+         }
+@@ -728,8 +754,9 @@
+ 
+         // drawTextureSet automatically derives appropriate local quad from localRect if clipPtr
+         // is not null.
+-        fSetEntries.push_back(
+-                {fImage, localRect, rect, matrixIdx, 1.f, this->maskToFlags(edgeAA), hasClip});
++        fSetEntries.push_back({fImage, localRect, rect, 1.f, this->maskToFlags(edgeAA)});
++        fDstClipCounts.push_back(clipCount);
++        fPreViewIdx.push_back(preViewIdx);
+ 
+         if (fResetEachQuad) {
+             // Only ever draw one entry at a time
+@@ -765,7 +792,10 @@
+     int fTransformBatchCount;
+ 
+     SkTArray<SkPoint> fDstClips;
+-    SkTArray<SkMatrix> fPreViewMatrices;
++    SkTArray<SkMatrix> fPreViewXforms;
++    // ImageSetEntry does not yet have a fDstClipCount or fPreViewIdx field
++    SkTArray<int> fDstClipCounts;
++    SkTArray<int> fPreViewIdx;
+     SkTArray<SkCanvas::ImageSetEntry> fSetEntries;
+ 
+     SkMatrix fBaseCTM;
+@@ -824,7 +854,8 @@
+     int drawAndReset(SkCanvas* canvas) {
+         // Early out if there's nothing to draw
+         if (fSetEntries.count() == 0) {
+-            SkASSERT(fDstClips.count() == 0 && fPreViewMatrices.count() == 0);
++            SkASSERT(fDstClips.count() == 0 && fPreViewXforms.count() == 0 &&
++                     fDstClipCounts.count() == 0 && fPreViewIdx.count() == 0);
+             return 0;
+         }
+ 
+@@ -841,12 +872,15 @@
+             canvas->setMatrix(fBaseCTM);
+         }
+ 
++        // NOTE: Eventually these will just be stored as a field on each entry
++        SkASSERT(fDstClipCounts.count() == fSetEntries.count());
++        SkASSERT(fPreViewIdx.count() == fSetEntries.count());
++
+ #ifdef SK_DEBUG
+         int expectedDstClipCount = 0;
+-        for (int i = 0; i < fSetEntries.count(); ++i) {
+-            expectedDstClipCount += 4 * fSetEntries[i].fHasClip;
+-            SkASSERT(fSetEntries[i].fMatrixIndex < 0 ||
+-                     fSetEntries[i].fMatrixIndex < fPreViewMatrices.count());
++        for (int i = 0; i < fDstClipCounts.count(); ++i) {
++            expectedDstClipCount += fDstClipCounts[i];
++            SkASSERT(fPreViewIdx[i] < 0 || fPreViewIdx[i] < fPreViewXforms.count());
+         }
+         SkASSERT(expectedDstClipCount == fDstClips.count());
+ #endif
+@@ -855,13 +889,16 @@
+         SkRect lastTileRect = fSetEntries[fSetEntries.count() - 1].fDstRect;
+         this->configureTilePaint(lastTileRect, &paint);
+ 
+-        canvas->experimental_DrawEdgeAAImageSet(
+-                fSetEntries.begin(), fSetEntries.count(), fDstClips.begin(),
+-                fPreViewMatrices.begin(), &paint, SkCanvas::kFast_SrcRectConstraint);
++        fDevice->tmp_drawImageSetV3(fSetEntries.begin(), fDstClipCounts.begin(),
++                                    fPreViewIdx.begin(), fSetEntries.count(),
++                                    fDstClips.begin(), fPreViewXforms.begin(),
++                                    paint, SkCanvas::kFast_SrcRectConstraint);
+ 
+         // Reset for next tile
+         fDstClips.reset();
+-        fPreViewMatrices.reset();
++        fDstClipCounts.reset();
++        fPreViewXforms.reset();
++        fPreViewIdx.reset();
+         fSetEntries.reset();
+         fBatchCount = 0;
+ 
+diff --git a/include/core/SkCanvas.h b/include/core/SkCanvas.h
+index b134e37..42c81a9 100644
+--- a/include/core/SkCanvas.h
++++ b/include/core/SkCanvas.h
+@@ -1821,10 +1821,8 @@
+         sk_sp<const SkImage> fImage;
+         SkRect fSrcRect;
+         SkRect fDstRect;
+-        int fMatrixIndex;   // Index into the preViewMatrices arg, or < 0
+         float fAlpha;
+         unsigned fAAFlags;  // QuadAAFlags
+-        bool fHasClip;      // True to use next 4 points in dstClip arg as quad
+     };
+ 
+     /**
+@@ -1834,9 +1832,6 @@
+      * to allow control over each edge's AA status, to allow perfect seaming for tile sets. The
+      * current implementation only antialiases if all edges are flagged, however.
+      * Results are undefined if an image's src rect is not within the image's bounds.
+-     *
+-     * Ignores fDstClipCount and fMatrixIndex in the image set entries.
+-     * <!deprecated in favor of experimental_DrawEdgeAAImageSet
+      */
+     void experimental_DrawImageSetV1(const ImageSetEntry imageSet[], int cnt,
+                                      SkFilterQuality quality, SkBlendMode mode);
+@@ -1847,65 +1842,10 @@
+      * over each edge's AA status, to allow perfect seaming for tile sets.
+      *
+      * When not fully supported, the implementation only antialiases if all edges are flagged.
+-     * <!deprecated in favor of experimental_DrawEdgeAAQuad
+      */
+     void experimental_DrawEdgeAARectV1(const SkRect& r, QuadAAFlags edgeAA, SkColor color,
+                                        SkBlendMode mode);
+ 
+-    /**
+-     * This is an experimental API for the SkiaRenderer Chromium project, and its API will surely
+-     * evolve if it is not removed outright.
+-     *
+-     * This behaves very similarly to drawRect() combined with a clipPath() formed by clip
+-     * quadrilateral. 'rect' and 'clip' are in the same coordinate space. If 'clip' is null, then it
+-     * is as if the rectangle was not clipped (or, alternatively, clipped to itself). If not null,
+-     * then it must provide 4 points.
+-     *
+-     * In addition to combining the draw and clipping into one operation, this function adds the
+-     * additional capability of controlling each of the rectangle's edges anti-aliasing
+-     * independently.  The edges of the clip will respect the per-edge AA flags. It is required that
+-     * 'clip' be contained inside 'rect'. In terms of mapping to edge labels, the 'clip' points
+-     * should be ordered top-left, top-right, bottom-right, bottom-left so that the edge between [0]
+-     * and [1] is "top", [1] and [2] is "right", [2] and [3] is "bottom", and [3] and [0] is "left".
+-     * This ordering matches SkRect::toQuad().
+-     *
+-     * This API only draws solid color, filled rectangles so it does not accept a full SkPaint.
+-     */
+-    void experimental_DrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4], QuadAAFlags aaFlags,
+-                                     SkColor color, SkBlendMode mode);
+-    /**
+-     * This is an bulk variant of experimental_DrawEdgeAAQuad() that renders 'cnt' textured quads.
+-     * For each entry, 'fDstRect' is rendered with its clip (determined by entry's 'fHasClip' and
+-     * the current index in 'dstClip'). The entry's fImage is applied to the destination rectangle
+-     * by sampling from 'fSrcRect' sub-image.  The corners of 'fSrcRect' map to the corners of
+-     * 'fDstRect', just like in drawImageRect(), and they will be properly interpolated when
+-     * applying a clip.
+-     *
+-     * Like experimental_DrawEdgeAAQuad(), each entry can specify edge AA flags that apply to both
+-     * the destination rect and its clip.
+-     *
+-     * If provided, the 'dstClips' array must have length equal 4 * the number of entries with
+-     * fHasClip true. If 'dstClips' is null, every entry must have 'fHasClip' set to false. The
+-     * destination clip coordinates will be read consecutively with the image set entries, advancing
+-     * by 4 points every time an entry with fHasClip is passed.
+-     *
+-     * This entry point supports per-entry manipulations to the canvas's current matrix. If an
+-     * entry provides 'fMatrixIndex' >= 0, it will be drawn as if the canvas's CTM was
+-     * canvas->getTotalMatrix() * preViewMatrices[fMatrixIndex]. If 'fMatrixIndex' is less than 0,
+-     * the pre-view matrix transform is implicitly the identity, so it will be drawn using just the
+-     * current canvas matrix. The pre-view matrix modifies the canvas's view matrix, it does not
+-     * affect the local coordinates of each entry.
+-     *
+-     * An optional paint may be provided, which supports the same subset of features usable with
+-     * drawImageRect (i.e. assumed to be filled and no path effects). When a paint is provided, the
+-     * image set is drawn as if each image used the applied paint independently, so each is affected
+-     * by the image, color, and/or mask filter.
+-     */
+-    void experimental_DrawEdgeAAImageSet(const ImageSetEntry imageSet[], int cnt,
+-                                         const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                         const SkPaint* paint = nullptr,
+-                                         SrcRectConstraint constraint = kStrict_SrcRectConstraint);
+-
+     /** Draws text, with origin at (x, y), using clip, SkMatrix, SkFont font,
+         and SkPaint paint.
+ 
+@@ -2439,6 +2379,8 @@
+     // that mechanism  will be required to implement the new function.
+     virtual void onDrawPaint(const SkPaint& paint);
+     virtual void onDrawRect(const SkRect& rect, const SkPaint& paint);
++    virtual void onDrawEdgeAARect(const SkRect& rect, QuadAAFlags edgeAA, SkColor color,
++                                  SkBlendMode mode);
+     virtual void onDrawRRect(const SkRRect& rrect, const SkPaint& paint);
+     virtual void onDrawDRRect(const SkRRect& outer, const SkRRect& inner, const SkPaint& paint);
+     virtual void onDrawOval(const SkRect& rect, const SkPaint& paint);
+@@ -2471,6 +2413,9 @@
+     virtual void onDrawImageLattice(const SkImage* image, const Lattice& lattice, const SkRect& dst,
+                                     const SkPaint* paint);
+ 
++    virtual void onDrawImageSet(const ImageSetEntry imageSet[], int count, SkFilterQuality,
++                                SkBlendMode);
++
+     virtual void onDrawBitmap(const SkBitmap& bitmap, SkScalar dx, SkScalar dy,
+                               const SkPaint* paint);
+     virtual void onDrawBitmapRect(const SkBitmap& bitmap, const SkRect* src, const SkRect& dst,
+@@ -2491,12 +2436,6 @@
+     virtual void onDrawPicture(const SkPicture* picture, const SkMatrix* matrix,
+                                const SkPaint* paint);
+ 
+-    virtual void onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4], QuadAAFlags aaFlags,
+-                                  SkColor color, SkBlendMode mode);
+-    virtual void onDrawEdgeAAImageSet(const ImageSetEntry imageSet[], int count,
+-                                      const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                      const SkPaint* paint, SrcRectConstraint constraint);
+-
+     enum ClipEdgeStyle {
+         kHard_ClipEdgeStyle,
+         kSoft_ClipEdgeStyle
+@@ -2624,6 +2563,7 @@
+     friend class SkPictureRecord;   // predrawNotify (why does it need it? <reed>)
+     friend class SkOverdrawCanvas;
+     friend class SkRasterHandleAllocator;
++    friend class ClipTileRenderer;  // GM needs getTopDevice() until API is in SkCanvas
+ protected:
+     // For use by SkNoDrawCanvas (via SkCanvasVirtualEnforcer, which can't be a friend)
+     SkCanvas(const SkIRect& bounds);
+diff --git a/include/core/SkCanvasVirtualEnforcer.h b/include/core/SkCanvasVirtualEnforcer.h
+index 4a284b3..f097911 100644
+--- a/include/core/SkCanvasVirtualEnforcer.h
++++ b/include/core/SkCanvasVirtualEnforcer.h
+@@ -53,17 +53,15 @@
+ #ifdef SK_BUILD_FOR_ANDROID_FRAMEWORK
+     // This is under active development for Chrome and not used in Android. Hold off on adding
+     // implementations in Android's SkCanvas subclasses until this stabilizes.
+-    void onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-            SkCanvas::QuadAAFlags aaFlags, SkColor color, SkBlendMode mode) override {}
+-    void onDrawEdgeAAImageSet(const SkCanvas::ImageSetEntry imageSet[], int count,
+-            const SkPoint dstClips[], const SkMatrix preViewMatrices[], const SkPaint* paint,
+-            SkCanvas::SrcRectConstraint constraint) override {}
++    void onDrawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality,
++                        SkBlendMode) override {};
++    void onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags edgeAA, SkColor color,
++                          SkBlendMode mode) override {};
+ #else
+-    void onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-            SkCanvas::QuadAAFlags aaFlags, SkColor color, SkBlendMode mode) override = 0;
+-    void onDrawEdgeAAImageSet(const SkCanvas::ImageSetEntry imageSet[], int count,
+-            const SkPoint dstClips[], const SkMatrix preViewMatrices[], const SkPaint* paint,
+-            SkCanvas::SrcRectConstraint constraint) override = 0;
++    void onDrawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality,
++                        SkBlendMode) override = 0;
++    void onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags edgeAA, SkColor color,
++                          SkBlendMode mode) override = 0;
+ #endif
+ 
+     void onDrawBitmap(const SkBitmap& bitmap, SkScalar dx, SkScalar dy,
+diff --git a/include/core/SkOverdrawCanvas.h b/include/core/SkOverdrawCanvas.h
+index cbd6646..e0d05c8 100644
+--- a/include/core/SkOverdrawCanvas.h
++++ b/include/core/SkOverdrawCanvas.h
+@@ -26,6 +26,7 @@
+                      const SkPaint&) override;
+     void onDrawPaint(const SkPaint&) override;
+     void onDrawRect(const SkRect&, const SkPaint&) override;
++    void onDrawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode) override;
+     void onDrawRegion(const SkRegion&, const SkPaint&) override;
+     void onDrawOval(const SkRect&, const SkPaint&) override;
+     void onDrawArc(const SkRect&, SkScalar, SkScalar, bool, const SkPaint&) override;
+@@ -42,6 +43,7 @@
+                          SrcRectConstraint) override;
+     void onDrawImageNine(const SkImage*, const SkIRect&, const SkRect&, const SkPaint*) override;
+     void onDrawImageLattice(const SkImage*, const Lattice&, const SkRect&, const SkPaint*) override;
++    void onDrawImageSet(const ImageSetEntry[], int count, SkFilterQuality, SkBlendMode) override;
+     void onDrawBitmap(const SkBitmap&, SkScalar, SkScalar, const SkPaint*) override;
+     void onDrawBitmapRect(const SkBitmap&, const SkRect*, const SkRect&, const SkPaint*,
+                           SrcRectConstraint) override;
+@@ -54,11 +56,6 @@
+     void onDrawAnnotation(const SkRect&, const char key[], SkData* value) override;
+     void onDrawShadowRec(const SkPath&, const SkDrawShadowRec&) override;
+ 
+-    void onDrawEdgeAAQuad(const SkRect&, const SkPoint[4], SkCanvas::QuadAAFlags, SkColor,
+-                          SkBlendMode) override;
+-    void onDrawEdgeAAImageSet(const ImageSetEntry[], int count, const SkPoint[], const SkMatrix[],
+-                              const SkPaint*, SrcRectConstraint) override;
+-
+ private:
+     void drawPosTextCommon(const SkGlyphID[], int, const SkScalar[], int, const SkPoint&,
+                            const SkFont&, const SkPaint&);
+diff --git a/include/utils/SkNWayCanvas.h b/include/utils/SkNWayCanvas.h
+index 716c3b8..09b071d 100644
+--- a/include/utils/SkNWayCanvas.h
++++ b/include/utils/SkNWayCanvas.h
+@@ -43,6 +43,7 @@
+     void onDrawPaint(const SkPaint&) override;
+     void onDrawPoints(PointMode, size_t count, const SkPoint pts[], const SkPaint&) override;
+     void onDrawRect(const SkRect&, const SkPaint&) override;
++    void onDrawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode) override;
+     void onDrawRegion(const SkRegion&, const SkPaint&) override;
+     void onDrawOval(const SkRect&, const SkPaint&) override;
+     void onDrawArc(const SkRect&, SkScalar, SkScalar, bool, const SkPaint&) override;
+@@ -59,6 +60,8 @@
+     void onDrawImageLattice(const SkImage*, const Lattice&, const SkRect&, const SkPaint*) override;
+     void onDrawImageNine(const SkImage*, const SkIRect& center, const SkRect& dst,
+                          const SkPaint*) override;
++    void onDrawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality,
++                        SkBlendMode) override;
+     void onDrawBitmapNine(const SkBitmap&, const SkIRect& center, const SkRect& dst,
+                           const SkPaint*) override;
+     void onDrawVerticesObject(const SkVertices*, const SkVertices::Bone bones[], int boneCount,
+@@ -76,11 +79,6 @@
+     void onDrawDrawable(SkDrawable*, const SkMatrix*) override;
+     void onDrawAnnotation(const SkRect&, const char[], SkData*) override;
+ 
+-    void onDrawEdgeAAQuad(const SkRect&, const SkPoint[4], QuadAAFlags, SkColor,
+-                          SkBlendMode) override;
+-    void onDrawEdgeAAImageSet(const ImageSetEntry[], int count, const SkPoint[], const SkMatrix[],
+-                              const SkPaint*, SrcRectConstraint) override;
+-
+     void onFlush() override;
+ 
+     class Iter;
+diff --git a/include/utils/SkNoDrawCanvas.h b/include/utils/SkNoDrawCanvas.h
+index a172632..ff1b027 100644
+--- a/include/utils/SkNoDrawCanvas.h
++++ b/include/utils/SkNoDrawCanvas.h
+@@ -51,6 +51,7 @@
+     void onDrawPaint(const SkPaint&) override {}
+     void onDrawPoints(PointMode, size_t, const SkPoint[], const SkPaint&) override {}
+     void onDrawRect(const SkRect&, const SkPaint&) override {}
++    void onDrawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode) override {}
+     void onDrawRegion(const SkRegion&, const SkPaint&) override {}
+     void onDrawOval(const SkRect&, const SkPaint&) override {}
+     void onDrawArc(const SkRect&, SkScalar, SkScalar, bool, const SkPaint&) override {}
+@@ -67,6 +68,8 @@
+                           const SkPaint*) override {}
+     void onDrawImageLattice(const SkImage*, const Lattice&, const SkRect&,
+                             const SkPaint*) override {}
++    void onDrawImageSet(const SkCanvas::ImageSetEntry[], int, SkFilterQuality,
++                        SkBlendMode) override {}
+     void onDrawBitmapLattice(const SkBitmap&, const Lattice&, const SkRect&,
+                              const SkPaint*) override {}
+     void onDrawVerticesObject(const SkVertices*, const SkVertices::Bone[], int, SkBlendMode,
+@@ -76,11 +79,6 @@
+     void onDrawShadowRec(const SkPath&, const SkDrawShadowRec&) override {}
+     void onDrawPicture(const SkPicture*, const SkMatrix*, const SkPaint*) override {}
+ 
+-    void onDrawEdgeAAQuad(const SkRect&, const SkPoint[4], QuadAAFlags, SkColor,
+-                          SkBlendMode) override {}
+-    void onDrawEdgeAAImageSet(const ImageSetEntry[], int, const SkPoint[],
+-                              const SkMatrix[], const SkPaint*, SrcRectConstraint) override {}
+-
+ private:
+     typedef SkCanvasVirtualEnforcer<SkCanvas> INHERITED;
+ };
+diff --git a/include/utils/SkPaintFilterCanvas.h b/include/utils/SkPaintFilterCanvas.h
+index 23019d3..2781a20 100644
+--- a/include/utils/SkPaintFilterCanvas.h
++++ b/include/utils/SkPaintFilterCanvas.h
+@@ -68,6 +68,7 @@
+     void onDrawPaint(const SkPaint&) override;
+     void onDrawPoints(PointMode, size_t count, const SkPoint pts[], const SkPaint&) override;
+     void onDrawRect(const SkRect&, const SkPaint&) override;
++    void onDrawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode) override;
+     void onDrawRRect(const SkRRect&, const SkPaint&) override;
+     void onDrawDRRect(const SkRRect&, const SkRRect&, const SkPaint&) override;
+     void onDrawRegion(const SkRegion&, const SkPaint&) override;
+@@ -88,6 +89,8 @@
+                          const SkPaint*) override;
+     void onDrawImageLattice(const SkImage*, const Lattice&, const SkRect&,
+                             const SkPaint*) override;
++    void onDrawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality,
++                        SkBlendMode) override;
+     void onDrawVerticesObject(const SkVertices*, const SkVertices::Bone bones[], int boneCount,
+                               SkBlendMode, const SkPaint&) override;
+     void onDrawPatch(const SkPoint cubics[12], const SkColor colors[4],
+@@ -103,11 +106,6 @@
+     void onDrawAnnotation(const SkRect& rect, const char key[], SkData* value) override;
+     void onDrawShadowRec(const SkPath& path, const SkDrawShadowRec& rec) override;
+ 
+-    void onDrawEdgeAAQuad(const SkRect&, const SkPoint[4], QuadAAFlags, SkColor,
+-                          SkBlendMode) override;
+-    void onDrawEdgeAAImageSet(const ImageSetEntry[], int count, const SkPoint[], const SkMatrix[],
+-                              const SkPaint*, SrcRectConstraint) override;
+-
+     // Forwarded to the wrapped canvas.
+     sk_sp<SkSurface> onNewSurface(const SkImageInfo&, const SkSurfaceProps&) override;
+     bool onPeekPixels(SkPixmap* pixmap) override;
+diff --git a/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN.json b/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN.json
+index 94b01e0..8fc03d7 100644
+--- a/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN.json
++++ b/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN.json
+@@ -377,10 +377,6 @@
+       "serialize-8888",
+       "gm",
+       "_",
+-      "compositor_quads_shader",
+-      "serialize-8888",
+-      "gm",
+-      "_",
+       "analytic_antialias_convex",
+       "serialize-8888",
+       "gm",
+diff --git a/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-BonusConfigs.json b/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-BonusConfigs.json
+index b7e39ad..ad2ecc6 100644
+--- a/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-BonusConfigs.json
++++ b/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-BonusConfigs.json
+@@ -453,10 +453,6 @@
+       "serialize-8888",
+       "gm",
+       "_",
+-      "compositor_quads_shader",
+-      "serialize-8888",
+-      "gm",
+-      "_",
+       "analytic_antialias_convex",
+       "serialize-8888",
+       "gm",
+diff --git a/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-MSAN.json b/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-MSAN.json
+index 72cf107..a816989 100644
+--- a/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-MSAN.json
++++ b/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Debug-All-MSAN.json
+@@ -371,10 +371,6 @@
+       "serialize-8888",
+       "gm",
+       "_",
+-      "compositor_quads_shader",
+-      "serialize-8888",
+-      "gm",
+-      "_",
+       "analytic_antialias_convex",
+       "serialize-8888",
+       "gm",
+diff --git a/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Release-All-TSAN.json b/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Release-All-TSAN.json
+index d6c5255..6c4cf1c 100644
+--- a/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Release-All-TSAN.json
++++ b/infra/bots/recipes/test.expected/Test-Debian9-Clang-GCE-CPU-AVX2-x86_64-Release-All-TSAN.json
+@@ -372,10 +372,6 @@
+       "serialize-8888",
+       "gm",
+       "_",
+-      "compositor_quads_shader",
+-      "serialize-8888",
+-      "gm",
+-      "_",
+       "analytic_antialias_convex",
+       "serialize-8888",
+       "gm",
+diff --git a/infra/bots/recipes/test.expected/Test-Win10-Clang-NUC8i5BEK-GPU-IntelIris655-x86_64-Debug-All-Vulkan.json b/infra/bots/recipes/test.expected/Test-Win10-Clang-NUC8i5BEK-GPU-IntelIris655-x86_64-Debug-All-Vulkan.json
+index 66339f8..ace6c29 100644
+--- a/infra/bots/recipes/test.expected/Test-Win10-Clang-NUC8i5BEK-GPU-IntelIris655-x86_64-Debug-All-Vulkan.json
++++ b/infra/bots/recipes/test.expected/Test-Win10-Clang-NUC8i5BEK-GPU-IntelIris655-x86_64-Debug-All-Vulkan.json
+@@ -424,10 +424,6 @@
+       "vk",
+       "gm",
+       "_",
+-      "compositor_quads_filter",
+-      "vk",
+-      "gm",
+-      "_",
+       "crbug_892988",
+       "vk",
+       "gm",
+diff --git a/infra/bots/recipes/test.py b/infra/bots/recipes/test.py
+index b91fbec..d7bf09b 100644
+--- a/infra/bots/recipes/test.py
++++ b/infra/bots/recipes/test.py
+@@ -484,7 +484,6 @@
+   bad_serialize_gms.append('makecolorspace')
+   bad_serialize_gms.append('readpixels')
+   bad_serialize_gms.append('draw_image_set_rect_to_rect')
+-  bad_serialize_gms.append('compositor_quads_shader')
+ 
+   # This GM forces a path to be convex. That property doesn't survive
+   # serialization.
+@@ -673,7 +672,6 @@
+     # skia:8659
+     blacklist(['vk', 'gm', '_', 'aarectmodes'])
+     blacklist(['vk', 'gm', '_', 'aaxfermodes'])
+-    blacklist(['vk', 'gm', '_', 'compositor_quads_filter'])
+     blacklist(['vk', 'gm', '_', 'crbug_892988'])
+     blacklist(['vk', 'gm', '_', 'dftext'])
+     blacklist(['vk', 'gm', '_', 'dftext_blob_persp'])
+diff --git a/src/core/SkCanvas.cpp b/src/core/SkCanvas.cpp
+index 720ac60..9e0b426 100644
+--- a/src/core/SkCanvas.cpp
++++ b/src/core/SkCanvas.cpp
+@@ -1876,6 +1876,23 @@
+     }
+ }
+ 
++void SkCanvas::experimental_DrawImageSetV1(const ImageSetEntry imageSet[], int cnt,
++                                           SkFilterQuality filterQuality, SkBlendMode mode) {
++    TRACE_EVENT0("skia", TRACE_FUNC);
++    RETURN_ON_NULL(imageSet);
++    RETURN_ON_FALSE(cnt);
++
++    this->onDrawImageSet(imageSet, cnt, filterQuality, mode);
++}
++
++void SkCanvas::experimental_DrawEdgeAARectV1(const SkRect& r, QuadAAFlags edgeAA, SkColor color,
++                                             SkBlendMode mode) {
++    TRACE_EVENT0("skia", TRACE_FUNC);
++    // To avoid redundant logic in our culling code and various backends, we always sort rects
++    // before passing them along.
++    this->onDrawEdgeAARect(r.makeSorted(), edgeAA, color, mode);
++}
++
+ void SkCanvas::drawBitmap(const SkBitmap& bitmap, SkScalar dx, SkScalar dy, const SkPaint* paint) {
+     TRACE_EVENT0("skia", TRACE_FUNC);
+     if (bitmap.drawsNothing()) {
+@@ -1995,56 +2012,6 @@
+     LOOPER_END
+ }
+ 
+-void SkCanvas::experimental_DrawImageSetV1(const ImageSetEntry imageSet[], int cnt,
+-                                           SkFilterQuality filterQuality, SkBlendMode mode) {
+-    TRACE_EVENT0("skia", TRACE_FUNC);
+-    RETURN_ON_NULL(imageSet);
+-    RETURN_ON_FALSE(cnt);
+-
+-    // DrawImageSetV1 is the same as DrawEdgeAAImageSet by making a paint from its filterQuality and
+-    // blend mode, and not providing any clip region. To safely handle that, we make a copy of the
+-    // entry set and set fHasClip to false and fMatrixIndex to -1 on each entry. Since this
+-    // function will be going away, that performance hit is acceptable.
+-    SkTArray<ImageSetEntry> safeImages(cnt);
+-    for (int i = 0; i < cnt; ++i) {
+-        ImageSetEntry& e = safeImages.push_back();
+-        e = imageSet[i];
+-        e.fHasClip = false;
+-        e.fMatrixIndex = -1;
+-    }
+-
+-    SkPaint paint;
+-    paint.setFilterQuality(filterQuality);
+-    paint.setBlendMode(mode);
+-    this->onDrawEdgeAAImageSet(safeImages.begin(), cnt, nullptr, nullptr, &paint,
+-                               kFast_SrcRectConstraint);
+-}
+-
+-void SkCanvas::experimental_DrawEdgeAARectV1(const SkRect& r, QuadAAFlags edgeAA, SkColor color,
+-                                             SkBlendMode mode) {
+-    TRACE_EVENT0("skia", TRACE_FUNC);
+-    // To avoid redundant logic in our culling code and various backends, we always sort rects
+-    // before passing them along.
+-    // DrawEdgeAARectV1 is the same as DrawEdgeAAQuad when no clip region is specified
+-    this->onDrawEdgeAAQuad(r.makeSorted(), nullptr, edgeAA, color, mode);
+-}
+-
+-void SkCanvas::experimental_DrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                           QuadAAFlags aaFlags, SkColor color, SkBlendMode mode) {
+-    TRACE_EVENT0("skia", TRACE_FUNC);
+-    // Make sure the rect is sorted before passing it along
+-    this->onDrawEdgeAAQuad(rect.makeSorted(), clip, aaFlags, color, mode);
+-}
+-
+-void SkCanvas::experimental_DrawEdgeAAImageSet(const ImageSetEntry imageSet[], int cnt,
+-                                               const SkPoint dstClips[],
+-                                               const SkMatrix preViewMatrices[],
+-                                               const SkPaint* paint,
+-                                               SrcRectConstraint constraint) {
+-    TRACE_EVENT0("skia", TRACE_FUNC);
+-    this->onDrawEdgeAAImageSet(imageSet, cnt, dstClips, preViewMatrices, paint, constraint);
+-}
+-
+ //////////////////////////////////////////////////////////////////////////////
+ //  These are the virtual drawing methods
+ //////////////////////////////////////////////////////////////////////////////
+@@ -2136,6 +2103,20 @@
+     }
+ }
+ 
++void SkCanvas::onDrawEdgeAARect(const SkRect& r, QuadAAFlags edgeAA, SkColor color,
++                                SkBlendMode mode) {
++    SkASSERT(r.isSorted());
++
++    SkPaint paint;
++    LOOPER_BEGIN(paint, nullptr)
++
++    while (iter.next()) {
++        iter.fDevice->drawEdgeAARect(r, edgeAA, color, mode);
++    }
++
++    LOOPER_END
++}
++
+ void SkCanvas::onDrawRegion(const SkRegion& region, const SkPaint& paint) {
+     SkRect regionRect = SkRect::Make(region.getBounds());
+     if (paint.canComputeFastBounds()) {
+@@ -2531,6 +2512,16 @@
+     LOOPER_END
+ }
+ 
++void SkCanvas::onDrawImageSet(const ImageSetEntry imageSet[], int count,
++                              SkFilterQuality filterQuality, SkBlendMode mode) {
++    SkPaint paint;
++    LOOPER_BEGIN(paint, nullptr)
++    while (iter.next()) {
++        iter.fDevice->drawImageSet(imageSet, count, filterQuality, mode);
++    }
++    LOOPER_END
++}
++
+ void SkCanvas::onDrawBitmapLattice(const SkBitmap& bitmap, const Lattice& lattice,
+                                    const SkRect& dst, const SkPaint* paint) {
+     SkPaint realPaint;
+@@ -2698,39 +2689,6 @@
+     LOOPER_END
+ }
+ 
+-void SkCanvas::onDrawEdgeAAQuad(const SkRect& r, const SkPoint clip[4],  QuadAAFlags edgeAA,
+-                                SkColor color, SkBlendMode mode) {
+-    SkASSERT(r.isSorted());
+-
+-    // If this used a paint, it would be a filled color with blend mode, which does not
+-    // need to use an autodraw loop, so use SkDrawIter directly.
+-    if (this->quickReject(r)) {
+-        return;
+-    }
+-
+-    this->predrawNotify();
+-    SkDrawIter iter(this);
+-    while(iter.next()) {
+-        iter.fDevice->drawEdgeAAQuad(r, clip, edgeAA, color, mode);
+-    }
+-}
+-
+-void SkCanvas::onDrawEdgeAAImageSet(const ImageSetEntry imageSet[], int count,
+-                                    const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                    const SkPaint* paint, SrcRectConstraint constraint) {
+-    SkPaint realPaint;
+-    init_image_paint(&realPaint, paint);
+-
+-    // Looper is used when there are image filters, which drawEdgeAAImageSet needs to support
+-    // for Chromium's RenderPassDrawQuads' filters.
+-    LOOPER_BEGIN(realPaint, nullptr)
+-    while (iter.next()) {
+-        iter.fDevice->drawEdgeAAImageSet(
+-                imageSet, count, dstClips, preViewMatrices, looper.paint(), constraint);
+-    }
+-    LOOPER_END
+-}
+-
+ //////////////////////////////////////////////////////////////////////////////
+ // These methods are NOT virtual, and therefore must call back into virtual
+ // methods, rather than actually drawing themselves.
+diff --git a/src/core/SkCanvasPriv.cpp b/src/core/SkCanvasPriv.cpp
+index 5249687..35c9866 100644
+--- a/src/core/SkCanvasPriv.cpp
++++ b/src/core/SkCanvasPriv.cpp
+@@ -83,17 +83,3 @@
+     buffer.writePad32(storage.get(), size);
+ }
+ 
+-void SkCanvasPriv::GetDstClipAndMatrixCounts(const SkCanvas::ImageSetEntry set[], int count,
+-                                             int* totalDstClipCount, int* totalMatrixCount) {
+-    int dstClipCount = 0;
+-    int maxMatrixIndex = -1;
+-    for (int i = 0; i < count; ++i) {
+-        dstClipCount += 4 * set[i].fHasClip;
+-        if (set[i].fMatrixIndex > maxMatrixIndex) {
+-            maxMatrixIndex = set[i].fMatrixIndex;
+-        }
+-    }
+-
+-    *totalDstClipCount = dstClipCount;
+-    *totalMatrixCount = maxMatrixIndex + 1;
+-}
+diff --git a/src/core/SkCanvasPriv.h b/src/core/SkCanvasPriv.h
+index e06e06a..cb25401 100644
+--- a/src/core/SkCanvasPriv.h
++++ b/src/core/SkCanvasPriv.h
+@@ -43,12 +43,6 @@
+     static int SaveBehind(SkCanvas* canvas, const SkRect* subset) {
+         return canvas->only_axis_aligned_saveBehind(subset);
+     }
+-
+-    // The experimental_DrawEdgeAAImageSet API accepts separate dstClips and preViewMatrices arrays,
+-    // where entries refer into them, but no explicit size is provided. Given a set of entries,
+-    // computes the minimum length for these arrays that would provide index access errors.
+-    static void GetDstClipAndMatrixCounts(const SkCanvas::ImageSetEntry set[], int count,
+-                                          int* totalDstClipCount, int* totalMatrixCount);
+ };
+ 
+ #endif
+diff --git a/src/core/SkColorSpaceXformCanvas.cpp b/src/core/SkColorSpaceXformCanvas.cpp
+index bfbdfa7..ceb014e 100644
+--- a/src/core/SkColorSpaceXformCanvas.cpp
++++ b/src/core/SkColorSpaceXformCanvas.cpp
+@@ -57,6 +57,10 @@
+     void onDrawRect(const SkRect& rect, const SkPaint& paint) override {
+         fTarget->drawRect(rect, fXformer->apply(paint));
+     }
++    void onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                          SkBlendMode mode) override {
++        fTarget->experimental_DrawEdgeAARectV1(rect, aa, fXformer->apply(color), mode);
++    }
+     void onDrawOval(const SkRect& oval, const SkPaint& paint) override {
+         fTarget->drawOval(oval, fXformer->apply(paint));
+     }
+@@ -151,6 +155,18 @@
+                                       dst, MaybePaint(paint, fXformer.get()));
+         }
+     }
++    void onDrawImageSet(const SkCanvas::ImageSetEntry set[], int count,
++                        SkFilterQuality filterQuality, SkBlendMode mode) override {
++        SkAutoTArray<ImageSetEntry> xformedSet(count);
++        for (int i = 0; i < count; ++i) {
++            xformedSet[i].fImage = this->prepareImage(set[i].fImage.get());
++            xformedSet[i].fSrcRect = set[i].fSrcRect;
++            xformedSet[i].fDstRect = set[i].fDstRect;
++            xformedSet[i].fAlpha = set[i].fAlpha;
++            xformedSet[i].fAAFlags = set[i].fAAFlags;
++        }
++        fTarget->experimental_DrawImageSetV1(xformedSet.get(), count, filterQuality, mode);
++    }
+ 
+     void onDrawAtlas(const SkImage* atlas, const SkRSXform* xforms, const SkRect* tex,
+                      const SkColor* colors, int count, SkBlendMode mode,
+@@ -230,28 +246,6 @@
+         SkCanvas::onDrawDrawable(drawable, matrix);
+     }
+ 
+-    void onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                          QuadAAFlags aa, SkColor color, SkBlendMode mode) override {
+-        fTarget->experimental_DrawEdgeAAQuad(
+-                rect, clip, aa, fXformer->apply(color), mode);
+-    }
+-    void onDrawEdgeAAImageSet(const ImageSetEntry set[], int count,
+-                              const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                              const SkPaint* paint, SrcRectConstraint constraint) override {
+-        SkAutoTArray<ImageSetEntry> xformedSet(count);
+-        for (int i = 0; i < count; ++i) {
+-            xformedSet[i].fImage = this->prepareImage(set[i].fImage.get());
+-            xformedSet[i].fSrcRect = set[i].fSrcRect;
+-            xformedSet[i].fDstRect = set[i].fDstRect;
+-            xformedSet[i].fMatrixIndex = set[i].fMatrixIndex;
+-            xformedSet[i].fAlpha = set[i].fAlpha;
+-            xformedSet[i].fAAFlags = set[i].fAAFlags;
+-            xformedSet[i].fHasClip = set[i].fHasClip;
+-        }
+-        fTarget->experimental_DrawEdgeAAImageSet(xformedSet.get(), count, dstClips, preViewMatrices,
+-                                                 MaybePaint(paint, fXformer.get()), constraint);
+-    }
+-
+     SaveLayerStrategy getSaveLayerStrategy(const SaveLayerRec& rec) override {
+         sk_sp<SkImageFilter> backdrop = rec.fBackdrop ? fXformer->apply(rec.fBackdrop) : nullptr;
+         sk_sp<SkImage> clipMask = rec.fClipMask ? fXformer->apply(rec.fClipMask) : nullptr;
+diff --git a/src/core/SkDevice.cpp b/src/core/SkDevice.cpp
+index a52bd84..d44dda8 100644
+--- a/src/core/SkDevice.cpp
++++ b/src/core/SkDevice.cpp
+@@ -128,6 +128,16 @@
+     this->drawPath(path, paint, true);
+ }
+ 
++void SkBaseDevice::drawEdgeAARect(const SkRect& r, SkCanvas::QuadAAFlags aa, SkColor color,
++                                  SkBlendMode mode) {
++    SkPaint paint;
++    paint.setColor(color);
++    paint.setBlendMode(mode);
++    paint.setAntiAlias(aa == SkCanvas::kAll_QuadAAFlags);
++
++    this->drawRect(r, paint);
++}
++
+ void SkBaseDevice::drawPatch(const SkPoint cubics[12], const SkColor colors[4],
+                              const SkPoint texCoords[4], SkBlendMode bmode, const SkPaint& paint) {
+     SkISize lod = SkPatchUtils::GetLevelOfDetail(cubics, &this->ctm());
+@@ -194,6 +204,22 @@
+     }
+ }
+ 
++void SkBaseDevice::drawImageSet(const SkCanvas::ImageSetEntry images[], int count,
++                                SkFilterQuality filterQuality, SkBlendMode mode) {
++    SkPaint paint;
++    paint.setFilterQuality(SkTPin(filterQuality, kNone_SkFilterQuality, kLow_SkFilterQuality));
++    paint.setBlendMode(mode);
++    for (int i = 0; i < count; ++i) {
++        // TODO: Handle per-edge AA. Right now this mirrors the SkiaRenderer component of Chrome
++        // which turns off antialiasing unless all four edges should be antialiased. This avoids
++        // seaming in tiled composited layers.
++        paint.setAntiAlias(images[i].fAAFlags == SkCanvas::kAll_QuadAAFlags);
++        paint.setAlpha(SkToUInt(SkTClamp(SkScalarRoundToInt(images[i].fAlpha * 255), 0, 255)));
++        this->drawImageRect(images[i].fImage.get(), &images[i].fSrcRect, images[i].fDstRect, paint,
++                            SkCanvas::kFast_SrcRectConstraint);
++    }
++}
++
+ void SkBaseDevice::drawBitmapLattice(const SkBitmap& bitmap,
+                                      const SkCanvas::Lattice& lattice, const SkRect& dst,
+                                      const SkPaint& paint) {
+@@ -249,70 +275,6 @@
+     this->drawVertices(builder.detach().get(), nullptr, 0, mode, p);
+ }
+ 
+-
+-void SkBaseDevice::drawEdgeAAQuad(const SkRect& r, const SkPoint clip[4],
+-                                  SkCanvas::QuadAAFlags aa, SkColor color, SkBlendMode mode) {
+-    SkPaint paint;
+-    paint.setColor(color);
+-    paint.setBlendMode(mode);
+-    paint.setAntiAlias(aa == SkCanvas::kAll_QuadAAFlags);
+-
+-    if (clip) {
+-        // Draw the clip directly as a quad since it's a filled color with no local coords
+-        SkPath clipPath;
+-        clipPath.addPoly(clip, 4, true);
+-        this->drawPath(clipPath, paint);
+-    } else {
+-        this->drawRect(r, paint);
+-    }
+-}
+-
+-void SkBaseDevice::drawEdgeAAImageSet(const SkCanvas::ImageSetEntry images[], int count,
+-                                      const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                      const SkPaint& paint,
+-                                      SkCanvas::SrcRectConstraint constraint) {
+-    SkASSERT(paint.getStyle() == SkPaint::kFill_Style);
+-    SkASSERT(!paint.getPathEffect());
+-
+-    SkPaint entryPaint = paint;
+-    const SkMatrix baseCTM = this->ctm();
+-    int clipIndex = 0;
+-    for (int i = 0; i < count; ++i) {
+-        // TODO: Handle per-edge AA. Right now this mirrors the SkiaRenderer component of Chrome
+-        // which turns off antialiasing unless all four edges should be antialiased. This avoids
+-        // seaming in tiled composited layers.
+-        entryPaint.setAntiAlias(images[i].fAAFlags == SkCanvas::kAll_QuadAAFlags);
+-        entryPaint.setAlphaf(paint.getAlphaf() * images[i].fAlpha);
+-
+-        bool needsRestore = false;
+-        SkASSERT(images[i].fMatrixIndex < 0 || preViewMatrices);
+-        if (images[i].fMatrixIndex >= 0) {
+-            this->save();
+-            this->setGlobalCTM(SkMatrix::Concat(
+-                    baseCTM, preViewMatrices[images[i].fMatrixIndex]));
+-            needsRestore = true;
+-        }
+-
+-        SkASSERT(!images[i].fHasClip || dstClips);
+-        if (images[i].fHasClip) {
+-            // Since drawImageRect requires a srcRect, the dst clip is implemented as a true clip
+-            if (!needsRestore) {
+-                this->save();
+-                needsRestore = true;
+-            }
+-            SkPath clipPath;
+-            clipPath.addPoly(dstClips + clipIndex, 4, true);
+-            this->clipPath(clipPath, SkClipOp::kIntersect, entryPaint.isAntiAlias());
+-            clipIndex += 4;
+-        }
+-        this->drawImageRect(images[i].fImage.get(), &images[i].fSrcRect, images[i].fDstRect,
+-                            entryPaint, constraint);
+-        if (needsRestore) {
+-            this->restore(baseCTM);
+-        }
+-    }
+-}
+-
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ void SkBaseDevice::drawDrawable(SkDrawable* drawable, const SkMatrix* matrix, SkCanvas* canvas) {
+diff --git a/src/core/SkDevice.h b/src/core/SkDevice.h
+index 5a0f246..c0796cd 100644
+--- a/src/core/SkDevice.h
++++ b/src/core/SkDevice.h
+@@ -175,6 +175,11 @@
+     virtual void drawDRRect(const SkRRect& outer,
+                             const SkRRect& inner, const SkPaint&);
+ 
++    // Default impl always calls drawRect() with a solid-color paint, setting it to anti-aliased
++    // only when all edge flags are set.
++    virtual void drawEdgeAARect(const SkRect& r, SkCanvas::QuadAAFlags aa, SkColor color,
++                                SkBlendMode mode);
++
+     /**
+      *  If pathIsMutable, then the implementation is allowed to cast path to a
+      *  non-const pointer and modify it in place (as an optimization). Canvas
+@@ -207,6 +212,9 @@
+     virtual void drawImageLattice(const SkImage*, const SkCanvas::Lattice&,
+                                   const SkRect& dst, const SkPaint&);
+ 
++    virtual void drawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality,
++                              SkBlendMode);
++
+     virtual void drawVertices(const SkVertices*, const SkVertices::Bone bones[], int boneCount,
+                               SkBlendMode, const SkPaint&) = 0;
+     virtual void drawShadow(const SkPath&, const SkDrawShadowRec&);
+@@ -222,17 +230,6 @@
+ 
+     virtual void drawAnnotation(const SkRect&, const char[], SkData*) {}
+ 
+-    // Default impl always calls drawRect() with a solid-color paint, setting it to anti-aliased
+-    // only when all edge flags are set. If there's a clip region, it draws that using drawPath,
+-    // or uses clipPath().
+-    virtual void drawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                SkCanvas::QuadAAFlags aaFlags, SkColor color, SkBlendMode mode);
+-    // Default impl uses drawImageRect per entry, being anti-aliased only when an entry's edge flags
+-    // are all set. If there's a clip region, it will be applied using clipPath().
+-    virtual void drawEdgeAAImageSet(const SkCanvas::ImageSetEntry[], int count,
+-                                    const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                    const SkPaint& paint, SkCanvas::SrcRectConstraint);
+-
+     /** The SkDevice passed will be an SkDevice which was returned by a call to
+         onCreateDevice on this device with kNeverTile_TileExpectation.
+      */
+@@ -344,6 +341,8 @@
+     friend class SkGlyphRunList;
+     friend class SkGlyphRunBuilder;
+ 
++    friend class ClipTileRenderer;  // GM needs context() until API is in SkCanvas
++
+     // used to change the backend's pixels (and possibly config/rowbytes)
+     // but cannot change the width/height, so there should be no change to
+     // any clip information.
+diff --git a/src/core/SkLiteDL.cpp b/src/core/SkLiteDL.cpp
+index 7083a7a..1c9c742 100644
+--- a/src/core/SkLiteDL.cpp
++++ b/src/core/SkLiteDL.cpp
+@@ -52,13 +52,12 @@
+     M(Flush) M(Save) M(Restore) M(SaveLayer) M(SaveBehind)                             \
+     M(Concat) M(SetMatrix) M(Translate)                                                \
+     M(ClipPath) M(ClipRect) M(ClipRRect) M(ClipRegion)                                 \
+-    M(DrawPaint) M(DrawPath) M(DrawRect)                                               \
++    M(DrawPaint) M(DrawPath) M(DrawRect) M(DrawEdgeAARect)                             \
+     M(DrawRegion) M(DrawOval) M(DrawArc)                                               \
+     M(DrawRRect) M(DrawDRRect) M(DrawAnnotation) M(DrawDrawable) M(DrawPicture)        \
+-    M(DrawImage) M(DrawImageNine) M(DrawImageRect) M(DrawImageLattice)                 \
++    M(DrawImage) M(DrawImageNine) M(DrawImageRect) M(DrawImageLattice) M(DrawImageSet) \
+     M(DrawTextBlob)                                                                    \
+-    M(DrawPatch) M(DrawPoints) M(DrawVertices) M(DrawAtlas) M(DrawShadowRec)           \
+-    M(DrawEdgeAAQuad) M(DrawEdgeAAImageSet)
++    M(DrawPatch) M(DrawPoints) M(DrawVertices) M(DrawAtlas) M(DrawShadowRec)
+ 
+ #define M(T) T,
+     enum class Type : uint8_t { TYPES(M) };
+@@ -191,6 +190,19 @@
+         SkPaint paint;
+         void draw(SkCanvas* c, const SkMatrix&) const { c->drawRect(rect, paint); }
+     };
++    struct DrawEdgeAARect final : Op {
++        static const auto kType = Type::DrawEdgeAARect;
++        DrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                       SkBlendMode mode)
++            : rect(rect), aa(aa), color(color), mode(mode) {}
++        SkRect rect;
++        SkCanvas::QuadAAFlags aa;
++        SkColor color;
++        SkBlendMode mode;
++        void draw(SkCanvas* c, const SkMatrix&) const {
++            c->experimental_DrawEdgeAARectV1(rect, aa, color, mode);
++        }
++    };
+     struct DrawRegion final : Op {
+         static const auto kType = Type::DrawRegion;
+         DrawRegion(const SkRegion& region, const SkPaint& paint) : region(region), paint(paint) {}
+@@ -337,6 +349,21 @@
+                                 &paint);
+         }
+     };
++    struct DrawImageSet final : Op {
++        static const auto kType = Type::DrawImageSet;
++        DrawImageSet(const SkCanvas::ImageSetEntry set[], int count, SkFilterQuality quality,
++                     SkBlendMode xfermode)
++                : count(count), quality(quality), xfermode(xfermode), set(count) {
++            std::copy_n(set, count, this->set.get());
++        }
++        int                                   count;
++        SkFilterQuality                       quality;
++        SkBlendMode                           xfermode;
++        SkAutoTArray<SkCanvas::ImageSetEntry> set;
++        void draw(SkCanvas* c, const SkMatrix&) const {
++            c->experimental_DrawImageSetV1(set.get(), count, quality, xfermode);
++        }
++    };
+     struct DrawTextBlob final : Op {
+         static const auto kType = Type::DrawTextBlob;
+         DrawTextBlob(const SkTextBlob* blob, SkScalar x, SkScalar y, const SkPaint& paint)
+@@ -432,48 +459,6 @@
+             c->private_draw_shadow_rec(fPath, fRec);
+         }
+     };
+-
+-    struct DrawEdgeAAQuad final : Op {
+-        static const auto kType = Type::DrawEdgeAAQuad;
+-        DrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                       SkCanvas::QuadAAFlags aa, SkColor color, SkBlendMode mode)
+-            : rect(rect), hasClip(clip != nullptr), aa(aa), color(color), mode(mode) {
+-                if (clip) {
+-                    for (int i = 0; i < 4; ++i) {
+-                        this->clip[i] = clip[i];
+-                    }
+-                }
+-            }
+-        SkRect rect;
+-        SkPoint clip[4];
+-        bool hasClip;
+-        SkCanvas::QuadAAFlags aa;
+-        SkColor color;
+-        SkBlendMode mode;
+-        void draw(SkCanvas* c, const SkMatrix&) const {
+-            c->experimental_DrawEdgeAAQuad(rect, hasClip ? clip : nullptr, aa, color, mode);
+-        }
+-    };
+-    struct DrawEdgeAAImageSet final : Op {
+-        static const auto kType = Type::DrawEdgeAAImageSet;
+-        DrawEdgeAAImageSet(const SkCanvas::ImageSetEntry set[], int count, int dstClipCount,
+-                     const SkPaint* paint, SkCanvas::SrcRectConstraint constraint)
+-                : count(count), set(count), dstClipCount(dstClipCount), constraint(constraint) {
+-            std::copy_n(set, count, this->set.get());
+-            if (paint) { this->paint = *paint; }
+-        }
+-        int count;
+-        SkAutoTArray<SkCanvas::ImageSetEntry> set;
+-        int dstClipCount;
+-        SkPaint paint;
+-        SkCanvas::SrcRectConstraint constraint;
+-        void draw(SkCanvas* c, const SkMatrix&) const {
+-            auto dstClips = pod<SkPoint>(this);
+-            auto preViewMatrices = pod<SkMatrix>(this, dstClipCount * sizeof(SkPoint));
+-            c->experimental_DrawEdgeAAImageSet(
+-                    set.get(), count, dstClips, preViewMatrices, &paint, constraint);
+-        }
+-    };
+ }
+ 
+ template <typename T, typename... Args>
+@@ -548,6 +533,10 @@
+ void SkLiteDL::drawRect(const SkRect& rect, const SkPaint& paint) {
+     this->push<DrawRect>(0, rect, paint);
+ }
++void SkLiteDL::drawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                              SkBlendMode mode) {
++    this->push<DrawEdgeAARect>(0, rect, aa, color, mode);
++}
+ void SkLiteDL::drawRegion(const SkRegion& region, const SkPaint& paint) {
+     this->push<DrawRegion>(0, region, paint);
+ }
+@@ -603,6 +592,11 @@
+                 lattice.fRectTypes, fs);
+ }
+ 
++void SkLiteDL::drawImageSet(const SkCanvas::ImageSetEntry set[], int count,
++                            SkFilterQuality filterQuality, SkBlendMode mode) {
++    this->push<DrawImageSet>(0, set, count, filterQuality, mode);
++}
++
+ void SkLiteDL::drawTextBlob(const SkTextBlob* blob, SkScalar x, SkScalar y, const SkPaint& paint) {
+     this->push<DrawTextBlob>(0, blob, x,y, paint);
+ }
+@@ -642,24 +636,6 @@
+     this->push<DrawShadowRec>(0, path, rec);
+ }
+ 
+-void SkLiteDL::drawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                              SkCanvas::QuadAAFlags aa, SkColor color, SkBlendMode mode) {
+-    this->push<DrawEdgeAAQuad>(0, rect, clip, aa, color, mode);
+-}
+-
+-void SkLiteDL::drawEdgeAAImageSet(const SkCanvas::ImageSetEntry set[], int count,
+-                            const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                            const SkPaint* paint, SkCanvas::SrcRectConstraint constraint) {
+-    int totalDstClipCount, totalMatrixCount;
+-    SkCanvasPriv::GetDstClipAndMatrixCounts(set, count, &totalDstClipCount, &totalMatrixCount);
+-
+-    size_t bytes = totalDstClipCount * sizeof(SkPoint) + totalMatrixCount * sizeof(SkMatrix);
+-    void* pod = this->push<DrawEdgeAAImageSet>(
+-            bytes, set, count, totalDstClipCount, paint, constraint);
+-    copy_v(pod, dstClips, totalDstClipCount,
+-           preViewMatrices, totalMatrixCount);
+-}
+-
+ typedef void(*draw_fn)(const void*,  SkCanvas*, const SkMatrix&);
+ typedef void(*void_fn)(const void*);
+ 
+diff --git a/src/core/SkLiteDL.h b/src/core/SkLiteDL.h
+index ea9a5fa..a6041bc 100644
+--- a/src/core/SkLiteDL.h
++++ b/src/core/SkLiteDL.h
+@@ -46,6 +46,7 @@
+     void drawPaint (const SkPaint&);
+     void drawPath  (const SkPath&, const SkPaint&);
+     void drawRect  (const SkRect&, const SkPaint&);
++    void drawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode);
+     void drawRegion(const SkRegion&, const SkPaint&);
+     void drawOval  (const SkRect&, const SkPaint&);
+     void drawArc   (const SkRect&, SkScalar, SkScalar, bool, const SkPaint&);
+@@ -64,6 +65,7 @@
+                        SkCanvas::SrcRectConstraint);
+     void drawImageLattice(sk_sp<const SkImage>, const SkCanvas::Lattice&,
+                           const SkRect&, const SkPaint*);
++    void drawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality, SkBlendMode);
+ 
+     void drawPatch(const SkPoint[12], const SkColor[4], const SkPoint[4],
+                    SkBlendMode, const SkPaint&);
+@@ -74,12 +76,6 @@
+                    SkBlendMode, const SkRect*, const SkPaint*);
+     void drawShadowRec(const SkPath&, const SkDrawShadowRec&);
+ 
+-    void drawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4], SkCanvas::QuadAAFlags aaFlags,
+-                        SkColor color, SkBlendMode mode);
+-    void drawEdgeAAImageSet(const SkCanvas::ImageSetEntry[], int count, const SkPoint dstClips[],
+-                            const SkMatrix preViewMatrices[], const SkPaint* paint,
+-                            SkCanvas::SrcRectConstraint constraint);
+-
+ private:
+     template <typename T, typename... Args>
+     void* push(size_t, Args&&...);
+diff --git a/src/core/SkLiteRecorder.cpp b/src/core/SkLiteRecorder.cpp
+index f95dc34..6dda8d6 100644
+--- a/src/core/SkLiteRecorder.cpp
++++ b/src/core/SkLiteRecorder.cpp
+@@ -66,6 +66,10 @@
+ void SkLiteRecorder::onDrawRect(const SkRect& rect, const SkPaint& paint) {
+     fDL->drawRect(rect, paint);
+ }
++void SkLiteRecorder::onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                                      SkBlendMode mode) {
++    fDL->drawEdgeAARect(rect, aa, color, mode);
++}
+ void SkLiteRecorder::onDrawRegion(const SkRegion& region, const SkPaint& paint) {
+     fDL->drawRegion(region, paint);
+ }
+@@ -143,6 +147,11 @@
+     fDL->drawImageLattice(sk_ref_sp(img), lattice, dst, paint);
+ }
+ 
++void SkLiteRecorder::onDrawImageSet(const ImageSetEntry set[], int count,
++                                    SkFilterQuality filterQuality, SkBlendMode mode) {
++    fDL->drawImageSet(set, count, filterQuality, mode);
++}
++
+ void SkLiteRecorder::onDrawPatch(const SkPoint cubics[12],
+                                  const SkColor colors[4], const SkPoint texCoords[4],
+                                  SkBlendMode bmode, const SkPaint& paint) {
+@@ -171,14 +180,3 @@
+ void SkLiteRecorder::onDrawShadowRec(const SkPath& path, const SkDrawShadowRec& rec) {
+     fDL->drawShadowRec(path, rec);
+ }
+-
+-void SkLiteRecorder::onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                      QuadAAFlags aaFlags, SkColor color, SkBlendMode mode) {
+-  fDL->drawEdgeAAQuad(rect, clip, aaFlags, color, mode);
+-}
+-void SkLiteRecorder::onDrawEdgeAAImageSet(const ImageSetEntry set[], int count,
+-                                          const SkPoint dstClips[],
+-                                          const SkMatrix preViewMatrices[], const SkPaint* paint,
+-                                          SkCanvas::SrcRectConstraint constraint) {
+-  fDL->drawEdgeAAImageSet(set, count, dstClips, preViewMatrices, paint, constraint);
+-}
+diff --git a/src/core/SkLiteRecorder.h b/src/core/SkLiteRecorder.h
+index 7b54f89..81eedb3 100644
+--- a/src/core/SkLiteRecorder.h
++++ b/src/core/SkLiteRecorder.h
+@@ -39,6 +39,7 @@
+     void onDrawPaint (const SkPaint&) override;
+     void onDrawPath  (const SkPath&, const SkPaint&) override;
+     void onDrawRect  (const SkRect&, const SkPaint&) override;
++    void onDrawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode) override;
+     void onDrawRegion(const SkRegion&, const SkPaint&) override;
+     void onDrawOval  (const SkRect&, const SkPaint&) override;
+     void onDrawArc(const SkRect&, SkScalar, SkScalar, bool, const SkPaint&) override;
+@@ -63,6 +64,7 @@
+     void onDrawImageNine(const SkImage*, const SkIRect&, const SkRect&, const SkPaint*) override;
+     void onDrawImageRect(const SkImage*, const SkRect*, const SkRect&, const SkPaint*,
+                          SrcRectConstraint) override;
++    void onDrawImageSet(const ImageSetEntry[], int count, SkFilterQuality, SkBlendMode) override;
+ 
+     void onDrawPatch(const SkPoint[12], const SkColor[4],
+                      const SkPoint[4], SkBlendMode, const SkPaint&) override;
+@@ -73,11 +75,6 @@
+                      int, SkBlendMode, const SkRect*, const SkPaint*) override;
+     void onDrawShadowRec(const SkPath&, const SkDrawShadowRec&) override;
+ 
+-    void onDrawEdgeAAQuad(const SkRect&, const SkPoint[4], QuadAAFlags, SkColor,
+-                          SkBlendMode) override;
+-    void onDrawEdgeAAImageSet(const ImageSetEntry[], int count, const SkPoint[], const SkMatrix[],
+-                              const SkPaint*, SrcRectConstraint) override;
+-
+ private:
+     typedef SkCanvasVirtualEnforcer<SkNoDrawCanvas> INHERITED;
+ 
+diff --git a/src/core/SkOverdrawCanvas.cpp b/src/core/SkOverdrawCanvas.cpp
+index ef611cd..a7b39bb 100644
+--- a/src/core/SkOverdrawCanvas.cpp
++++ b/src/core/SkOverdrawCanvas.cpp
+@@ -117,6 +117,11 @@
+     fList[0]->onDrawRect(rect, this->overdrawPaint(paint));
+ }
+ 
++void SkOverdrawCanvas::onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                                        SkBlendMode mode) {
++    fList[0]->onDrawRect(rect, fPaint);
++}
++
+ void SkOverdrawCanvas::onDrawRegion(const SkRegion& region, const SkPaint& paint) {
+     fList[0]->onDrawRegion(region, this->overdrawPaint(paint));
+ }
+@@ -206,6 +211,13 @@
+     }
+ }
+ 
++void SkOverdrawCanvas::onDrawImageSet(const ImageSetEntry set[], int count, SkFilterQuality,
++                                      SkBlendMode) {
++    for (int i = 0; i < count; ++i) {
++        fList[0]->onDrawRect(set[i].fDstRect, fPaint);
++    }
++}
++
+ void SkOverdrawCanvas::onDrawBitmap(const SkBitmap& bitmap, SkScalar x, SkScalar y,
+                                     const SkPaint*) {
+     fList[0]->onDrawRect(SkRect::MakeXYWH(x, y, bitmap.width(), bitmap.height()), fPaint);
+@@ -244,41 +256,6 @@
+     fList[0]->onDrawRect(bounds, fPaint);
+ }
+ 
+-void SkOverdrawCanvas::onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                        QuadAAFlags aa, SkColor color, SkBlendMode mode) {
+-    if (clip) {
+-        SkPath path;
+-        path.addPoly(clip, 4, true);
+-        fList[0]->onDrawPath(path, fPaint);
+-    } else {
+-        fList[0]->onDrawRect(rect, fPaint);
+-    }
+-}
+-
+-void SkOverdrawCanvas::onDrawEdgeAAImageSet(const ImageSetEntry set[], int count,
+-                                            const SkPoint dstClips[],
+-                                            const SkMatrix preViewMatrices[], const SkPaint* paint,
+-                                            SrcRectConstraint constraint) {
+-    int clipIndex = 0;
+-    for (int i = 0; i < count; ++i) {
+-        if (set[i].fMatrixIndex >= 0) {
+-            fList[0]->save();
+-            fList[0]->concat(preViewMatrices[set[i].fMatrixIndex]);
+-        }
+-        if (set[i].fHasClip) {
+-            SkPath path;
+-            path.addPoly(dstClips + clipIndex, 4, true);
+-            clipIndex += 4;
+-            fList[0]->onDrawPath(path, fPaint);
+-        } else {
+-            fList[0]->onDrawRect(set[i].fDstRect, fPaint);
+-        }
+-        if (set[i].fMatrixIndex >= 0) {
+-            fList[0]->restore();
+-        }
+-    }
+-}
+-
+ inline SkPaint SkOverdrawCanvas::overdrawPaint(const SkPaint& paint) {
+     SkPaint newPaint = fPaint;
+     newPaint.setStyle(paint.getStyle());
+diff --git a/src/core/SkPictureFlat.h b/src/core/SkPictureFlat.h
+index 34e4dfb..de1c269 100644
+--- a/src/core/SkPictureFlat.h
++++ b/src/core/SkPictureFlat.h
+@@ -97,13 +97,13 @@
+ 
+     FLUSH,
+ 
+-    DRAW_EDGEAA_IMAGE_SET,
++    DRAW_IMAGE_SET,
+ 
+     SAVE_BEHIND,
+ 
+-    DRAW_EDGEAA_QUAD,
++    DRAW_EDGEAA_RECT,
+ 
+-    LAST_DRAWTYPE_ENUM = DRAW_EDGEAA_QUAD,
++    LAST_DRAWTYPE_ENUM = DRAW_EDGEAA_RECT,
+ };
+ 
+ enum DrawVertexFlags {
+diff --git a/src/core/SkPicturePlayback.cpp b/src/core/SkPicturePlayback.cpp
+index 4a51ab0..e0120dd 100644
+--- a/src/core/SkPicturePlayback.cpp
++++ b/src/core/SkPicturePlayback.cpp
+@@ -274,55 +274,15 @@
+                 canvas->drawDRRect(outer, inner, *paint);
+             }
+         } break;
+-        case DRAW_EDGEAA_QUAD: {
++        case DRAW_EDGEAA_RECT: {
+             SkRect rect;
+             reader->readRect(&rect);
+             SkCanvas::QuadAAFlags aaFlags = static_cast<SkCanvas::QuadAAFlags>(reader->read32());
+             SkColor color = reader->read32();
+             SkBlendMode blend = static_cast<SkBlendMode>(reader->read32());
+-            bool hasClip = reader->readInt();
+-            SkPoint clip[4];
+-            if (hasClip) {
+-                for (int i = 0; i < 4; ++i) {
+-                    reader->readPoint(&clip[i]);
+-                }
+-            }
+-            BREAK_ON_READ_ERROR(reader);
+-            canvas->experimental_DrawEdgeAAQuad(rect, hasClip ? clip : nullptr,
+-                                                aaFlags, color, blend);
+-        } break;
+-        case DRAW_EDGEAA_IMAGE_SET: {
+-            int cnt = reader->readInt();
+-            if (!reader->validate(cnt >= 0)) {
+-                break;
+-            }
+-            const SkPaint* paint = fPictureData->getPaint(reader);
+-            SkCanvas::SrcRectConstraint constraint = (SkCanvas::SrcRectConstraint)reader->readInt();
+-            SkAutoTArray<SkCanvas::ImageSetEntry> set(cnt);
+-            for (int i = 0; i < cnt; ++i) {
+-                set[i].fImage = sk_ref_sp(fPictureData->getImage(reader));
+-                reader->readRect(&set[i].fSrcRect);
+-                reader->readRect(&set[i].fDstRect);
+-                set[i].fMatrixIndex = reader->readInt();
+-                set[i].fAlpha = reader->readScalar();
+-                set[i].fAAFlags = reader->readUInt();
+-                set[i].fHasClip = reader->readInt();
+-            }
+-
+-            int dstClipCount = reader->readInt();
+-            SkTArray<SkPoint> dstClips(dstClipCount);
+-            for (int i = 0; i < dstClipCount; ++i) {
+-                reader->readPoint(&dstClips.push_back());
+-            }
+-            int matrixCount = reader->readInt();
+-            SkTArray<SkMatrix> matrices(matrixCount);
+-            for (int i = 0; i < matrixCount; ++i) {
+-                reader->readMatrix(&matrices.push_back());
+-            }
+             BREAK_ON_READ_ERROR(reader);
+ 
+-            canvas->experimental_DrawEdgeAAImageSet(set.get(), cnt, dstClips.begin(),
+-                                                    matrices.begin(), paint, constraint);
++            canvas->experimental_DrawEdgeAARectV1(rect, aaFlags, color, blend);
+         } break;
+         case DRAW_IMAGE: {
+             const SkPaint* paint = fPictureData->getPaint(reader);
+@@ -371,6 +331,25 @@
+ 
+             canvas->legacy_drawImageRect(image, src, dst, paint, constraint);
+         } break;
++        case DRAW_IMAGE_SET: {
++            int cnt = reader->readInt();
++            if (!reader->validate(cnt >= 0)) {
++                break;
++            }
++            SkFilterQuality filterQuality = (SkFilterQuality)reader->readUInt();
++            SkBlendMode mode = (SkBlendMode)reader->readUInt();
++            SkAutoTArray<SkCanvas::ImageSetEntry> set(cnt);
++            for (int i = 0; i < cnt; ++i) {
++                set[i].fImage = sk_ref_sp(fPictureData->getImage(reader));
++                reader->readRect(&set[i].fSrcRect);
++                reader->readRect(&set[i].fDstRect);
++                set[i].fAlpha = reader->readScalar();
++                set[i].fAAFlags = reader->readUInt();
++            }
++            BREAK_ON_READ_ERROR(reader);
++
++            canvas->experimental_DrawImageSetV1(set.get(), cnt, filterQuality, mode);
++        } break;
+         case DRAW_OVAL: {
+             const SkPaint* paint = fPictureData->getPaint(reader);
+             SkRect rect;
+diff --git a/src/core/SkPictureRecord.cpp b/src/core/SkPictureRecord.cpp
+index d8bc36b..01115bf 100644
+--- a/src/core/SkPictureRecord.cpp
++++ b/src/core/SkPictureRecord.cpp
+@@ -467,6 +467,18 @@
+     this->validate(initialOffset, size);
+ }
+ 
++void SkPictureRecord::onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa,
++                                       SkColor color, SkBlendMode mode) {
++    // op + rect + aa flags + color + mode
++    size_t size = 4 * kUInt32Size + sizeof(rect);
++    size_t initialOffset = this->addDraw(DRAW_EDGEAA_RECT, &size);
++    this->addRect(rect);
++    this->addInt((int) aa);
++    this->addInt((int) color);
++    this->addInt((int) mode);
++    this->validate(initialOffset, size);
++}
++
+ void SkPictureRecord::onDrawRegion(const SkRegion& region, const SkPaint& paint) {
+     // op + paint index + region
+     size_t regionBytes = region.writeToMemory(nullptr);
+@@ -562,6 +574,25 @@
+     this->validate(initialOffset, size);
+ }
+ 
++void SkPictureRecord::onDrawImageSet(const SkCanvas::ImageSetEntry set[], int count,
++                                     SkFilterQuality filterQuality, SkBlendMode mode) {
++    // op + count + alpha + fq + mode + (image index, src rect, dst rect, alpha, aa flags) * cnt
++    size_t size =
++            4 * kUInt32Size + (2 * kUInt32Size + 2 * sizeof(SkRect) + sizeof(SkScalar)) * count;
++    size_t initialOffset = this->addDraw(DRAW_IMAGE_SET, &size);
++    this->addInt(count);
++    this->addInt((int)filterQuality);
++    this->addInt((int)mode);
++    for (int i = 0; i < count; ++i) {
++        this->addImage(set[i].fImage.get());
++        this->addRect(set[i].fSrcRect);
++        this->addRect(set[i].fDstRect);
++        this->addScalar(set[i].fAlpha);
++        this->addInt((int)set[i].fAAFlags);
++    }
++    this->validate(initialOffset, size);
++}
++
+ void SkPictureRecord::onDrawTextBlob(const SkTextBlob* blob, SkScalar x, SkScalar y,
+                                      const SkPaint& paint) {
+ 
+@@ -731,59 +762,6 @@
+     this->validate(initialOffset, size);
+ }
+ 
+-void SkPictureRecord::onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                       SkCanvas::QuadAAFlags aa, SkColor color, SkBlendMode mode) {
+-
+-    // op + rect + aa flags + color + mode + hasClip(as int) + clipCount*points
+-    size_t size = 5 * kUInt32Size + sizeof(rect) + (clip ? 4 : 0) * sizeof(SkPoint);
+-    size_t initialOffset = this->addDraw(DRAW_EDGEAA_QUAD, &size);
+-    this->addRect(rect);
+-    this->addInt((int) aa);
+-    this->addInt((int) color);
+-    this->addInt((int) mode);
+-    this->addInt(clip != nullptr);
+-    if (clip) {
+-        this->addPoints(clip, 4);
+-    }
+-    this->validate(initialOffset, size);
+-}
+-
+-void SkPictureRecord::onDrawEdgeAAImageSet(const SkCanvas::ImageSetEntry set[], int count,
+-                                           const SkPoint dstClips[],
+-                                           const SkMatrix preViewMatrices[],
+-                                           const SkPaint* paint,
+-                                           SkCanvas::SrcRectConstraint constraint) {
+-    static constexpr size_t kMatrixSize = 9 * sizeof(SkScalar); // *not* sizeof(SkMatrix)
+-    // op + count + paint + constraint + (image index, src rect, dst rect, alpha, aa flags,
+-    // hasClip(int), matrixIndex) * cnt + totalClipCount + dstClips + totalMatrixCount + matrices
+-    int totalDstClipCount, totalMatrixCount;
+-    SkCanvasPriv::GetDstClipAndMatrixCounts(set, count, &totalDstClipCount, &totalMatrixCount);
+-
+-    size_t size = 6 * kUInt32Size + sizeof(SkPoint) * totalDstClipCount +
+-                  kMatrixSize * totalMatrixCount +
+-                  (4 * kUInt32Size + 2 * sizeof(SkRect) + sizeof(SkScalar)) * count;
+-    size_t initialOffset = this->addDraw(DRAW_EDGEAA_IMAGE_SET, &size);
+-    this->addInt(count);
+-    this->addPaintPtr(paint);
+-    this->addInt((int) constraint);
+-    for (int i = 0; i < count; ++i) {
+-        this->addImage(set[i].fImage.get());
+-        this->addRect(set[i].fSrcRect);
+-        this->addRect(set[i].fDstRect);
+-        this->addInt(set[i].fMatrixIndex);
+-        this->addScalar(set[i].fAlpha);
+-        this->addInt((int)set[i].fAAFlags);
+-        this->addInt(set[i].fHasClip);
+-    }
+-    this->addInt(totalDstClipCount);
+-    this->addPoints(dstClips, totalDstClipCount);
+-    this->addInt(totalMatrixCount);
+-    for (int i = 0; i < totalMatrixCount; ++i) {
+-        this->addMatrix(preViewMatrices[i]);
+-    }
+-    this->validate(initialOffset, size);
+-}
+-
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ // De-duping helper.
+diff --git a/src/core/SkPictureRecord.h b/src/core/SkPictureRecord.h
+index f355e41..77137c4 100644
+--- a/src/core/SkPictureRecord.h
++++ b/src/core/SkPictureRecord.h
+@@ -176,6 +176,7 @@
+     void onDrawPaint(const SkPaint&) override;
+     void onDrawPoints(PointMode, size_t count, const SkPoint pts[], const SkPaint&) override;
+     void onDrawRect(const SkRect&, const SkPaint&) override;
++    void onDrawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode) override;
+     void onDrawRegion(const SkRegion&, const SkPaint&) override;
+     void onDrawOval(const SkRect&, const SkPaint&) override;
+     void onDrawArc(const SkRect&, SkScalar, SkScalar, bool, const SkPaint&) override;
+@@ -188,7 +189,8 @@
+                          const SkPaint*) override;
+     void onDrawImageLattice(const SkImage*, const SkCanvas::Lattice& lattice, const SkRect& dst,
+                             const SkPaint*) override;
+-
++    void onDrawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality,
++                        SkBlendMode) override;
+     void onDrawShadowRec(const SkPath&, const SkDrawShadowRec&) override;
+     void onDrawVerticesObject(const SkVertices*, const SkVertices::Bone bones[], int boneCount,
+                               SkBlendMode, const SkPaint&) override;
+@@ -203,11 +205,6 @@
+     void onDrawDrawable(SkDrawable*, const SkMatrix*) override;
+     void onDrawAnnotation(const SkRect&, const char[], SkData*) override;
+ 
+-    void onDrawEdgeAAQuad(const SkRect&, const SkPoint[4], QuadAAFlags, SkColor,
+-                          SkBlendMode) override;
+-    void onDrawEdgeAAImageSet(const ImageSetEntry[], int count, const SkPoint[], const SkMatrix[],
+-                              const SkPaint*, SrcRectConstraint) override;
+-
+     int addPathToHeap(const SkPath& path);  // does not write to ops stream
+ 
+     // These entry points allow the writing of matrices, clips, saves &
+diff --git a/src/core/SkRecordDraw.cpp b/src/core/SkRecordDraw.cpp
+index b6a3033..4dcc455 100644
+--- a/src/core/SkRecordDraw.cpp
++++ b/src/core/SkRecordDraw.cpp
+@@ -115,6 +115,7 @@
+ 
+ DRAW(DrawImageRect, legacy_drawImageRect(r.image.get(), r.src, r.dst, r.paint, r.constraint));
+ DRAW(DrawImageNine, drawImageNine(r.image.get(), r.center, r.dst, r.paint));
++DRAW(DrawImageSet, experimental_DrawImageSetV1(r.set.get(), r.count, r.quality, r.mode));
+ DRAW(DrawOval, drawOval(r.oval, r.paint));
+ DRAW(DrawPaint, drawPaint(r.paint));
+ DRAW(DrawPath, drawPath(r.path, r.paint));
+@@ -123,6 +124,7 @@
+ DRAW(DrawPoints, drawPoints(r.mode, r.count, r.pts, r.paint));
+ DRAW(DrawRRect, drawRRect(r.rrect, r.paint));
+ DRAW(DrawRect, drawRect(r.rect, r.paint));
++DRAW(DrawEdgeAARect, experimental_DrawEdgeAARectV1(r.rect, r.aa, r.color, r.mode));
+ DRAW(DrawRegion, drawRegion(r.region, r.paint));
+ DRAW(DrawTextBlob, drawTextBlob(r.blob.get(), r.x, r.y, r.paint));
+ DRAW(DrawAtlas, drawAtlas(r.atlas.get(),
+@@ -130,12 +132,6 @@
+ DRAW(DrawVertices, drawVertices(r.vertices, r.bones, r.boneCount, r.bmode, r.paint));
+ DRAW(DrawShadowRec, private_draw_shadow_rec(r.path, r.rec));
+ DRAW(DrawAnnotation, drawAnnotation(r.rect, r.key.c_str(), r.value.get()));
+-
+-DRAW(DrawEdgeAAQuad, experimental_DrawEdgeAAQuad(
+-        r.rect, r.clip, r.aa, r.color, r.mode));
+-DRAW(DrawEdgeAAImageSet, experimental_DrawEdgeAAImageSet(
+-        r.set.get(), r.count, r.dstClips, r.preViewMatrices, r.paint, r.constraint));
+-
+ #undef DRAW
+ 
+ template <> void Draw::draw(const DrawDrawable& r) {
+@@ -361,6 +357,8 @@
+     Bounds bounds(const NoOp&)  const { return Bounds::MakeEmpty(); }    // NoOps don't draw.
+ 
+     Bounds bounds(const DrawRect& op) const { return this->adjustAndMap(op.rect, &op.paint); }
++    Bounds bounds(const DrawEdgeAARect& op) const { return this->adjustAndMap(op.rect, nullptr); }
++
+     Bounds bounds(const DrawRegion& op) const {
+         SkRect rect = SkRect::Make(op.region.getBounds());
+         return this->adjustAndMap(rect, &op.paint);
+@@ -389,6 +387,13 @@
+     Bounds bounds(const DrawImageNine& op) const {
+         return this->adjustAndMap(op.dst, op.paint);
+     }
++    Bounds bounds(const DrawImageSet& op) const {
++        SkRect rect = SkRect::MakeEmpty();
++        for (int i = 0; i < op.count; ++i) {
++            rect.join(this->adjustAndMap(op.set[i].fDstRect, nullptr));
++        }
++        return rect;
++    }
+     Bounds bounds(const DrawPath& op) const {
+         return op.path.isInverseFillType() ? fCullRect
+                                            : this->adjustAndMap(op.path.getBounds(), &op.paint);
+@@ -447,29 +452,6 @@
+     Bounds bounds(const DrawAnnotation& op) const {
+         return this->adjustAndMap(op.rect, nullptr);
+     }
+-    Bounds bounds(const DrawEdgeAAQuad& op) const {
+-        SkRect bounds = op.rect;
+-        if (op.clip) {
+-            bounds.setBounds(op.clip, 4);
+-        }
+-        return this->adjustAndMap(bounds, nullptr);
+-    }
+-    Bounds bounds(const DrawEdgeAAImageSet& op) const {
+-        SkRect rect = SkRect::MakeEmpty();
+-        int clipIndex = 0;
+-        for (int i = 0; i < op.count; ++i) {
+-            SkRect entryBounds = op.set[i].fDstRect;
+-            if (op.set[i].fHasClip) {
+-                entryBounds.setBounds(op.dstClips + clipIndex, 4);
+-                clipIndex += 4;
+-            }
+-            if (op.set[i].fMatrixIndex >= 0) {
+-                op.preViewMatrices[op.set[i].fMatrixIndex].mapRect(&entryBounds);
+-            }
+-            rect.join(this->adjustAndMap(entryBounds, nullptr));
+-        }
+-        return rect;
+-    }
+ 
+     // Returns true if rect was meaningfully adjusted for the effects of paint,
+     // false if the paint could affect the rect in unknown ways.
+diff --git a/src/core/SkRecorder.cpp b/src/core/SkRecorder.cpp
+index ef43f81..bfe1067 100644
+--- a/src/core/SkRecorder.cpp
++++ b/src/core/SkRecorder.cpp
+@@ -151,6 +151,11 @@
+     this->append<SkRecords::DrawRect>(paint, rect);
+ }
+ 
++void SkRecorder::onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                                  SkBlendMode mode) {
++    this->append<SkRecords::DrawEdgeAARect>(rect, aa, color, mode);
++}
++
+ void SkRecorder::onDrawRegion(const SkRegion& region, const SkPaint& paint) {
+     this->append<SkRecords::DrawRegion>(paint, region);
+ }
+@@ -253,6 +258,15 @@
+            this->copy(lattice.fColors, flagCount), *lattice.fBounds, dst);
+ }
+ 
++void SkRecorder::onDrawImageSet(const ImageSetEntry set[], int count, SkFilterQuality filterQuality,
++                                SkBlendMode mode) {
++    SkAutoTArray<ImageSetEntry> setCopy(count);
++    for (int i = 0; i < count; ++i) {
++        setCopy[i] = set[i];
++    }
++    this->append<SkRecords::DrawImageSet>(std::move(setCopy), count, filterQuality, mode);
++}
++
+ void SkRecorder::onDrawTextBlob(const SkTextBlob* blob, SkScalar x, SkScalar y,
+                                 const SkPaint& paint) {
+     TRY_MINIRECORDER(drawTextBlob, blob, x, y, paint);
+@@ -310,28 +324,6 @@
+     this->append<SkRecords::DrawAnnotation>(rect, SkString(key), sk_ref_sp(value));
+ }
+ 
+-void SkRecorder::onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                  QuadAAFlags aa, SkColor color, SkBlendMode mode) {
+-    this->append<SkRecords::DrawEdgeAAQuad>(
+-            rect, this->copy(clip, 4), aa, color, mode);
+-}
+-
+-void SkRecorder::onDrawEdgeAAImageSet(const ImageSetEntry set[], int count,
+-                                      const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                      const SkPaint* paint, SrcRectConstraint constraint) {
+-    int totalDstClipCount, totalMatrixCount;
+-    SkCanvasPriv::GetDstClipAndMatrixCounts(set, count, &totalDstClipCount, &totalMatrixCount);
+-
+-    SkAutoTArray<ImageSetEntry> setCopy(count);
+-    for (int i = 0; i < count; ++i) {
+-        setCopy[i] = set[i];
+-    }
+-
+-    this->append<SkRecords::DrawEdgeAAImageSet>(this->copy(paint), std::move(setCopy), count,
+-            this->copy(dstClips, totalDstClipCount),
+-            this->copy(preViewMatrices, totalMatrixCount), constraint);
+-}
+-
+ void SkRecorder::onFlush() {
+     this->append<SkRecords::Flush>();
+ }
+diff --git a/src/core/SkRecorder.h b/src/core/SkRecorder.h
+index a1d3a69..6b4c7fe 100644
+--- a/src/core/SkRecorder.h
++++ b/src/core/SkRecorder.h
+@@ -79,6 +79,7 @@
+     void onDrawPaint(const SkPaint&) override;
+     void onDrawPoints(PointMode, size_t count, const SkPoint pts[], const SkPaint&) override;
+     void onDrawRect(const SkRect&, const SkPaint&) override;
++    void onDrawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode) override;
+     void onDrawRegion(const SkRegion&, const SkPaint&) override;
+     void onDrawOval(const SkRect&, const SkPaint&) override;
+     void onDrawArc(const SkRect&, SkScalar, SkScalar, bool, const SkPaint&) override;
+@@ -98,6 +99,8 @@
+                             const SkPaint*) override;
+     void onDrawBitmapLattice(const SkBitmap&, const Lattice& lattice, const SkRect& dst,
+                              const SkPaint*) override;
++    void onDrawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality,
++                        SkBlendMode) override;
+     void onDrawVerticesObject(const SkVertices*, const SkVertices::Bone bones[], int boneCount,
+                               SkBlendMode, const SkPaint&) override;
+     void onDrawAtlas(const SkImage*, const SkRSXform[], const SkRect[], const SkColor[],
+@@ -113,11 +116,6 @@
+ 
+     void onDrawAnnotation(const SkRect&, const char[], SkData*) override;
+ 
+-    void onDrawEdgeAAQuad(const SkRect&, const SkPoint[4], QuadAAFlags, SkColor,
+-                          SkBlendMode) override;
+-    void onDrawEdgeAAImageSet(const ImageSetEntry[], int count, const SkPoint[], const SkMatrix[],
+-                              const SkPaint*, SrcRectConstraint) override;
+-
+     sk_sp<SkSurface> onNewSurface(const SkImageInfo&, const SkSurfaceProps&) override;
+ 
+     void flushMiniRecorder();
+diff --git a/src/core/SkRecords.h b/src/core/SkRecords.h
+index 6612a06..8f80924 100644
+--- a/src/core/SkRecords.h
++++ b/src/core/SkRecords.h
+@@ -57,6 +57,7 @@
+     M(DrawImageLattice)                                             \
+     M(DrawImageRect)                                                \
+     M(DrawImageNine)                                                \
++    M(DrawImageSet)                                                 \
+     M(DrawDRRect)                                                   \
+     M(DrawOval)                                                     \
+     M(DrawPaint)                                                    \
+@@ -66,15 +67,13 @@
+     M(DrawPoints)                                                   \
+     M(DrawRRect)                                                    \
+     M(DrawRect)                                                     \
++    M(DrawEdgeAARect)                                               \
+     M(DrawRegion)                                                   \
+     M(DrawTextBlob)                                                 \
+     M(DrawAtlas)                                                    \
+     M(DrawVertices)                                                 \
+     M(DrawShadowRec)                                                \
+-    M(DrawAnnotation)                                               \
+-    M(DrawEdgeAAQuad)                                               \
+-    M(DrawEdgeAAImageSet)
+-
++    M(DrawAnnotation)
+ 
+ // Defines SkRecords::Type, an enum of all record types.
+ #define ENUM(T) T##_Type,
+@@ -260,6 +259,11 @@
+         sk_sp<const SkImage> image;
+         SkIRect center;
+         SkRect dst);
++RECORD(DrawImageSet, kDraw_Tag|kHasImage_Tag,
++       SkAutoTArray<SkCanvas::ImageSetEntry> set;
++       int count;
++       SkFilterQuality quality;
++       SkBlendMode mode);
+ RECORD(DrawOval, kDraw_Tag|kHasPaint_Tag,
+         SkPaint paint;
+         SkRect oval);
+@@ -283,6 +287,11 @@
+ RECORD(DrawRect, kDraw_Tag|kHasPaint_Tag,
+         SkPaint paint;
+         SkRect rect);
++RECORD(DrawEdgeAARect, kDraw_Tag,
++       SkRect rect;
++       SkCanvas::QuadAAFlags aa;
++       SkColor color;
++       SkBlendMode mode);
+ RECORD(DrawRegion, kDraw_Tag|kHasPaint_Tag,
+         SkPaint paint;
+         SkRegion region);
+@@ -319,19 +328,6 @@
+        SkRect rect;
+        SkString key;
+        sk_sp<SkData> value);
+-RECORD(DrawEdgeAAQuad, kDraw_Tag,
+-       SkRect rect;
+-       PODArray<SkPoint> clip;
+-       SkCanvas::QuadAAFlags aa;
+-       SkColor color;
+-       SkBlendMode mode);
+-RECORD(DrawEdgeAAImageSet, kDraw_Tag|kHasImage_Tag|kHasPaint_Tag,
+-       Optional<SkPaint> paint;
+-       SkAutoTArray<SkCanvas::ImageSetEntry> set;
+-       int count;
+-       PODArray<SkPoint> dstClips;
+-       PODArray<SkMatrix> preViewMatrices;
+-       SkCanvas::SrcRectConstraint constraint);
+ #undef RECORD
+ 
+ }  // namespace SkRecords
+diff --git a/src/gpu/SkGpuDevice.cpp b/src/gpu/SkGpuDevice.cpp
+index aa40a3d..0e0efb4 100644
+--- a/src/gpu/SkGpuDevice.cpp
++++ b/src/gpu/SkGpuDevice.cpp
+@@ -397,10 +397,20 @@
+                                    this->ctm(), rect, &style);
+ }
+ 
+-void SkGpuDevice::drawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                 SkCanvas::QuadAAFlags aaFlags, SkColor color, SkBlendMode mode) {
++void SkGpuDevice::drawEdgeAARect(const SkRect& r, SkCanvas::QuadAAFlags aa, SkColor color,
++                                 SkBlendMode mode) {
++    this->tmp_drawEdgeAAQuad(r, nullptr, 0, aa, color, mode);
++}
++
++void SkGpuDevice::tmp_drawEdgeAAQuad(const SkRect& rect, const SkPoint clip[], int clipCount,
++                                     SkCanvas::QuadAAFlags aaFlags, SkColor color,
++                                     SkBlendMode mode) {
+     ASSERT_SINGLE_OWNER
+-    GR_CREATE_TRACE_MARKER_CONTEXT("SkGpuDevice", "drawEdgeAAQuad", fContext.get());
++    GR_CREATE_TRACE_MARKER_CONTEXT("SkGpuDevice", "tmp_drawEdgeAAQuad", fContext.get());
++
++    // Only no clip or a quad clip is currently supported
++    SkASSERT(clipCount == 0 || clipCount == 4);
++    SkASSERT(clipCount == 0 || clip);
+ 
+     SkPMColor4f dstColor = SkColor4fPrepForDst(SkColor4f::FromColor(color),
+                                               fRenderTargetContext->colorSpaceInfo(),
+@@ -415,7 +425,7 @@
+ 
+     // This is exclusively meant for tiling operations, so keep AA enabled to handle MSAA seaming
+     GrQuadAAFlags grAA = SkToGrQuadAAFlags(aaFlags);
+-    if (clip) {
++    if (clipCount > 0) {
+         // Use fillQuadWithEdgeAA
+         fRenderTargetContext->fillQuadWithEdgeAA(this->clip(), std::move(grPaint), GrAA::kYes, grAA,
+                                                  this->ctm(), clip, nullptr);
+@@ -1394,6 +1404,16 @@
+     this->drawProducerLattice(&maker, std::move(iter), dst, paint);
+ }
+ 
++void SkGpuDevice::drawImageSet(const SkCanvas::ImageSetEntry set[], int count,
++                               SkFilterQuality filterQuality, SkBlendMode mode) {
++    SkPaint paint;
++    paint.setBlendMode(mode);
++    paint.setFilterQuality(filterQuality);
++    paint.setAntiAlias(true);
++    this->tmp_drawImageSetV3(set, nullptr, nullptr, count, nullptr, nullptr, paint,
++                             SkCanvas::kFast_SrcRectConstraint);
++}
++
+ static bool init_vertices_paint(GrContext* context, const GrColorSpaceInfo& colorSpaceInfo,
+                                 const SkPaint& skPaint, const SkMatrix& matrix, SkBlendMode bmode,
+                                 bool hasTexs, bool hasColors, GrPaint* grPaint) {
+diff --git a/src/gpu/SkGpuDevice.h b/src/gpu/SkGpuDevice.h
+index 21072a6..b41b8c8 100644
+--- a/src/gpu/SkGpuDevice.h
++++ b/src/gpu/SkGpuDevice.h
+@@ -72,6 +72,8 @@
+     void drawPoints(SkCanvas::PointMode mode, size_t count, const SkPoint[],
+                     const SkPaint& paint) override;
+     void drawRect(const SkRect& r, const SkPaint& paint) override;
++    void drawEdgeAARect(const SkRect& r, SkCanvas::QuadAAFlags edgeAA, SkColor color,
++                        SkBlendMode mode) override;
+     void drawRRect(const SkRRect& r, const SkPaint& paint) override;
+     void drawDRRect(const SkRRect& outer, const SkRRect& inner, const SkPaint& paint) override;
+     void drawRegion(const SkRegion& r, const SkPaint& paint) override;
+@@ -103,17 +105,13 @@
+                           const SkRect& dst, const SkPaint&) override;
+     void drawBitmapLattice(const SkBitmap&, const SkCanvas::Lattice&,
+                            const SkRect& dst, const SkPaint&) override;
++    void drawImageSet(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality,
++                      SkBlendMode) override;
+ 
+     void drawDrawable(SkDrawable*, const SkMatrix*, SkCanvas* canvas) override;
+ 
+     void drawSpecial(SkSpecialImage*, int left, int top, const SkPaint& paint,
+                      SkImage*, const SkMatrix&) override;
+-
+-    void drawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                        SkCanvas::QuadAAFlags aaFlags, SkColor color, SkBlendMode mode) override;
+-    void drawEdgeAAImageSet(const SkCanvas::ImageSetEntry[], int count, const SkPoint dstClips[],
+-                            const SkMatrix[], const SkPaint&, SkCanvas::SrcRectConstraint) override;
+-
+     sk_sp<SkSpecialImage> makeSpecial(const SkBitmap&) override;
+     sk_sp<SkSpecialImage> makeSpecial(const SkImage*) override;
+     sk_sp<SkSpecialImage> snapSpecial() override;
+@@ -128,6 +126,19 @@
+ 
+     bool onAccessPixels(SkPixmap*) override;
+ 
++    // Temporary interface until it gets lifted up to SkDevice and exposed in SkCanvas
++
++    /*
++     * dstClipCounts[] is a parallel array to the image entries, acting like the intended
++     * dstClipCount field in ImageSetEntry. Similarly, preViewMatrixIdx is parallel and will
++     * become an index field in ImageSetEntry that specifies an entry in the matrix array.
++     */
++    void tmp_drawImageSetV3(const SkCanvas::ImageSetEntry[],
++            int dstClipCounts[], int preViewMatrixIdx[], int count,
++            const SkPoint dstClips[], const SkMatrix preViewMatrices[], const SkPaint& paint,
++            SkCanvas::SrcRectConstraint constraint = SkCanvas::kStrict_SrcRectConstraint);
++    void tmp_drawEdgeAAQuad(const SkRect& rect, const SkPoint clip[], int clipCount,
++                            SkCanvas::QuadAAFlags aaFlags, SkColor color, SkBlendMode mode);
+ protected:
+     bool onReadPixels(const SkPixmap&, int, int) override;
+     bool onWritePixels(const SkPixmap&, int, int) override;
+diff --git a/src/gpu/SkGpuDevice_drawTexture.cpp b/src/gpu/SkGpuDevice_drawTexture.cpp
+index d23097c4..8c280d5 100644
+--- a/src/gpu/SkGpuDevice_drawTexture.cpp
++++ b/src/gpu/SkGpuDevice_drawTexture.cpp
+@@ -454,9 +454,12 @@
+     // Otherwise don't know how to draw it
+ }
+ 
+-void SkGpuDevice::drawEdgeAAImageSet(const SkCanvas::ImageSetEntry set[], int count,
+-                                     const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                     const SkPaint& paint, SkCanvas::SrcRectConstraint constraint) {
++// For ease-of-use, the temporary API treats null dstClipCounts as if it were the proper sized
++// array, filled with all 0s (so dstClips can be null too)
++void SkGpuDevice::tmp_drawImageSetV3(const SkCanvas::ImageSetEntry set[], int dstClipCounts[],
++                                     int preViewMatrixIdx[], int count, const SkPoint dstClips[],
++                                     const SkMatrix preViewMatrices[], const SkPaint& paint,
++                                     SkCanvas::SrcRectConstraint constraint) {
+     SkASSERT(count > 0);
+ 
+     if (!can_use_draw_texture(paint)) {
+@@ -464,16 +467,19 @@
+         int dstClipIndex = 0;
+         for (int i = 0; i < count; ++i) {
+             // Only no clip or quad clip are supported
+-            SkASSERT(!set[i].fHasClip || dstClips);
+-            SkASSERT(set[i].fMatrixIndex < 0 || preViewMatrices);
++            SkASSERT(!dstClipCounts || dstClipCounts[i] == 0 || dstClipCounts[i] == 4);
++
++            int xform = preViewMatrixIdx ? preViewMatrixIdx[i] : -1;
++            SkASSERT(xform < 0 || preViewMatrices);
+ 
+             // Always send GrAA::kYes to preserve seaming across tiling in MSAA
+             this->drawImageQuad(set[i].fImage.get(), &set[i].fSrcRect, &set[i].fDstRect,
+-                    set[i].fHasClip ? dstClips + dstClipIndex : nullptr,
++                    (dstClipCounts && dstClipCounts[i] > 0) ? dstClips + dstClipIndex : nullptr,
+                     GrAA::kYes, SkToGrQuadAAFlags(set[i].fAAFlags),
+-                    set[i].fMatrixIndex < 0 ? nullptr : preViewMatrices + set[i].fMatrixIndex,
+-                    paint, constraint);
+-            dstClipIndex += 4 * set[i].fHasClip;
++                    xform < 0 ? nullptr : preViewMatrices + xform, paint, constraint);
++            if (dstClipCounts) {
++                dstClipIndex += dstClipCounts[i];
++            }
+         }
+         return;
+     }
+@@ -500,10 +506,12 @@
+     for (int i = 0; i < count; ++i) {
+         // Manage the dst clip pointer tracking before any continues are used so we don't lose
+         // our place in the dstClips array.
+-        SkASSERT(!set[i].fHasClip || dstClips);
+-        const SkPoint* clip = set[i].fHasClip ? dstClips + dstClipIndex : nullptr;
+-        dstClipIndex += 4 * set[i].fHasClip;
+-
++        int clipCount = (dstClipCounts ? dstClipCounts[i] : 0);
++        SkASSERT(clipCount == 0 || (dstClipCounts[i] == 4 && dstClips));
++        const SkPoint* clip = clipCount > 0 ? dstClips + dstClipIndex : nullptr;
++        if (dstClipCounts) {
++            dstClipIndex += dstClipCounts[i];
++        }
+         // The default SkBaseDevice implementation is based on drawImageRect which does not allow
+         // non-sorted src rects. TODO: Decide this is OK or make sure we handle it.
+         if (!set[i].fSrcRect.isSorted()) {
+@@ -536,13 +544,13 @@
+             }
+         }
+ 
+-        SkASSERT(set[i].fMatrixIndex < 0 || preViewMatrices);
++        int xform = preViewMatrixIdx ? preViewMatrixIdx[i] : -1;
++        SkASSERT(xform < 0 || preViewMatrices);
+ 
+         textures[i].fSrcRect = set[i].fSrcRect;
+         textures[i].fDstRect = set[i].fDstRect;
+         textures[i].fDstClipQuad = clip;
+-        textures[i].fPreViewMatrix =
+-                set[i].fMatrixIndex < 0 ? nullptr : preViewMatrices + set[i].fMatrixIndex;
++        textures[i].fPreViewMatrix = xform < 0 ? nullptr : preViewMatrices + xform;
+         textures[i].fAlpha = set[i].fAlpha * paint.getAlphaf();
+         textures[i].fAAFlags = SkToGrQuadAAFlags(set[i].fAAFlags);
+ 
+diff --git a/src/utils/SkNWayCanvas.cpp b/src/utils/SkNWayCanvas.cpp
+index 39d5a40..1e6cd89 100644
+--- a/src/utils/SkNWayCanvas.cpp
++++ b/src/utils/SkNWayCanvas.cpp
+@@ -162,6 +162,14 @@
+     }
+ }
+ 
++void SkNWayCanvas::onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                                    SkBlendMode mode) {
++    Iter iter(fList);
++    while (iter.next()) {
++        iter->experimental_DrawEdgeAARectV1(rect, aa, color, mode);
++    }
++}
++
+ void SkNWayCanvas::onDrawRegion(const SkRegion& region, const SkPaint& paint) {
+     Iter iter(fList);
+     while (iter.next()) {
+@@ -269,6 +277,14 @@
+     }
+ }
+ 
++void SkNWayCanvas::onDrawImageSet(const SkCanvas::ImageSetEntry set[], int count,
++                                  SkFilterQuality filterQuality, SkBlendMode mode) {
++    Iter iter(fList);
++    while (iter.next()) {
++        iter->experimental_DrawImageSetV1(set, count, filterQuality, mode);
++    }
++}
++
+ void SkNWayCanvas::onDrawTextBlob(const SkTextBlob* blob, SkScalar x, SkScalar y,
+                                   const SkPaint &paint) {
+     Iter iter(fList);
+@@ -332,24 +348,6 @@
+     }
+ }
+ 
+-void SkNWayCanvas::onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                    QuadAAFlags aa, SkColor color, SkBlendMode mode) {
+-    Iter iter(fList);
+-    while (iter.next()) {
+-        iter->experimental_DrawEdgeAAQuad(rect, clip, aa, color, mode);
+-    }
+-}
+-
+-void SkNWayCanvas::onDrawEdgeAAImageSet(const ImageSetEntry set[], int count,
+-                                        const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                        const SkPaint* paint, SrcRectConstraint constraint) {
+-    Iter iter(fList);
+-    while (iter.next()) {
+-        iter->experimental_DrawEdgeAAImageSet(
+-                set, count, dstClips, preViewMatrices, paint, constraint);
+-    }
+-}
+-
+ void SkNWayCanvas::onFlush() {
+     Iter iter(fList);
+     while (iter.next()) {
+diff --git a/src/utils/SkPaintFilterCanvas.cpp b/src/utils/SkPaintFilterCanvas.cpp
+index f09e6c2..ded7fc2 100644
+--- a/src/utils/SkPaintFilterCanvas.cpp
++++ b/src/utils/SkPaintFilterCanvas.cpp
+@@ -64,6 +64,17 @@
+     }
+ }
+ 
++void SkPaintFilterCanvas::onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa,
++                                           SkColor color, SkBlendMode mode) {
++    SkPaint paint;
++    paint.setColor(color);
++    paint.setBlendMode(mode);
++    AutoPaintFilter apf(this, kRect_Type, paint);
++    if (apf.shouldDraw()) {
++        this->SkNWayCanvas::onDrawEdgeAARect(rect, aa, paint.getColor(), paint.getBlendMode());
++    }
++}
++
+ void SkPaintFilterCanvas::onDrawRRect(const SkRRect& rrect, const SkPaint& paint) {
+     AutoPaintFilter apf(this, kRRect_Type, paint);
+     if (apf.shouldDraw()) {
+@@ -173,6 +184,17 @@
+     }
+ }
+ 
++void SkPaintFilterCanvas::onDrawImageSet(const SkCanvas::ImageSetEntry set[], int count,
++                                         SkFilterQuality filterQuality, SkBlendMode mode) {
++    SkPaint paint;
++    paint.setBlendMode(mode);
++    AutoPaintFilter apf(this, kBitmap_Type, &paint);
++    mode = paint.getBlendMode();
++    if (apf.shouldDraw()) {
++        this->SkNWayCanvas::onDrawImageSet(set, count, filterQuality, mode);
++    }
++}
++
+ void SkPaintFilterCanvas::onDrawVerticesObject(const SkVertices* vertices,
+                                                const SkVertices::Bone bones[], int boneCount,
+                                                SkBlendMode bmode, const SkPaint& paint) {
+@@ -234,29 +256,6 @@
+     this->SkNWayCanvas::onDrawShadowRec(path, rec);
+ }
+ 
+-void SkPaintFilterCanvas::onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                           QuadAAFlags aa, SkColor color, SkBlendMode mode) {
+-    SkPaint paint;
+-    paint.setColor(color);
+-    paint.setBlendMode(mode);
+-    AutoPaintFilter apf(this, kRect_Type, paint);
+-    if (apf.shouldDraw()) {
+-        this->SkNWayCanvas::onDrawEdgeAAQuad(rect, clip, aa, apf.paint()->getColor(),
+-                                             apf.paint()->getBlendMode());
+-    }
+-}
+-
+-void SkPaintFilterCanvas::onDrawEdgeAAImageSet(const ImageSetEntry set[], int count,
+-                                               const SkPoint dstClips[],
+-                                               const SkMatrix preViewMatrices[],
+-                                               const SkPaint* paint, SrcRectConstraint constraint) {
+-    AutoPaintFilter apf(this, kBitmap_Type, paint);
+-    if (apf.shouldDraw()) {
+-        this->SkNWayCanvas::onDrawEdgeAAImageSet(
+-                set, count, dstClips, preViewMatrices, apf.paint(), constraint);
+-    }
+-}
+-
+ sk_sp<SkSurface> SkPaintFilterCanvas::onNewSurface(const SkImageInfo& info,
+                                                    const SkSurfaceProps& props) {
+     return proxy()->makeSurface(info, &props);
+diff --git a/tools/debugger/SkDebugCanvas.cpp b/tools/debugger/SkDebugCanvas.cpp
+index 7580dc6..45eaf96 100644
+--- a/tools/debugger/SkDebugCanvas.cpp
++++ b/tools/debugger/SkDebugCanvas.cpp
+@@ -362,6 +362,11 @@
+     this->addDrawCommand(new SkDrawImageNineCommand(image, center, dst, paint));
+ }
+ 
++void SkDebugCanvas::onDrawImageSet(const SkCanvas::ImageSetEntry set[], int count,
++                                   SkFilterQuality filterQuality, SkBlendMode mode) {
++    this->addDrawCommand(new SkDrawImageSetCommand(set, count, filterQuality, mode));
++}
++
+ void SkDebugCanvas::onDrawOval(const SkRect& oval, const SkPaint& paint) {
+     this->addDrawCommand(new SkDrawOvalCommand(oval, paint));
+ }
+@@ -402,6 +407,11 @@
+     addDrawCommand(new SkDrawRectCommand(rect, paint));
+ }
+ 
++void SkDebugCanvas::onDrawEdgeAARect(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                                     SkBlendMode mode) {
++    this->addDrawCommand(new SkDrawEdgeAARectCommand(rect, aa, color, mode));
++}
++
+ void SkDebugCanvas::onDrawRRect(const SkRRect& rrect, const SkPaint& paint) {
+     this->addDrawCommand(new SkDrawRRectCommand(rrect, paint));
+ }
+@@ -445,18 +455,6 @@
+     this->addDrawCommand(new SkDrawDrawableCommand(drawable, matrix));
+ }
+ 
+-void SkDebugCanvas::onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4],
+-                                     QuadAAFlags aa, SkColor color, SkBlendMode mode) {
+-    this->addDrawCommand(new SkDrawEdgeAAQuadCommand(rect, clip, aa, color, mode));
+-}
+-
+-void SkDebugCanvas::onDrawEdgeAAImageSet(const ImageSetEntry set[], int count,
+-                                         const SkPoint dstClips[], const SkMatrix preViewMatrices[],
+-                                         const SkPaint* paint, SrcRectConstraint constraint) {
+-    this->addDrawCommand(new SkDrawEdgeAAImageSetCommand(set, count, dstClips, preViewMatrices,
+-                                                         paint, constraint));
+-}
+-
+ void SkDebugCanvas::willRestore() {
+     this->addDrawCommand(new SkRestoreCommand());
+     this->INHERITED::willRestore();
+diff --git a/tools/debugger/SkDebugCanvas.h b/tools/debugger/SkDebugCanvas.h
+index 56da424..9ae2950 100644
+--- a/tools/debugger/SkDebugCanvas.h
++++ b/tools/debugger/SkDebugCanvas.h
+@@ -133,6 +133,7 @@
+     void onDrawPaint(const SkPaint&) override;
+ 
+     void onDrawRect(const SkRect&, const SkPaint&) override;
++    void onDrawEdgeAARect(const SkRect&, SkCanvas::QuadAAFlags, SkColor, SkBlendMode) override;
+     void onDrawOval(const SkRect&, const SkPaint&) override;
+     void onDrawArc(const SkRect&, SkScalar, SkScalar, bool, const SkPaint&) override;
+     void onDrawRRect(const SkRRect&, const SkPaint&) override;
+@@ -151,6 +152,7 @@
+                             const SkRect& dst, const SkPaint* paint) override;
+     void onDrawImageRect(const SkImage*, const SkRect* src, const SkRect& dst,
+                          const SkPaint*, SrcRectConstraint) override;
++    void onDrawImageSet(const ImageSetEntry[], int count, SkFilterQuality, SkBlendMode) override;
+     void onDrawBitmapNine(const SkBitmap&, const SkIRect& center, const SkRect& dst,
+                           const SkPaint*) override;
+     void onDrawImageNine(const SkImage*, const SkIRect& center, const SkRect& dst,
+@@ -166,11 +168,6 @@
+     void onDrawDrawable(SkDrawable*, const SkMatrix*) override;
+     void onDrawPicture(const SkPicture*, const SkMatrix*, const SkPaint*) override;
+ 
+-    void onDrawEdgeAAQuad(const SkRect&, const SkPoint[4], QuadAAFlags, SkColor,
+-                          SkBlendMode) override;
+-    void onDrawEdgeAAImageSet(const ImageSetEntry[], int count, const SkPoint[], const SkMatrix[],
+-                              const SkPaint*, SrcRectConstraint) override;
+-
+ private:
+     SkTDArray<SkDrawCommand*> fCommandVector;
+     SkMatrix fMatrix;
+diff --git a/tools/debugger/SkDrawCommand.cpp b/tools/debugger/SkDrawCommand.cpp
+index 347cc26..d9723ac 100644
+--- a/tools/debugger/SkDrawCommand.cpp
++++ b/tools/debugger/SkDrawCommand.cpp
+@@ -9,7 +9,6 @@
+ 
+ #include <algorithm>
+ #include "SkAutoMalloc.h"
+-#include "SkCanvasPriv.h"
+ #include "SkClipOpPriv.h"
+ #include "SkColorFilter.h"
+ #include "SkDashPathEffect.h"
+@@ -228,6 +227,7 @@
+         case kDrawImageLattice_OpType: return "DrawImageLattice";
+         case kDrawImageNine_OpType: return "DrawImageNine";
+         case kDrawImageRect_OpType: return "DrawImageRect";
++        case kDrawImageSet_OpType: return "DrawImageSet";
+         case kDrawOval_OpType: return "DrawOval";
+         case kDrawPaint_OpType: return "DrawPaint";
+         case kDrawPatch_OpType: return "DrawPatch";
+@@ -242,8 +242,6 @@
+         case kDrawVertices_OpType: return "DrawVertices";
+         case kDrawAtlas_OpType: return "DrawAtlas";
+         case kDrawDrawable_OpType: return "DrawDrawable";
+-        case kDrawEdgeAAQuad_OpType: return "DrawEdgeAAQuad";
+-        case kDrawEdgeAAImageSet_OpType: return "DrawEdgeAAImageSet";
+         case kEndDrawPicture_OpType: return "EndDrawPicture";
+         case kRestore_OpType: return "Restore";
+         case kSave_OpType: return "Save";
+@@ -1479,6 +1477,20 @@
+     writer.appendString(SKDEBUGCANVAS_ATTRIBUTE_SHORTDESC, str_append(&desc, fDst)->c_str());
+ }
+ 
++SkDrawImageSetCommand::SkDrawImageSetCommand(const SkCanvas::ImageSetEntry set[], int count,
++                                             SkFilterQuality filterQuality, SkBlendMode mode)
++        : INHERITED(kDrawImageSet_OpType)
++        , fSet(count)
++        , fCount(count)
++        , fFilterQuality(filterQuality)
++        , fMode(mode) {
++    std::copy_n(set, count, fSet.get());
++}
++
++void SkDrawImageSetCommand::execute(SkCanvas* canvas) const {
++    canvas->experimental_DrawImageSetV1(fSet.get(), fCount, fFilterQuality, fMode);
++}
++
+ SkDrawImageNineCommand::SkDrawImageNineCommand(const SkImage* image, const SkIRect& center,
+                                                const SkRect& dst, const SkPaint* paint)
+     : INHERITED(kDrawImageNine_OpType)
+@@ -1887,6 +1899,19 @@
+     writer.appendString(SKDEBUGCANVAS_ATTRIBUTE_SHORTDESC, str_append(&desc, fRect)->c_str());
+ }
+ 
++SkDrawEdgeAARectCommand::SkDrawEdgeAARectCommand(const SkRect& rect, SkCanvas::QuadAAFlags aa,
++                                                 SkColor color, SkBlendMode mode)
++    : INHERITED(kDrawEdgeAARect_OpType) {
++    fRect = rect;
++    fAA = aa;
++    fColor = color;
++    fMode = mode;
++}
++
++void SkDrawEdgeAARectCommand::execute(SkCanvas* canvas) const {
++    canvas->experimental_DrawEdgeAARectV1(fRect, fAA, fColor, fMode);
++}
++
+ SkDrawRRectCommand::SkDrawRRectCommand(const SkRRect& rrect, const SkPaint& paint)
+     : INHERITED(kDrawRRect_OpType) {
+     fRRect = rrect;
+@@ -1971,52 +1996,6 @@
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-SkDrawEdgeAAQuadCommand::SkDrawEdgeAAQuadCommand(const SkRect& rect, const SkPoint clip[],
+-                                                 SkCanvas::QuadAAFlags aa, SkColor color,
+-                                                 SkBlendMode mode)
+-        : INHERITED(kDrawEdgeAAQuad_OpType)
+-        , fRect(rect)
+-        , fHasClip(clip != nullptr)
+-        , fAA(aa)
+-        , fColor(color)
+-        , fMode(mode) {
+-    if (clip) {
+-        for (int i = 0; i < 4; ++i) {
+-            fClip[i] = clip[i];
+-        }
+-    }
+-}
+-
+-void SkDrawEdgeAAQuadCommand::execute(SkCanvas* canvas) const {
+-    canvas->experimental_DrawEdgeAAQuad(fRect, fHasClip ? fClip : nullptr, fAA, fColor, fMode);
+-}
+-
+-SkDrawEdgeAAImageSetCommand::SkDrawEdgeAAImageSetCommand(
+-        const SkCanvas::ImageSetEntry set[], int count, const SkPoint dstClips[],
+-        const SkMatrix preViewMatrices[], const SkPaint* paint,
+-        SkCanvas::SrcRectConstraint constraint)
+-        : INHERITED(kDrawEdgeAAImageSet_OpType)
+-        , fSet(count)
+-        , fCount(count)
+-        , fPaint(paint)
+-        , fConstraint(constraint) {
+-    int totalDstClipCount, totalMatrixCount;
+-    SkCanvasPriv::GetDstClipAndMatrixCounts(set, count, &totalDstClipCount, &totalMatrixCount);
+-
+-    std::copy_n(set, count, fSet.get());
+-    fDstClips.reset(totalDstClipCount);
+-    std::copy_n(dstClips, totalDstClipCount, fDstClips.get());
+-    fPreViewMatrices.reset(totalMatrixCount);
+-    std::copy_n(preViewMatrices, totalMatrixCount, fPreViewMatrices.get());
+-}
+-
+-void SkDrawEdgeAAImageSetCommand::execute(SkCanvas* canvas) const {
+-    canvas->experimental_DrawEdgeAAImageSet(fSet.get(), fCount, fDstClips.get(),
+-            fPreViewMatrices.get(), fPaint.getMaybeNull(), fConstraint);
+-}
+-
+-///////////////////////////////////////////////////////////////////////////////////////////////////
+-
+ SkDrawDrawableCommand::SkDrawDrawableCommand(SkDrawable* drawable, const SkMatrix* matrix)
+     : INHERITED(kDrawDrawable_OpType)
+     , fDrawable(SkRef(drawable))
+diff --git a/tools/debugger/SkDrawCommand.h b/tools/debugger/SkDrawCommand.h
+index 0812d85..7c386bc 100644
+--- a/tools/debugger/SkDrawCommand.h
++++ b/tools/debugger/SkDrawCommand.h
+@@ -43,6 +43,7 @@
+         kDrawImageLattice_OpType,
+         kDrawImageNine_OpType,
+         kDrawImageRect_OpType,
++        kDrawImageSet_OpType,
+         kDrawOval_OpType,
+         kDrawArc_OpType,
+         kDrawPaint_OpType,
+@@ -50,6 +51,7 @@
+         kDrawPath_OpType,
+         kDrawPoints_OpType,
+         kDrawRect_OpType,
++        kDrawEdgeAARect_OpType,
+         kDrawRRect_OpType,
+         kDrawRegion_OpType,
+         kDrawShadow_OpType,
+@@ -57,8 +59,6 @@
+         kDrawVertices_OpType,
+         kDrawAtlas_OpType,
+         kDrawDrawable_OpType,
+-        kDrawEdgeAAQuad_OpType,
+-        kDrawEdgeAAImageSet_OpType,
+         kEndDrawPicture_OpType,
+         kRestore_OpType,
+         kSave_OpType,
+@@ -360,6 +360,20 @@
+     typedef SkDrawCommand INHERITED;
+ };
+ 
++class SkDrawImageSetCommand : public SkDrawCommand {
++public:
++    SkDrawImageSetCommand(const SkCanvas::ImageSetEntry[], int count, SkFilterQuality, SkBlendMode);
++    void execute(SkCanvas* canvas) const override;
++
++private:
++    SkAutoTArray<SkCanvas::ImageSetEntry> fSet;
++    int fCount;
++    SkFilterQuality fFilterQuality;
++    SkBlendMode fMode;
++
++    typedef SkDrawCommand INHERITED;
++};
++
+ class SkDrawOvalCommand : public SkDrawCommand {
+ public:
+     SkDrawOvalCommand(const SkRect& oval, const SkPaint& paint);
+@@ -529,6 +543,21 @@
+     typedef SkDrawCommand INHERITED;
+ };
+ 
++class SkDrawEdgeAARectCommand : public SkDrawCommand {
++public:
++    SkDrawEdgeAARectCommand(const SkRect& rect, SkCanvas::QuadAAFlags aa, SkColor color,
++                            SkBlendMode mode);
++    void execute(SkCanvas* canvas) const override;
++
++private:
++    SkRect  fRect;
++    SkCanvas::QuadAAFlags fAA;
++    SkColor fColor;
++    SkBlendMode fMode;
++
++    typedef SkDrawCommand INHERITED;
++};
++
+ class SkDrawRRectCommand : public SkDrawCommand {
+ public:
+     SkDrawRRectCommand(const SkRRect& rrect, const SkPaint& paint);
+@@ -653,38 +682,4 @@
+ 
+     typedef SkDrawCommand INHERITED;
+ };
+-
+-class SkDrawEdgeAAQuadCommand : public SkDrawCommand {
+-public:
+-    SkDrawEdgeAAQuadCommand(const SkRect& rect, const SkPoint clip[4],
+-                            SkCanvas::QuadAAFlags aa, SkColor color, SkBlendMode mode);
+-    void execute(SkCanvas* canvas) const override;
+-
+-private:
+-    SkRect  fRect;
+-    SkPoint fClip[4];
+-    int fHasClip;
+-    SkCanvas::QuadAAFlags fAA;
+-    SkColor fColor;
+-    SkBlendMode fMode;
+-
+-    typedef SkDrawCommand INHERITED;
+-};
+-
+-class SkDrawEdgeAAImageSetCommand : public SkDrawCommand {
+-public:
+-    SkDrawEdgeAAImageSetCommand(const SkCanvas::ImageSetEntry[], int count, const SkPoint[],
+-                                const SkMatrix[], const SkPaint*, SkCanvas::SrcRectConstraint);
+-    void execute(SkCanvas* canvas) const override;
+-
+-private:
+-    SkAutoTArray<SkCanvas::ImageSetEntry> fSet;
+-    int fCount;
+-    SkAutoTArray<SkPoint> fDstClips;
+-    SkAutoTArray<SkMatrix> fPreViewMatrices;
+-    SkTLazy<SkPaint> fPaint;
+-    SkCanvas::SrcRectConstraint fConstraint;
+-
+-    typedef SkDrawCommand INHERITED;
+-};
+ #endif

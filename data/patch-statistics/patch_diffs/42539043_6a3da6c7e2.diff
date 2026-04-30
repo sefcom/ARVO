@@ -1,0 +1,46 @@
+From 76d1dccf3e5ce0c67125964d0908b322e7d1afb9 Mon Sep 17 00:00:00 2001
+From: Marti Maria <info@littlecms.com>
+Date: Wed, 15 Mar 2017 09:13:53 +0100
+Subject: [PATCH] [oss-fuzz] added a check for LUT channels consistency
+
+Also added a conditional for VS  20123 on fpclassify(). Thanks to Robin
+Watts for providing the code.
+---
+ src/cmsplugin.c | 8 ++++++--
+ src/cmstypes.c  | 4 ++++
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/cmsplugin.c b/src/cmsplugin.c
+index dd6f7db71..164061fe5 100644
+--- a/src/cmsplugin.c
++++ b/src/cmsplugin.c
+@@ -180,8 +180,12 @@ cmsBool CMSEXPORT  _cmsReadFloat32Number(cmsIOHANDLER* io, cmsFloat32Number* n)
+         tmp = _cmsAdjustEndianess32(tmp);
+         *n = *(cmsFloat32Number*)(void*)&tmp;
+ 
+-        // fpclassify() required by C99
+-        return ((fpclassify(*n) == FP_ZERO) || (fpclassify(*n) == FP_NORMAL));
++        #if defined(_MSC_VER) && _MSC_VER < 1800
++           return TRUE;
++        #else
++           // fpclassify() required by C99 (only provided by MSVC >= 1800, VS2013 onwards)
++           return ((fpclassify(*n) == FP_ZERO) || (fpclassify(*n) == FP_NORMAL));
++        #endif        
+     }
+ 
+     return TRUE;
+diff --git a/src/cmstypes.c b/src/cmstypes.c
+index 987ae19f8..09723f49f 100644
+--- a/src/cmstypes.c
++++ b/src/cmstypes.c
+@@ -4477,6 +4477,10 @@ void *Type_MPE_Read(struct _cms_typehandler_struct* self, cmsIOHANDLER* io, cmsU
+     if (!_cmsReadUInt32Number(io, &ElementCount)) goto Error;    
+     if (!ReadPositionTable(self, io, ElementCount, BaseOffset, NewLUT, ReadMPEElem)) goto Error;
+ 
++    // Check channel count
++    if (InputChans != NewLUT->InputChannels ||
++        OutputChans != NewLUT->OutputChannels) goto Error;
++
+     // Success
+     *nItems = 1;
+     return NewLUT;

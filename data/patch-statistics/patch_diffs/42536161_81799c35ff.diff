@@ -1,0 +1,150 @@
+From 40c41d5110a706396c38b690e57fcf6724743800 Mon Sep 17 00:00:00 2001
+From: "liang.he" <liang.he@intel.com>
+Date: Thu, 13 Jun 2024 16:06:36 +0800
+Subject: [PATCH] Fix several issues reported by oss-fuzz (#3526)
+
+- possible integer overflow in adjust_table_max_size:
+  unsigned integer overflow: 2684354559 * 2 cannot be represented in type 'uint32'
+- limit max memory size in wasm_runtime_malloc
+- add more checks in aot loader
+- adjust compilation options
+---
+ core/config.h                               |  6 ++----
+ core/iwasm/aot/aot_loader.c                 | 10 +++++++++-
+ core/iwasm/common/wasm_memory.c             |  7 +++++++
+ core/iwasm/interpreter/wasm_loader.c        | 15 ++++++++++-----
+ tests/fuzz/wasm-mutator-fuzz/CMakeLists.txt | 13 ++++++++++++-
+ 5 files changed, 40 insertions(+), 11 deletions(-)
+
+diff --git a/core/config.h b/core/config.h
+index 2f3e401dde..b4d8d19659 100644
+--- a/core/config.h
++++ b/core/config.h
+@@ -667,13 +667,11 @@
+ #define WASM_ENABLE_FUZZ_TEST 0
+ #endif
+ 
+-#ifndef WASM_MEM_ALLOC_MAX_SIZE
+ #if WASM_ENABLE_FUZZ_TEST != 0
++#ifndef WASM_MEM_ALLOC_MAX_SIZE
+ /* In oss-fuzz, the maximum RAM is ~2.5G */
+ #define WASM_MEM_ALLOC_MAX_SIZE (2U * 1024 * 1024 * 1024)
+-#else
+-#define WASM_MEM_ALLOC_MAX_SIZE UINT32_MAX
+-#endif
+ #endif
++#endif /* WASM_ENABLE_FUZZ_TEST != 0 */
+ 
+ #endif /* end of _CONFIG_H_ */
+diff --git a/core/iwasm/aot/aot_loader.c b/core/iwasm/aot/aot_loader.c
+index 8d705248c5..c54871e1e8 100644
+--- a/core/iwasm/aot/aot_loader.c
++++ b/core/iwasm/aot/aot_loader.c
+@@ -367,6 +367,8 @@ get_aot_file_target(AOTTargetInfo *target_info, char *target_buf,
+             break;
+         case E_MACHINE_ARM:
+         case E_MACHINE_AARCH64:
++            /* TODO: this will make following `strncmp()` ~L392 unnecessary.
++             * Use const strings here */
+             machine_type = target_info->arch;
+             break;
+         case E_MACHINE_MIPS:
+@@ -501,6 +503,11 @@ load_target_info_section(const uint8 *buf, const uint8 *buf_end,
+     read_uint64(p, p_end, target_info.reserved);
+     read_byte_array(p, p_end, target_info.arch, sizeof(target_info.arch));
+ 
++    if (target_info.arch[sizeof(target_info.arch) - 1] != '\0') {
++        set_error_buf(error_buf, error_buf_size, "invalid arch string");
++        return false;
++    }
++
+     if (p != buf_end) {
+         set_error_buf(error_buf, error_buf_size, "invalid section size");
+         return false;
+@@ -1033,7 +1040,8 @@ load_memory_info(const uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
+ 
+     read_uint32(buf, buf_end, module->import_memory_count);
+     /* We don't support import_memory_count > 0 currently */
+-    bh_assert(module->import_memory_count == 0);
++    if (module->import_memory_count > 0)
++        return false;
+ 
+     read_uint32(buf, buf_end, module->memory_count);
+     total_size = sizeof(AOTMemory) * (uint64)module->memory_count;
+diff --git a/core/iwasm/common/wasm_memory.c b/core/iwasm/common/wasm_memory.c
+index f47215f256..3aeb64ce67 100644
+--- a/core/iwasm/common/wasm_memory.c
++++ b/core/iwasm/common/wasm_memory.c
+@@ -284,6 +284,13 @@ wasm_runtime_malloc(unsigned int size)
+ #endif
+     }
+ 
++#if WASM_ENABLE_FUZZ_TEST != 0
++    if (size >= WASM_MEM_ALLOC_MAX_SIZE) {
++        LOG_WARNING("warning: wasm_runtime_malloc with too large size\n");
++        return NULL;
++    }
++#endif
++
+     return wasm_runtime_malloc_internal(size);
+ }
+ 
+diff --git a/core/iwasm/interpreter/wasm_loader.c b/core/iwasm/interpreter/wasm_loader.c
+index bf117dd828..129ca5221a 100644
+--- a/core/iwasm/interpreter/wasm_loader.c
++++ b/core/iwasm/interpreter/wasm_loader.c
+@@ -380,8 +380,7 @@ loader_malloc(uint64 size, char *error_buf, uint32 error_buf_size)
+ {
+     void *mem;
+ 
+-    if (size >= WASM_MEM_ALLOC_MAX_SIZE
+-        || !(mem = wasm_runtime_malloc((uint32)size))) {
++    if (size >= UINT32_MAX || !(mem = wasm_runtime_malloc((uint32)size))) {
+         set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+         return NULL;
+     }
+@@ -2255,9 +2254,15 @@ load_type_section(const uint8 *buf, const uint8 *buf_end, WASMModule *module,
+ static void
+ adjust_table_max_size(uint32 init_size, uint32 max_size_flag, uint32 *max_size)
+ {
+-    uint32 default_max_size = init_size * 2 > WASM_TABLE_MAX_SIZE
+-                                  ? init_size * 2
+-                                  : WASM_TABLE_MAX_SIZE;
++    uint32 default_max_size;
++
++    if (UINT32_MAX / 2 > init_size)
++        default_max_size = init_size * 2;
++    else
++        default_max_size = UINT32_MAX;
++
++    if (default_max_size < WASM_TABLE_MAX_SIZE)
++        default_max_size = WASM_TABLE_MAX_SIZE;
+ 
+     if (max_size_flag) {
+         /* module defines the table limitation */
+diff --git a/tests/fuzz/wasm-mutator-fuzz/CMakeLists.txt b/tests/fuzz/wasm-mutator-fuzz/CMakeLists.txt
+index ec993a76d2..6bb7fc75a6 100644
+--- a/tests/fuzz/wasm-mutator-fuzz/CMakeLists.txt
++++ b/tests/fuzz/wasm-mutator-fuzz/CMakeLists.txt
+@@ -131,9 +131,20 @@ string(FIND "${CFLAGS_ENV}" "-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION" IN_OSS_
+ if (IN_OSS_FUZZ EQUAL -1)
+   message("[ceith]:Enable ASan and UBSan in non-oss-fuzz environment")
+   add_compile_options(
+-    -fsanitize=signed-integer-overflow
+     -fprofile-instr-generate -fcoverage-mapping
++    -fno-sanitize-recover=all
+     -fsanitize=address,undefined
++    # reference: https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html
++    # -fsanitize=undefined: All of the checks listed above other than float-divide-by-zero,
++    #     unsigned-integer-overflow, implicit-conversion, local-bounds and
++    #     the nullability-* group of checks.
++    #
++    # for now, we disable below from UBSan
++    # -alignment
++    # -implicit-conversion
++    #
++    -fsanitize=float-divide-by-zero,unsigned-integer-overflow,local-bounds,nullability
++    -fno-sanitize=alignment
+   )
+   add_link_options(-fsanitize=address -fprofile-instr-generate)
+ endif ()

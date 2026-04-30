@@ -1,0 +1,100 @@
+From a064261e854317bcc48aab31f86f3cbee67855c3 Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Sat, 11 May 2024 23:37:31 +0200
+Subject: [PATCH] Revert `ndpi_strnstr()` optimization introduced in a813121e0
+ (#2439)
+
+New implementation fails tests 11b, 12 and 13.
+Revert to the original (BSD) implementation (with also some basic
+parameters check)
+---
+ example/ndpiReader.c | 10 +++++++++
+ src/lib/ndpi_main.c  | 51 ++++++++++++++++----------------------------
+ 2 files changed, 28 insertions(+), 33 deletions(-)
+
+diff --git a/example/ndpiReader.c b/example/ndpiReader.c
+index 7a326f71b62..cf26d0841d5 100644
+--- a/example/ndpiReader.c
++++ b/example/ndpiReader.c
+@@ -5691,6 +5691,16 @@ void strnstrUnitTest(void) {
+ 
+   /* Test 10: substring equal to the string */
+   assert(strcmp(ndpi_strnstr("string", "string", 6), "string") == 0);
++
++  /* Test 11a,b: max_length bigger that string length */
++  assert(strcmp(ndpi_strnstr("string", "string", 66), "string") == 0);
++  assert(ndpi_strnstr("string", "a", 66) == NULL);
++
++  /* Test 12: substring longer than the string */
++  assert(ndpi_strnstr("string", "stringA", 6) == NULL);
++
++  /* Test 13 */
++  assert(ndpi_strnstr("abcdef", "abc", 2) == NULL);
+ }
+ 
+ /* *********************************************** */
+diff --git a/src/lib/ndpi_main.c b/src/lib/ndpi_main.c
+index f15d0cb8fd5..eb5959dd658 100644
+--- a/src/lib/ndpi_main.c
++++ b/src/lib/ndpi_main.c
+@@ -9687,42 +9687,27 @@ void ndpi_dump_risks_score(FILE *risk_out) {
+  * first slen characters of s.
+  */
+ char *ndpi_strnstr(const char *s, const char *find, size_t slen) {
+-  if (s == NULL || find == NULL || slen == 0) {
+-    return NULL;
+-  }
+-
+-  char c = *find;
+-
+-  if (c == '\0') {
+-    return (char *)s;
+-  }
+-
+-  if (*(find + 1) == '\0') {
+-    return (char *)memchr(s, c, slen);
+-  }
+-
+-  size_t find_len = strnlen(find, slen);
++  char c;
++  size_t len;
+ 
+-  if (find_len > slen) {
++  if(s == NULL || find == NULL || slen == 0)
+     return NULL;
+-  }
+ 
+-  const char *end = s + slen - find_len;
+-
+-  while (s <= end) {
+-    if (memcmp(s, find, find_len) == 0) {
+-      return (char *)s;
+-    }
+-
+-    size_t remaining_length = end - s;
+-    s = (char *)memchr(s + 1, c, remaining_length);
+-
+-    if (s == NULL || s > end) {
+-      return NULL;
+-    }
+-  }
+-
+-  return NULL;
++  if((c = *find++) != '\0') {
++    len = strnlen(find, slen);
++    do {
++      char sc;
++
++      do {
++	if(slen-- < 1 || (sc = *s++) == '\0')
++	  return(NULL);
++      } while(sc != c);
++      if(len > slen)
++	return(NULL);
++    } while(strncmp(s, find, len) != 0);
++    s--;
++  }
++  return((char *) s);
+ }
+ 
+ /* ****************************************************** */

@@ -1,0 +1,149 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1579384277 21600
+#      Sat Jan 18 15:51:17 2020 -0600
+# Node ID b2982b34791b78ba5469b8772d6df82ed11f73e4
+# Parent  9b958e79d967101509dbe9ddf26b42e580c35909
+PICT DecodeImage(): Fix heap buffer over-reads.
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,5 +1,12 @@
+ 2020-01-18  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
++	* coders/pict.c (DecodeImage): Fix heap buffer over-reads. Fixes
++	oss-fuzz issue 20053 "graphicsmagick:coder_PICT_fuzzer:
++	Heap-buffer-overflow in ExpandBuffer" and oss-fuzz issue 20048
++	"graphicsmagick:coder_PICT_fuzzer: Heap-buffer-overflow in
++	DecodeImage".  Both of these oss-fuzz issues appeared due to
++	recent changes since the last release.
++
+ 	* coders/meta.c (WriteMETAImage): Assure that 'iptc_offset' is
+ 	initialized and valid.
+ 
+diff --git a/coders/pict.c b/coders/pict.c
+--- a/coders/pict.c
++++ b/coders/pict.c
+@@ -770,12 +770,8 @@
+                                   const unsigned int bits_per_pixel)
+ {
+   unsigned long
+-    j,
+     y;
+ 
+-  register unsigned long
+-    i;
+-
+   register const unsigned char
+     *p;
+ 
+@@ -784,6 +780,7 @@
+ 
+   size_t
+     allocated_pixels,
++    scanline_alloc,
+     row_bytes;
+ 
+   unsigned char
+@@ -792,15 +789,19 @@
+     *scanline = NULL;
+ 
+   unsigned long
+-    bytes_per_pixel,
+-    length,
+     number_pixels,
+-    scanline_length,
+     width;
+ 
+   magick_off_t
+     file_size;
+ 
++  unsigned int
++    bytes_per_pixel,
++    i,
++    j,
++    length,
++    scanline_length;
++
+   ARG_NOT_USED(image_info);
+ 
+   if (image->logging)
+@@ -887,8 +888,15 @@
+                      image->filename);
+       goto decode_error_exit;
+     }
+-  /* FIXME: Extra +1 avoids heap read overflow (oss-fuzz 12019) */
+-  scanline=MagickAllocateMemory(unsigned char *,row_bytes+1);
++  /* Use a worst-case allocation policy (because we can afford to) */
++  if (bytes_per_line < 8)
++    scanline_alloc = bytes_per_line;
++  else if (bytes_per_line <= 200)
++    scanline_alloc = 256U;
++  else
++    scanline_alloc = 65536U;
++
++  scanline=MagickAllocateMemory(unsigned char *,scanline_alloc);
+   if (scanline == (unsigned char *) NULL)
+     {
+       ThrowException(&image->exception,ResourceLimitError,MemoryAllocationFailed,
+@@ -927,23 +935,26 @@
+         scanline_length=ReadBlobMSBShort(blob);
+       else
+         scanline_length=ReadBlobByte(blob);
+-      if (scanline_length >= row_bytes)
++      if (image->logging)
++        (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                              "scanline_length = %u, "
++                              "scanline_alloc = %"MAGICK_SIZE_T_F"u",
++                              scanline_length, (MAGICK_SIZE_T)scanline_alloc);
++      if (scanline_length < 2)
+         {
+-          if (image->logging)
+-            (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+-                                  "scanline_length = %lu, row_bytes = %"MAGICK_SIZE_T_F"u",
+-                                  scanline_length, (MAGICK_SIZE_T)row_bytes);
+           ThrowException(&image->exception,CorruptImageError,UnableToUncompressImage,
+-                         "scanline length exceeds row bytes");
++                         image->filename);
+           goto decode_error_exit;
+         }
+       if (ReadBlob(blob,scanline_length,(char *) scanline) != scanline_length)
+         {
+           ThrowException(&image->exception,CorruptImageError,UnexpectedEndOfFile,
+-                         image->filename);
++                         "Scanline length too small!");
+           goto decode_error_exit;
+         }
+-      (void) memset(scanline+scanline_length,0,row_bytes-scanline_length); /* Zero remainder */
++      #if 0
++      (void) memset(scanline+scanline_length,0,scanline_alloc-scanline_length); /* Zero remainder */
++      #endif
+       for (j=0; j < scanline_length; )
+         if ((scanline[j] & 0x80) == 0)
+           {
+@@ -956,7 +967,7 @@
+                                "Decoded RLE pixels exceeds allocation!");
+                 goto decode_error_exit;
+               }
+-            (void) memcpy(q,p,number_pixels); /* ASAN report */
++            (void) memcpy(q,p,number_pixels);
+             q+=number_pixels;
+             j+=length*bytes_per_pixel+1;
+           }
+diff --git a/www/Changelog.html b/www/Changelog.html
+--- a/www/Changelog.html
++++ b/www/Changelog.html
+@@ -38,6 +38,12 @@
+ <p>2020-01-18  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
+ <blockquote>
+ <ul class="simple">
++<li>coders/pict.c (DecodeImage): Fix heap buffer over-reads. Fixes
++oss-fuzz issue 20053 &quot;graphicsmagick:coder_PICT_fuzzer:
++Heap-buffer-overflow in ExpandBuffer&quot; and oss-fuzz issue 20048
++&quot;graphicsmagick:coder_PICT_fuzzer: Heap-buffer-overflow in
++DecodeImage&quot;.  Both of these oss-fuzz issues appeared due to
++recent changes since the last release.</li>
+ <li>coders/meta.c (WriteMETAImage): Assure that 'iptc_offset' is
+ initialized and valid.</li>
+ <li>coders/jpeg.c (ReadJPEGImage): Assure that evaluating the

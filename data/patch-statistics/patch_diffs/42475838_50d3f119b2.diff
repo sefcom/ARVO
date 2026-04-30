@@ -1,0 +1,54 @@
+From 41a641203d9eba9469416f9e87ff241ed4f743a7 Mon Sep 17 00:00:00 2001
+From: Dan Bloomberg <dan.bloomberg@gmail.com>
+Date: Sat, 22 Jun 2019 14:14:39 -0700
+Subject: [PATCH] even.rouault@gmail.com fixed two difficult bugs in tiffio
+ found by oss-fuzz
+
+Issues 14773 (heap buffer overflow), 15269 (uninitialized value).
+Both fixes handle fuzzing overflows: a 64 bit overflow in the read from
+buffer callback, and a 32 bit overflow in size_t (which is 32 bits in
+32 bit systems).  The readback issue can also be triggered when
+using versions of tifflib before 4.0, which used uint32 for t_off.
+---
+ prog/comparetest.c | 3 ---
+ src/tiffio.c       | 6 +++++-
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/prog/comparetest.c b/prog/comparetest.c
+index 775f537bf..1f1918353 100644
+--- a/prog/comparetest.c
++++ b/prog/comparetest.c
+@@ -131,9 +131,6 @@ static char  mainName[] = "comparetest";
+         if (d1 != 16 && !same) {
+             na1 = pixCompareRankDifference(pixs1, pixs2, 1);
+             if (na1) {
+-                fprintf(stderr, "na1[150] = %20.10f\n", na1->array[150]);
+-                fprintf(stderr, "na1[200] = %20.10f\n", na1->array[200]);
+-                fprintf(stderr, "na1[250] = %20.10f\n", na1->array[250]);
+                 numaGetNonzeroRange(na1, 0.00005, &first, &last);
+                 fprintf(stderr, "Nonzero diff range: first = %d, last = %d\n",
+                         first, last);
+diff --git a/src/tiffio.c b/src/tiffio.c
+index cd59a83ca..5a761ff70 100644
+--- a/src/tiffio.c
++++ b/src/tiffio.c
+@@ -2347,7 +2347,8 @@ size_t        amount;
+     amount = L_MIN((size_t)length, mstream->hw - mstream->offset);
+ 
+         /* Fuzzed files can create this condition! */
+-    if (mstream->offset + amount > mstream->hw) {
++    if (mstream->offset + amount < amount ||  /* overflow */
++        mstream->offset + amount > mstream->hw) {
+         fprintf(stderr, "Bad file: amount too big: %zu\n", amount);
+         return 0;
+     }
+@@ -2397,6 +2398,9 @@ L_MEMSTREAM  *mstream;
+     switch (whence) {
+         case SEEK_SET:
+ /*            fprintf(stderr, "seek_set: offset = %d\n", offset); */
++            if((size_t)offset != offset) {  /* size_t overflow on uint32 */
++                return (toff_t)ERROR_INT("too large offset value", procName, 1);
++            }
+             mstream->offset = offset;
+             break;
+         case SEEK_CUR:

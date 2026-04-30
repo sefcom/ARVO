@@ -1,0 +1,43 @@
+From 4d70d3a3c407cad15e4117c2cafe6a6dcf03fc96 Mon Sep 17 00:00:00 2001
+From: Sean Parkinson <sean@wolfssl.com>
+Date: Tue, 9 Feb 2021 12:51:53 +1000
+Subject: [PATCH] TLS 1.3: Only allow one ServerHello and one HelloRetryRequest
+
+---
+ src/tls13.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/tls13.c b/src/tls13.c
+index 199189d3d1f..0807c084b29 100644
+--- a/src/tls13.c
++++ b/src/tls13.c
+@@ -2881,8 +2881,19 @@ int DoTls13ServerHello(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+     if ((i - begin) + RAN_LEN + ENUM_LEN > helloSz)
+         return BUFFER_ERROR;
+ 
+-    if (XMEMCMP(input + i, helloRetryRequestRandom, RAN_LEN) == 0)
++    if (XMEMCMP(input + i, helloRetryRequestRandom, RAN_LEN) == 0) {
+         *extMsgType = hello_retry_request;
++        /* A HelloRetryRequest comes in as an ServerHello for MiddleBox compat.
++         * Found message to be a HelloRetryRequest.
++         * Don't allow more than one HelloRetryRequest or ServerHello.
++         */
++        if (ssl->msgsReceived.got_hello_retry_request == 1) {
++            return DUPLICATE_MSG_E;
++        }
++        /* Update counts to reflect change of message type. */
++        ssl->msgsReceived.got_hello_retry_request++;
++        ssl->msgsReceived.got_server_hello--;
++    }
+ 
+     /* Server random - keep for debugging. */
+     XMEMCPY(ssl->arrays->serverRandom, input + i, RAN_LEN);
+@@ -6749,7 +6760,7 @@ static int SanityCheckTls13MsgReceived(WOLFSSL* ssl, byte type)
+                 return OUT_OF_ORDER_E;
+             }
+         #endif
+-            if (ssl->msgsReceived.got_server_hello == 2) {
++            if (ssl->msgsReceived.got_server_hello == 1) {
+                 WOLFSSL_MSG("Duplicate ServerHello received");
+                 return DUPLICATE_MSG_E;
+             }

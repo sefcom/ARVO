@@ -1,0 +1,202 @@
+From 364908fa52a94322d810fe59168db0b7e30c179b Mon Sep 17 00:00:00 2001
+From: Cristy <urban-warrior@imagemagick.org>
+Date: Sun, 14 Jul 2019 19:03:56 -0400
+Subject: [PATCH] Create define for optimal small buffer size
+
+---
+ MagickCore/blob.c           |  4 ++--
+ MagickCore/blob.h           |  1 +
+ coders/bytebuffer-private.h |  4 +++-
+ coders/jpeg.c               | 19 +++++++++----------
+ coders/mat.c                |  4 ++--
+ coders/psd.c                | 10 ++++------
+ 6 files changed, 21 insertions(+), 21 deletions(-)
+
+diff --git a/MagickCore/blob.c b/MagickCore/blob.c
+index 70760a83b68..d498addb786 100644
+--- a/MagickCore/blob.c
++++ b/MagickCore/blob.c
+@@ -1105,7 +1105,7 @@ MagickExport MagickBooleanType DiscardBlobBytes(Image *image,
+     count;
+ 
+   unsigned char
+-    buffer[16384];
++    buffer[MagickMinBufferExtent];
+ 
+   assert(image != (Image *) NULL);
+   assert(image->signature == MagickCoreSignature);
+@@ -3163,7 +3163,7 @@ static inline MagickBooleanType SetStreamBuffering(const ImageInfo *image_info,
+   size_t
+     size;
+ 
+-  size=16384;
++  size=MagickMinBufferExtent;
+   option=GetImageOption(image_info,"stream:buffer-size");
+   if (option != (const char *) NULL)
+     size=StringToUnsignedLong(option);
+diff --git a/MagickCore/blob.h b/MagickCore/blob.h
+index d0e425985a4..7dabbbecc2f 100644
+--- a/MagickCore/blob.h
++++ b/MagickCore/blob.h
+@@ -23,6 +23,7 @@ extern "C" {
+ #endif
+ 
+ #define MagickMaxBufferExtent  81920
++#define MagickMinBufferExtent  16384
+ 
+ typedef enum
+ {
+diff --git a/coders/bytebuffer-private.h b/coders/bytebuffer-private.h
+index db516d99e19..d3a01465cde 100644
+--- a/coders/bytebuffer-private.h
++++ b/coders/bytebuffer-private.h
+@@ -16,6 +16,8 @@
+ #ifndef MAGICK_BYTE_BUFFER_PRIVATE_H
+ #define MAGICK_BYTE_BUFFER_PRIVATE_H
+ 
++#include "MagickCore/blob.h"
++
+ typedef struct _MagickByteBuffer
+ {
+   Image
+@@ -26,7 +28,7 @@ typedef struct _MagickByteBuffer
+     count;
+ 
+   unsigned char
+-    data[8192];
++    data[MagickMinBufferExtent];
+ } MagickByteBuffer;
+ 
+ static inline int ReadMagickByteBuffer(MagickByteBuffer *buffer)
+diff --git a/coders/jpeg.c b/coders/jpeg.c
+index 2d62c99543d..275be95cd8a 100644
+--- a/coders/jpeg.c
++++ b/coders/jpeg.c
+@@ -104,7 +104,6 @@
+ #define ICC_PROFILE  "ICC_PROFILE"
+ #define IPTC_MARKER  (JPEG_APP0+13)
+ #define XML_MARKER  (JPEG_APP0+1)
+-#define MaxBufferExtent  16384
+ #define MaxJPEGScans  1024
+ 
+ /*
+@@ -259,7 +258,7 @@ static boolean FillInputBuffer(j_decompress_ptr cinfo)
+ 
+   source=(SourceManager *) cinfo->src;
+   source->manager.bytes_in_buffer=(size_t) ReadBlob(source->image,
+-    MaxBufferExtent,source->buffer);
++    MagickMinBufferExtent,source->buffer);
+   if (source->manager.bytes_in_buffer == 0)
+     {
+       if (source->start_of_blob != FALSE)
+@@ -887,7 +886,7 @@ static void JPEGSourceManager(j_decompress_ptr cinfo,Image *image)
+     ((j_common_ptr) cinfo,JPOOL_IMAGE,sizeof(SourceManager));
+   source=(SourceManager *) cinfo->src;
+   source->buffer=(JOCTET *) (*cinfo->mem->alloc_small)
+-    ((j_common_ptr) cinfo,JPOOL_IMAGE,MaxBufferExtent*sizeof(JOCTET));
++    ((j_common_ptr) cinfo,JPOOL_IMAGE,MagickMinBufferExtent*sizeof(JOCTET));
+   source=(SourceManager *) cinfo->src;
+   source->manager.init_source=InitializeSource;
+   source->manager.fill_input_buffer=FillInputBuffer;
+@@ -1819,8 +1818,8 @@ static boolean EmptyOutputBuffer(j_compress_ptr cinfo)
+ 
+   destination=(DestinationManager *) cinfo->dest;
+   destination->manager.free_in_buffer=(size_t) WriteBlob(destination->image,
+-    MaxBufferExtent,destination->buffer);
+-  if (destination->manager.free_in_buffer != MaxBufferExtent)
++    MagickMinBufferExtent,destination->buffer);
++  if (destination->manager.free_in_buffer != MagickMinBufferExtent)
+     ERREXIT(cinfo,JERR_FILE_WRITE);
+   destination->manager.next_output_byte=destination->buffer;
+   return(TRUE);
+@@ -2027,9 +2026,9 @@ static void InitializeDestination(j_compress_ptr cinfo)
+ 
+   destination=(DestinationManager *) cinfo->dest;
+   destination->buffer=(JOCTET *) (*cinfo->mem->alloc_small)
+-    ((j_common_ptr) cinfo,JPOOL_IMAGE,MaxBufferExtent*sizeof(JOCTET));
++    ((j_common_ptr) cinfo,JPOOL_IMAGE,MagickMinBufferExtent*sizeof(JOCTET));
+   destination->manager.next_output_byte=destination->buffer;
+-  destination->manager.free_in_buffer=MaxBufferExtent;
++  destination->manager.free_in_buffer=MagickMinBufferExtent;
+ }
+ 
+ static void TerminateDestination(j_compress_ptr cinfo)
+@@ -2038,15 +2037,15 @@ static void TerminateDestination(j_compress_ptr cinfo)
+     *destination;
+ 
+   destination=(DestinationManager *) cinfo->dest;
+-  if ((MaxBufferExtent-(int) destination->manager.free_in_buffer) > 0)
++  if ((MagickMinBufferExtent-(int) destination->manager.free_in_buffer) > 0)
+     {
+       ssize_t
+         count;
+ 
+-      count=WriteBlob(destination->image,MaxBufferExtent-
++      count=WriteBlob(destination->image,MagickMinBufferExtent-
+         destination->manager.free_in_buffer,destination->buffer);
+       if (count != (ssize_t)
+-          (MaxBufferExtent-destination->manager.free_in_buffer))
++          (MagickMinBufferExtent-destination->manager.free_in_buffer))
+         ERREXIT(cinfo,JERR_FILE_WRITE);
+     }
+ }
+diff --git a/coders/mat.c b/coders/mat.c
+index 17817371f54..f1af3d534dc 100644
+--- a/coders/mat.c
++++ b/coders/mat.c
+@@ -501,7 +501,7 @@ ssize_t TotalSize = 0;
+     (void) remove_utf8(clone_info->filename);
+   }
+ 
+-  cache_block = AcquireQuantumMemory((size_t)(*Size < 16384) ? *Size: 16384,sizeof(unsigned char *));
++  cache_block = AcquireQuantumMemory((size_t)(*Size < MagickMinBufferExtent) ? *Size: MagickMinBufferExtent,sizeof(unsigned char *));
+   if(cache_block==NULL) return NULL;
+   decompress_block = AcquireQuantumMemory((size_t)(4096),sizeof(unsigned char *));
+   if(decompress_block==NULL)
+@@ -542,7 +542,7 @@ ssize_t TotalSize = 0;
+   zip_info.total_out = 0;
+   while(*Size>0 && !EOFBlob(orig))
+   {
+-    magick_size = ReadBlob(orig, (*Size < 16384) ? *Size : 16384, (unsigned char *) cache_block);
++    magick_size = ReadBlob(orig, (*Size < MagickMinBufferExtent) ? *Size : MagickMinBufferExtent, (unsigned char *) cache_block);
+     if (magick_size == 0)
+       break;
+     zip_info.next_in = (Bytef *) cache_block;
+diff --git a/coders/psd.c b/coders/psd.c
+index 157551ae9ac..18986d4ccd0 100644
+--- a/coders/psd.c
++++ b/coders/psd.c
+@@ -2755,8 +2755,6 @@ static size_t WritePSDChannel(const PSDInfo *psd_info,
+ 
+ #ifdef MAGICKCORE_ZLIB_DELEGATE
+ 
+-#define CHUNK 16384
+-
+   int
+     flush,
+     level;
+@@ -2787,8 +2785,8 @@ static size_t WritePSDChannel(const PSDInfo *psd_info,
+ #ifdef MAGICKCORE_ZLIB_DELEGATE
+   if (compression == ZipCompression)
+     {
+-      compressed_pixels=(unsigned char *) AcquireQuantumMemory(CHUNK,
+-        sizeof(*compressed_pixels));
++      compressed_pixels=(unsigned char *) AcquireQuantumMemory(
++        MagickMinBufferExtent,sizeof(*compressed_pixels));
+       if (compressed_pixels == (unsigned char *) NULL)
+         {
+           quantum_info=DestroyQuantumInfo(quantum_info);
+@@ -2833,11 +2831,11 @@ static size_t WritePSDChannel(const PSDInfo *psd_info,
+         if (y == (ssize_t) next_image->rows-1)
+           flush=Z_FINISH;
+         do {
+-            stream.avail_out=(uInt) CHUNK;
++            stream.avail_out=(uInt) MagickMinBufferExtent;
+             stream.next_out=(Bytef *) compressed_pixels;
+             if (deflate(&stream,flush) == Z_STREAM_ERROR)
+               break;
+-            length=(size_t) CHUNK-stream.avail_out;
++            length=(size_t) MagickMinBufferExtent-stream.avail_out;
+             if (length > 0)
+               count+=WriteBlob(image,length,compressed_pixels);
+         } while (stream.avail_out == 0);

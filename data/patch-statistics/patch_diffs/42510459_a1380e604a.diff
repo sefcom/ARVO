@@ -1,0 +1,47 @@
+From 9e28aae868156242e4a83faa71190ad15df7c108 Mon Sep 17 00:00:00 2001
+From: Albert Astals Cid <aacid@kde.org>
+Date: Thu, 7 Apr 2022 00:31:16 +0200
+Subject: [PATCH] psd: Protect against broken images
+
+If you have an image that says it's Mono but has 16 as header.depth we
+end up doing invalid memory accesses
+
+oss-fuzz/46437
+---
+ src/imageformats/psd.cpp | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/imageformats/psd.cpp b/src/imageformats/psd.cpp
+index c55bc503..a60fe502 100644
+--- a/src/imageformats/psd.cpp
++++ b/src/imageformats/psd.cpp
+@@ -501,10 +501,8 @@ static QImage::Format imageFormat(const PSDHeader &header)
+         format = QImage::Format_Indexed8;
+         break;
+     case CM_BITMAP:
+-        format = QImage::Format_Mono;
++        format = header.depth == 1 ? QImage::Format_Mono : QImage::Format_Invalid;
+         break;
+-    default:
+-        qDebug() << "Unsupported color mode" << header.color_mode;
+     }
+     return format;
+ }
+@@ -624,7 +622,13 @@ static bool LoadPSD(QDataStream &stream, const PSDHeader &header, QImage &img)
+         return false;
+     }
+ 
+-    img = QImage(header.width, header.height, imageFormat(header));
++    const QImage::Format format = imageFormat(header);
++    if (format == QImage::Format_Invalid) {
++        qWarning() << "Unsupported image format" << header.color_mode << header.depth;
++        return false;
++    }
++
++    img = QImage(header.width, header.height, format);
+     if (img.isNull()) {
+         qWarning() << "Failed to allocate image, invalid dimensions?" << QSize(header.width, header.height);
+         return false;
+-- 
+GitLab
+

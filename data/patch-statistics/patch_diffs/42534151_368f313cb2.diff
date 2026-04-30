@@ -1,0 +1,95 @@
+From 12e2e71b241cd7523ed69adb4ff7307f488fea8d Mon Sep 17 00:00:00 2001
+From: ShashankPathmudi <146080254+ShashankPathmudi@users.noreply.github.com>
+Date: Tue, 16 Apr 2024 17:58:40 +0530
+Subject: [PATCH] Fix for Heap-buffer-overflow in Codec__decodeXAACStream (#85)
+
+These changes fix the Heap-buffer-overflow in Codec__decodeXAACStream runtime error
+caused due to unsupported frame length type configuration for LATM streams.
+
+Bug: ossFuzz:67767
+Test: poc in bug
+---
+ decoder/ixheaacd_headerdecode.c | 13 +++----------
+ decoder/ixheaacd_latmdemux.c    |  2 ++
+ fuzzer/xaac_dec_fuzzer.cpp      | 14 +++++++++-----
+ 3 files changed, 14 insertions(+), 15 deletions(-)
+
+diff --git a/decoder/ixheaacd_headerdecode.c b/decoder/ixheaacd_headerdecode.c
+index 03fb0677..260ef0f9 100644
+--- a/decoder/ixheaacd_headerdecode.c
++++ b/decoder/ixheaacd_headerdecode.c
+@@ -1127,19 +1127,12 @@ WORD32 ixheaacd_aac_headerdecode(
+             ixheaacd_latm_header_decode(aac_state_struct, &it_bit_buff,
+                                         bytes_consumed, pstr_samp_rate_info);
+         if (result != 0) {
+-          if ((result ==
+-               (WORD32)
+-                   IA_XHEAAC_DEC_EXE_NONFATAL_INSUFFICIENT_INPUT_BYTES) ||
+-              (result ==
+-               (WORD32)IA_XHEAAC_DEC_INIT_FATAL_STREAM_CHAN_GT_MAX)) {
++          if ((result == (WORD32)IA_XHEAAC_DEC_EXE_NONFATAL_INSUFFICIENT_INPUT_BYTES) ||
++              (result < 0)) {
+             bytes_taken += *bytes_consumed;
+             *bytes_consumed = bytes_taken;
+             return result;
+-          } else if (result == -1)
+-            return -1;
+-          else if (result == (WORD32)IA_FATAL_ERROR)
+-            return IA_FATAL_ERROR;
+-          else
++          } else
+             bytes_taken += *bytes_consumed - 1;
+           continue;
+         }
+diff --git a/decoder/ixheaacd_latmdemux.c b/decoder/ixheaacd_latmdemux.c
+index 49f7d23d..30edaf67 100644
+--- a/decoder/ixheaacd_latmdemux.c
++++ b/decoder/ixheaacd_latmdemux.c
+@@ -253,6 +253,8 @@ IA_ERRORCODE ixheaacd_latm_stream_mux_config(
+             }
+             break;
+ 
++          case 1:
++            latm_element->frame_length = ixheaacd_read_bits_buf(it_bit_buff, 9);
+           default:
+             return IA_XHEAAC_DEC_EXE_FATAL_INVALID_LOAS_HEADER;
+         }
+diff --git a/fuzzer/xaac_dec_fuzzer.cpp b/fuzzer/xaac_dec_fuzzer.cpp
+index 3cd67491..555ba290 100644
+--- a/fuzzer/xaac_dec_fuzzer.cpp
++++ b/fuzzer/xaac_dec_fuzzer.cpp
+@@ -52,6 +52,13 @@
+ 
+ #define MAX_MEM_ALLOCS 100
+ 
++#define IA_MAX_OUTPUT_PCM_SIZE (3)
++#define IA_MAX_USAC_CH (2)
++#define IA_MAX_OUT_SAMPLES_PER_FRAME (4096)
++
++#define IA_DRC_DEC_IN_OUT_BUF_SIZE \
++  (IA_MAX_USAC_CH * IA_MAX_OUT_SAMPLES_PER_FRAME * IA_MAX_OUTPUT_PCM_SIZE)
++
+ class Codec {
+  public:
+   IA_ERRORCODE initDecoder(const uint8_t* data, size_t size, bool isADTS);
+@@ -396,10 +403,7 @@ IA_ERRORCODE Codec::initMPEGDDDrc() {
+                               pv_alloc_ptr);
+   }
+ 
+-  WORD32 ui_size;
+-  ui_size = 8192 * 2;
+-
+-  mDrcInBuf = (int8_t*)malloc(ui_size);
++  mDrcInBuf = (int8_t*)malloc(IA_DRC_DEC_IN_OUT_BUF_SIZE);
+   if (mDrcInBuf == nullptr) {
+     return IA_FATAL_ERROR;
+   }
+@@ -408,7 +412,7 @@ IA_ERRORCODE Codec::initMPEGDDDrc() {
+   err_code =
+       ia_drc_dec_api(mMpegDDrcHandle, IA_API_CMD_SET_MEM_PTR, 2, mDrcInBuf);
+ 
+-  mDrcOutBuf = (int8_t*)malloc(ui_size);
++  mDrcOutBuf = (int8_t*)malloc(IA_DRC_DEC_IN_OUT_BUF_SIZE);
+   if (mDrcOutBuf == nullptr) {
+     return IA_FATAL_ERROR;
+   }

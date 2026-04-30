@@ -1,0 +1,97 @@
+From 4962050f47ecdef3539b7035b030ff712c1fc6f7 Mon Sep 17 00:00:00 2001
+From: Elango Cheran <elango@unicode.org>
+Date: Tue, 22 Feb 2022 18:28:12 +0000
+Subject: [PATCH] ICU-21919 Fix buffer overflow bug in Dutch accented IJ
+ titlecase
+
+See #1990
+---
+ icu4c/source/common/ucasemap.cpp                              | 3 ++-
+ icu4c/source/common/ustrcase.cpp                              | 1 +
+ icu4c/source/test/intltest/strcase.cpp                        | 4 +++-
+ icu4j/main/classes/core/src/com/ibm/icu/impl/CaseMapImpl.java | 2 ++
+ .../src/com/ibm/icu/dev/test/lang/UCharacterCaseTest.java     | 3 +++
+ 5 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/icu4c/source/common/ucasemap.cpp b/icu4c/source/common/ucasemap.cpp
+index b6e7f2b744d5..f727560b5716 100644
+--- a/icu4c/source/common/ucasemap.cpp
++++ b/icu4c/source/common/ucasemap.cpp
+@@ -437,6 +437,7 @@ constexpr uint8_t ACUTE_BYTE1 = u8"\u0301"[1];
+  */
+ int32_t maybeTitleDutchIJ(const uint8_t *src, UChar32 c, int32_t start, int32_t segmentLimit,
+                           ByteSink &sink, uint32_t options, icu::Edits *edits, UErrorCode &errorCode) {
++    U_ASSERT(start < segmentLimit);
+ 
+     int32_t index = start;
+     bool withAcute = false;
+@@ -594,7 +595,7 @@ ucasemap_internalUTF8ToTitle(
+                 }
+ 
+                 /* Special case Dutch IJ titlecasing */
+-                if (titleStart+1 < index &&
++                if (titleLimit < index &&
+                     caseLocale == UCASE_LOC_DUTCH) {
+                     if (c < 0) {
+                         c = ~c;
+diff --git a/icu4c/source/common/ustrcase.cpp b/icu4c/source/common/ustrcase.cpp
+index acd37a598ab1..43910ea52098 100644
+--- a/icu4c/source/common/ustrcase.cpp
++++ b/icu4c/source/common/ustrcase.cpp
+@@ -416,6 +416,7 @@ namespace {
+ int32_t maybeTitleDutchIJ(const UChar *src, UChar32 c, int32_t start, int32_t segmentLimit,
+                           UChar *dest, int32_t &destIndex, int32_t destCapacity, uint32_t options,
+                           icu::Edits *edits) {
++    U_ASSERT(start < segmentLimit);
+ 
+     int32_t index = start;
+     bool withAcute = false;
+diff --git a/icu4c/source/test/intltest/strcase.cpp b/icu4c/source/test/intltest/strcase.cpp
+index 14df2a36bdb4..b5eff9f0af80 100644
+--- a/icu4c/source/test/intltest/strcase.cpp
++++ b/icu4c/source/test/intltest/strcase.cpp
+@@ -741,6 +741,9 @@ void StringCaseTest::TestDutchTitle() {
+         {u"íjabc\u0308",        u"Íjabc\u0308",       u"Í"},
+         {u"íj́abc\U0001D16E",    u"ÍJ́abc\U0001D16E",   u"ÍJ"},
+         {u"íjabc\u1ABE",        u"Íjabc\u1ABE",       u"Í"},
++
++        // Bug ICU-21919
++        {u"Í",                  u"Í",                 u""},
+     };
+ 
+     for (const auto& cas : dutchTitleTestCases) {
+@@ -763,7 +766,6 @@ void StringCaseTest::TestDutchTitle() {
+                 testOptions
+             );
+         }
+-        
+     }
+ }
+ #endif
+diff --git a/icu4j/main/classes/core/src/com/ibm/icu/impl/CaseMapImpl.java b/icu4j/main/classes/core/src/com/ibm/icu/impl/CaseMapImpl.java
+index 052e52c592f4..c6521a580227 100644
+--- a/icu4j/main/classes/core/src/com/ibm/icu/impl/CaseMapImpl.java
++++ b/icu4j/main/classes/core/src/com/ibm/icu/impl/CaseMapImpl.java
+@@ -794,6 +794,8 @@ public static <A extends Appendable> A toTitle(
+     private static <A extends Appendable> int maybeTitleDutchIJ(
+             CharSequence src, int c, int start, int segmentLimit,
+             A dest, int options, Edits edits) throws IOException {
++        assert start < segmentLimit;
++
+         int index = start;
+         boolean withAcute = false;
+ 
+diff --git a/icu4j/main/tests/core/src/com/ibm/icu/dev/test/lang/UCharacterCaseTest.java b/icu4j/main/tests/core/src/com/ibm/icu/dev/test/lang/UCharacterCaseTest.java
+index f56f2950e31d..b929dfa9ee5a 100644
+--- a/icu4j/main/tests/core/src/com/ibm/icu/dev/test/lang/UCharacterCaseTest.java
++++ b/icu4j/main/tests/core/src/com/ibm/icu/dev/test/lang/UCharacterCaseTest.java
+@@ -497,6 +497,9 @@ public void TestDutchTitle() {
+                 {"íjabc\u0308",        "Íjabc\u0308",       "Í"},
+                 {"íj́abc\uD834\uDD6E",  "ÍJ́abc\uD834\uDD6E", "ÍJ"},
+                 {"íjabc\u1ABE",        "Íjabc\u1ABE",       "Í"},
++
++                // Bug ICU-21919
++                {"Í",                  "Í",                 ""},
+         };
+ 
+         for (String[] caseDatum : dutchIJCasesData) {

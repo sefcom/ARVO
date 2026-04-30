@@ -1,0 +1,203 @@
+From be4d1caad40e05b0c6b1cf2320fd8112fe9da14b Mon Sep 17 00:00:00 2001
+From: Vignesh Venkatasubramanian <vigneshv-at-google.com@ffmpeg.org>
+Date: Tue, 28 Jun 2022 11:56:20 -0700
+Subject: [PATCH] avformat/mov: Only read the primary item for AVIF
+
+Update the still AVIF parser to only read the primary item. With this
+patch, AVIF still images with exif/icc/alpha channel will no longer
+fail to parse.
+
+For example, this patch enables parsing of files in:
+https://github.com/AOMediaCodec/av1-avif/tree/master/testFiles/Microsoft
+
+Adding two fate tests:
+1) demuxing of still image with 1 item - this test will pass regardless
+   of this patch.
+2) demuxing of still image with 2 items - this test will fail without
+   this patch and will pass with patch applied.
+
+Partially fixes trac ticket #7621
+
+Signed-off-by: Vignesh Venkatasubramanian <vigneshv@google.com>
+Signed-off-by: James Zern <jzern@google.com>
+---
+ libavformat/isom.h                            |  1 +
+ libavformat/mov.c                             | 41 ++++++++++---------
+ tests/fate/mov.mak                            | 13 ++++++
+ .../fate/mov-avif-demux-still-image-1-item    | 11 +++++
+ .../mov-avif-demux-still-image-multiple-items | 11 +++++
+ 5 files changed, 57 insertions(+), 20 deletions(-)
+ create mode 100644 tests/ref/fate/mov-avif-demux-still-image-1-item
+ create mode 100644 tests/ref/fate/mov-avif-demux-still-image-multiple-items
+
+diff --git a/libavformat/isom.h b/libavformat/isom.h
+index cf36f04d5b..f05c2d9c28 100644
+--- a/libavformat/isom.h
++++ b/libavformat/isom.h
+@@ -317,6 +317,7 @@ typedef struct MOVContext {
+     uint32_t mfra_size;
+     uint32_t max_stts_delta;
+     int is_still_picture_avif;
++    int primary_item_id;
+ } MOVContext;
+ 
+ int ff_mp4_read_descr_len(AVIOContext *pb);
+diff --git a/libavformat/mov.c b/libavformat/mov.c
+index c6fbe511c0..88669faa70 100644
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -7470,6 +7470,13 @@ static int rb_size(AVIOContext *pb, uint64_t* value, int size)
+     return size;
+ }
+ 
++static int mov_read_pitm(MOVContext *c, AVIOContext *pb, MOVAtom atom)
++{
++    avio_rb32(pb);  // version & flags.
++    c->primary_item_id = avio_rb16(pb);
++    return atom.size;
++}
++
+ static int mov_read_iloc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+ {
+     int version, offset_size, length_size, base_offset_size, index_size;
+@@ -7526,34 +7533,25 @@ static int mov_read_iloc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+         return AVERROR_PATCHWELCOME;
+     }
+     item_count = (version < 2) ? avio_rb16(pb) : avio_rb32(pb);
+-    if (item_count > 1) {
+-        // For still AVIF images, we only support one item. Second item will
+-        // generally be found for AVIF images with alpha channel. We don't
+-        // support them as of now.
+-        av_log(c->fc, AV_LOG_ERROR, "iloc: item_count > 1 not supported.\n");
+-        return AVERROR_PATCHWELCOME;
+-    }
+ 
+     // Populate the necessary fields used by mov_build_index.
+-    sc->stsc_count = item_count;
+-    sc->stsc_data = av_malloc_array(item_count, sizeof(*sc->stsc_data));
++    sc->stsc_count = 1;
++    sc->stsc_data = av_malloc_array(1, sizeof(*sc->stsc_data));
+     if (!sc->stsc_data)
+         return AVERROR(ENOMEM);
+     sc->stsc_data[0].first = 1;
+     sc->stsc_data[0].count = 1;
+     sc->stsc_data[0].id = 1;
+-    sc->chunk_count = item_count;
+-    sc->chunk_offsets =
+-        av_malloc_array(item_count, sizeof(*sc->chunk_offsets));
++    sc->chunk_count = 1;
++    sc->chunk_offsets = av_malloc_array(1, sizeof(*sc->chunk_offsets));
+     if (!sc->chunk_offsets)
+         return AVERROR(ENOMEM);
+-    sc->sample_count = item_count;
+-    sc->sample_sizes =
+-        av_malloc_array(item_count, sizeof(*sc->sample_sizes));
++    sc->sample_count = 1;
++    sc->sample_sizes = av_malloc_array(1, sizeof(*sc->sample_sizes));
+     if (!sc->sample_sizes)
+         return AVERROR(ENOMEM);
+-    sc->stts_count = item_count;
+-    sc->stts_data = av_malloc_array(item_count, sizeof(*sc->stts_data));
++    sc->stts_count = 1;
++    sc->stts_data = av_malloc_array(1, sizeof(*sc->stts_data));
+     if (!sc->stts_data)
+         return AVERROR(ENOMEM);
+     sc->stts_data[0].count = 1;
+@@ -7561,7 +7559,7 @@ static int mov_read_iloc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+     sc->stts_data[0].duration = 0;
+ 
+     for (int i = 0; i < item_count; i++) {
+-        (version < 2) ? avio_rb16(pb) : avio_rb32(pb);  // item_id;
++        int item_id = (version < 2) ? avio_rb16(pb) : avio_rb32(pb);
+         if (version > 0)
+             avio_rb16(pb);  // construction_method.
+         avio_rb16(pb);  // data_reference_index.
+@@ -7577,8 +7575,10 @@ static int mov_read_iloc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+             if (rb_size(pb, &extent_offset, offset_size) < 0 ||
+                 rb_size(pb, &extent_length, length_size) < 0)
+                 return AVERROR_INVALIDDATA;
+-            sc->sample_sizes[0] = extent_length;
+-            sc->chunk_offsets[0] = base_offset + extent_offset;
++            if (item_id == c->primary_item_id) {
++                sc->sample_sizes[0] = extent_length;
++                sc->chunk_offsets[0] = base_offset + extent_offset;
++            }
+         }
+     }
+ 
+@@ -7696,6 +7696,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
+ { MKTAG('S','A','N','D'), mov_read_SAND }, /* non diegetic audio box */
+ { MKTAG('i','l','o','c'), mov_read_iloc },
+ { MKTAG('p','c','m','C'), mov_read_pcmc }, /* PCM configuration box */
++{ MKTAG('p','i','t','m'), mov_read_pitm },
+ { 0, NULL }
+ };
+ 
+diff --git a/tests/fate/mov.mak b/tests/fate/mov.mak
+index 2fae054423..8a7218a215 100644
+--- a/tests/fate/mov.mak
++++ b/tests/fate/mov.mak
+@@ -17,6 +17,10 @@ FATE_MOV = fate-mov-3elist \
+            fate-mov-bbi-elst-starts-b \
+            fate-mov-neg-firstpts-discard-frames \
+            fate-mov-stream-shorter-than-movie \
++# FIXME: Uncomment these two lines once the test files are uploaded to the fate
++# server.
++#           fate-mov-avif-demux-still-image-1-item \
++#           fate-mov-avif-demux-still-image-multiple-items \
+ 
+ FATE_MOV_FFPROBE = fate-mov-neg-firstpts-discard \
+                    fate-mov-neg-firstpts-discard-vorbis \
+@@ -138,6 +142,15 @@ FATE_MOV_FFMPEG_FFPROBE-$(call TRANSCODE, TTML SUBRIP, MP4 MOV, SRT_DEMUXER TTML
+ fate-mov-mp4-ttml-stpp: CMD = transcode srt $(TARGET_SAMPLES)/sub/SubRip_capability_tester.srt mp4 "-map 0:s -c:s ttml -time_base:s 1:1000" "-map 0 -c copy" "-of json -show_entries packet:stream=index,codec_type,codec_tag_string,codec_tag,codec_name,time_base,start_time,duration_ts,duration,nb_frames,nb_read_packets:stream_tags"
+ fate-mov-mp4-ttml-dfxp: CMD = transcode srt $(TARGET_SAMPLES)/sub/SubRip_capability_tester.srt mp4 "-map 0:s -c:s ttml -time_base:s 1:1000 -tag:s dfxp -strict unofficial" "-map 0 -c copy" "-of json -show_entries packet:stream=index,codec_type,codec_tag_string,codec_tag,codec_name,time_base,start_time,duration_ts,duration,nb_frames,nb_read_packets:stream_tags"
+ 
++# FIXME: Uncomment these two tests once the test files are uploaded to the fate
++# server.
++# avif demuxing - still image with 1 item.
++#fate-mov-avif-demux-still-image-1-item: CMD = framemd5 -i $(TARGET_SAMPLES)/avif/still_image.avif -c:v copy
++
++# avif demuxing - still image with multiple items. only the primary item will be
++# parsed.
++#fate-mov-avif-demux-still-image-multiple-items: CMD = framemd5 -i $(TARGET_SAMPLES)/avif/still_image_exif.avif -c:v copy
++
+ # Resulting remux should have:
+ # 1. first audio stream with AV_DISPOSITION_HEARING_IMPAIRED
+ # 2. second audio stream with AV_DISPOSITION_VISUAL_IMPAIRED | DESCRIPTIONS
+diff --git a/tests/ref/fate/mov-avif-demux-still-image-1-item b/tests/ref/fate/mov-avif-demux-still-image-1-item
+new file mode 100644
+index 0000000000..93773afd4e
+--- /dev/null
++++ b/tests/ref/fate/mov-avif-demux-still-image-1-item
+@@ -0,0 +1,11 @@
++#format: frame checksums
++#version: 2
++#hash: MD5
++#extradata 0,                              13, b52ae298d37128862ef1918cf916239c
++#tb 0: 1/1
++#media_type 0: video
++#codec_id 0: av1
++#dimensions 0: 352x288
++#sar 0: 1/1
++#stream#, dts,        pts, duration,     size, hash
++0,          0,          0,        1,    36265, 235b0c6e389c4084845981e08d60db04
+diff --git a/tests/ref/fate/mov-avif-demux-still-image-multiple-items b/tests/ref/fate/mov-avif-demux-still-image-multiple-items
+new file mode 100644
+index 0000000000..93773afd4e
+--- /dev/null
++++ b/tests/ref/fate/mov-avif-demux-still-image-multiple-items
+@@ -0,0 +1,11 @@
++#format: frame checksums
++#version: 2
++#hash: MD5
++#extradata 0,                              13, b52ae298d37128862ef1918cf916239c
++#tb 0: 1/1
++#media_type 0: video
++#codec_id 0: av1
++#dimensions 0: 352x288
++#sar 0: 1/1
++#stream#, dts,        pts, duration,     size, hash
++0,          0,          0,        1,    36265, 235b0c6e389c4084845981e08d60db04
+-- 
+2.25.1
+

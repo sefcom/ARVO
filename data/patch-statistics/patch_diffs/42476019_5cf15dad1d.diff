@@ -1,0 +1,94 @@
+From 2331456dc1f83e6b20e656e69fa01b6e30302865 Mon Sep 17 00:00:00 2001
+From: Grzegorz Antoniak <ga@anadoxin.org>
+Date: Mon, 24 Jun 2019 07:07:02 +0200
+Subject: [PATCH] RAR5 reader: fix ARM filter going beyond window buffer
+ boundary
+
+RAR5 uses filters in order to mutate data just before compression, to
+achieve a better compression ratio. After decompression, this mutation
+needs to be reversed by processing various filters that the compressor
+uses.
+
+One of such filters is an ARM executable file filter, which changes some
+bytes in the input stream if the stream is recognized as an executable
+file with ARM native code.
+
+This commit fixes the situation when the decompressor using an ARM filter
+was referencing a byte outside current window buffer. Such action is
+invalid and can produce segmentation faults.
+
+This commit also adds a test using OSSFuzz sample #15431.
+---
+ Makefile.am                                       |  1 +
+ libarchive/archive_read_support_format_rar5.c     |  4 ++--
+ libarchive/test/test_read_format_rar5.c           | 15 +++++++++++++++
+ ...rmat_rar5_arm_filter_on_window_boundary.rar.uu |  9 +++++++++
+ 4 files changed, 27 insertions(+), 2 deletions(-)
+ create mode 100644 libarchive/test/test_read_format_rar5_arm_filter_on_window_boundary.rar.uu
+
+diff --git a/Makefile.am b/Makefile.am
+index 76703e4fe..20eb5312e 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -865,6 +865,7 @@ libarchive_test_EXTRA_DIST=\
+ 	libarchive/test/test_read_format_rar5_symlink.rar.uu \
+ 	libarchive/test/test_read_format_rar5_truncated_huff.rar.uu \
+ 	libarchive/test/test_read_format_rar5_win32.rar.uu \
++	libarchive/test/test_read_format_rar5_arm_filter_on_window_boundary.rar.uu \
+ 	libarchive/test/test_read_format_raw.bufr.uu \
+ 	libarchive/test/test_read_format_raw.data.gz.uu \
+ 	libarchive/test/test_read_format_raw.data.Z.uu \
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index 95579e15c..e58cbbf6d 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -623,9 +623,9 @@ static int run_arm_filter(struct rar5* rar, struct filter_info* flt) {
+ 	for(i = 0; i < flt->block_length - 3; i += 4) {
+ 		uint8_t* b = &rar->cstate.window_buf[
+ 		    (rar->cstate.solid_offset +
+-		    flt->block_start + i) & rar->cstate.window_mask];
++		    flt->block_start + i + 3) & rar->cstate.window_mask];
+ 
+-		if(b[3] == 0xEB) {
++		if(*b == 0xEB) {
+ 			/* 0xEB = ARM's BL (branch + link) instruction. */
+ 			offset = read_filter_data(rar,
+ 			    (rar->cstate.solid_offset + flt->block_start + i) &
+diff --git a/libarchive/test/test_read_format_rar5.c b/libarchive/test/test_read_format_rar5.c
+index 2a55e2015..b4ef29e46 100644
+--- a/libarchive/test/test_read_format_rar5.c
++++ b/libarchive/test/test_read_format_rar5.c
+@@ -1215,3 +1215,18 @@ DEFINE_TEST(test_read_format_rar5_different_window_size)
+ 
+ 	EPILOGUE();
+ }
++
++DEFINE_TEST(test_read_format_rar5_arm_filter_on_window_boundary)
++{
++	char buf[4096];
++	PROLOGUE("test_read_format_rar5_arm_filter_on_window_boundary.rar");
++
++	/* Return codes of those calls are ignored, because this sample file
++	 * is invalid. However, the unpacker shouldn't produce any SIGSEGV
++	 * errors during processing. */
++
++	(void) archive_read_next_header(a, &ae);
++	while(0 != archive_read_data(a, buf, sizeof(buf))) {}
++
++	EPILOGUE();
++}
+diff --git a/libarchive/test/test_read_format_rar5_arm_filter_on_window_boundary.rar.uu b/libarchive/test/test_read_format_rar5_arm_filter_on_window_boundary.rar.uu
+new file mode 100644
+index 000000000..b2b9fdb60
+--- /dev/null
++++ b/libarchive/test/test_read_format_rar5_arm_filter_on_window_boundary.rar.uu
+@@ -0,0 +1,9 @@
++begin 600 test_read_format_rar5_arm_filter_on_window_boundary.rar
++M4F%R(1H'`0"-[P+2``(''(`'`/[_(`#_!``"(0$``/X(TB`!'O___P@``/W_
++M_Q``_]U84%"0_P1LAFVQ9,S,M[$`20"#__\`_P#_`/G___!DSR0V2+$`20`Z
++M@R[_______\I:!<**-@P70D`KB1!<YOZFQ/___^<`^5L*0```/________\_
++M`0#__RE@%PHHV#!="0"N)$%S"```_?]84/7___]0D/\$;(9ML63,S/\R'Q\?
++M'Q\?'Q\?'Q\?'Q\?'[$`20"#__\`_P#_`/G___!DSR0V2+$`20`Z@R[_____
++0_Q\?'Q\?'Q\?'Q]5"E`*4```
++`
++end

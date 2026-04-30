@@ -1,0 +1,154 @@
+From 8f3986a66c390e1125493531648b828099fab982 Mon Sep 17 00:00:00 2001
+From: Alex Rebert <alexandre.rebert@gmail.com>
+Date: Mon, 29 Aug 2022 14:22:17 +0200
+Subject: [PATCH] Fix memory safety issues found by OSS-Fuzz (#301)
+
+* Add integer overflow checks in NewCodePage
+
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=33457
+
+* TouchSlot should track slots outside of functions
+
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=33554.
+
+The OSS-Fuzz inputs led to a crash on a Const64 instruction that
+overflows the stack. The overflow was not detected during compilation as
+TouchSlot did not track maxStackSlots if o->function is NULL. This
+commit changes TouchSlot to track slots outside of functions.
+
+* Fix out-of-bounds write in MarkSlotsAllocatedByType
+
+While pushing the params back onto the stack in CompileBlock,
+GetSlotForStackIndex may return c_slotUnused. If that is the case,
+passing the slot to MarkSlotsAllocatedByType leads to a crash.
+
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=33555
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=36551
+
+* Fix memory leak in CompileElseBlock
+
+In the case of an exception in CompileElseBlock, the original page was not
+properly restored and was leaked. This commit moves the release/restore
+in the _catch: block which always executes.
+
+* Fix stackIndex underflow in param deallocation
+
+When the stack is polymorphic, the stack should never underflow. This
+commits fixes an unreported stack underflow while led to an integer
+underflow in stackIndex. Now, if the stack is polymorphic, we only
+decrement stackIndex up until blockStackIndex.
+---
+ source/m3_code.c    | 15 +++++++++++++++
+ source/m3_compile.c | 28 +++++++++++++++-------------
+ 2 files changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/source/m3_code.c b/source/m3_code.c
+index a5dd5d3f..b399b825 100644
+--- a/source/m3_code.c
++++ b/source/m3_code.c
+@@ -5,6 +5,7 @@
+ //  Copyright © 2019 Steven Massey. All rights reserved.
+ //
+ 
++#include <limits.h>
+ #include "m3_code.h"
+ #include "m3_env.h"
+ 
+@@ -15,9 +16,23 @@ IM3CodePage  NewCodePage  (IM3Runtime i_runtime, u32 i_minNumLines)
+ {
+     IM3CodePage page;
+ 
++    // check multiplication overflow
++    if (i_minNumLines > UINT_MAX / sizeof (code_t)) {
++        return NULL;
++    }
+     u32 pageSize = sizeof (M3CodePageHeader) + sizeof (code_t) * i_minNumLines;
+ 
++    // check addition overflow
++    if (pageSize < sizeof (M3CodePageHeader)) {
++        return NULL;
++    }
++
+     pageSize = (pageSize + (d_m3CodePageAlignSize-1)) & ~(d_m3CodePageAlignSize-1); // align
++    // check alignment overflow
++    if (pageSize == 0) {
++        return NULL;
++    }
++
+     page = (IM3CodePage)m3_Malloc ("M3CodePage", pageSize);
+ 
+     if (page)
+diff --git a/source/m3_compile.c b/source/m3_compile.c
+index 2baf069c..3fa533a3 100644
+--- a/source/m3_compile.c
++++ b/source/m3_compile.c
+@@ -322,11 +322,8 @@ u16  GetExtraSlotForStackIndex  (IM3Compilation o, u16 i_stackIndex)
+ static inline
+ void  TouchSlot  (IM3Compilation o, u16 i_slot)
+ {
+-    if (o->function)
+-    {
+-        // op_Entry uses this value to track and detect stack overflow
+-        o->maxStackSlots = M3_MAX (o->maxStackSlots, i_slot + 1);
+-    }
++    // op_Entry uses this value to track and detect stack overflow
++    o->maxStackSlots = M3_MAX (o->maxStackSlots, i_slot + 1);
+ }
+ 
+ static inline
+@@ -1900,6 +1897,7 @@ _   (CompileBlock (o, blockType, i_opcode));
+ static
+ M3Result  CompileElseBlock  (IM3Compilation o, pc_t * o_startPC, IM3FuncType i_blockType)
+ {
++    IM3CodePage savedPage = o->page;
+ _try {
+ 
+     IM3CodePage elsePage;
+@@ -1907,19 +1905,17 @@ _   (AcquireCompilationCodePage (o, & elsePage));
+ 
+     * o_startPC = GetPagePC (elsePage);
+ 
+-    IM3CodePage savedPage = o->page;
+     o->page = elsePage;
+ 
+ _   (CompileBlock (o, i_blockType, c_waOp_else));
+ 
+ _   (EmitOp (o, op_Branch));
+     EmitPointer (o, GetPagePC (savedPage));
+-
+-    ReleaseCompilationCodePage (o);
+-
+-    o->page = savedPage;
+-
+ } _catch:
++    if(o->page != savedPage) {
++        ReleaseCompilationCodePage (o);
++    }
++    o->page = savedPage;
+     return result;
+ }
+ 
+@@ -2702,7 +2698,13 @@ _try {
+ _           (PopType (o, type));
+         }
+     }
+-    else o->stackIndex -= numParams;
++    else {
++        if (IsStackPolymorphic (o) && o->block.blockStackIndex + numParams > o->stackIndex) {
++            o->stackIndex = o->block.blockStackIndex;
++        } else {
++            o->stackIndex -= numParams;
++        }
++    }
+ 
+     u16 paramIndex = o->stackIndex;
+     block->exitStackIndex = paramIndex; // consume the params at block exit
+@@ -2730,7 +2732,7 @@ _           (PopType (o, type));
+         u16 slot = GetSlotForStackIndex (o, paramIndex + i);
+         Push (o, type, slot);
+ 
+-        if (slot >= o->slotFirstDynamicIndex)
++        if (slot >= o->slotFirstDynamicIndex && slot != c_slotUnused)
+             MarkSlotsAllocatedByType (o, slot, type);
+     }
+ 

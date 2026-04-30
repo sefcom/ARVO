@@ -1,0 +1,61 @@
+From 5d9544cfb03d8597aa2b0037def3a4679949cec6 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sun, 23 Jun 2024 23:17:24 +0200
+Subject: [PATCH] avcodec/hevc/hevcdec: Do not allow slices to depend on failed
+ slices
+
+An alternative would be to leave the context unchanged on failure of hls_slice_header()
+
+Fixes: out of array access
+Fixes: NULL pointer dereference
+Fixes: 69584/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_HEVC_fuzzer-5931086299856896
+Fixes: 69724/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_HEVC_fuzzer-5104066422702080
+Fixes: 70422/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_HEVC_fuzzer-5908731129298944
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/hevc/hevcdec.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index 0e4b26dad3..6b3cf0fec3 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -621,6 +621,10 @@ static int hls_slice_header(SliceHeader *sh, const HEVCContext *s, GetBitContext
+ 
+         if (pps->dependent_slice_segments_enabled_flag)
+             sh->dependent_slice_segment_flag = get_bits1(gb);
++        if (sh->dependent_slice_segment_flag && !s->slice_initialized) {
++            av_log(s->avctx, AV_LOG_ERROR, "Independent slice segment missing.\n");
++            return AVERROR_INVALIDDATA;
++        }
+ 
+         slice_address_length = av_ceil_log2(sps->ctb_width *
+                                             sps->ctb_height);
+@@ -893,9 +897,6 @@ static int hls_slice_header(SliceHeader *sh, const HEVCContext *s, GetBitContext
+         } else {
+             sh->slice_loop_filter_across_slices_enabled_flag = pps->seq_loop_filter_across_slices_enabled_flag;
+         }
+-    } else if (!s->slice_initialized) {
+-        av_log(s->avctx, AV_LOG_ERROR, "Independent slice segment missing.\n");
+-        return AVERROR_INVALIDDATA;
+     }
+ 
+     sh->num_entry_point_offsets = 0;
+@@ -3155,8 +3156,11 @@ static int decode_slice(HEVCContext *s, const H2645NAL *nal, GetBitContext *gb)
+     int ret;
+ 
+     ret = hls_slice_header(&s->sh, s, gb);
+-    if (ret < 0)
++    if (ret < 0) {
++        // hls_slice_header() does not cleanup on failure thus the state now is inconsistant so we cannot use it on depandant slices
++        s->slice_initialized = 0;
+         return ret;
++    }
+ 
+     if ((s->avctx->skip_frame >= AVDISCARD_BIDIR && s->sh.slice_type == HEVC_SLICE_B) ||
+         (s->avctx->skip_frame >= AVDISCARD_NONINTRA && s->sh.slice_type != HEVC_SLICE_I) ||
+-- 
+2.25.1
+

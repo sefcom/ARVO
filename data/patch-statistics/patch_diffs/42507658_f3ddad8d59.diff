@@ -1,0 +1,989 @@
+From 6ccbd8776fae649e4624e9f076a8381c3d563d24 Mon Sep 17 00:00:00 2001
+From: David Garske <david@wolfssl.com>
+Date: Thu, 13 Jan 2022 16:09:11 -0800
+Subject: [PATCH] DTLS SRTP (RFC5764) support (adds `--enable-srtp`). Used with
+ WebRTC to agree on profile for new real-time session keys.
+
+---
+ configure.ac             |  12 ++-
+ examples/client/client.c |  59 +++++++++---
+ examples/server/server.c |  60 +++++++++---
+ src/internal.c           |  47 +++++++---
+ src/ssl.c                | 127 +++++++++++++++++++++-----
+ src/tls.c                | 191 +++++++++++++++++++++++++++++++++++++++
+ wolfssl/internal.h       |  29 ++++--
+ wolfssl/openssl/ssl.h    |   9 ++
+ wolfssl/ssl.h            |  27 ++++++
+ wolfssl/test.h           |  11 ++-
+ 10 files changed, 501 insertions(+), 71 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index 55677749f79..682392ed59c 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -899,6 +899,11 @@ AS_IF([test "x$ENABLED_SCTP" = "xyes"],
+ : ,
+ : )])
+ 
++# DTLS-SRTP
++AC_ARG_ENABLE([srtp],
++    [AS_HELP_STRING([--enable-srtp],[Enable wolfSSL DTLS-SRTP support (default: disabled)])],
++    [ENABLED_SRTP=$enableval],
++    [ENABLED_SRTP=no])
+ 
+ # DTLS-MULTICAST
+ AC_ARG_ENABLE([mcast],
+@@ -7119,6 +7124,9 @@ AS_IF([test "x$ENABLED_MAXSTRENGTH" = "xyes" && \
+ AS_IF([test "x$ENABLED_SCTP" = "xyes"],
+       [AM_CFLAGS="$AM_CFLAGS -DWOLFSSL_SCTP"])
+ 
++AS_IF([test "x$ENABLED_SRTP" = "xyes"],
++      [AM_CFLAGS="$AM_CFLAGS -DWOLFSSL_SRTP"])
++
+ AS_IF([test "x$ENABLED_MCAST" = "xyes"],
+       [AM_CFLAGS="$AM_CFLAGS -DWOLFSSL_MULTICAST"])
+ 
+@@ -7132,7 +7140,7 @@ AS_IF([(test "x$ENABLED_DEVCRYPTO" = "xyes") && (test "x$ENABLED_SHA224" = "xyes
+ 
+ # SCTP and Multicast require DTLS
+ AS_IF([(test "x$ENABLED_DTLS" = "xno") && \
+-        (test "x$ENABLED_SCTP" = "xyes" || test "x$ENABLED_MCAST" = "xyes")],
++        (test "x$ENABLED_SCTP" = "xyes" || test "x$ENABLED_MCAST" = "xyes" || test "x$ENABLED_SRTP" = "xyes")],
+       [AM_CFLAGS="$AM_CFLAGS -DWOLFSSL_DTLS"
+        ENABLED_DTLS=yes])
+ 
+@@ -7335,6 +7343,7 @@ AM_CONDITIONAL([BUILD_ALL],[test "x$ENABLED_ALL" = "xyes"])
+ AM_CONDITIONAL([BUILD_TLS13],[test "x$ENABLED_TLS13" = "xyes" || test "x$ENABLED_USERSETTINGS" = "xyes"])
+ AM_CONDITIONAL([BUILD_RNG],[test "x$ENABLED_RNG" = "xyes" || test "x$ENABLED_USERSETTINGS" = "xyes"])
+ AM_CONDITIONAL([BUILD_SCTP],[test "x$ENABLED_SCTP" = "xyes" || test "x$ENABLED_USERSETTINGS" = "xyes"])
++AM_CONDITIONAL([BUILD_SRTP],[test "x$ENABLED_SRTP" = "xyes" || test "x$ENABLED_USERSETTINGS" = "xyes"])
+ AM_CONDITIONAL([BUILD_MCAST],[test "x$ENABLED_MCAST" = "xyes"])
+ AM_CONDITIONAL([BUILD_IPV6],[test "x$ENABLED_IPV6" = "xyes"])
+ AM_CONDITIONAL([BUILD_LEANPSK],[test "x$ENABLED_LEANPSK" = "xyes"])
+@@ -7777,6 +7786,7 @@ echo "   * SIGNAL:                     $ENABLED_SIGNAL"
+ echo "   * ERROR_STRINGS:              $ENABLED_ERROR_STRINGS"
+ echo "   * DTLS:                       $ENABLED_DTLS"
+ echo "   * SCTP:                       $ENABLED_SCTP"
++echo "   * SRTP:                       $ENABLED_SRTP"
+ echo "   * Indefinite Length:          $ENABLED_BER_INDEF"
+ echo "   * Multicast:                  $ENABLED_MCAST"
+ echo "   * SSL v3.0 (Old):             $ENABLED_SSLV3"
+diff --git a/examples/client/client.c b/examples/client/client.c
+index b42ba231e84..2f8d363ae90 100644
+--- a/examples/client/client.c
++++ b/examples/client/client.c
+@@ -1311,10 +1311,14 @@ static const char* client_usage_msg[][70] = {
+         "            P384_NTRU_HPS_LEVEL3, P521_NTRU_HPS_LEVEL5, P384_NTRU_HRSS_LEVEL3,\n"
+         "            P256_SABER_LEVEL1, P384_SABER_LEVEL3, P521_SABER_LEVEL5, P256_KYBER_LEVEL1,\n"
+         "            P384_KYBER_LEVEL3, P521_KYBER_LEVEL5, P256_KYBER_90S_LEVEL1, P384_KYBER_90S_LEVEL3,\n"
+-        "            P521_KYBER_90S_LEVEL5]\n\n",                  /* 70 */
++        "            P521_KYBER_90S_LEVEL5]\n",                  /* 70 */
+ #endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++        "--srtp <profile> (default is SRTP_AES128_CM_SHA1_80)\n", /* 71 */
++#endif
++        "\n"
+         "For simpler wolfSSL TLS client examples, visit\n"
+-        "https://github.com/wolfSSL/wolfssl-examples/tree/master/tls\n", /* 71 */
++        "https://github.com/wolfSSL/wolfssl-examples/tree/master/tls\n", /* 72 */
+         NULL,
+     },
+ #ifndef NO_MULTIBYTE_PRINT
+@@ -1514,17 +1518,21 @@ static const char* client_usage_msg[][70] = {
+         " SSLv3(0) - TLS1.3(4)\n",                            /* 69 */
+ #endif
+ #ifdef HAVE_PQC
+-        "--pqc <alg> post-quantum 名前付きグループとの鍵共有のみ\n",
+-        "[KYBER_LEVEL1, KYBER_LEVEL3, KYBER_LEVEL5, KYBER_90S_LEVEL1, KYBER_90S_LEVEL3, KYBER_90S_LEVEL5,\n",
+-        " NTRU_HPS_LEVEL1, NTRU_HPS_LEVEL3, NTRU_HPS_LEVEL5, NTRU_HRSS_LEVEL3,\n",
+-        " LIGHTSABER, SABER, FIRESABER, P256_NTRU_HPS_LEVEL1,\n"
+-        " P384_NTRU_HPS_LEVEL3, P521_NTRU_HPS_LEVEL5, P384_NTRU_HRSS_LEVEL3,\n"
+-        " P256_SABER_LEVEL1, P384_SABER_LEVEL3, P521_SABER_LEVEL5, P256_KYBER_LEVEL1,\n"
+-        " P384_KYBER_LEVEL3, P521_KYBER_LEVEL5, P256_KYBER_90S_LEVEL1, P384_KYBER_90S_LEVEL3,\n"
+-        " P521_KYBER_90S_LEVEL5]\n\n",                            /* 70 */
++        "--pqc <alg> post-quantum 名前付きグループとの鍵共有のみ [KYBER_LEVEL1, KYBER_LEVEL3,\n",
++        "            KYBER_LEVEL5, KYBER_90S_LEVEL1, KYBER_90S_LEVEL3, KYBER_90S_LEVEL5,\n",
++        "            NTRU_HPS_LEVEL1, NTRU_HPS_LEVEL3, NTRU_HPS_LEVEL5, NTRU_HRSS_LEVEL3,\n",
++        "            SABER_LEVEL1, SABER_LEVEL3, SABER_LEVEL5, P256_NTRU_HPS_LEVEL1,\n"
++        "            P384_NTRU_HPS_LEVEL3, P521_NTRU_HPS_LEVEL5, P384_NTRU_HRSS_LEVEL3,\n"
++        "            P256_SABER_LEVEL1, P384_SABER_LEVEL3, P521_SABER_LEVEL5, P256_KYBER_LEVEL1,\n"
++        "            P384_KYBER_LEVEL3, P521_KYBER_LEVEL5, P256_KYBER_90S_LEVEL1, P384_KYBER_90S_LEVEL3,\n"
++        "            P521_KYBER_90S_LEVEL5]\n",                  /* 70 */
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++        "--srtp <profile> (default is SRTP_AES128_CM_SHA1_80)\n", /* 71 */
+ #endif
++        "\n"
+         "For simpler wolfSSL TLS client examples, visit\n"
+-        "https://github.com/wolfSSL/wolfssl-examples/tree/master/tls\n", /* 71 */
++        "https://github.com/wolfSSL/wolfssl-examples/tree/master/tls\n", /* 72 */
+         NULL,
+     },
+ #endif
+@@ -1746,6 +1754,9 @@ static void Usage(void)
+     printf("%s", msg[++msgid]);     /* more --pqc options */
+     printf("%s", msg[++msgid]);     /* more --pqc options */
+ #endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    printf("%s", msg[++msgid]);     /* dtls-srtp */
++#endif
+ }
+ 
+ THREAD_RETURN WOLFSSL_THREAD client_test(void* args)
+@@ -1789,6 +1800,9 @@ THREAD_RETURN WOLFSSL_THREAD client_test(void* args)
+         { "ヘルプ", 0, 258 },
+ #if defined(HAVE_PQC)
+         { "pqc", 1, 259 },
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++        { "srtp", 2, 260 }, /* optional argument */
+ #endif
+         { 0, 0, 0 }
+     };
+@@ -1911,6 +1925,10 @@ THREAD_RETURN WOLFSSL_THREAD client_test(void* args)
+     !defined(NO_FILESYSTEM) && !defined(NO_WOLFSSL_DIR)
+     int useCertFolder = 0;
+ #endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    const char* dtlsSrtpProfile = NULL;
++#endif
++
+     char buffer[WOLFSSL_MAX_ERROR_SZ];
+ 
+     int     argc = ((func_args*)args)->argc;
+@@ -2048,9 +2066,19 @@ THREAD_RETURN WOLFSSL_THREAD client_test(void* args)
+             #endif
+                 break;
+ 
++        #if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++            case 260:
++                doDTLS = 1;
++                dtlsUDP = 1;
++                dtlsSrtpProfile = myoptarg != NULL ? myoptarg :
++                    "SRTP_AES128_CM_SHA1_80";
++                break;
++        #endif
++
+             case 'G' :
+             #ifdef WOLFSSL_SCTP
+                 doDTLS = 1;
++                dtlsUDP = 1;
+                 dtlsSCTP = 1;
+             #endif
+                 break;
+@@ -2803,6 +2831,15 @@ THREAD_RETURN WOLFSSL_THREAD client_test(void* args)
+     }
+ #endif
+ 
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    if (dtlsSrtpProfile != NULL) {
++        if (wolfSSL_CTX_set_tlsext_use_srtp(ctx, dtlsSrtpProfile)
++                                                           != WOLFSSL_SUCCESS) {
++            err_sys("unable to set DTLS SRTP profile");
++        }
++    }
++#endif
++
+ #ifdef WOLFSSL_WOLFSENTRY_HOOKS
+     if (wolfsentry_setup(&wolfsentry, wolfsentry_config_path,
+                                      WOLFSENTRY_ROUTE_FLAG_DIRECTION_OUT) < 0) {
+diff --git a/examples/server/server.c b/examples/server/server.c
+index 378c360e1c8..a1356c3f04e 100644
+--- a/examples/server/server.c
++++ b/examples/server/server.c
+@@ -953,10 +953,14 @@ static const char* server_usage_msg[][60] = {
+         "            P384_NTRU_HPS_LEVEL3, P521_NTRU_HPS_LEVEL5, P384_NTRU_HRSS_LEVEL3,\n"
+         "            P256_SABER_LEVEL1, P384_SABER_LEVEL3, P521_SABER_LEVEL5, P256_KYBER_LEVEL1,\n"
+         "            P384_KYBER_LEVEL3, P521_KYBER_LEVEL5, P256_KYBER_90S_LEVEL1, P384_KYBER_90S_LEVEL3,\n"
+-        "            P521_KYBER_90S_LEVEL5]\n\n",                          /* 60 */
++        "            P521_KYBER_90S_LEVEL5]\n",                          /* 60 */
+ #endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++        "--srtp <profile> (default is SRTP_AES128_CM_SHA1_80)\n", /* 61 */
++#endif
++        "\n"
+         "For simpler wolfSSL TLS server examples, visit\n"
+-        "https://github.com/wolfSSL/wolfssl-examples/tree/master/tls\n", /* 61 */
++        "https://github.com/wolfSSL/wolfssl-examples/tree/master/tls\n", /* 62 */
+         NULL,
+     },
+ #ifndef NO_MULTIBYTE_PRINT
+@@ -1110,17 +1114,21 @@ static const char* server_usage_msg[][60] = {
+         " SSLv3(0) - TLS1.3(4)\n",                          /* 59 */
+ #endif
+ #ifdef HAVE_PQC
+-        "--pqc <alg>  post-quantum 名前付きグループとの鍵共有のみ\n",
+-        "[KYBER_LEVEL1, KYBER_LEVEL3, KYBER_LEVEL5, KYBER_90S_LEVEL1, KYBER_90S_LEVEL3, KYBER_90S_LEVEL5,\n",
+-        " NTRU_HPS_LEVEL1, NTRU_HPS_LEVEL3, NTRU_HPS_LEVEL5, NTRU_HRSS_LEVEL3,\n",
+-        " SABER_LEVEL1, SABER_LEVEL3, SABER_LEVEL5, P256_NTRU_HPS_LEVEL1,\n"
+-        " P384_NTRU_HPS_LEVEL1, P521_NTRU_HPS_LEVEL3, P384_NTRU_HRS_LEVEL5,\n"
+-        " P256_SABER_LEVEL1, P384_SABER_LEVEL3, P521_SABER_LEVEL5, P256_KYBER_LEVEL1,\n"
+-        " P384_KYBER_LEVEL3, P521_KYBER_LEVEL5, P256_KYBER_90S_LEVEL1, P384_KYBER_90S_LEVEL3,\n"
+-        " P521_KYBER_90S_LEVEL5]\n\n",                          /* 60 */
++        "--pqc <alg> post-quantum 名前付きグループとの鍵共有のみ [KYBER_LEVEL1, KYBER_LEVEL3,\n",
++        "            KYBER_LEVEL5, KYBER_90S_LEVEL1, KYBER_90S_LEVEL3, KYBER_90S_LEVEL5,\n",
++        "            NTRU_HPS_LEVEL1, NTRU_HPS_LEVEL3, NTRU_HPS_LEVEL5, NTRU_HRSS_LEVEL3,\n",
++        "            SABER_LEVEL1, SABER_LEVEL3, SABER_LEVEL5, P256_NTRU_HPS_LEVEL1,\n"
++        "            P384_NTRU_HPS_LEVEL3, P521_NTRU_HPS_LEVEL5, P384_NTRU_HRSS_LEVEL3,\n"
++        "            P256_SABER_LEVEL1, P384_SABER_LEVEL3, P521_SABER_LEVEL5, P256_KYBER_LEVEL1,\n"
++        "            P384_KYBER_LEVEL3, P521_KYBER_LEVEL5, P256_KYBER_90S_LEVEL1, P384_KYBER_90S_LEVEL3,\n"
++        "            P521_KYBER_90S_LEVEL5]\n",                          /* 60 */
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++        "--srtp <profile> (default is SRTP_AES128_CM_SHA1_80)\n", /* 61 */
+ #endif
++        "\n"
+         "For simpler wolfSSL TLS server examples, visit\n"
+-        "https://github.com/wolfSSL/wolfssl-examples/tree/master/tls\n", /* 61 */
++        "https://github.com/wolfSSL/wolfssl-examples/tree/master/tls\n", /* 62 */
+         NULL,
+     },
+ #endif
+@@ -1266,6 +1274,9 @@ static void Usage(void)
+     printf("%s", msg[++msgId]);     /* more --pqc options */
+     printf("%s", msg[++msgId]);     /* more --pqc options */
+ #endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    printf("%s", msg[++msgId]);     /* dtls-srtp */
++#endif
+ }
+ 
+ THREAD_RETURN WOLFSSL_THREAD server_test(void* args)
+@@ -1295,6 +1306,9 @@ THREAD_RETURN WOLFSSL_THREAD server_test(void* args)
+         { "ヘルプ", 0, 258 },
+ #if defined(HAVE_PQC)
+         { "pqc", 1, 259 },
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++        { "srtp", 2, 260 }, /* optional argument */
+ #endif
+         { 0, 0, 0 }
+     };
+@@ -1461,6 +1475,10 @@ THREAD_RETURN WOLFSSL_THREAD server_test(void* args)
+     int useCertFolder = 0;
+ #endif
+ 
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    const char* dtlsSrtpProfile = NULL;
++#endif
++
+     ((func_args*)args)->return_code = -1; /* error state */
+ 
+ #ifndef NO_RSA
+@@ -1584,9 +1602,20 @@ THREAD_RETURN WOLFSSL_THREAD server_test(void* args)
+             #endif
+                 break;
+ 
++        #if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++            case 260:
++                doDTLS = 1;
++                dtlsUDP = 1;
++                dtlsSrtpProfile = myoptarg != NULL ? myoptarg :
++                    "SRTP_AES128_CM_SHA1_80";
++                printf("Using SRTP Profile: %s\n", dtlsSrtpProfile);
++                break;
++        #endif
++
+             case 'G' :
+             #ifdef WOLFSSL_SCTP
+                 doDTLS  = 1;
++                dtlsUDP = 1;
+                 dtlsSCTP = 1;
+             #endif
+                 break;
+@@ -2191,6 +2220,15 @@ THREAD_RETURN WOLFSSL_THREAD server_test(void* args)
+     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_DEFAULT, NULL);
+ #endif
+ 
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    if (dtlsSrtpProfile != NULL) {
++        if (wolfSSL_CTX_set_tlsext_use_srtp(ctx, dtlsSrtpProfile)
++                                                           != WOLFSSL_SUCCESS) {
++            err_sys_ex(catastrophic, "unable to set DTLS SRTP profile");
++        }
++    }
++#endif
++
+ #ifdef WOLFSSL_WOLFSENTRY_HOOKS
+     if (wolfsentry_setup(&wolfsentry, wolfsentry_config_path,
+                                       WOLFSENTRY_ROUTE_FLAG_DIRECTION_IN) < 0) {
+diff --git a/src/internal.c b/src/internal.c
+index 87c8a981cc1..15aed908aa7 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -485,10 +485,11 @@ static WC_INLINE int IsEncryptionOn(WOLFSSL* ssl, int isSend)
+ }
+ 
+ 
+-#if defined(WOLFSSL_DTLS) || !defined(WOLFSSL_NO_TLS12)
++#ifdef WOLFSSL_DTLS
++/* Stream Control Transmission Protocol */
+ /* If SCTP is not enabled returns the state of the dtls option.
+  * If SCTP is enabled returns dtls && !sctp. */
+-static WC_INLINE int IsDtlsNotSctpMode(WOLFSSL* ssl)
++int IsDtlsNotSctpMode(WOLFSSL* ssl)
+ {
+ #ifdef WOLFSSL_SCTP
+     return ssl->options.dtls && !ssl->options.dtlsSctp;
+@@ -496,7 +497,20 @@ static WC_INLINE int IsDtlsNotSctpMode(WOLFSSL* ssl)
+     return ssl->options.dtls;
+ #endif
+ }
+-#endif /* DTLS || !WOLFSSL_NO_TLS12 */
++
++/* Secure Real-time Transport Protocol */
++/* If SRTP is not enabled returns the state of the dtls option.
++ * If SRTP is enabled returns dtls && !dtlsSrtpProfile. */
++int IsDtlsNotSrtpMode(WOLFSSL* ssl)
++{
++#ifdef WOLFSSL_SRTP
++    return ssl->options.dtls && !ssl->dtlsSrtpProfile;
++#else
++    return ssl->options.dtls;
++#endif
++}
++#endif /* WOLFSSL_DTLS */
++
+ 
+ #ifdef HAVE_LIBZ
+ 
+@@ -6397,6 +6411,9 @@ int InitSSL(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
+     #ifdef WOLFSSL_SCTP
+         ssl->options.dtlsSctp           = ctx->dtlsSctp;
+     #endif
++    #ifdef WOLFSSL_SRTP
++        ssl->dtlsSrtpProfile            = ctx->dtlsSrtpProfile;
++    #endif
+     #if defined(WOLFSSL_SCTP) || defined(WOLFSSL_DTLS_MTU)
+         ssl->dtlsMtuSz                  = ctx->dtlsMtuSz;
+         /* Add some bytes so that we can operate with slight difference
+@@ -14175,8 +14192,10 @@ static int DoHandShakeMsgType(WOLFSSL* ssl, byte* input, word32* inOutIdx,
+     /* hello_request not hashed */
+     /* Also, skip hashing the client_hello message here for DTLS. It will be
+      * hashed later if the DTLS cookie is correct. */
+-    if (type != hello_request &&
+-            !(IsDtlsNotSctpMode(ssl) && type == client_hello)
++    if (type != hello_request
++    #ifdef WOLFSSL_DTLS
++            && !(IsDtlsNotSctpMode(ssl) && type == client_hello)
++    #endif
+     #ifdef WOLFSSL_ASYNC_CRYPT
+             && ssl->error != WC_PENDING_E
+     #endif
+@@ -19764,7 +19783,7 @@ static int ModifyForMTU(WOLFSSL* ssl, int buffSz, int outputSz, int mtuSz)
+ 
+     return buffSz;
+ }
+-#endif
++#endif /* WOLFSSL_DTLS */
+ 
+ 
+ int SendData(WOLFSSL* ssl, const void* data, int sz)
+@@ -29493,7 +29512,8 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+         XMEMCPY(&pv, input + i, OPAQUE16_LEN);
+         ssl->chVersion = pv;   /* store */
+ #ifdef WOLFSSL_DTLS
+-        if (IsDtlsNotSctpMode(ssl) && !IsSCR(ssl) && !ssl->options.resuming) {
++        if (IsDtlsNotSctpMode(ssl) && IsDtlsNotSrtpMode(ssl) && !IsSCR(ssl) &&
++                                                       !ssl->options.resuming) {
+             #if defined(NO_SHA) && defined(NO_SHA256)
+                 #error "DTLS needs either SHA or SHA-256"
+             #endif /* NO_SHA && NO_SHA256 */
+@@ -29655,7 +29675,8 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+         /* random */
+         XMEMCPY(ssl->arrays->clientRandom, input + i, RAN_LEN);
+ #ifdef WOLFSSL_DTLS
+-        if (IsDtlsNotSctpMode(ssl) && !IsSCR(ssl) && !ssl->options.resuming) {
++        if (IsDtlsNotSctpMode(ssl) && IsDtlsNotSrtpMode(ssl) && !IsSCR(ssl) &&
++                                                       !ssl->options.resuming) {
+             ret = wc_HmacUpdate(&cookieHmac, input + i, RAN_LEN);
+             if (ret != 0) goto out;
+         }
+@@ -29690,8 +29711,8 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+ 
+             XMEMCPY(ssl->arrays->sessionID, input + i, b);
+ #ifdef WOLFSSL_DTLS
+-            if (IsDtlsNotSctpMode(ssl) && !IsSCR(ssl) &&
+-                    !ssl->options.resuming) {
++            if (IsDtlsNotSctpMode(ssl) && IsDtlsNotSrtpMode(ssl) && !IsSCR(ssl)
++                                                    && !ssl->options.resuming) {
+                 ret = wc_HmacUpdate(&cookieHmac, input + i - 1, b + 1);
+                 if (ret != 0) goto out;
+             }
+@@ -29796,7 +29817,8 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+ #endif
+ 
+ #ifdef WOLFSSL_DTLS
+-        if (IsDtlsNotSctpMode(ssl) && !IsSCR(ssl) && !ssl->options.resuming) {
++        if (IsDtlsNotSctpMode(ssl) && IsDtlsNotSrtpMode(ssl) && !IsSCR(ssl) &&
++                                                       !ssl->options.resuming) {
+             ret = wc_HmacUpdate(&cookieHmac,
+                                     input + i - OPAQUE16_LEN,
+                                     clSuites.suiteSz + OPAQUE16_LEN);
+@@ -29825,7 +29847,8 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
+ 
+ #ifdef WOLFSSL_DTLS
+         if (IsDtlsNotSctpMode(ssl)) {
+-            if (!IsSCR(ssl) && !ssl->options.resuming) {
++            if (IsDtlsNotSrtpMode(ssl) && !IsSCR(ssl) &&
++                                                       !ssl->options.resuming) {
+                 byte newCookie[MAX_COOKIE_LEN];
+ 
+                 ret = wc_HmacUpdate(&cookieHmac, input + i - 1, b + 1);
+diff --git a/src/ssl.c b/src/ssl.c
+index 32df93ed4b6..99f3034f266 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -1277,6 +1277,105 @@ int wolfSSL_dtls_set_mtu(WOLFSSL* ssl, word16 newMtu)
+ 
+ #endif /* WOLFSSL_DTLS && (WOLFSSL_SCTP || WOLFSSL_DTLS_MTU) */
+ 
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++
++static const WOLFSSL_SRTP_PROTECTION_PROFILE gSrtpProfiles[] = {
++    /* AES CCM 128, Salt:112-bits, HMAC-SHA1, Tag:80 bits */
++    {"SRTP_AES128_CM_SHA1_80", SRTP_AES128_CM_SHA1_80}
++};
++
++static const WOLFSSL_SRTP_PROTECTION_PROFILE* FindDtlsSrtpProfile(
++    const char* profile_str, unsigned long id)
++{
++    int i;
++    const WOLFSSL_SRTP_PROTECTION_PROFILE* profile = NULL;
++    for (i=0;
++         i<(int)(sizeof(gSrtpProfiles)/sizeof(WOLFSSL_SRTP_PROTECTION_PROFILE));
++         i++) {
++        if (profile_str != NULL) {
++            if (XSTRCMP(gSrtpProfiles[i].name, profile_str) == 0) {
++                profile = &gSrtpProfiles[i];
++                break;
++            }
++        }
++        else if (id != 0 && gSrtpProfiles[i].id == id) {
++            profile = &gSrtpProfiles[i];
++            break;
++        }
++    }
++    return profile;
++}
++int wolfSSL_CTX_set_tlsext_use_srtp(WOLFSSL_CTX* ctx, const char* profile_str)
++{
++    int ret = WOLFSSL_FAILURE;
++    if (ctx != NULL) {
++        const WOLFSSL_SRTP_PROTECTION_PROFILE* profile = 
++            FindDtlsSrtpProfile(profile_str, 0);
++        ctx->dtlsSrtpProfile = profile != NULL ? profile->id : 0;
++        ret = WOLFSSL_SUCCESS;
++    }
++    return ret;
++}
++int wolfSSL_set_tlsext_use_srtp(WOLFSSL* ssl, const char* profile_str)
++{
++    int ret = WOLFSSL_FAILURE;
++    if (ssl != NULL) {
++        const WOLFSSL_SRTP_PROTECTION_PROFILE* profile = 
++            FindDtlsSrtpProfile(profile_str, 0);
++        ssl->dtlsSrtpProfile = profile != NULL ? profile->id : 0;
++        ret = WOLFSSL_SUCCESS;
++    }
++    return ret;
++}
++
++const WOLFSSL_SRTP_PROTECTION_PROFILE* wolfSSL_get_selected_srtp_profile(WOLFSSL* ssl)
++{
++    const WOLFSSL_SRTP_PROTECTION_PROFILE* profile = NULL;
++    if (ssl) {
++        profile = FindDtlsSrtpProfile(NULL, ssl->dtlsSrtpProfile);
++    }
++    return profile;
++}
++
++int wolfSSL_export_dtls_srtp_keying_material(WOLFSSL* ssl,
++    unsigned char* out, size_t* olen)
++{
++	int ret = WOLFSSL_FAILURE;
++	const char* label = "EXTRACTOR-dtls_srtp";
++
++    /* (master_key:128bits + master_salt:112bits) * 2 = 480 bits (60) */
++	size_t length = (128 + (112 * 2)) / 8;
++
++	if (ssl == NULL || out == NULL || olen == NULL || *olen < length) {
++		return BAD_FUNC_ARG;
++    }
++
++#ifdef WOLFSSL_HAVE_PRF
++    /* pass the seed via the output (it gets copied out first) */
++    XMEMCPY(out,           ssl->arrays->serverRandom, RAN_LEN);
++    XMEMCPY(out + RAN_LEN, ssl->arrays->clientRandom, RAN_LEN);
++
++    PRIVATE_KEY_UNLOCK();
++    ret = wc_PRF_TLSv1(out, (word32)length,
++        ssl->arrays->masterSecret, SECRET_LEN,  /* existing master secret */
++        (const byte*)label, (int)XSTRLEN(label),/* label */
++        out, SEED_LEN,                          /* seed = client/server random */
++        ssl->heap, INVALID_DEVID);
++    if (ret == 0) {
++        *olen = length;
++        ret = WOLFSSL_SUCCESS;
++    }
++    PRIVATE_KEY_LOCK();
++#else
++    /* Pseudo random function must be enabled in the configuration */
++    ret = PRF_MISSING;
++#endif
++
++    return ret;
++}
++
++#endif /* WOLFSSL_DTLS && WOLFSSL_SRTP */
++
+ 
+ #ifdef WOLFSSL_DTLS_DROP_STATS
+ 
+@@ -14046,26 +14145,6 @@ int wolfSSL_DTLS_SetCookieSecret(WOLFSSL* ssl,
+         return method;
+     }
+ 
+-
+-    #if defined(WOLFSSL_DTLS) || !defined(WOLFSSL_NO_TLS12) || !defined(NO_OLD_TLS) || \
+-        defined(WOLFSSL_ALLOW_SSLV3)
+-    /* If SCTP is not enabled returns the state of the dtls option.
+-     * If SCTP is enabled returns dtls && !sctp. */
+-    static WC_INLINE int IsDtlsNotSctpMode(WOLFSSL* ssl)
+-    {
+-        int result = ssl->options.dtls;
+-
+-        if (result) {
+-        #ifdef WOLFSSL_SCTP
+-            result = !ssl->options.dtlsSctp;
+-        #endif
+-        }
+-
+-        return result;
+-    }
+-    #endif /* WOLFSSL_DTLS || !WOLFSSL_NO_TLS12 || !NO_OLD_TLS */
+-
+-
+     /* please see note at top of README if you get an error from connect */
+     WOLFSSL_ABI
+     int wolfSSL_connect(WOLFSSL* ssl)
+@@ -14196,10 +14275,12 @@ int wolfSSL_DTLS_SetCookieSecret(WOLFSSL* ssl,
+                 /* if resumption failed, reset needed state */
+                 else if (neededState == SERVER_FINISHED_COMPLETE)
+                     if (!ssl->options.resuming) {
+-                        if (!IsDtlsNotSctpMode(ssl))
+-                            neededState = SERVER_HELLODONE_COMPLETE;
+-                        else
++                    #ifdef WOLFSSL_DTLS
++                        if (IsDtlsNotSctpMode(ssl))
+                             neededState = SERVER_HELLOVERIFYREQUEST_COMPLETE;
++                        else
++                    #endif
++                            neededState = SERVER_HELLODONE_COMPLETE;
+                     }
+             }
+ 
+diff --git a/src/tls.c b/src/tls.c
+index 8af5ae3a2fd..1660e877a79 100644
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -5351,6 +5351,165 @@ int TLSX_EncryptThenMac_Respond(WOLFSSL* ssl)
+ 
+ #endif /* HAVE_ENCRYPT_THEN_MAC && !WOLFSSL_AEAD_ONLY */
+ 
++
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++
++/******************************************************************************/
++/* DTLS SRTP (Secure Real-time Transport Protocol)                            */
++/******************************************************************************/
++
++/* Only support single SRTP profile */
++typedef struct TlsxSrtp {
++    word16 len;
++    word16 id;
++} TlsxSrtp;
++
++static int TLSX_UseSRTP_GetSize(TlsxSrtp *srtp)
++{
++    /* only supports single profile */
++    const int profileCount = 1;
++    (void)srtp;
++    /*   SRTP Profile Len (2)
++     *      SRTP Profiles (2)
++     *   MKI (master key id) Length */
++    return (OPAQUE16_LEN + (profileCount * OPAQUE16_LEN) + 1);
++}
++
++static TlsxSrtp* TLSX_UseSRTP_New(word16 id, void* heap)
++{
++    TlsxSrtp* srtp;
++
++    srtp = (TlsxSrtp*)XMALLOC(sizeof(TlsxSrtp), heap, DYNAMIC_TYPE_TLSX);
++    if (srtp == NULL) {
++        WOLFSSL_MSG("TLSX SRTP Memory failure");
++        return NULL;
++    }
++    srtp->len = 2;
++    srtp->id = id;
++
++    return srtp;
++}
++
++static void TLSX_UseSRTP_Free(TlsxSrtp *srtp, void* heap)
++{
++    if (srtp != NULL) {
++        XFREE(srtp, heap, DYNAMIC_TYPE_TLSX);
++    }
++    (void)heap;
++}
++
++static int TLSX_UseSRTP_Parse(WOLFSSL* ssl, const byte* input, word16 length,
++    byte isRequest)
++{
++    int ret = BAD_FUNC_ARG;
++#ifndef NO_WOLFSSL_SERVER
++    int i;
++    TlsxSrtp* srtp = NULL;
++    word16 profile_len = 0;
++    word16 profile_value = 0;
++    word16 offset = 0;
++#endif
++
++    if (length < OPAQUE16_LEN) {
++        return BUFFER_ERROR;
++    }
++
++    if (!isRequest) {
++#ifndef NO_WOLFSSL_CLIENT
++        ssl->dtlsSrtpProfile = ssl->ctx->dtlsSrtpProfile;
++        ret = 0; /* success */
++#endif
++    }
++#ifndef NO_WOLFSSL_SERVER
++    else {
++        /* total length, not include itself */
++        ato16(input, &profile_len);
++        offset += OPAQUE16_LEN;
++        /* parse remainder one profile at a time, looking for match in CTX */
++        for (i=offset; i<length; i+=OPAQUE16_LEN) {
++            ato16(input+i, &profile_value);
++            if (profile_value == ssl->ctx->dtlsSrtpProfile) {
++                ssl->dtlsSrtpProfile = profile_value;
++
++                srtp = TLSX_UseSRTP_New(profile_value, ssl->heap);
++                if (srtp != NULL) {
++                    ret = TLSX_Push(&ssl->extensions, TLSX_USE_SRTP,
++                        (void*)srtp, ssl->heap);
++                    if (ret == 0) {
++                        TLSX_SetResponse(ssl, TLSX_USE_SRTP);
++                    }
++                }
++                else {
++                    ret = MEMORY_E;
++                }
++            }
++        }
++        (void)profile_len;
++    }
++
++    if (ret != 0) {
++        ssl->dtlsSrtpProfile = 0;
++        TLSX_UseSRTP_Free(srtp, ssl->heap);
++    }
++#endif
++
++    return ret;
++}
++
++static word16 TLSX_UseSRTP_Write(TlsxSrtp* srtp, byte* output)
++{
++    word16 offset = 0;
++
++    c16toa(srtp->len, output+offset);
++    offset += OPAQUE16_LEN;
++    c16toa(srtp->id, output+offset);
++    offset += srtp->len;
++    output[offset++] = 0x00; /* MKI Length */
++
++    return offset;
++}
++
++static int TLSX_UseSRTP(TLSX** extensions, word16 profile_value, void* heap)
++{
++    int ret = 0;
++    TlsxSrtp *srtp = NULL;
++    TLSX* extension;
++
++    if (extensions == NULL) {
++        return BAD_FUNC_ARG;
++    }
++
++    srtp = TLSX_UseSRTP_New(profile_value, heap);
++    if (srtp == NULL) {
++        return MEMORY_E;
++    }
++
++    extension = TLSX_Find(*extensions, TLSX_USE_SRTP);
++    if (extension == NULL) {
++        ret = TLSX_Push(extensions, TLSX_USE_SRTP, (void*)srtp, heap);
++        if (ret != 0) {
++            TLSX_UseSRTP_Free(srtp, heap);
++        }
++    }
++
++    return ret;
++}
++
++#ifndef NO_WOLFSSL_SERVER
++    #define SRTP_FREE     TLSX_UseSRTP_Free
++    #define SRTP_PARSE    TLSX_UseSRTP_Parse
++    #define SRTP_WRITE    TLSX_UseSRTP_Write
++    #define SRTP_GET_SIZE TLSX_UseSRTP_GetSize
++#else
++    #define SRTP_FREE(a, b)
++    #define SRTP_PARSE(a, b, c, d)      0
++    #define SRTP_WRITE(a, b)            0
++    #define SRTP_GET_SIZE(a)            0
++#endif
++
++#endif /* WOLFSSL_DTLS && WOLFSSL_SRTP */
++
++
+ /******************************************************************************/
+ /* Supported Versions                                                         */
+ /******************************************************************************/
+@@ -9630,6 +9789,11 @@ void TLSX_FreeAll(TLSX* list, void* heap)
+                 KS_FREE_ALL((KeyShareEntry*)extension->data, heap);
+                 break;
+ #endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++            case TLSX_USE_SRTP:
++                SRTP_FREE((TlsxSrtp*)extension->data, heap);
++                break;
++#endif
+ 
+             default:
+                 break;
+@@ -9780,6 +9944,11 @@ static int TLSX_GetSize(TLSX* list, byte* semaphore, byte msgType,
+             case TLSX_KEY_SHARE:
+                 length += KS_GET_SIZE((KeyShareEntry*)extension->data, msgType);
+                 break;
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++            case TLSX_USE_SRTP:
++                length += SRTP_GET_SIZE((TlsxSrtp*)extension->data);
++                break;
+ #endif
+             default:
+                 break;
+@@ -9963,6 +10132,11 @@ static int TLSX_Write(TLSX* list, byte* output, byte* semaphore,
+                 offset += KS_WRITE((KeyShareEntry*)extension->data,
+                                                       output + offset, msgType);
+                 break;
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++            case TLSX_USE_SRTP:
++                offset += SRTP_WRITE((TlsxSrtp*)extension->data, output+offset);
++                break;
+ #endif
+             default:
+                 break;
+@@ -10341,6 +10515,17 @@ int TLSX_PopulateExtensions(WOLFSSL* ssl, byte isServer)
+ #endif /* (HAVE_ECC || CURVE25519 || CURVE448) && HAVE_SUPPORTED_CURVES */
+     } /* is not server */
+ 
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    if (ssl->options.dtls && ssl->dtlsSrtpProfile != 0) {
++        WOLFSSL_MSG("Adding DTLS SRTP extension");
++        if ((ret = TLSX_UseSRTP(&ssl->extensions, ssl->dtlsSrtpProfile,
++                                                             ssl->heap)) != 0) {
++            return ret;
++        }
++    }
++
++#endif
++
+ #if !defined(NO_CERTS) && !defined(WOLFSSL_NO_SIGALG)
+     WOLFSSL_MSG("Adding signature algorithms extension");
+     if ((ret = TLSX_SetSignatureAlgorithms(&ssl->extensions, ssl, ssl->heap))
+@@ -11562,6 +11747,12 @@ int TLSX_Parse(WOLFSSL* ssl, const byte* input, word16 length, byte msgType,
+ 
+                 ret = KS_PARSE(ssl, input + offset, size, msgType);
+                 break;
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++            case TLSX_USE_SRTP:
++                WOLFSSL_MSG("Use SRTP extension received");
++                ret = SRTP_PARSE(ssl, input + offset, size, isRequest);
++                break;
+ #endif
+             default:
+                 WOLFSSL_MSG("Unknown TLS extension type");
+diff --git a/wolfssl/internal.h b/wolfssl/internal.h
+index f6f35ec8f2d..7d7bafb6d9b 100644
+--- a/wolfssl/internal.h
++++ b/wolfssl/internal.h
+@@ -2284,6 +2284,9 @@ typedef enum {
+     TLSX_EC_POINT_FORMATS           = 0x000b,
+ #if !defined(NO_CERTS) && !defined(WOLFSSL_NO_SIGALG)
+     TLSX_SIGNATURE_ALGORITHMS       = 0x000d, /* HELLO_EXT_SIG_ALGO */
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    TLSX_USE_SRTP                   = 0x000e, /* 14 */
+ #endif
+     TLSX_APPLICATION_LAYER_PROTOCOL = 0x0010, /* a.k.a. ALPN */
+     TLSX_STATUS_REQUEST_V2          = 0x0011, /* a.k.a. OCSP stapling v2 */
+@@ -2855,16 +2858,21 @@ struct WOLFSSL_CTX {
+ #if defined(WOLFSSL_STATIC_EPHEMERAL) && !defined(SINGLE_THREADED)
+     byte        staticKELockInit:1;
+ #endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SCTP)
++    byte        dtlsSctp:1;         /* DTLS-over-SCTP mode */
++#endif
++    word16      minProto:1; /* sets min to min available */
++    word16      maxProto:1; /* sets max to max available */
+ 
+-#ifdef WOLFSSL_MULTICAST
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++    word16      dtlsSrtpProfile;  /* DTLS-with-SRTP mode */
++#endif
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_MULTICAST)
+     byte        haveMcast;        /* multicast requested */
+     byte        mcastID;          /* multicast group ID */
+ #endif
+-#if defined(WOLFSSL_SCTP) && defined(WOLFSSL_DTLS)
+-    byte        dtlsSctp;         /* DTLS-over-SCTP mode */
+-#endif
+-#if (defined(WOLFSSL_SCTP) || defined(WOLFSSL_DTLS_MTU)) && \
+-                                                           defined(WOLFSSL_DTLS)
++#if defined(WOLFSSL_DTLS) && \
++    (defined(WOLFSSL_SCTP) || defined(WOLFSSL_DTLS_MTU))
+     word16      dtlsMtuSz;        /* DTLS MTU size */
+ #endif
+ #ifndef NO_DH
+@@ -2881,8 +2889,6 @@ struct WOLFSSL_CTX {
+     short       minFalconKeySz;   /* minimum Falcon key size */
+ #endif
+     unsigned long     mask;             /* store SSL_OP_ flags */
+-    word16            minProto:1; /* sets min to min available */
+-    word16            maxProto:1; /* sets max to max available */
+ #ifdef OPENSSL_EXTRA
+     byte              sessionCtx[ID_LEN]; /* app session context ID */
+     word32            disabledCurves;   /* curves disabled by user */
+@@ -3708,7 +3714,7 @@ typedef struct Options {
+ #ifdef WOLFSSL_SCTP
+     word16            dtlsSctp:1;         /* DTLS-over-SCTP mode */
+ #endif
+-#endif
++#endif /* WOLFSSL_DTLS */
+ #if defined(HAVE_TLS_EXTENSIONS) && defined(HAVE_SUPPORTED_CURVES)
+     word16            userCurves:1;       /* indicates user called wolfSSL_UseSupportedCurve */
+ #endif
+@@ -4401,6 +4407,9 @@ struct WOLFSSL {
+     word32 macDropCount;
+     word32 replayDropCount;
+ #endif /* WOLFSSL_DTLS_DROP_STATS */
++#ifdef WOLFSSL_SRTP
++    word16          dtlsSrtpProfile;    /* DTLS-with-SRTP mode */
++#endif
+ #endif /* WOLFSSL_DTLS */
+ #ifdef WOLFSSL_CALLBACKS
+     TimeoutInfo     timeoutInfo;        /* info saved during handshake */
+@@ -4936,6 +4945,8 @@ WOLFSSL_LOCAL  int GrowInputBuffer(WOLFSSL* ssl, int size, int usedLength);
+     WOLFSSL_LOCAL int DtlsCheckOrder(WOLFSSL* ssl, int order);
+ #endif
+     WOLFSSL_LOCAL int IsSCR(WOLFSSL* ssl);
++    WOLFSSL_LOCAL int IsDtlsNotSctpMode(WOLFSSL* ssl);
++    WOLFSSL_LOCAL int IsDtlsNotSrtpMode(WOLFSSL* ssl);
+ 
+     WOLFSSL_LOCAL void WriteSEQ(WOLFSSL* ssl, int verifyOrder, byte* out);
+ 
+diff --git a/wolfssl/openssl/ssl.h b/wolfssl/openssl/ssl.h
+index cad636554c3..39a8c5c7281 100644
+--- a/wolfssl/openssl/ssl.h
++++ b/wolfssl/openssl/ssl.h
+@@ -1080,6 +1080,15 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
+ #define DTLSv1_handle_timeout               wolfSSL_DTLSv1_handle_timeout
+ #define DTLSv1_set_initial_timeout_duration wolfSSL_DTLSv1_set_initial_timeout_duration
+ 
++/* DTLS SRTP */
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++typedef WOLFSSL_SRTP_PROTECTION_PROFILE      SRTP_PROTECTION_PROFILE;
++#endif
++#define SSL_CTX_set_tlsext_use_srtp          wolfSSL_CTX_set_tlsext_use_srtp
++#define SSL_set_tlsext_use_srtp              wolfSSL_set_tlsext_use_srtp
++#define SSL_get_selected_srtp_profile        wolfSSL_get_selected_srtp_profile
++#define SSL_export_dtls_srtp_keying_material wolfSSL_export_dtls_srtp_keying_material
++
+ #ifndef NO_WOLFSSL_STUB
+ #define SSL_CTX_set_current_time_cb(ssl, cb) ({ (void)ssl; (void)cb; })
+ #endif
+diff --git a/wolfssl/ssl.h b/wolfssl/ssl.h
+index 461fd192a40..5e6ff1f4133 100644
+--- a/wolfssl/ssl.h
++++ b/wolfssl/ssl.h
+@@ -1292,6 +1292,33 @@ WOLFSSL_API int  wolfSSL_dtls_set_sctp(WOLFSSL*);
+ WOLFSSL_API int  wolfSSL_CTX_dtls_set_mtu(WOLFSSL_CTX*, unsigned short);
+ WOLFSSL_API int  wolfSSL_dtls_set_mtu(WOLFSSL*, unsigned short);
+ 
++#if defined(WOLFSSL_DTLS) && defined(WOLFSSL_SRTP)
++
++/* SRTP Profile ID's */
++/* NOTE: we only support the SRTP_AES128_CM_SHA1_80 profile
++ * (as required by draft-ietf-rtcweb-security-arch) */
++#define SRTP_AES128_CM_SHA1_80 0x0001
++#define SRTP_AES128_CM_SHA1_32 0x0002
++#define SRTP_AES128_F8_SHA1_80 0x0003
++#define SRTP_AES128_F8_SHA1_32 0x0004
++#define SRTP_NULL_SHA1_80      0x0005
++#define SRTP_NULL_SHA1_32      0x0006
++#define SRTP_AEAD_AES_128_GCM  0x0007
++#define SRTP_AEAD_AES_256_GCM  0x0008
++
++typedef struct WOLFSSL_SRTP_PROTECTION_PROFILE {
++    const char*   name;
++    unsigned long id;
++} WOLFSSL_SRTP_PROTECTION_PROFILE;
++
++WOLFSSL_API int wolfSSL_CTX_set_tlsext_use_srtp(WOLFSSL_CTX*, const char*);
++WOLFSSL_API int wolfSSL_set_tlsext_use_srtp(WOLFSSL*, const char*);
++WOLFSSL_API const WOLFSSL_SRTP_PROTECTION_PROFILE* 
++                wolfSSL_get_selected_srtp_profile(WOLFSSL*);
++WOLFSSL_API int wolfSSL_export_dtls_srtp_keying_material(WOLFSSL*,
++    unsigned char*, size_t*);
++#endif /* WOLFSSL_DTLS && WOLFSSL_SRTP */
++
+ WOLFSSL_API int  wolfSSL_dtls_get_drop_stats(WOLFSSL*,
+                                              unsigned int*, unsigned int*);
+ WOLFSSL_API int  wolfSSL_CTX_mcast_set_member_id(WOLFSSL_CTX*, unsigned short);
+diff --git a/wolfssl/test.h b/wolfssl/test.h
+index 2bb13c454aa..155741750c7 100644
+--- a/wolfssl/test.h
++++ b/wolfssl/test.h
+@@ -726,7 +726,7 @@ static WC_INLINE int mygetopt(int argc, char** argv, const char* optstring)
+ 
+ struct mygetopt_long_config {
+     const char *name;
+-    int takes_arg;
++    int takes_arg; /* 0=no arg, 1=required arg, 2=optional arg */
+     int value;
+ };
+ 
+@@ -794,10 +794,13 @@ static WC_INLINE int mygetopt_long(int argc, char** argv, const char* optstring,
+                         *longindex = (int)((i - longopts) / sizeof *i);
+                     if (i->takes_arg) {
+                         if (myoptind < argc) {
+-                            myoptarg = argv[myoptind];
+-                            myoptind++;
+-                        } else
++                            if (i->takes_arg == 1 || argv[myoptind][0] != '-') {
++                                myoptarg = argv[myoptind];
++                                myoptind++;
++                            }
++                        } else if (i->takes_arg != 2) {
+                             return -1;
++                        }
+                     }
+                     break;
+                 }

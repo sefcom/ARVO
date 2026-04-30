@@ -1,0 +1,102 @@
+From 2745cd99973a5b422c66d62b9d9229da22e82a34 Mon Sep 17 00:00:00 2001
+From: Dmitry Stogov <dmitry@zend.com>
+Date: Fri, 17 Dec 2021 12:49:58 +0300
+Subject: [PATCH] Fix array clobbering by user error handler
+
+Fixes oss-fuzz #42503
+---
+ ext/opcache/jit/zend_jit_helpers.c         | 53 +++++++++++++++++++++-
+ ext/opcache/tests/jit/fetch_dim_w_003.phpt | 17 +++++++
+ 2 files changed, 69 insertions(+), 1 deletion(-)
+ create mode 100644 ext/opcache/tests/jit/fetch_dim_w_003.phpt
+
+diff --git a/ext/opcache/jit/zend_jit_helpers.c b/ext/opcache/jit/zend_jit_helpers.c
+index e7cd2796b589d..5257a6af9c819 100644
+--- a/ext/opcache/jit/zend_jit_helpers.c
++++ b/ext/opcache/jit/zend_jit_helpers.c
+@@ -730,10 +730,61 @@ static zval* ZEND_FASTCALL zend_jit_fetch_dim_w_helper(zend_array *ht, zval *dim
+ 			offset_key = ZSTR_EMPTY_ALLOC();
+ 			goto str_index;
+ 		case IS_DOUBLE:
+-			hval = zend_dval_to_lval_safe(Z_DVAL_P(dim));
++			hval = zend_dval_to_lval(Z_DVAL_P(dim));
++			if (!zend_is_long_compatible(Z_DVAL_P(dim), hval)) {
++				/* The array may be destroyed while throwing the notice.
++				 * Temporarily increase the refcount to detect this situation. */
++				if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE)) {
++					GC_ADDREF(ht);
++				}
++				execute_data = EG(current_execute_data);
++				opline = EX(opline);
++				zend_incompatible_double_to_long_error(Z_DVAL_P(dim));
++				if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE) && !GC_DELREF(ht)) {
++					zend_array_destroy(ht);
++					if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
++						if (EG(exception)) {
++							ZVAL_UNDEF(EX_VAR(opline->result.var));
++						} else {
++							ZVAL_NULL(EX_VAR(opline->result.var));
++						}
++					}
++					return NULL;
++				}
++				if (EG(exception)) {
++					if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
++						ZVAL_UNDEF(EX_VAR(opline->result.var));
++					}
++					return NULL;
++				}
++			}
+ 			goto num_index;
+ 		case IS_RESOURCE:
++			/* The array may be destroyed while throwing the notice.
++			 * Temporarily increase the refcount to detect this situation. */
++			if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE)) {
++				GC_ADDREF(ht);
++			}
++			execute_data = EG(current_execute_data);
++			opline = EX(opline);
+ 			zend_use_resource_as_offset(dim);
++			if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE) && !GC_DELREF(ht)) {
++				zend_array_destroy(ht);
++				if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
++					if (EG(exception)) {
++						ZVAL_UNDEF(EX_VAR(opline->result.var));
++					} else {
++						ZVAL_NULL(EX_VAR(opline->result.var));
++					}
++				}
++				return NULL;
++			}
++			if (EG(exception)) {
++				if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
++					ZVAL_UNDEF(EX_VAR(opline->result.var));
++				}
++				return NULL;
++			}
+ 			hval = Z_RES_HANDLE_P(dim);
+ 			goto num_index;
+ 		case IS_FALSE:
+diff --git a/ext/opcache/tests/jit/fetch_dim_w_003.phpt b/ext/opcache/tests/jit/fetch_dim_w_003.phpt
+new file mode 100644
+index 0000000000000..33fc2ccbb8459
+--- /dev/null
++++ b/ext/opcache/tests/jit/fetch_dim_w_003.phpt
+@@ -0,0 +1,17 @@
++--TEST--
++JIT FETCH_DIM_W: 003
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=1M
++--FILE--
++<?php
++set_error_handler(function() {
++    $GLOBALS['a']='';
++});
++$a[3E44]='';
++?>
++DONE
++--EXPECT--
++DONE

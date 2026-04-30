@@ -1,0 +1,258 @@
+From d0c4e7802dae311d71059d0e2114150a5e09acf1 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Thu, 11 Jun 2020 13:27:50 +0930
+Subject: [PATCH] asan: readelf: process_mips_specific buffer overflow
+
+DT_MIPS_OPTIONS is not a regular array as assumed by readelf.  This
+patch corrects that assumption, and to do so easily, makes various
+internal (host byte order) structs the same size as external (target
+byte order) structs.
+
+include/
+	* elf/mips.h (Elf32_RegInfo): Use fixed width integer types.
+	(Elf64_Internal_RegInfo, Elf_Internal_Options): Likewise.
+binutils/
+	* readelf.c (process_mips_specific): Assert size of internal
+	types match size of external types, and simplify allocation of
+	internal buffer.  Catch possible integer overflow when sanity
+	checking option size.  Don't assume options are a regular array.
+	Sanity check reginfo option against option size.  Use PRI macros
+	when printing.
+---
+ binutils/ChangeLog |  9 ++++++++
+ binutils/readelf.c | 51 +++++++++++++++++++++++-----------------------
+ include/ChangeLog  |  5 +++++
+ include/elf/mips.h | 18 ++++++++--------
+ 4 files changed, 49 insertions(+), 34 deletions(-)
+
+diff --git a/binutils/ChangeLog b/binutils/ChangeLog
+index 43eabaa0441..25e21ff6dca 100644
+--- a/binutils/ChangeLog
++++ b/binutils/ChangeLog
+@@ -1,3 +1,12 @@
++2020-06-11  Alan Modra  <amodra@gmail.com>
++
++	* readelf.c (process_mips_specific): Assert size of internal
++	types match size of external types, and simplify allocation of
++	internal buffer.  Catch possible integer overflow when sanity
++	checking option size.  Don't assume options are a regular array.
++	Sanity check reginfo option against option size.  Use PRI macros
++	when printing.
++
+ 2020-06-10  Ralf Habacker  <ralf.habacker@freenet.de>
+ 
+ 	PR 26082
+diff --git a/binutils/readelf.c b/binutils/readelf.c
+index 0bdabccc8eb..0705a49c0d8 100644
+--- a/binutils/readelf.c
++++ b/binutils/readelf.c
+@@ -16896,10 +16896,11 @@ process_mips_specific (Filedata * filedata)
+ 	{
+ 	  Elf_Internal_Options * iopt;
+ 	  Elf_Internal_Options * option;
+-	  Elf_Internal_Options * iopt_end;
+ 
+-	  iopt = (Elf_Internal_Options *)
+-              cmalloc ((sect->sh_size / sizeof (eopt)), sizeof (* iopt));
++	  assert (sizeof (Elf_Internal_Options) == sizeof (Elf_External_Options));
++	  assert (sizeof (Elf32_RegInfo) == sizeof (Elf32_External_RegInfo));
++	  assert (sizeof (Elf64_Internal_RegInfo) == sizeof (Elf64_External_RegInfo));
++	  iopt = (Elf_Internal_Options *) cmalloc (sect->sh_size, 1);
+ 	  if (iopt == NULL)
+ 	    {
+ 	      error (_("Out of memory allocating space for MIPS options\n"));
+@@ -16909,7 +16910,6 @@ process_mips_specific (Filedata * filedata)
+ 
+ 	  offset = cnt = 0;
+ 	  option = iopt;
+-	  iopt_end = iopt + (sect->sh_size / sizeof (eopt));
+ 	  
+ 	  while (offset <= sect->sh_size - sizeof (* eopt))
+ 	    {
+@@ -16924,7 +16924,7 @@ process_mips_specific (Filedata * filedata)
+ 
+ 	      /* PR 17531: file: ffa0fa3b.  */
+ 	      if (option->size < sizeof (* eopt)
+-		  || offset + option->size > sect->sh_size)
++		  || option->size > sect->sh_size - offset)
+ 		{
+ 		  error (_("Invalid size (%u) for MIPS option\n"),
+ 			 option->size);
+@@ -16943,18 +16943,18 @@ process_mips_specific (Filedata * filedata)
+ 			    cnt),
+ 		  printable_section_name (filedata, sect), cnt);
+ 
+-	  option = iopt;
+ 	  offset = 0;
+-
+ 	  while (cnt-- > 0)
+ 	    {
+ 	      size_t len;
+ 
++	      option = (Elf_Internal_Options *) ((char *) iopt + offset);
+ 	      switch (option->kind)
+ 		{
+ 		case ODK_NULL:
+ 		  /* This shouldn't happen.  */
+-		  printf (" NULL       %d %lx", option->section, option->info);
++		  printf (" NULL       %" PRId16 " %" PRIx32,
++			  option->section, option->info);
+ 		  break;
+ 
+ 		case ODK_REGINFO:
+@@ -16965,7 +16965,8 @@ process_mips_specific (Filedata * filedata)
+ 		      Elf32_RegInfo reginfo;
+ 
+ 		      /* 32bit form.  */
+-		      if (option + 2 > iopt_end)
++		      if (option->size < (sizeof (Elf_External_Options)
++					  + sizeof (Elf32_External_RegInfo)))
+ 			{
+ 			  printf (_("<corrupt>\n"));
+ 			  error (_("Truncated MIPS REGINFO option\n"));
+@@ -16982,10 +16983,11 @@ process_mips_specific (Filedata * filedata)
+ 		      reginfo.ri_cprmask[3] = BYTE_GET (ereg->ri_cprmask[3]);
+ 		      reginfo.ri_gp_value = BYTE_GET (ereg->ri_gp_value);
+ 
+-		      printf ("GPR %08lx  GP 0x%lx\n",
+-			      reginfo.ri_gprmask,
+-			      (unsigned long) reginfo.ri_gp_value);
+-		      printf ("            CPR0 %08lx  CPR1 %08lx  CPR2 %08lx  CPR3 %08lx\n",
++		      printf ("GPR %08" PRIx32 "  GP 0x%" PRIx32 "\n",
++			      reginfo.ri_gprmask, reginfo.ri_gp_value);
++		      printf ("          "
++			      "  CPR0 %08" PRIx32 "  CPR1 %08" PRIx32
++			      "  CPR2 %08" PRIx32 "  CPR3 %08" PRIx32 "\n",
+ 			      reginfo.ri_cprmask[0], reginfo.ri_cprmask[1],
+ 			      reginfo.ri_cprmask[2], reginfo.ri_cprmask[3]);
+ 		    }
+@@ -16995,7 +16997,8 @@ process_mips_specific (Filedata * filedata)
+ 		      Elf64_External_RegInfo * ereg;
+ 		      Elf64_Internal_RegInfo reginfo;
+ 
+-		      if (option + 2 > iopt_end)
++		      if (option->size < (sizeof (Elf_External_Options)
++					  + sizeof (Elf64_External_RegInfo)))
+ 			{
+ 			  printf (_("<corrupt>\n"));
+ 			  error (_("Truncated MIPS REGINFO option\n"));
+@@ -17011,16 +17014,15 @@ process_mips_specific (Filedata * filedata)
+ 		      reginfo.ri_cprmask[3] = BYTE_GET (ereg->ri_cprmask[3]);
+ 		      reginfo.ri_gp_value   = BYTE_GET (ereg->ri_gp_value);
+ 
+-		      printf ("GPR %08lx  GP 0x",
+-			      reginfo.ri_gprmask);
+-		      printf_vma (reginfo.ri_gp_value);
+-		      printf ("\n");
+-
+-		      printf ("            CPR0 %08lx  CPR1 %08lx  CPR2 %08lx  CPR3 %08lx\n",
++		      printf ("GPR %08" PRIx32 "  GP 0x%" PRIx64 "\n",
++			      reginfo.ri_gprmask, reginfo.ri_gp_value);
++		      printf ("          "
++			      "  CPR0 %08" PRIx32 "  CPR1 %08" PRIx32
++			      "  CPR2 %08" PRIx32 "  CPR3 %08" PRIx32 "\n",
+ 			      reginfo.ri_cprmask[0], reginfo.ri_cprmask[1],
+ 			      reginfo.ri_cprmask[2], reginfo.ri_cprmask[3]);
+ 		    }
+-		  ++option;
++		  offset += option->size;
+ 		  continue;
+ 
+ 		case ODK_EXCEPTIONS:
+@@ -17089,20 +17091,20 @@ process_mips_specific (Filedata * filedata)
+ 		  break;
+ 
+ 		case ODK_GP_GROUP:
+-		  printf (" GP_GROUP  %#06lx  self-contained %#06lx",
++		  printf (" GP_GROUP  %#06x  self-contained %#06x",
+ 			  option->info & OGP_GROUP,
+ 			  (option->info & OGP_SELF) >> 16);
+ 		  break;
+ 
+ 		case ODK_IDENT:
+-		  printf (" IDENT     %#06lx  self-contained %#06lx",
++		  printf (" IDENT     %#06x  self-contained %#06x",
+ 			  option->info & OGP_GROUP,
+ 			  (option->info & OGP_SELF) >> 16);
+ 		  break;
+ 
+ 		default:
+ 		  /* This shouldn't happen.  */
+-		  printf (" %3d ???     %d %lx",
++		  printf (" %3d ???     %" PRId16 " %" PRIx32,
+ 			  option->kind, option->section, option->info);
+ 		  break;
+ 		}
+@@ -17121,7 +17123,6 @@ process_mips_specific (Filedata * filedata)
+ 	      fputs ("\n", stdout);
+ 
+ 	      offset += option->size;
+-	      ++option;
+ 	    }
+ 	  free (iopt);
+ 	  free (eopt);
+diff --git a/include/ChangeLog b/include/ChangeLog
+index f6200db75c1..3c2765274d4 100644
+--- a/include/ChangeLog
++++ b/include/ChangeLog
+@@ -1,3 +1,8 @@
++2020-06-11  Alan Modra  <amodra@gmail.com>
++
++	* elf/mips.h (Elf32_RegInfo): Use fixed width integer types.
++	(Elf64_Internal_RegInfo, Elf_Internal_Options): Likewise.
++
+ 2020-06-06  Alan Modra  <amodra@gmail.com>
+ 
+ 	* elf/ppc64.h (elf_ppc64_reloc_type): Rename
+diff --git a/include/elf/mips.h b/include/elf/mips.h
+index d116b036b62..cc08ebd4318 100644
+--- a/include/elf/mips.h
++++ b/include/elf/mips.h
+@@ -560,11 +560,11 @@ typedef union
+ typedef struct
+ {
+   /* Mask of general purpose registers used.  */
+-  unsigned long ri_gprmask;
++  uint32_t ri_gprmask;
+   /* Mask of co-processor registers used.  */
+-  unsigned long ri_cprmask[4];
++  uint32_t ri_cprmask[4];
+   /* GP register value for this object file.  */
+-  long ri_gp_value;
++  uint32_t ri_gp_value;
+ } Elf32_RegInfo;
+ 
+ /* The external version of the Elf_RegInfo structure.  */
+@@ -1008,9 +1008,9 @@ typedef struct
+   /* Size of option descriptor, including header.  */
+   unsigned char size;
+   /* Section index of affected section, or 0 for global option.  */
+-  unsigned short section;
++  uint16_t section;
+   /* Information specific to this kind of option.  */
+-  unsigned long info;
++  uint32_t info;
+ } Elf_Internal_Options;
+ 
+ /* MIPS ELF option header swapping routines.  */
+@@ -1074,13 +1074,13 @@ typedef struct
+ typedef struct
+ {
+   /* Mask of general purpose registers used.  */
+-  unsigned long ri_gprmask;
++  uint32_t ri_gprmask;
+   /* Padding.  */
+-  unsigned long ri_pad;
++  uint32_t ri_pad;
+   /* Mask of co-processor registers used.  */
+-  unsigned long ri_cprmask[4];
++  uint32_t ri_cprmask[4];
+   /* GP register value for this object file.  */
+-  bfd_vma ri_gp_value;
++  uint64_t ri_gp_value;
+ } Elf64_Internal_RegInfo;
+ 
+ /* ABI Flags structure version 0.  */
+-- 
+GitLab
+

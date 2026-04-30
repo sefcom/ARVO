@@ -1,0 +1,606 @@
+From 97f1b3cc11c5881f7412687d0aaa1b24ee98da2f Mon Sep 17 00:00:00 2001
+From: Lucas <lmiller@imageworks.com>
+Date: Sat, 29 Aug 2020 13:05:45 -0700
+Subject: [PATCH] Change up the throw message for bad meta data to make it
+ easier to test. Fuzzer Issue 25081 correctly throws.
+
+Fuzzer Issues 25166, 25175, 25185, 25204, and 25236 all seem to be different
+variations on an illegal meta data index value coming through.  We more
+carefully check for that now.
+
+Fuzzer Issue 25192 turned up a leak in OrData where the raw pointer allocated
+for the children was not being released because the constructor threw.
+Putting it into a unique_ptr fixes this problem.
+---
+ lib/Alembic/AbcCoreOgawa/OrData.cpp           |   5 +-
+ lib/Alembic/AbcCoreOgawa/OrData.h             |   2 +-
+ lib/Alembic/AbcCoreOgawa/ReadUtil.cpp         |   6 +-
+ lib/Alembic/AbcCoreOgawa/Tests/CMakeLists.txt |   7 +-
+ lib/Alembic/AbcCoreOgawa/Tests/fuzzTest.cpp   | 168 ++++++++++++++++++
+ .../AbcCoreOgawa/Tests/fuzzer_issue25081.abc  | Bin 298 -> 202 bytes
+ .../AbcCoreOgawa/Tests/fuzzer_issue25166.abc  | Bin 0 -> 1240 bytes
+ .../AbcCoreOgawa/Tests/fuzzer_issue25175.abc  | Bin 0 -> 32914 bytes
+ .../AbcCoreOgawa/Tests/fuzzer_issue25185.abc  | Bin 0 -> 32913 bytes
+ .../AbcCoreOgawa/Tests/fuzzer_issue25192.abc  | Bin 0 -> 715 bytes
+ .../AbcCoreOgawa/Tests/fuzzer_issue25204.abc  | Bin 0 -> 346 bytes
+ .../AbcCoreOgawa/Tests/fuzzer_issue25236.abc  | Bin 0 -> 396 bytes
+ lib/Alembic/Util/TokenMap.cpp                 |  15 +-
+ 13 files changed, 189 insertions(+), 14 deletions(-)
+ create mode 100644 lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25166.abc
+ create mode 100644 lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25175.abc
+ create mode 100644 lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25185.abc
+ create mode 100644 lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25192.abc
+ create mode 100644 lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25204.abc
+ create mode 100644 lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25236.abc
+
+diff --git a/lib/Alembic/AbcCoreOgawa/OrData.cpp b/lib/Alembic/AbcCoreOgawa/OrData.cpp
+index b2ea761f..48a32666 100644
+--- a/lib/Alembic/AbcCoreOgawa/OrData.cpp
++++ b/lib/Alembic/AbcCoreOgawa/OrData.cpp
+@@ -50,7 +50,6 @@ OrData::OrData( Ogawa::IGroupPtr iGroup,
+                 std::size_t iThreadId,
+                 AbcA::ArchiveReader & iArchive,
+                 const std::vector< AbcA::MetaData > & iIndexedMetaData )
+-    : m_children( NULL )
+ {
+     ABCA_ASSERT( iGroup, "Invalid object data group" );
+ 
+@@ -66,7 +65,8 @@ OrData::OrData( Ogawa::IGroupPtr iGroup,
+ 
+         if ( !headers.empty() )
+         {
+-            m_children = new Child[ headers.size() ];
++            m_children = Alembic::Util::unique_ptr< Child[] > (
++                new Child[ headers.size() ] );
+         }
+ 
+         for ( std::size_t i = 0; i < headers.size(); ++i )
+@@ -87,7 +87,6 @@ OrData::OrData( Ogawa::IGroupPtr iGroup,
+ //-*****************************************************************************
+ OrData::~OrData()
+ {
+-    delete [] m_children;
+ }
+ 
+ //-*****************************************************************************
+diff --git a/lib/Alembic/AbcCoreOgawa/OrData.h b/lib/Alembic/AbcCoreOgawa/OrData.h
+index 1df699b8..e6dc161e 100644
+--- a/lib/Alembic/AbcCoreOgawa/OrData.h
++++ b/lib/Alembic/AbcCoreOgawa/OrData.h
+@@ -94,7 +94,7 @@ class OrData : public Alembic::Util::enable_shared_from_this<OrData>
+     typedef std::map<std::string, size_t> ChildrenMap;
+ 
+     // The children
+-    Child * m_children;
++    Alembic::Util::unique_ptr< Child[] > m_children;
+     ChildrenMap m_childrenMap;
+ 
+     // Our "top" property.
+diff --git a/lib/Alembic/AbcCoreOgawa/ReadUtil.cpp b/lib/Alembic/AbcCoreOgawa/ReadUtil.cpp
+index c9d0f3ea..b492ac7c 100644
+--- a/lib/Alembic/AbcCoreOgawa/ReadUtil.cpp
++++ b/lib/Alembic/AbcCoreOgawa/ReadUtil.cpp
+@@ -1820,10 +1820,14 @@ ReadPropertyHeaders( Ogawa::IGroupPtr iGroup,
+             md.deserialize( metaData );
+             header->header.setMetaData( md );
+         }
+-        else
++        else if (metaDataIndex < iMetaDataVec.size())
+         {
+             header->header.setMetaData( iMetaDataVec[metaDataIndex] );
+         }
++        else
++        {
++            ABCA_THROW("Read invalid: Property Header MetaData index.");
++        }
+ 
+         oHeaders.push_back( header );
+ 
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/CMakeLists.txt b/lib/Alembic/AbcCoreOgawa/Tests/CMakeLists.txt
+index 81d44439..fa7e1f5a 100644
+--- a/lib/Alembic/AbcCoreOgawa/Tests/CMakeLists.txt
++++ b/lib/Alembic/AbcCoreOgawa/Tests/CMakeLists.txt
+@@ -92,4 +92,9 @@ file(COPY fuzzer_issue24846.abc DESTINATION .)
+ file(COPY fuzzer_issue24853.abc DESTINATION .)
+ file(COPY fuzzer_issue24598.abc DESTINATION .)
+ file(COPY fuzzer_issue25051.abc DESTINATION .)
+-file(COPY fuzzer_issue25081.abc DESTINATION .)
+\ No newline at end of file
++file(COPY fuzzer_issue25081.abc DESTINATION .)
++file(COPY fuzzer_issue25166.abc DESTINATION .)
++file(COPY fuzzer_issue25175.abc DESTINATION .)
++file(COPY fuzzer_issue25185.abc DESTINATION .)
++file(COPY fuzzer_issue25192.abc DESTINATION .)
++file(COPY fuzzer_issue25236.abc DESTINATION .)
+\ No newline at end of file
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/fuzzTest.cpp b/lib/Alembic/AbcCoreOgawa/Tests/fuzzTest.cpp
+index 4e324245..7a1c9cdc 100644
+--- a/lib/Alembic/AbcCoreOgawa/Tests/fuzzTest.cpp
++++ b/lib/Alembic/AbcCoreOgawa/Tests/fuzzTest.cpp
+@@ -127,8 +127,10 @@ void testIssue254(bool iUseMMap)
+     {
+         std::string msg = "Ogawa IData illegal size.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
+ 
++    TESTING_ASSERT(1);
+ }
+ 
+ void testIssue255(bool iUseMMap)
+@@ -150,8 +152,10 @@ void testIssue256(bool iUseMMap)
+     {
+         std::string msg = "Read invalid: TimeSamples sample times.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
+ 
++    TESTING_ASSERT(1);
+ }
+ 
+ void testIssue257(bool iUseMMap)
+@@ -166,7 +170,10 @@ void testIssue257(bool iUseMMap)
+     {
+         std::string msg = "Read invalid: Object Headers name and MetaData index.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ void testIssue258(bool iUseMMap)
+@@ -180,7 +187,10 @@ void testIssue258(bool iUseMMap)
+     {
+         std::string msg = "Read invalid: Indexed MetaData string.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ void testIssue269(bool iUseMMap)
+@@ -195,7 +205,10 @@ void testIssue269(bool iUseMMap)
+     {
+         std::string msg = "ReadData invalid: Null IDataPtr.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ void testIssue270(bool iUseMMap)
+@@ -224,7 +237,10 @@ void testIssue272(bool iUseMMap)
+     {
+         std::string msg = "Read invalid: Object Headers MetaData index.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ void testIssue282(bool iUseMMap)
+@@ -245,7 +261,10 @@ void testIssue283(bool iUseMMap)
+     {
+         std::string msg = "Invalid Alembic file.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ void testFuzzer24846(bool iUseMMap)
+@@ -259,7 +278,10 @@ void testFuzzer24846(bool iUseMMap)
+     {
+         std::string msg = "Ogawa IData illegal size.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ void testFuzzer24853(bool iUseMMap)
+@@ -273,7 +295,10 @@ void testFuzzer24853(bool iUseMMap)
+     {
+         std::string msg = "Ogawa IData illegal size.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ 
+@@ -288,7 +313,10 @@ void testFuzzer24598(bool iUseMMap)
+     {
+         std::string msg = "Ogawa IData illegal size.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ void testFuzzer25051(bool iUseMMap)
+@@ -302,7 +330,10 @@ void testFuzzer25051(bool iUseMMap)
+     {
+         std::string msg = "Ogawa IData illegal size.";
+         TESTING_ASSERT(msg == e.what());
++        return;
+     }
++
++    TESTING_ASSERT(1);
+ }
+ 
+ void testFuzzer25081(bool iUseMMap)
+@@ -318,6 +349,125 @@ void testFuzzer25081(bool iUseMMap)
+         std::string msg = "Invalid data in CprImpl(Object)";
+         TESTING_ASSERT(msg == e.what());
+     }
++
++    ABCA::MetaData ph = ar->getTop()->getHeader().getMetaData();
++    try
++    {
++        ph.serialize();
++    }
++    catch(const std::exception& e)
++    {
++        std::string msg = "TokenMap::get: Token-Value pair  contains separator characters: ; or = for ";
++        std::string err = e.what();
++        TESTING_ASSERT(msg == err.substr(0, msg.size()));
++        return;
++    }
++    TESTING_ASSERT(1);
++}
++
++void testFuzzer25166(bool iUseMMap)
++{
++    // found issue with illegal meta data index
++    Alembic::AbcCoreOgawa::ReadArchive r(1, iUseMMap);
++    try
++    {
++        ABCA::ArchiveReaderPtr ar = r("fuzzer_issue25166.abc");
++    }
++    catch(const std::exception& e)
++    {
++        std::string msg = "Read invalid: Property Header MetaData index.";
++        TESTING_ASSERT(msg == e.what());
++        return;
++    }
++    TESTING_ASSERT(1);
++}
++
++void testFuzzer25175(bool iUseMMap)
++{
++    // seems to be fixed by fix for 25166 (bad meta data index)
++    Alembic::AbcCoreOgawa::ReadArchive r(1, iUseMMap);
++
++    try
++    {
++        ABCA::ArchiveReaderPtr ar = r("fuzzer_issue25175.abc");
++    }
++    catch(const std::exception& e)
++    {
++        std::string msg = "Read invalid: Property Header MetaData index.";
++        TESTING_ASSERT(msg == e.what());
++        return;
++    }
++    TESTING_ASSERT(1);
++}
++
++void testFuzzer25185(bool iUseMMap)
++{
++    // seems to be fixed by fix for 25166 (bad meta data index)
++    Alembic::AbcCoreOgawa::ReadArchive r(1, iUseMMap);
++    try
++    {
++        ABCA::ArchiveReaderPtr ar = r("fuzzer_issue25185.abc");
++    }
++    catch(const std::exception& e)
++    {
++        std::string msg = "Read invalid: Property Header MetaData index.";
++        TESTING_ASSERT(msg == e.what());
++        return;
++    }
++    TESTING_ASSERT(1);
++}
++
++void testFuzzer25192(bool iUseMMap)
++{
++    // found leak in AbcOgawa::OrData with raw pointer
++    // to m_children
++    Alembic::AbcCoreOgawa::ReadArchive r(1, iUseMMap);
++    try
++    {
++        ABCA::ArchiveReaderPtr ar = r("fuzzer_issue25192.abc");
++    }
++    catch(const std::exception& e)
++    {
++        std::string msg = "Ogawa IStreams::read failed.";
++        TESTING_ASSERT(msg == e.what());
++        return;
++    }
++    TESTING_ASSERT(1);
++
++}
++
++void testFuzzer25204(bool iUseMMap)
++{
++    // seems to be fixed by fix for 25166 (bad meta data index)
++    Alembic::AbcCoreOgawa::ReadArchive r(1, iUseMMap);
++    try
++    {
++        ABCA::ArchiveReaderPtr ar = r("fuzzer_issue25204.abc");
++    }
++    catch(const std::exception& e)
++    {
++        std::string msg = "Read invalid: Property Header MetaData index.";
++        TESTING_ASSERT(msg == e.what());
++        return;
++    }
++    TESTING_ASSERT(1);
++}
++
++void testFuzzer25236(bool iUseMMap)
++{
++    // seems to be fixed by fix for 25166 (bad meta data index)
++    Alembic::AbcCoreOgawa::ReadArchive r(1, iUseMMap);
++    try
++    {
++        ABCA::ArchiveReaderPtr ar = r("fuzzer_issue25236.abc");
++    }
++    catch(const std::exception& e)
++    {
++        std::string msg = "Read invalid: Property Header MetaData index.";
++        TESTING_ASSERT(msg == e.what());
++        return;
++    }
++    TESTING_ASSERT(1);
+ }
+ 
+ int main ( int argc, char *argv[] )
+@@ -370,5 +520,23 @@ int main ( int argc, char *argv[] )
+     testFuzzer25081(true);
+     testFuzzer25081(false);
+ 
++    testFuzzer25166(true);
++    testFuzzer25166(false);
++
++    testFuzzer25175(true);
++    testFuzzer25175(false);
++
++    testFuzzer25185(true);
++    testFuzzer25185(false);
++
++    testFuzzer25192(true);
++    testFuzzer25192(false);
++
++    testFuzzer25204(true);
++    testFuzzer25204(false);
++
++    testFuzzer25236(true);
++    testFuzzer25236(false);
++
+     return 0;
+ }
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25081.abc b/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25081.abc
+index 852277a990570a3b98f30a84f41fc7cdc593d670..0dcb42061b20d43e5cc9cc95d62781401e9e8d7c 100644
+GIT binary patch
+delta 34
+lcmZ3*bc%68HAf=@7;sE%w%})AU<GpSpJDjV`akhM0|1hW34#Cs
+
+delta 130
+zcmX@bxQb~)HOK$||6eA4&lH*1Y?1HJz`*bmh#8s~7#jXJSX%>`4FU`)AfbjP1|Ek0
+zi3|!X3=FL304xns1q6&>@+{l^GmEFXR0qFi=W0`AU<ls&ZDmq+T@Og|e>x-U|HS_c
+E0QJ5h(f|Me
+
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25166.abc b/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25166.abc
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b84fee4d487c61970716835b1bdc5af010262d7
+GIT binary patch
+literal 1240
+zcmeHFEf&Hs49)<7KvbY`NG`C)kD0*l3{^ZlJOqNiorDW<11^9@;3#R9uFEKU6O%+V
+zKi`)$O`7lYNn1z?C}qT&)G-54aCWv)6aiDf0IY^}MYIUqu>?R;Qap2sOp*zm?gj<c
+zNs6XRNFVyOpAzaY60>4m3>iSR0l2YemLAXBT0bC5foV;uaqxN6nYCLtjWOqCtVt08
+zEhg3>vY%I&`(QO4ACNlom^VKct4nToZ}x-g8fNGcC{?c^BrM*hi1q4(P0F&7;dnwc
+oWf3|Jc;02BR2F}<kjVA5kM{pFVpt6)Y@z}5<%R{zieF3n0N~$;@&Et;
+
+literal 0
+HcmV?d00001
+
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25175.abc b/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25175.abc
+new file mode 100644
+index 0000000000000000000000000000000000000000..31d2655758ca69b72187691c0a44ccbbcd6633e8
+GIT binary patch
+literal 32914
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25185.abc b/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25185.abc
+new file mode 100644
+index 0000000000000000000000000000000000000000..28773ba66d9e7ef3e651a656f68e520528c01e91
+GIT binary patch
+literal 32913
+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
+a6{)xVmbX@WqpAzbqZ-~L(Uyyi;{ONn_r#<C
+
+literal 0
+HcmV?d00001
+
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25192.abc b/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25192.abc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b239b73ed097c91096a7e3c74188e5fe0d911402
+GIT binary patch
+literal 715
+zcmeZIPb^RT&%oHk00Ase8ccx%1sJLs7?>Cu1RxTPO+e27L<TFk!awQEtp9;VKmjXI
+z2LnR`n8#!Rrg*?4#IXNRAOaNo|Nmv;_e>BA1fUi)SVFiBhafbVv}Ry9D-0Ef3OD#e
+zUG4xC@P^RLV5-T1VKSKU7b1#5reTOsU%&xuWCJW{ku88rfdccLJvcD`|NjmQ9EJu+
+zpfNP~qX&WU4~P*B$R<&n?F=;#9=||-2@nfF;uM??FdT*!R|Fl3-4sIJBcKZa3%5aS
+
+literal 0
+HcmV?d00001
+
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25204.abc b/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25204.abc
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2c980e8ed2e25c80dae830ac051a21196358b6c
+GIT binary patch
+literal 346
+zcmeZIPb^RT&%oHk00Ase8ca2*F)$c1R5LLAW)OggH@tz;S}=vv{-iUq{s$Vt07PK$
+z8^~Z{WMF4t$OiHmIT#qY{{IKb|7Z9gsK*FZ1*T*fG8sgm0x%maA^Zj{sLF02pJ^Gx
+zS*WrG7~K?~&cF)g5Jzdjl{qjl|Ns9D%I&nifB!xMgCblO&S(I!fbMEQwhQV`xFRqE
+MB-r2$6@!=r0M&*j?*IS*
+
+literal 0
+HcmV?d00001
+
+diff --git a/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25236.abc b/lib/Alembic/AbcCoreOgawa/Tests/fuzzer_issue25236.abc
+new file mode 100644
+index 0000000000000000000000000000000000000000..26307422c77abceb26eb12e9a336bec16e8eda6d
+GIT binary patch
+literal 396
+zcmZutI|{-;5PcgGlr&n{Dp&{-LBUQuf`xd3kSd4=u&^1@i5Kt$UcxhY1#<xlZM29m
+zPIe~{B*QN6GqW?hyH1mR!Y~<J_=*<p%sj^dD9|kp0v<L2imF2Yo0@>71!UPMgm?xm
+zU?<wNfl&HLp23@`5lah!KDOwovJ+&+!fA@M>?GQ|;HG6%VHOXRHiC@({3XscJz{>V
+zJTCJ*2Zpt*QYtZ|H16P)1#0R&RRQ)Rp3Gy=%9%6Us^I~X>d>_$<dpnPE?eRU<T5<1
+
+literal 0
+HcmV?d00001
+
+diff --git a/lib/Alembic/Util/TokenMap.cpp b/lib/Alembic/Util/TokenMap.cpp
+index 83fedb0a..518968fb 100644
+--- a/lib/Alembic/Util/TokenMap.cpp
++++ b/lib/Alembic/Util/TokenMap.cpp
+@@ -128,17 +128,17 @@ std::string TokenMap::get( char pairSep,
+                            bool check ) const
+ {
+     char buf[2] = { 0, 0 };
+-    
++
+     buf[0] = pairSep;
+     std::string pairSepStr( ( const char * )buf );
+-    
++
+     buf[0] = assignSep;
+     std::string assignSepStr( ( const char * )buf );
+ 
+     std::stringstream output;
+ 
+     bool start = true;
+-    
++
+     for ( const_iterator iter = m_map.begin();
+           iter != m_map.end(); ++iter )
+     {
+@@ -151,11 +151,10 @@ std::string TokenMap::get( char pairSep,
+                value.find( pairSep ) != std::string::npos ||
+                value.find( assignSep ) != std::string::npos ) )
+         {
+-            ALEMBIC_THROW( "TokenMap::get: Token-Value pair: "
+-                           << token << ", " << value
+-                           << " contains separator characters: "
+-                           << pairSepStr << " or "
+-                           << assignSepStr );
++            ALEMBIC_THROW( "TokenMap::get: Token-Value pair " <<
++                " contains separator characters: " <<
++                pairSepStr << " or " << assignSepStr <<
++                " for " << token << " or "  << value);
+         }
+ 
+         if ( value == "" )

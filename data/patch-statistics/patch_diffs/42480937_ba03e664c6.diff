@@ -1,0 +1,45 @@
+From 090ceea45289cd6a7a14487595f4534d57d1c552 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Wed, 31 May 2017 21:56:53 +0000
+Subject: [PATCH] RMF: fix heap-buffer-overflow read. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=1986. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@38744 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/frmts/rmf/rmfdataset.cpp | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/gdal/frmts/rmf/rmfdataset.cpp b/gdal/frmts/rmf/rmfdataset.cpp
+index 48d243dc8244..fb52c8e3be26 100644
+--- a/gdal/frmts/rmf/rmfdataset.cpp
++++ b/gdal/frmts/rmf/rmfdataset.cpp
+@@ -1272,7 +1272,11 @@ do {                                                                    \
+ 
+     if( poDS->sHeader.nExtHdrOffset && poDS->sHeader.nExtHdrSize )
+     {
+-        /* coverity[tainted_data] */
++        if( poDS->sHeader.nExtHdrSize > 1000000 )
++        {
++            delete poDS;
++            return NULL;
++        }
+         GByte *pabyExtHeader = reinterpret_cast<GByte *>(
+             VSICalloc( poDS->sHeader.nExtHdrSize, 1 ) );
+         if( pabyExtHeader == NULL )
+@@ -1285,9 +1289,12 @@ do {                                                                    \
+                    SEEK_SET );
+         VSIFReadL( pabyExtHeader, 1, poDS->sHeader.nExtHdrSize, poDS->fp );
+ 
+-        RMF_READ_LONG( pabyExtHeader, poDS->sExtHeader.nEllipsoid, 24 );
+-        RMF_READ_LONG( pabyExtHeader, poDS->sExtHeader.nDatum, 32 );
+-        RMF_READ_LONG( pabyExtHeader, poDS->sExtHeader.nZone, 36 );
++        if( poDS->sHeader.nExtHdrSize >= 36 + 4 )
++        {
++            RMF_READ_LONG( pabyExtHeader, poDS->sExtHeader.nEllipsoid, 24 );
++            RMF_READ_LONG( pabyExtHeader, poDS->sExtHeader.nDatum, 32 );
++            RMF_READ_LONG( pabyExtHeader, poDS->sExtHeader.nZone, 36 );
++        }
+ 
+         CPLFree( pabyExtHeader );
+     }

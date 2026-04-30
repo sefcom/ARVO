@@ -1,0 +1,52 @@
+From c12e8c97b13f33897bd9c6095432c9740504f5c7 Mon Sep 17 00:00:00 2001
+From: Andreas Rheinhardt <andreas.rheinhardt@outlook.com>
+Date: Wed, 27 May 2020 10:54:44 +0200
+Subject: [PATCH] avcodec/vp9_superframe_bsf: Check for existence of data
+ before reading it
+
+Packets without data need to be handled specially in order to avoid
+undefined reads. Pass these packets through unchanged in case there
+are no cached packets* and error out in case there are cached packets:
+Returning the packet would mess with the order of the packets;
+if one returned the zero-sized packet before the superframe that will
+be created from the packets in the cache, the zero-sized packet would
+overtake the packets in the cache; if one returned the packet later,
+the packets that complete the superframe will overtake the zero-sized
+packet.
+
+*: This case e.g. encompasses the scenario of updated extradata
+side-data at the end.
+
+Fixes: Out of array read
+Fixes: 45722/clusterfuzz-testcase-minimized-ffmpeg_BSF_VP9_SUPERFRAME_fuzzer-5173378975137792
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+
+Signed-off-by: Andreas Rheinhardt <andreas.rheinhardt@outlook.com>
+---
+ libavcodec/vp9_superframe_bsf.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/libavcodec/vp9_superframe_bsf.c b/libavcodec/vp9_superframe_bsf.c
+index 349d43d62e..a0978c7ef0 100644
+--- a/libavcodec/vp9_superframe_bsf.c
++++ b/libavcodec/vp9_superframe_bsf.c
+@@ -108,6 +108,15 @@ static int vp9_superframe_filter(AVBSFContext *ctx, AVPacket *pkt)
+     if (res < 0)
+         return res;
+ 
++    if (!pkt->size) {
++        /* In case the cache is empty we can pass side-data-only packets
++         * through unchanged. Otherwise, such a packet makes no sense. */
++        if (!s->n_cache)
++            return 0;
++        res = AVERROR_INVALIDDATA;
++        goto done;
++    }
++
+     marker = pkt->data[pkt->size - 1];
+     if ((marker & 0xe0) == 0xc0) {
+         int nbytes = 1 + ((marker >> 3) & 0x3);
+-- 
+2.25.1
+

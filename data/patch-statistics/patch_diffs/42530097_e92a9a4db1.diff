@@ -1,0 +1,208 @@
+From 1ff377c5de22caf9907fcc31f3f71ea138346155 Mon Sep 17 00:00:00 2001
+From: Axel Mahr <115995876+axmahr@users.noreply.github.com>
+Date: Tue, 12 Mar 2024 18:56:23 +0100
+Subject: [PATCH] Handle too high interface ID for pcapng (Issue #1334) (#1337)
+
+---
+ .../LightPcapNg/src/light_pcapng_ext.c        |  39 +++++++++++-------
+ Packet++/header/RawPacket.h                   |   4 +-
+ Pcap++/src/PcapFileDevice.cpp                 |   8 +++-
+ Tests/Pcap++Test/Common/PcapFileNamesDef.h    |   1 +
+ .../PcapExamples/too_many_interfaces.pcapng   | Bin 0 -> 4876 bytes
+ Tests/Pcap++Test/TestDefinition.h             |   1 +
+ Tests/Pcap++Test/Tests/FileTests.cpp          |  23 +++++++++++
+ Tests/Pcap++Test/main.cpp                     |   1 +
+ 8 files changed, 61 insertions(+), 16 deletions(-)
+ create mode 100644 Tests/Pcap++Test/PcapExamples/too_many_interfaces.pcapng
+
+diff --git a/3rdParty/LightPcapNg/LightPcapNg/src/light_pcapng_ext.c b/3rdParty/LightPcapNg/LightPcapNg/src/light_pcapng_ext.c
+index 11050c360e..add45a468f 100644
+--- a/3rdParty/LightPcapNg/LightPcapNg/src/light_pcapng_ext.c
++++ b/3rdParty/LightPcapNg/LightPcapNg/src/light_pcapng_ext.c
+@@ -411,27 +411,38 @@ int light_get_next_packet(light_pcapng_t *pcapng, light_packet_header *packet_he
+ 		packet_header->interface_id = epb->interface_id;
+ 		packet_header->captured_length = epb->capture_packet_length;
+ 		packet_header->original_length = epb->original_capture_length;
+-		uint64_t timestamp = epb->timestamp_high;
+-		timestamp = timestamp << 32;
+-		timestamp += epb->timestamp_low;
+-		double timestamp_res = pcapng->file_info->timestamp_resolution[epb->interface_id];
+-		uint64_t packet_secs = timestamp * timestamp_res;
+-		if (packet_secs <= MAXIMUM_PACKET_SECONDS_VALUE)
++
++		/// PCPP patch begin
++		if (epb->interface_id < pcapng->file_info->interface_block_count)
+ 		{
+-			packet_header->timestamp.tv_sec = packet_secs;
+-			packet_header->timestamp.tv_nsec =
+-					(timestamp - (packet_secs / timestamp_res))	// number of time units less than seconds
+-					* timestamp_res								// shift . to the left to get 0.{previous_number}
+-					* 1000000000;								// get the nanoseconds
++			uint64_t timestamp = epb->timestamp_high;
++			timestamp = timestamp << 32;
++			timestamp += epb->timestamp_low;
++			double timestamp_res = pcapng->file_info->timestamp_resolution[epb->interface_id];
++			uint64_t packet_secs = timestamp * timestamp_res;
++			if (packet_secs <= MAXIMUM_PACKET_SECONDS_VALUE)
++			{
++				packet_header->timestamp.tv_sec = packet_secs;
++				packet_header->timestamp.tv_nsec =
++						(timestamp - (packet_secs / timestamp_res))	// number of time units less than seconds
++						* timestamp_res								// shift . to the left to get 0.{previous_number}
++						* 1000000000;								// get the nanoseconds
++			}
++			else
++			{
++				packet_header->timestamp.tv_sec = 0;
++				packet_header->timestamp.tv_nsec = 0;
++			}
++
++			packet_header->data_link = pcapng->file_info->link_types[epb->interface_id];
+ 		}
+ 		else
+ 		{
+ 			packet_header->timestamp.tv_sec = 0;
+ 			packet_header->timestamp.tv_nsec = 0;
++			packet_header->data_link = 0xFFFF;
+ 		}
+-
+-		if (epb->interface_id < pcapng->file_info->interface_block_count)
+-			packet_header->data_link = pcapng->file_info->link_types[epb->interface_id];
++		/// PCPP patch end
+ 
+ 		*packet_data = (uint8_t*)epb->packet_data;
+ 	}
+diff --git a/Packet++/header/RawPacket.h b/Packet++/header/RawPacket.h
+index 34a7f6f669..a212b3d3c7 100644
+--- a/Packet++/header/RawPacket.h
++++ b/Packet++/header/RawPacket.h
+@@ -236,7 +236,9 @@ namespace pcpp
+ 		/** Messages between ISO 14443 contactless smartcards (Proximity Integrated Circuit Card, PICC) and card readers (Proximity Coupling Device, PCD), with the message format specified by the PCAP format for ISO14443 specification */
+ 		LINKTYPE_ISO_14443 = 264,
+ 		/** Linux "cooked" capture encapsulation v2 */
+-		LINKTYPE_LINUX_SLL2 = 276
++		LINKTYPE_LINUX_SLL2 = 276,
++		/** Set if interface ID for a packet of a pcapng file is too high */
++		LINKTYPE_INVALID = 0xFFFF
+ 	};
+ 
+ 	/**
+diff --git a/Pcap++/src/PcapFileDevice.cpp b/Pcap++/src/PcapFileDevice.cpp
+index 2e361353cd..b911bb7c8f 100644
+--- a/Pcap++/src/PcapFileDevice.cpp
++++ b/Pcap++/src/PcapFileDevice.cpp
+@@ -385,7 +385,13 @@ bool PcapNgFileReaderDevice::getNextPacket(RawPacket& rawPacket, std::string& pa
+ 
+ 	uint8_t* myPacketData = new uint8_t[pktHeader.captured_length];
+ 	memcpy(myPacketData, pktData, pktHeader.captured_length);
+-	if (!rawPacket.setRawData(myPacketData, pktHeader.captured_length, pktHeader.timestamp, static_cast<LinkLayerType>(pktHeader.data_link), pktHeader.original_length))
++	const LinkLayerType linkType = static_cast<LinkLayerType>(pktHeader.data_link);
++	if (linkType == LinkLayerType::LINKTYPE_INVALID)
++	{
++		PCPP_LOG_ERROR("Link layer type of raw packet could not be determined");
++	}
++
++	if (!rawPacket.setRawData(myPacketData, pktHeader.captured_length, pktHeader.timestamp, linkType, pktHeader.original_length))
+ 	{
+ 		PCPP_LOG_ERROR("Couldn't set data to raw packet");
+ 		return false;
+diff --git a/Tests/Pcap++Test/Common/PcapFileNamesDef.h b/Tests/Pcap++Test/Common/PcapFileNamesDef.h
+index 689833fc19..9fd550651b 100644
+--- a/Tests/Pcap++Test/Common/PcapFileNamesDef.h
++++ b/Tests/Pcap++Test/Common/PcapFileNamesDef.h
+@@ -20,6 +20,7 @@
+ #define EXAMPLE_PCAPNG_ZSTD_WRITE_PATH "PcapExamples/many_interfaces_copy.pcapng.zstd"
+ #define EXAMPLE2_PCAPNG_ZSTD_WRITE_PATH "PcapExamples/pcapng-example-write.pcapng.zstd"
+ #define EXAMPLE2_PCAPNG_ZST_WRITE_PATH "PcapExamples/pcapng-example-write.pcapng.zst"
++#define EXAMPLE_PCAPNG_INTERFACES_PATH "PcapExamples/too_many_interfaces.pcapng"
+ #define EXAMPLE_PCAP_GRE "PcapExamples/GrePackets.cap"
+ #define EXAMPLE_PCAP_IGMP "PcapExamples/IgmpPackets.pcap"
+ #define EXAMPLE_LINKTYPE_IPV6 "PcapExamples/linktype_ipv6.pcap"
+diff --git a/Tests/Pcap++Test/PcapExamples/too_many_interfaces.pcapng b/Tests/Pcap++Test/PcapExamples/too_many_interfaces.pcapng
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f76f43fbf07a7aaa269fdd9217b5a118cc2b114
+GIT binary patch
+literal 4876
+zcmeHKOKTiQ5H3r0@Cw_I;EQuGgCRjeZqcvl=>|hIJv~DXvM_OiaxfT4J4lPg+Q@4w
+z4+orE5^~5PB)RIApAmBM@5n#MF(;*ZwWZyx#*$*mk^^aIs<x-A>)U#EPhGw|^&9|h
+z-<o~*9MYY^n1mZ(G+XKPlBG_!{c!7XGA-qYa^_~T@}#rTPNXza0GtN}x9iQddUg3x
+zGQHH<tRJs0Z$6kw^c<g)$@J4cWt^>Pk?Pd6g;E)xK}`V9aYmib26Sf!U;-rE3-!~^
+zYJG3<PIdpwB5)_UshB~A=}MQ(8(*>_msL>S8l8o&09ts`TX@bTxIT_saKbFO)EqbA
+zAf2BgA2C1@b)N%<?C`AF@w2kzZoL`7C3lurA0&cK&J0Im;GpwvA-`+Sc<u$*+F0&J
+z)x)zd!9u6|<g-N02{WgnEXn8**|@)jzbD`dw5{dJx%O&p+V}G)0YH0+MjO6V#=nBh
+z3Fx_sYRMMF6ODL@C)@4D!O8i8eBBsdoEr?t$}n4HmgzE6%v!0K$$iB!xP+Gc81ZFC
+z{`&-GOWj-N2gLyG|7IW;Gi+Z@7-MpT%n`1wn9fzsT%J3|MdfUsiYi!#m?u$oX(3-6
+z>N{Fa$0#BF2ih*zHd9t+%*wQ2I<<j0tvJhaQF2*{U`2im+vyS8y)>pzAU;n^&kqOr
+zv?wbc0?(N#3bds{pW1+2T4<L!87!C4mXmN1%HDdt*{yp+zrHtKrvy)?h2hy=xfWWv
+zevv^8gyZ88`|huOjb}<R(gK9zI@&G{Ix9h*a-Dn@ztcL=(K>aK-%rbzr=^E#Vl?1>
+zAH8~ix{5|8KM_wf)*RxAj;>K{IP2QfgzcBX|7yfmXj3R%2IkX{F&&I#-iefzm6J|q
+zMixT#bL<Lya@Qv;p-da?+l_gFsi20rW|fgKsBsXUCah$~=DuVLU+}=0$70U3#Ve09
+z4%-yhnOCXOd5BntHDDH${KtLm(7OuhCwkU64(v6rxlbqPE6Rtns9RK%o8$KMd&8TC
+z=fD`Pti)UnjwzlCyboo9+1z?;rDZ9c7cK-pmMdd#n<MASkApaA^pg)fc#pRrqbuy;
+z8D7bpFAY;7tBfjB$wk_)FRi^E&hflq4mZ{o$+;fZ7VNpZFAV^~G9J6}9TZ1`Gsg7y
+z1KNmLXD%;2H>?o&$kMscEZ0)AP`NaCDXrDIkGbjIarFBnVc4sK7l-$LJ-|15C-^VF
+zcapLHGwzSWzBk!uZ|#uY{BQR~o0AODqprnxA{nCpuc7mgV;2k#vL(?be>CYh>b@q~
+z<E*_dy)kbd;rs~ab$$VU-hQ^dh<u!I?T_uhzJ+%_nELJ~tV{s&FSh1k{_U^d|Lxaq
+t>-TFAUfh5bZvMH@`y6XvEQ2`CuWUSAYi-pl{rA%sllX{=-|%bH^Eb6A!Ak%D
+
+literal 0
+HcmV?d00001
+
+diff --git a/Tests/Pcap++Test/TestDefinition.h b/Tests/Pcap++Test/TestDefinition.h
+index ce6fade0a3..160d4867a7 100644
+--- a/Tests/Pcap++Test/TestDefinition.h
++++ b/Tests/Pcap++Test/TestDefinition.h
+@@ -24,6 +24,7 @@ PTF_TEST_CASE(TestPcapRawIPFileReadWrite);
+ PTF_TEST_CASE(TestPcapFileAppend);
+ PTF_TEST_CASE(TestPcapNgFileReadWrite);
+ PTF_TEST_CASE(TestPcapNgFileReadWriteAdv);
++PTF_TEST_CASE(TestPcapNgFileTooManyInterfaces);
+ PTF_TEST_CASE(TestPcapFileReadLinkTypeIPv6);
+ PTF_TEST_CASE(TestPcapFileReadLinkTypeIPv4);
+ PTF_TEST_CASE(TestSolarisSnoopFileRead);
+diff --git a/Tests/Pcap++Test/Tests/FileTests.cpp b/Tests/Pcap++Test/Tests/FileTests.cpp
+index 3f3ab07a69..408b6f7627 100644
+--- a/Tests/Pcap++Test/Tests/FileTests.cpp
++++ b/Tests/Pcap++Test/Tests/FileTests.cpp
+@@ -731,6 +731,29 @@ PTF_TEST_CASE(TestPcapNgFileReadWriteAdv)
+ } // TestPcapNgFileReadWriteAdv
+ 
+ 
++
++PTF_TEST_CASE(TestPcapNgFileTooManyInterfaces)
++{
++	pcpp::Logger::getInstance().suppressLogs();
++	pcpp::PcapNgFileReaderDevice readerDev(EXAMPLE_PCAPNG_INTERFACES_PATH);
++	PTF_ASSERT_TRUE(readerDev.open());
++	pcpp::RawPacket rawPacket;
++	int packetCount = 0;
++	while (readerDev.getNextPacket(rawPacket))
++	{
++		packetCount++;
++		PTF_ASSERT_EQUAL(rawPacket.getLinkLayerType(), pcpp::LINKTYPE_INVALID, enum);
++		const timespec timestamp = rawPacket.getPacketTimeStamp();
++		pcpp::Logger::getInstance().enableLogs();
++		PTF_ASSERT_EQUAL(timestamp.tv_sec, 0);
++		PTF_ASSERT_EQUAL(timestamp.tv_nsec, 0);
++	}
++	PTF_ASSERT_EQUAL(packetCount, 1);
++	readerDev.close();
++} // TestPcapNgFileTooManyInterfaces
++
++
++
+ PTF_TEST_CASE(TestPcapFileReadLinkTypeIPv6)
+ {
+ 	pcpp::PcapFileReaderDevice readerDev(EXAMPLE_LINKTYPE_IPV6);
+diff --git a/Tests/Pcap++Test/main.cpp b/Tests/Pcap++Test/main.cpp
+index b1a5904266..7a6981c61f 100644
+--- a/Tests/Pcap++Test/main.cpp
++++ b/Tests/Pcap++Test/main.cpp
+@@ -218,6 +218,7 @@ int main(int argc, char* argv[])
+ 	PTF_RUN_TEST(TestPcapFileAppend, "no_network;pcap");
+ 	PTF_RUN_TEST(TestPcapNgFileReadWrite, "no_network;pcap;pcapng");
+ 	PTF_RUN_TEST(TestPcapNgFileReadWriteAdv, "no_network;pcap;pcapng");
++	PTF_RUN_TEST(TestPcapNgFileTooManyInterfaces, "no_network;pcap;pcapng");
+ 	PTF_RUN_TEST(TestPcapFileReadLinkTypeIPv6, "no_network;pcap");
+ 	PTF_RUN_TEST(TestPcapFileReadLinkTypeIPv4, "no_network;pcap");
+ 	PTF_RUN_TEST(TestSolarisSnoopFileRead, "no_network;pcap;snoop");

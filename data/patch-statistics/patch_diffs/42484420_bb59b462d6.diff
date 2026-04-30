@@ -1,0 +1,194 @@
+From adcb898a00746c8aa886eb06cc9f5a1cb1834fca Mon Sep 17 00:00:00 2001
+From: Alex Tutubalin <lexa@lexa.ru>
+Date: Tue, 15 Feb 2022 19:37:27 +0300
+Subject: [PATCH] OM-1 support
+
+---
+ internal/libraw_cameraids.h      |  1 +
+ libraw/libraw_const.h            |  2 ++
+ src/metadata/identify.cpp        |  8 ++++++--
+ src/metadata/makernotes.cpp      | 10 ++++++----
+ src/metadata/normalize_model.cpp |  7 +++++--
+ src/metadata/tiff.cpp            |  4 ++--
+ src/tables/cameralist.cpp        |  1 +
+ src/tables/colordata.cpp         |  3 +++
+ 8 files changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/internal/libraw_cameraids.h b/internal/libraw_cameraids.h
+index 538d1057a..90652e30d 100644
+--- a/internal/libraw_cameraids.h
++++ b/internal/libraw_cameraids.h
+@@ -157,6 +157,7 @@ it under the terms of the one of two licenses as you choose:
+ #define OlyID_E_M5_Mark_III   OlyID_str2hex("S0089")
+ #define OlyID_E_M1_Mark_III   OlyID_str2hex("S0092")
+ #define OlyID_E_P7            OlyID_str2hex("S0093")
++#define OlyID_OM_1            OlyID_str2hex("S0095")
+ #define OlyID_C_3030Z         OlyID_str2hex("SX351")
+ #define OlyID_C_5050Z         OlyID_str2hex("SX558")
+ #define OlyID_C_350Z          OlyID_str2hex("SX751")
+diff --git a/libraw/libraw_const.h b/libraw/libraw_const.h
+index fd6ba741e..81d42b685 100644
+--- a/libraw/libraw_const.h
++++ b/libraw/libraw_const.h
+@@ -362,6 +362,8 @@ enum LibRaw_cameramaker_index
+   LIBRAW_CAMERAMAKER_HMD_Global,
+   LIBRAW_CAMERAMAKER_HUAWEI,
+   LIBRAW_CAMERAMAKER_RaspberryPi,
++  LIBRAW_CAMERAMAKER_OmDigital,
++
+   // Insert additional indexes here
+   LIBRAW_CAMERAMAKER_TheLastOne
+ };
+diff --git a/src/metadata/identify.cpp b/src/metadata/identify.cpp
+index a3d9b0218..f17bb2290 100644
+--- a/src/metadata/identify.cpp
++++ b/src/metadata/identify.cpp
+@@ -42,7 +42,8 @@ static const struct
+     {LIBRAW_CAMERAMAKER_Nikon,          "Nikon"},
+     {LIBRAW_CAMERAMAKER_Nokia,          "Nokia"},
+     {LIBRAW_CAMERAMAKER_Olympus,        "Olympus"},
+-    {LIBRAW_CAMERAMAKER_Ricoh,          "Ricoh"},
++    {LIBRAW_CAMERAMAKER_OmDigital,		"OM Digital"},
++    {LIBRAW_CAMERAMAKER_Ricoh,			"Ricoh"},
+     {LIBRAW_CAMERAMAKER_Pentax,         "Pentax"},
+     {LIBRAW_CAMERAMAKER_PhaseOne,       "Phase One"},
+     {LIBRAW_CAMERAMAKER_PhaseOne,       "PhaseOne"},
+@@ -2212,12 +2213,15 @@ void LibRaw::identify_finetune_dcr(char head[64], int fsize, int flen)
+ 			if (width == 4080) // Olympus E-PM1, E-PL3, E-P3;
+ 				width -= 24;
+ 
+-			if (width == 10400) // Olympus PEN-F, E-M1-II, E-M1-III, E-M1X
++			if (width == 10400) // Olympus PEN-F, E-M1-II, E-M1-III, E-M1X, OM-1
+ 				width -= 12;
+ 
+ 			if (width == 8200) // E-M1-III in 50Mp mode, E-M1X
+ 				width -= 30;
+ 
++			if (width == 8180) // OM-1 in 50Mp
++              width -= 10;
++
+ 			if (width == 9280) { // Olympus E-M5 Mark II;
+ 				width -= 6;
+ 				height -= 6;
+diff --git a/src/metadata/makernotes.cpp b/src/metadata/makernotes.cpp
+index f4bb2cc77..feb36bd6b 100644
+--- a/src/metadata/makernotes.cpp
++++ b/src/metadata/makernotes.cpp
+@@ -116,7 +116,7 @@ void LibRaw::parse_makernote_0xc634(int base, int uptag, unsigned dng_writer)
+   uchar *table_buf_0x940e;
+   ushort table_buf_0x940e_len = 0;
+ 
+-  if (!strcmp(buf, "OLYMPUS") || !strcmp(buf, "PENTAX ") ||
++  if (!strcmp(buf, "OLYMPUS") || !strcmp(buf, "PENTAX ") || !strncmp(buf,"OM SYS",6)||
+       (!strncmp(make, "SAMSUNG", 7) && (dng_writer == CameraDNG)))
+   {
+     base = ftell(ifp) - 10;
+@@ -176,7 +176,7 @@ void LibRaw::parse_makernote_0xc634(int base, int uptag, unsigned dng_writer)
+     is_Sony = 1;
+ 
+   if (!is_Olympus &&
+-      (!strncmp(make, "OLYMPUS", 7) ||
++      (!strncmp(make, "OLYMPUS", 7) || !strncmp(make, "OM Digi", 7) ||
+       (!strncasecmp(make, "CLAUSS", 6) && !strncasecmp(model, "piX 5oo", 7)))) {
+     is_Olympus = 1;
+     OlympusDNG_SubDirOffsetValid =
+@@ -433,11 +433,13 @@ void LibRaw::parse_makernote(int base, int uptag)
+     goto quit;
+   }
+ 
+-  if (!strcmp(buf, "OLYMPUS") ||
++  if (!strcmp(buf, "OLYMPUS") || !strncmp(buf, "OM SYS",6) ||
+       !strcmp(buf, "PENTAX "))
+   {
+     base = ftell(ifp) - 10;
+     fseek(ifp, -2, SEEK_CUR);
++	if (buf[1] == 'M')
++		get4();
+     order = get2();
+     if (buf[0] == 'O')
+       get2();
+@@ -484,7 +486,7 @@ void LibRaw::parse_makernote(int base, int uptag)
+   }
+ 
+   if (!is_Olympus &&
+-      (!strncasecmp(make, "Olympus", 7) ||
++      (!strncasecmp(make, "Olympus", 7) || !strncmp(make, "OM Digi", 7) ||
+       (!strncasecmp(make, "CLAUSS", 6) && !strncasecmp(model, "piX 5oo", 7)))) {
+     is_Olympus = 1;
+   }
+diff --git a/src/metadata/normalize_model.cpp b/src/metadata/normalize_model.cpp
+index e3de0dbb4..10fad9873 100644
+--- a/src/metadata/normalize_model.cpp
++++ b/src/metadata/normalize_model.cpp
+@@ -600,10 +600,13 @@ void LibRaw::GetNormalizedModel()
+   {
+ 	  setMakeFromIndex(LIBRAW_CAMERAMAKER_Sony);
+   }
++  else if (makeIs(LIBRAW_CAMERAMAKER_OmDigital))
++  {
++	  setMakeFromIndex(LIBRAW_CAMERAMAKER_Olympus);
++  }
+   else if (makeIs(LIBRAW_CAMERAMAKER_Clauss) && (OlyID == OlyID_E_M10_Mark_II))
+   {
+ 	  setMakeFromIndex(LIBRAW_CAMERAMAKER_Olympus);
+-
+   } else if (makeIs(LIBRAW_CAMERAMAKER_Canon) &&
+              (!strncmp(model, "EOS D2000", 9) || // don't use unique_id here
+               !strncmp(model, "EOS D6000", 9) || // because ids for Monochrome models are unknown
+@@ -1420,7 +1423,7 @@ void LibRaw::SetStandardIlluminants (unsigned makerIdx, const char* normModel) {
+   int c;
+   if (!icWBC[LIBRAW_WBI_Ill_A][0] &&
+       !icWBC[LIBRAW_WBI_D65][0]) {
+-    if (makerIdx == LIBRAW_CAMERAMAKER_Olympus) {
++    if (makerIdx == LIBRAW_CAMERAMAKER_Olympus ) {
+       while (++i, icWBCCTC[i][0]) {
+         if (icWBCCTC[i][0] == 3000)
+           FORC4 icWBC[LIBRAW_WBI_Ill_A][c] = icWBCCTC[i][c+1];
+diff --git a/src/metadata/tiff.cpp b/src/metadata/tiff.cpp
+index 29523f53b..9e5357b2f 100644
+--- a/src/metadata/tiff.cpp
++++ b/src/metadata/tiff.cpp
+@@ -1881,7 +1881,7 @@ void LibRaw::apply_tiff()
+         filters = 0;
+         break;
+       }
+-      if ((!strncmp(make, "OLYMPUS", 7) ||
++      if ((!strncmp(make, "OLYMPUS", 7) || !strncmp(make, "OM Digi", 7) ||
+            (!strncasecmp(make, "CLAUSS", 6) &&
+             !strncasecmp(model, "piX 5oo", 7))) && // 0x5330303539 works here
+           (INT64(tiff_ifd[raw].bytes) * 2ULL ==
+@@ -1913,7 +1913,7 @@ void LibRaw::apply_tiff()
+         load_flags = 0;
+       case 16:
+         load_raw = &LibRaw::unpacked_load_raw;
+-        if ((!strncmp(make, "OLYMPUS", 7) ||
++        if ((!strncmp(make, "OLYMPUS", 7) || !strncmp(make, "OM Digi", 7) ||
+              (!strncasecmp(make, "CLAUSS", 6) &&
+               !strncasecmp(model, "piX 5oo", 7))) && // 0x5330303539 works here
+             (INT64(tiff_ifd[raw].bytes) * 7ULL >
+diff --git a/src/tables/cameralist.cpp b/src/tables/cameralist.cpp
+index cc25b5276..c2522833a 100644
+--- a/src/tables/cameralist.cpp
++++ b/src/tables/cameralist.cpp
+@@ -834,6 +834,7 @@ static const char *static_camera_list[] = {
+ 	"Olympus XZ-1",
+ 	"Olympus XZ-2",
+ 	"Olympus XZ-10",
++	"OM Digital OM-1",
+ 	"OmniVision 4688",
+ 	"OmniVision OV5647",
+ 	"OmniVision OV5648",
+diff --git a/src/tables/colordata.cpp b/src/tables/colordata.cpp
+index 7e7f5e108..060d374d2 100644
+--- a/src/tables/colordata.cpp
++++ b/src/tables/colordata.cpp
+@@ -1144,6 +1144,9 @@ int LibRaw::adobe_coeff(unsigned make_idx, const char *t_model,
+     { LIBRAW_CAMERAMAKER_Olympus, "XZ-2", 0, 0,
+       { 9777,-3483,-925,-2886,11297,1800,-602,1663,5134 } },
+ 
++	  { LIBRAW_CAMERAMAKER_Olympus, "OM-1", 0, 0,
++		{ 9488, -3984, -714, -2887, 10945, 2229, -137, 960, 5786 } },
++
+ 	{ LIBRAW_CAMERAMAKER_OmniVison, "", 16, 0x3ff,
+       { 12782,-4059,-379,-478,9066,1413,1340,1513,5176 } }, /* DJC */
+ 

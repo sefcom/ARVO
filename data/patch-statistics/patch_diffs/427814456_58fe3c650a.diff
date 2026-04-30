@@ -1,0 +1,83 @@
+From 91749844e629b4813d8cc24e4462be678fb03e91 Mon Sep 17 00:00:00 2001
+From: Niels Dossche <7771979+nielsdos@users.noreply.github.com>
+Date: Thu, 26 Jun 2025 23:30:16 +0200
+Subject: [PATCH] Fix OSS-Fuzz #427814456
+
+The first warning may trigger an error handler, destroying the operand
+and its string. So we need to protect the string in that case.
+Care was taken to avoid unnecessary refcounts and to avoid touching the
+hot code path.
+
+Closes GH-18951.
+---
+ NEWS                                               |  1 +
+ Zend/tests/numeric_strings/oss_fuzz_427814456.phpt | 11 +++++++++++
+ Zend/zend_operators.c                              |  7 ++++++-
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+ create mode 100644 Zend/tests/numeric_strings/oss_fuzz_427814456.phpt
+
+diff --git a/NEWS b/NEWS
+index 44c964099bc8e..259270fdfcf82 100644
+--- a/NEWS
++++ b/NEWS
+@@ -8,6 +8,7 @@ PHP                                                                        NEWS
+ - Core:
+   . Fixed bug GH-18833 (Use after free with weakmaps dependent on destruction
+     order). (Daniil Gentili)
++  . Fix OSS-Fuzz #427814456. (nielsdos)
+ 
+ - Curl:
+   . Fix memory leaks when returning refcounted value from curl callback.
+diff --git a/Zend/tests/numeric_strings/oss_fuzz_427814456.phpt b/Zend/tests/numeric_strings/oss_fuzz_427814456.phpt
+new file mode 100644
+index 0000000000000..f91563385e9f5
+--- /dev/null
++++ b/Zend/tests/numeric_strings/oss_fuzz_427814456.phpt
+@@ -0,0 +1,11 @@
++--TEST--
++OSS-Fuzz #427814456
++--FILE--
++<?php
++set_error_handler(function(){unset($GLOBALS['x']);});
++$x = str_repeat("3e33", random_int(2, 2));
++$x & true;
++echo "Done\n";
++?>
++--EXPECT--
++Done
+diff --git a/Zend/zend_operators.c b/Zend/zend_operators.c
+index 890c19c0ab223..38c87dfe98dbd 100644
+--- a/Zend/zend_operators.c
++++ b/Zend/zend_operators.c
+@@ -401,6 +401,7 @@ static zend_never_inline zend_long ZEND_FASTCALL zendi_try_get_long(const zval *
+ 				zend_long lval;
+ 				double dval;
+ 				bool trailing_data = false;
++				zend_string *op_str = NULL; /* protect against error handlers */
+ 
+ 				/* For BC reasons we allow errors so that we can warn on leading numeric string */
+ 				type = is_numeric_string_ex(Z_STRVAL_P(op), Z_STRLEN_P(op), &lval, &dval,
+@@ -410,6 +411,9 @@ static zend_never_inline zend_long ZEND_FASTCALL zendi_try_get_long(const zval *
+ 					return 0;
+ 				}
+ 				if (UNEXPECTED(trailing_data)) {
++					if (type != IS_LONG) {
++						op_str = zend_string_copy(Z_STR_P(op));
++					}
+ 					zend_error(E_WARNING, "A non-numeric value encountered");
+ 					if (UNEXPECTED(EG(exception))) {
+ 						*failed = 1;
+@@ -425,11 +429,12 @@ static zend_never_inline zend_long ZEND_FASTCALL zendi_try_get_long(const zval *
+ 					 */
+ 					lval = zend_dval_to_lval_cap(dval);
+ 					if (!zend_is_long_compatible(dval, lval)) {
+-						zend_incompatible_string_to_long_error(Z_STR_P(op));
++						zend_incompatible_string_to_long_error(op_str ? op_str : Z_STR_P(op));
+ 						if (UNEXPECTED(EG(exception))) {
+ 							*failed = 1;
+ 						}
+ 					}
++					zend_tmp_string_release(op_str);
+ 					return lval;
+ 				}
+ 			}

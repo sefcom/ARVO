@@ -1,0 +1,48 @@
+From 87638737b8f54ebd771faf3478562dae7dd0cc41 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Sat, 11 Nov 2017 16:25:01 +0000
+Subject: [PATCH] GTiff: fix potential crash with old-jpeg compression and
+ internal libtiff. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=4180. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@40690 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/frmts/gtiff/geotiff.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/gdal/frmts/gtiff/geotiff.cpp b/gdal/frmts/gtiff/geotiff.cpp
+index 87672aa9a54d..b47183e4a5da 100644
+--- a/gdal/frmts/gtiff/geotiff.cpp
++++ b/gdal/frmts/gtiff/geotiff.cpp
+@@ -5812,6 +5812,30 @@ CPLErr GTiffRGBABand::IReadBlock( int nBlockXOff, int nBlockYOff,
+     const int nBlockBufSize = 4 * nBlockXSize * nBlockYSize;
+     const int nBlockId = nBlockXOff + nBlockYOff * nBlocksPerRow;
+ 
++#ifdef INTERNAL_LIBTIFF
++    if( poGDS->nCompression == COMPRESSION_OJPEG )
++    {
++        // Need to fetch all offsets for Old-JPEG compression
++        if( poGDS->pabyBlockBuf == NULL )
++        {
++            toff_t *panByteCounts = NULL;
++            toff_t *panOffsets = NULL;
++            const bool bIsTiled = CPL_TO_BOOL( TIFFIsTiled(poGDS->hTIFF) );
++
++            if( bIsTiled )
++            {
++                TIFFGetField( poGDS->hTIFF, TIFFTAG_TILEBYTECOUNTS, &panByteCounts );
++                TIFFGetField( poGDS->hTIFF, TIFFTAG_TILEOFFSETS, &panOffsets );
++            }
++            else
++            {
++                TIFFGetField( poGDS->hTIFF, TIFFTAG_STRIPBYTECOUNTS, &panByteCounts );
++                TIFFGetField( poGDS->hTIFF, TIFFTAG_STRIPOFFSETS, &panOffsets );
++            }
++        }
++    }
++#endif
++
+     if( poGDS->nPlanarConfig == PLANARCONFIG_SEPARATE )
+     {
+         for( int iBand = 0; iBand < poGDS->nSamplesPerPixel; iBand ++ )

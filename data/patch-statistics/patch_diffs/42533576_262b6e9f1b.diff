@@ -1,0 +1,93 @@
+From b3e26c3036a54e9821ea7119c26cdabe484fe36d Mon Sep 17 00:00:00 2001
+From: Ilija Tovilo <ilija.tovilo@me.com>
+Date: Fri, 19 Apr 2024 15:19:02 +0200
+Subject: [PATCH] Fix missing handling of CALLABLE_CONVERT in
+ cleanup_unfinished_calls()
+
+Fixes GH-14003
+---
+ NEWS                    |  2 ++
+ Zend/tests/gh14003.phpt | 24 ++++++++++++++++++++++++
+ Zend/zend_execute.c     |  4 ++++
+ 3 files changed, 30 insertions(+)
+ create mode 100644 Zend/tests/gh14003.phpt
+
+diff --git a/NEWS b/NEWS
+index e5f8e3eba5ff3..0cc2d50baf281 100644
+--- a/NEWS
++++ b/NEWS
+@@ -9,6 +9,8 @@ PHP                                                                        NEWS
+     Zend/zend_opcode.c). (nielsdos)
+   . Fixed bug GH-13942 (Align the behavior of zend-max-execution-timers with
+     other timeout implementations). (Kévin Dunglas)
++  . Fixed bug GH-14003 (Broken cleanup of unfinished calls with callable convert
++    parameters). (ilutov)
+ 
+ - Fibers:
+   . Fixed bug GH-13903 (ASAN false positive underflow when executing copy()).
+diff --git a/Zend/tests/gh14003.phpt b/Zend/tests/gh14003.phpt
+new file mode 100644
+index 0000000000000..92a6c5919ab5b
+--- /dev/null
++++ b/Zend/tests/gh14003.phpt
+@@ -0,0 +1,24 @@
++--TEST--
++GH-14003: Missing handling of CALLABLE_CONVERT in cleanup_unfinished_calls()
++--FILE--
++<?php
++
++function foo(string $key): string {
++    throw new \Exception('Test');
++}
++
++array_filter(
++    array_combine(
++        ['a'],
++        array_map(foo(...), ['a']),
++    ),
++);
++
++?>
++--EXPECTF--
++Fatal error: Uncaught Exception: Test in %s:%d
++Stack trace:
++#0 [internal function]: foo('a')
++#1 %s(%d): array_map(Object(Closure), Array)
++#2 {main}
++  thrown in %s on line %d
+diff --git a/Zend/zend_execute.c b/Zend/zend_execute.c
+index 0df529203c1b9..5a060540db015 100644
+--- a/Zend/zend_execute.c
++++ b/Zend/zend_execute.c
+@@ -4104,6 +4104,7 @@ ZEND_API void zend_unfinished_calls_gc(zend_execute_data *execute_data, zend_exe
+ 				case ZEND_DO_ICALL:
+ 				case ZEND_DO_UCALL:
+ 				case ZEND_DO_FCALL_BY_NAME:
++				case ZEND_CALLABLE_CONVERT:
+ 					level++;
+ 					break;
+ 				case ZEND_INIT_FCALL:
+@@ -4159,6 +4160,7 @@ ZEND_API void zend_unfinished_calls_gc(zend_execute_data *execute_data, zend_exe
+ 					case ZEND_DO_ICALL:
+ 					case ZEND_DO_UCALL:
+ 					case ZEND_DO_FCALL_BY_NAME:
++					case ZEND_CALLABLE_CONVERT:
+ 						level++;
+ 						break;
+ 					case ZEND_INIT_FCALL:
+@@ -4237,6 +4239,7 @@ static void cleanup_unfinished_calls(zend_execute_data *execute_data, uint32_t o
+ 					case ZEND_DO_ICALL:
+ 					case ZEND_DO_UCALL:
+ 					case ZEND_DO_FCALL_BY_NAME:
++					case ZEND_CALLABLE_CONVERT:
+ 						level++;
+ 						break;
+ 					case ZEND_INIT_FCALL:
+@@ -4292,6 +4295,7 @@ static void cleanup_unfinished_calls(zend_execute_data *execute_data, uint32_t o
+ 						case ZEND_DO_ICALL:
+ 						case ZEND_DO_UCALL:
+ 						case ZEND_DO_FCALL_BY_NAME:
++						case ZEND_CALLABLE_CONVERT:
+ 							level++;
+ 							break;
+ 						case ZEND_INIT_FCALL:

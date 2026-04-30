@@ -1,0 +1,50 @@
+From 05b6773fbcce1075edbe498a821f9a41249cf384 Mon Sep 17 00:00:00 2001
+From: Nick Terrell <terrelln@fb.com>
+Date: Mon, 14 Jun 2021 11:25:55 -0700
+Subject: [PATCH] [fix] Add missing bounds checks during compression
+
+* The block splitter missed a bounds check, so when the buffer is too small it
+  passes an erroneously large size to `ZSTD_entropyCompressSeqStore()`, which
+  can then write the compressed data past the end of the buffer. This is a new
+  regression in v1.5.0 when the block splitter is enabled. It is either enabled
+  explicitly, or implicitly when using the optimal parser and `ZSTD_compress2()`
+  or `ZSTD_compressStream*()`.
+* `HUF_writeCTable_wksp()` omits a bounds check when calling
+  `HUF_compressWeights()`. If it is called with `dstCapacity == 0` it will pass
+  an erroneously large size to `HUF_compressWeights()`, which can then write
+  past the end of the buffer. This bug has been present for ages. However, I
+  believe that zstd cannot trigger the bug, because it never calls
+  `HUF_compress*()` with `dstCapacity == 0` because of [this check][1].
+
+Credit to: Oss-Fuzz
+
+[1]: https://github.com/facebook/zstd/blob/89127e5ee2f3c1e141668fa6d4ee91245f05d132/lib/compress/zstd_compress_literals.c#L100
+---
+ lib/compress/huf_compress.c  | 1 +
+ lib/compress/zstd_compress.c | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/lib/compress/huf_compress.c b/lib/compress/huf_compress.c
+index 485906e678a..e9cb0bd5f55 100644
+--- a/lib/compress/huf_compress.c
++++ b/lib/compress/huf_compress.c
+@@ -133,6 +133,7 @@ size_t HUF_writeCTable_wksp(void* dst, size_t maxDstSize,
+         wksp->huffWeight[n] = wksp->bitsToWeight[CTable[n].nbBits];
+ 
+     /* attempt weights compression by FSE */
++    if (maxDstSize < 1) return ERROR(dstSize_tooSmall);
+     {   CHECK_V_F(hSize, HUF_compressWeights(op+1, maxDstSize-1, wksp->huffWeight, maxSymbolValue, &wksp->wksp, sizeof(wksp->wksp)) );
+         if ((hSize>1) & (hSize < maxSymbolValue/2)) {   /* FSE compressed */
+             op[0] = (BYTE)hSize;
+diff --git a/lib/compress/zstd_compress.c b/lib/compress/zstd_compress.c
+index 70f1693574b..9e814e31d1d 100644
+--- a/lib/compress/zstd_compress.c
++++ b/lib/compress/zstd_compress.c
+@@ -3486,6 +3486,7 @@ static size_t ZSTD_compressSeqStore_singleBlock(ZSTD_CCtx* zc, seqStore_t* const
+     if (isPartition)
+         ZSTD_seqStore_resolveOffCodes(dRep, cRep, seqStore, (U32)(seqStore->sequences - seqStore->sequencesStart));
+ 
++    RETURN_ERROR_IF(dstCapacity < ZSTD_blockHeaderSize, dstSize_tooSmall, "Block header doesn't fit");
+     cSeqsSize = ZSTD_entropyCompressSeqStore(seqStore,
+                 &zc->blockState.prevCBlock->entropy, &zc->blockState.nextCBlock->entropy,
+                 &zc->appliedParams,

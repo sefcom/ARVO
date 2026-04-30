@@ -1,0 +1,72 @@
+From 2bfa13e520e53210b96ead88f49a9ca20c5a5d18 Mon Sep 17 00:00:00 2001
+From: Roberto Ierusalimschy <roberto@inf.puc-rio.br>
+Date: Fri, 5 Feb 2021 11:00:28 -0300
+Subject: [PATCH] Fixed some bugs around stack reallocation
+
+Long time without using HARDSTACKTESTS...
+---
+ lapi.c  | 1 +
+ ldo.c   | 2 +-
+ lfunc.c | 2 ++
+ lvm.c   | 2 ++
+ 4 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/lapi.c b/lapi.c
+index 163533a2fc..27bf23da72 100644
+--- a/lapi.c
++++ b/lapi.c
+@@ -207,6 +207,7 @@ LUA_API void lua_closeslot (lua_State *L, int idx) {
+                uplevel(L->openupval) == level,
+      "no variable to close at given level");
+   luaF_close(L, level, CLOSEKTOP, 0);
++  level = index2stack(L, idx);  /* stack may be moved */
+   setnilvalue(s2v(level));
+   lua_unlock(L);
+ }
+diff --git a/ldo.c b/ldo.c
+index e8cccccb0d..65f0a7b9e7 100644
+--- a/ldo.c
++++ b/ldo.c
+@@ -412,12 +412,12 @@ static void moveresults (lua_State *L, StkId res, int nres, int wanted) {
+       if (hastocloseCfunc(wanted)) {  /* to-be-closed variables? */
+         ptrdiff_t savedres = savestack(L, res);
+         luaF_close(L, res, CLOSEKTOP, 0);  /* may change the stack */
+-        res = restorestack(L, savedres);
+         wanted = codeNresults(wanted);  /* correct value */
+         if (wanted == LUA_MULTRET)
+           wanted = nres;
+         if (L->hookmask)  /* if needed, call hook after '__close's */
+           rethook(L, L->ci, nres);
++        res = restorestack(L, savedres);  /* close and hook can move stack */
+       }
+       break;
+   }
+diff --git a/lfunc.c b/lfunc.c
+index 81ac9f0aa8..105590fc45 100644
+--- a/lfunc.c
++++ b/lfunc.c
+@@ -190,9 +190,11 @@ void luaF_close (lua_State *L, StkId level, int status, int yy) {
+   UpVal *uv;
+   StkId upl;  /* stack index pointed by 'uv' */
+   if (unlikely(status == LUA_ERRMEM && L->ptbc != NULL)) {
++    ptrdiff_t levelrel = savestack(L, level);
+     upl = L->ptbc;
+     L->ptbc = NULL;  /* remove from "list" before closing */
+     prepcallclosemth(L, upl, status, yy);
++    level = restorestack(L, levelrel);
+   }
+   else
+     lua_assert(L->ptbc == NULL);  /* must be empty for other status */
+diff --git a/lvm.c b/lvm.c
+index d6c05bbd6b..e9b1dcddb4 100644
+--- a/lvm.c
++++ b/lvm.c
+@@ -1150,6 +1150,8 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
+     Instruction i;  /* instruction being executed */
+     StkId ra;  /* instruction's A register */
+     vmfetch();
++// low-level line tracing for debugging Lua
++// printf("line: %d\n", luaG_getfuncline(cl->p, pcRel(pc, cl->p)));
+     lua_assert(base == ci->func + 1);
+     lua_assert(base <= L->top && L->top < L->stack_last);
+     /* invalidate top for instructions not expecting it */

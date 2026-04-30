@@ -1,0 +1,50 @@
+From 110d8d6dcafaed517e8f77a6253169535ee3a20e Mon Sep 17 00:00:00 2001
+From: DRC <information@libjpeg-turbo.org>
+Date: Mon, 7 Dec 2020 11:12:49 -0600
+Subject: [PATCH] decompress_smooth_data(): Fix another uninit. read
+
+Regression introduced by 42825b68d570fb07fe820ac62ad91017e61e9a25
+
+The test case
+https://user-images.githubusercontent.com/3491627/101376530-fde56180-38b0-11eb-938d-734119a5b5ba.jpg
+is a malformed progressive JPEG image containing an interleaved Y/Cb/Cr
+DC scan followed by two non-interleaved Y DC scans.  Thus, the
+prev_coef_bits[] array was initialized for the Y component but not the
+other components, the uninitialized values for Cb and Cr were
+transferred to the prev_coef_bits_latch[] array in smoothing_ok(), and
+because cinfo->master->last_good_iMCU_row was 0,
+decompress_smooth_data() read those uninitialized values when attempting
+to smooth the second iMCU row.
+
+Possibly fixes #478
+---
+ jdarith.c | 2 ++
+ jdphuff.c | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/jdarith.c b/jdarith.c
+index 3c7ac576c..7f0d3a785 100644
+--- a/jdarith.c
++++ b/jdarith.c
+@@ -672,6 +672,8 @@ start_pass(j_decompress_ptr cinfo)
+       for (coefi = MIN(cinfo->Ss, 1); coefi <= MAX(cinfo->Se, 9); coefi++) {
+         if (cinfo->input_scan_number > 1)
+           prev_coef_bit_ptr[coefi] = coef_bit_ptr[coefi];
++        else
++          prev_coef_bit_ptr[coefi] = 0;
+       }
+       for (coefi = cinfo->Ss; coefi <= cinfo->Se; coefi++) {
+         int expected = (coef_bit_ptr[coefi] < 0) ? 0 : coef_bit_ptr[coefi];
+diff --git a/jdphuff.c b/jdphuff.c
+index cac45823c..0e981f2f5 100644
+--- a/jdphuff.c
++++ b/jdphuff.c
+@@ -130,6 +130,8 @@ start_pass_phuff_decoder(j_decompress_ptr cinfo)
+     for (coefi = MIN(cinfo->Ss, 1); coefi <= MAX(cinfo->Se, 9); coefi++) {
+       if (cinfo->input_scan_number > 1)
+         prev_coef_bit_ptr[coefi] = coef_bit_ptr[coefi];
++      else
++        prev_coef_bit_ptr[coefi] = 0;
+     }
+     for (coefi = cinfo->Ss; coefi <= cinfo->Se; coefi++) {
+       int expected = (coef_bit_ptr[coefi] < 0) ? 0 : coef_bit_ptr[coefi];

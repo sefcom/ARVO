@@ -1,0 +1,246 @@
+From 28727baf58aa7c8983769aff1ceecb3121a26ee6 Mon Sep 17 00:00:00 2001
+From: Mallikarjun Kamble <mallikarjun.kamble@ittiam.com>
+Date: Tue, 9 Jan 2024 18:36:07 +0530
+Subject: [PATCH] svcdec: oss-fuzz bug fixes
+
+ID#
+65031
+65035
+65057
+65059
+65060
+65132
+65172
+65482
+---
+ decoder/svc/isvcd_api.c           | 30 ++++++----
+ decoder/svc/isvcd_parse_headers.c | 92 ++++++-------------------------
+ decoder/svc/isvcd_structs.h       |  4 ++
+ 3 files changed, 42 insertions(+), 84 deletions(-)
+
+diff --git a/decoder/svc/isvcd_api.c b/decoder/svc/isvcd_api.c
+index 38d876d6..c7897856 100644
+--- a/decoder/svc/isvcd_api.c
++++ b/decoder/svc/isvcd_api.c
+@@ -4435,6 +4435,15 @@ WORD32 isvcd_dec_non_vcl(void *pv_out_non_vcl, void *pv_seq_params, void *pv_pic
+                 {
+                     ps_dec->i4_header_decoded |= 0x1;
+                     ps_svcd_ctxt->u4_num_sps_ctr++;
++
++                    if(ps_svcd_ctxt->pic_width < ps_svc_lyr_dec->pic_width)
++                    {
++                        ps_svcd_ctxt->pic_width = ps_svc_lyr_dec->pic_width;
++                    }
++                    if(ps_svcd_ctxt->pic_height < ps_svc_lyr_dec->pic_height)
++                    {
++                        ps_svcd_ctxt->pic_height = ps_svc_lyr_dec->pic_height;
++                    }
+                 }
+ 
+                 if(i_status) return i_status;
+@@ -4448,6 +4457,15 @@ WORD32 isvcd_dec_non_vcl(void *pv_out_non_vcl, void *pv_seq_params, void *pv_pic
+                 {
+                     ps_svcd_ctxt->u4_num_sps_ctr++;
+                     ps_dec->i4_header_decoded |= 0x1;
++
++                    if(ps_svcd_ctxt->pic_width < ps_svc_lyr_dec->pic_width)
++                    {
++                        ps_svcd_ctxt->pic_width = ps_svc_lyr_dec->pic_width;
++                    }
++                    if(ps_svcd_ctxt->pic_height < ps_svc_lyr_dec->pic_height)
++                    {
++                        ps_svcd_ctxt->pic_height = ps_svc_lyr_dec->pic_height;
++                    }
+                 }
+                 if(i_status) return i_status;
+ 
+@@ -6086,16 +6104,8 @@ WORD32 isvcd_get_buf_info(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
+ 
+     if(ps_dec->i4_header_decoded == 3)
+     {
+-        if(0 == ps_dec->u4_share_disp_buf)
+-        {
+-            pic_wd = ps_dec->u2_disp_width;
+-            pic_ht = ps_dec->u2_disp_height;
+-        }
+-        else
+-        {
+-            pic_wd = ps_dec->u2_frm_wd_y;
+-            pic_ht = ps_dec->u2_frm_ht_y;
+-        }
++        pic_wd = ps_svcd_ctxt->pic_width;
++        pic_ht = ps_svcd_ctxt->pic_height;
+     }
+ 
+     for(i = 0; i < ps_ctl_op->u4_min_num_in_bufs; i++)
+diff --git a/decoder/svc/isvcd_parse_headers.c b/decoder/svc/isvcd_parse_headers.c
+index abf4a1ba..d1370406 100644
+--- a/decoder/svc/isvcd_parse_headers.c
++++ b/decoder/svc/isvcd_parse_headers.c
+@@ -193,14 +193,6 @@ WORD32 isvcd_parse_subset_sps(svc_dec_lyr_struct_t *ps_svc_lyr_dec, dec_bit_stre
+     ps_seq = ps_dec->pv_scratch_sps_pps;
+     memset(ps_seq, 0, sizeof(dec_seq_params_t));
+ 
+-    if(ps_dec->i4_header_decoded & 1)
+-    {
+-        if(NULL != ps_dec->ps_cur_sps)
+-            *ps_seq = *ps_dec->ps_cur_sps;
+-        else
+-            return ERROR_INV_SPS_PPS_T;
+-    }
+-
+     ps_seq->u1_profile_idc = u1_profile_idc;
+     ps_seq->u1_level_idc = u1_level_idc;
+     ps_seq->u1_seq_parameter_set_id = u1_seq_parameter_set_id;
+@@ -414,6 +406,15 @@ WORD32 isvcd_parse_subset_sps(svc_dec_lyr_struct_t *ps_svc_lyr_dec, dec_bit_stre
+ 
+     u2_pic_wd = (u4_pic_width_in_mbs << 4);
+     u2_pic_ht = (u4_pic_height_in_map_units << 4);
++    if(ps_svc_lyr_dec->pic_width < u2_pic_wd)
++    {
++        ps_svc_lyr_dec->pic_width = u2_pic_wd;
++    }
++    if(ps_svc_lyr_dec->pic_height < u2_pic_ht)
++    {
++        ps_svc_lyr_dec->pic_height = u2_pic_ht;
++    }
++
+     /*--------------------------------------------------------------------*/
+     /* Get the value of MaxMbAddress and Number of bits needed for it     */
+     /*--------------------------------------------------------------------*/
+@@ -850,35 +851,6 @@ WORD32 isvcd_parse_subset_sps(svc_dec_lyr_struct_t *ps_svc_lyr_dec, dec_bit_stre
+     ps_subset_seq->u2_crop_offset_y = u2_crop_offset_y;
+     ps_subset_seq->u2_crop_offset_uv = u2_crop_offset_uv;
+ 
+-    if(((ps_dec->u2_pic_wd * ps_dec->u2_pic_ht) <
+-        (ps_subset_seq->u2_pic_wd * ps_subset_seq->u2_pic_ht)) ||
+-       (ps_dec->i4_reorder_depth < ps_subset_seq->i4_reorder_depth))
+-    {
+-        ps_dec->i4_reorder_depth = ps_subset_seq->i4_reorder_depth;
+-
+-        ps_dec->u2_disp_height = ps_subset_seq->u2_disp_height;
+-        ps_dec->u2_disp_width = ps_subset_seq->u2_disp_width;
+-
+-        ps_dec->u2_pic_wd = ps_subset_seq->u2_pic_wd;
+-        ps_dec->u2_pic_ht = ps_subset_seq->u2_pic_ht;
+-        ps_dec->u4_total_mbs = ps_seq->u2_total_num_of_mbs << (1 - ps_seq->u1_frame_mbs_only_flag);
+-
+-        /* Determining the Width and Height of Frame from that of Picture */
+-        ps_dec->u2_frm_wd_y = ps_subset_seq->u2_frm_wd_y;
+-        ps_dec->u2_frm_ht_y = ps_subset_seq->u2_frm_ht_y;
+-        ps_dec->u2_frm_wd_uv = ps_subset_seq->u2_frm_wd_uv;
+-        ps_dec->u2_frm_ht_uv = ps_subset_seq->u2_frm_ht_uv;
+-
+-        ps_dec->s_pad_mgr.u1_pad_len_y_v = ps_subset_seq->u1_pad_len_y_v;
+-        ps_dec->s_pad_mgr.u1_pad_len_cr_v = ps_subset_seq->u1_pad_len_cr_v;
+-
+-        ps_dec->u2_frm_wd_in_mbs = ps_seq->u2_frm_wd_in_mbs;
+-        ps_dec->u2_frm_ht_in_mbs = ps_seq->u2_frm_ht_in_mbs;
+-
+-        ps_dec->u2_crop_offset_y = ps_subset_seq->u2_crop_offset_y;
+-        ps_dec->u2_crop_offset_uv = ps_subset_seq->u2_crop_offset_uv;
+-    }
+-
+     ps_seq->u1_is_valid = TRUE;
+     ps_dec->ps_sps[u1_seq_parameter_set_id] = *ps_seq;
+     if(NULL != ps_svc_lyr_dec->ps_subset_sps[u1_seq_parameter_set_id].s_sps_svc_ext.ps_svc_vui_ext)
+@@ -887,7 +859,6 @@ WORD32 isvcd_parse_subset_sps(svc_dec_lyr_struct_t *ps_svc_lyr_dec, dec_bit_stre
+             ps_svc_lyr_dec->ps_subset_sps[u1_seq_parameter_set_id].s_sps_svc_ext.ps_svc_vui_ext;
+     }
+     ps_svc_lyr_dec->ps_subset_sps[u1_seq_parameter_set_id] = *ps_subset_seq;
+-    ps_dec->ps_cur_sps = &ps_dec->ps_sps[u1_seq_parameter_set_id];
+     ps_svc_lyr_dec->ps_cur_subset_sps = &ps_svc_lyr_dec->ps_subset_sps[u1_seq_parameter_set_id];
+ 
+     return OK;
+@@ -1186,14 +1157,6 @@ WORD32 isvcd_parse_sps(svc_dec_lyr_struct_t *ps_svc_lyr_dec, dec_bit_stream_t *p
+     ps_seq = ps_dec->pv_scratch_sps_pps;
+     memset(ps_seq, 0, sizeof(dec_seq_params_t));
+ 
+-    if(ps_dec->i4_header_decoded & 1)
+-    {
+-        if(ps_dec->ps_cur_sps != NULL)
+-            *ps_seq = *ps_dec->ps_cur_sps;
+-        else
+-            return ERROR_INV_SPS_PPS_T;
+-    }
+-
+     if((ps_dec->i4_header_decoded & 1) &&
+        (1 == ps_dec->ps_sps[u1_seq_parameter_set_id].u1_is_valid) &&
+        (ps_dec->ps_sps[u1_seq_parameter_set_id].u1_profile_idc != u1_profile_idc))
+@@ -1404,6 +1367,15 @@ WORD32 isvcd_parse_sps(svc_dec_lyr_struct_t *ps_svc_lyr_dec, dec_bit_stream_t *p
+     ps_seq->u2_frm_ht_in_mbs = u4_pic_height_in_map_units;
+     u2_pic_wd = (u4_pic_width_in_mbs << 4);
+     u2_pic_ht = (u4_pic_height_in_map_units << 4);
++    if(ps_svc_lyr_dec->pic_width < u2_pic_wd)
++    {
++        ps_svc_lyr_dec->pic_width = u2_pic_wd;
++    }
++    if(ps_svc_lyr_dec->pic_height < u2_pic_ht)
++    {
++        ps_svc_lyr_dec->pic_height = u2_pic_ht;
++    }
++
+     /*--------------------------------------------------------------------*/
+     /* Get the value of MaxMbAddress and Number of bits needed for it     */
+     /*--------------------------------------------------------------------*/
+@@ -1639,37 +1611,9 @@ WORD32 isvcd_parse_sps(svc_dec_lyr_struct_t *ps_svc_lyr_dec, dec_bit_stream_t *p
+     ps_subset_seq->u2_crop_offset_y = u2_crop_offset_y;
+     ps_subset_seq->u2_crop_offset_uv = u2_crop_offset_uv;
+ 
+-    if(((ps_dec->u2_pic_wd * ps_dec->u2_pic_ht) <
+-        (ps_subset_seq->u2_pic_wd * ps_subset_seq->u2_pic_ht)) ||
+-       (ps_dec->i4_reorder_depth < ps_subset_seq->i4_reorder_depth))
+-    {
+-        ps_dec->i4_reorder_depth = ps_subset_seq->i4_reorder_depth;
+-
+-        ps_dec->u2_disp_height = ps_subset_seq->u2_disp_height;
+-        ps_dec->u2_disp_width = ps_subset_seq->u2_disp_width;
+-        ps_dec->u2_pic_wd = ps_subset_seq->u2_pic_wd;
+-        ps_dec->u2_pic_ht = ps_subset_seq->u2_pic_ht;
+-        ps_dec->u4_total_mbs = ps_seq->u2_total_num_of_mbs << (1 - ps_seq->u1_frame_mbs_only_flag);
+-
+-        /* Determining the Width and Height of Frame from that of Picture */
+-        ps_dec->u2_frm_wd_y = ps_subset_seq->u2_frm_wd_y;
+-        ps_dec->u2_frm_ht_y = ps_subset_seq->u2_frm_ht_y;
+-        ps_dec->u2_frm_wd_uv = ps_subset_seq->u2_frm_wd_uv;
+-        ps_dec->u2_frm_ht_uv = ps_subset_seq->u2_frm_ht_uv;
+-
+-        ps_dec->s_pad_mgr.u1_pad_len_y_v = ps_subset_seq->u1_pad_len_y_v;
+-        ps_dec->s_pad_mgr.u1_pad_len_cr_v = ps_subset_seq->u1_pad_len_cr_v;
+-
+-        ps_dec->u2_frm_wd_in_mbs = ps_seq->u2_frm_wd_in_mbs;
+-        ps_dec->u2_frm_ht_in_mbs = ps_seq->u2_frm_ht_in_mbs;
+-        ps_dec->u2_crop_offset_y = ps_subset_seq->u2_crop_offset_y;
+-        ps_dec->u2_crop_offset_uv = ps_subset_seq->u2_crop_offset_uv;
+-    }
+-
+     ps_seq->u1_is_valid = TRUE;
+     ps_dec->ps_sps[u1_seq_parameter_set_id] = *ps_seq;
+     ps_svc_lyr_dec->ps_subset_sps[u1_seq_parameter_set_id] = *ps_subset_seq;
+-    ps_dec->ps_cur_sps = &ps_dec->ps_sps[u1_seq_parameter_set_id];
+     ps_svc_lyr_dec->ps_cur_subset_sps = &ps_svc_lyr_dec->ps_subset_sps[u1_seq_parameter_set_id];
+ 
+     return OK;
+diff --git a/decoder/svc/isvcd_structs.h b/decoder/svc/isvcd_structs.h
+index fefd32d5..85f12954 100644
+--- a/decoder/svc/isvcd_structs.h
++++ b/decoder/svc/isvcd_structs.h
+@@ -661,6 +661,8 @@ typedef struct _SvcDecLyrStruct
+     UWORD32 u4_pps_id_for_layer;
+     UWORD8 u1_error_in_cur_frame;
+     UWORD8 u1_res_init_done;
++    WORD32 pic_width;
++    WORD32 pic_height;
+ } svc_dec_lyr_struct_t;
+ 
+ typedef struct
+@@ -720,6 +722,8 @@ typedef struct
+     UWORD8 u1_parse_nal_unit_error;
+     UWORD8 u1_exit_till_next_IDR;
+     UWORD8 u1_pre_parse_in_flush;
++    WORD32 pic_width;
++    WORD32 pic_height;
+ } svc_dec_ctxt_t;
+ 
+ #endif /*_ISVCD_STRUCTS_H_*/
+\ No newline at end of file

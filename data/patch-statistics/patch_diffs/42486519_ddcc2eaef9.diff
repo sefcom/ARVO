@@ -1,0 +1,85 @@
+From 570184b9b1aac88ea0f82a13655babe3c730c8f6 Mon Sep 17 00:00:00 2001
+From: Antoine Pitrou <antoine@python.org>
+Date: Fri, 14 Aug 2020 06:42:05 +0900
+Subject: [PATCH] ARROW-9727: [C++] Fix crashes on invalid IPC input (OSS-Fuzz)
+
+Should fix the following issues:
+- https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24855
+- https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=24866
+
+Closes #7956 from pitrou/ARROW-9727-ipc-oss-fuzz
+
+Authored-by: Antoine Pitrou <antoine@python.org>
+Signed-off-by: Sutou Kouhei <kou@clear-code.com>
+---
+ cpp/src/arrow/ipc/metadata_internal.cc |  3 +--
+ cpp/src/arrow/type.cc                  | 12 ++++++++++++
+ cpp/src/arrow/type.h                   |  3 +++
+ testing                                |  2 +-
+ 4 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/cpp/src/arrow/ipc/metadata_internal.cc b/cpp/src/arrow/ipc/metadata_internal.cc
+index b2420049394..f47a6a3dd13 100644
+--- a/cpp/src/arrow/ipc/metadata_internal.cc
++++ b/cpp/src/arrow/ipc/metadata_internal.cc
+@@ -275,8 +275,7 @@ Status ConcreteTypeFromFlatbuffer(flatbuf::Type type, const void* type_data,
+       return Status::OK();
+     case flatbuf::Type::FixedSizeBinary: {
+       auto fw_binary = static_cast<const flatbuf::FixedSizeBinary*>(type_data);
+-      *out = fixed_size_binary(fw_binary->byteWidth());
+-      return Status::OK();
++      return FixedSizeBinaryType::Make(fw_binary->byteWidth()).Value(out);
+     }
+     case flatbuf::Type::Utf8:
+       *out = utf8();
+diff --git a/cpp/src/arrow/type.cc b/cpp/src/arrow/type.cc
+index 186daace56d..5482deaccac 100644
+--- a/cpp/src/arrow/type.cc
++++ b/cpp/src/arrow/type.cc
+@@ -20,6 +20,7 @@
+ #include <algorithm>
+ #include <climits>
+ #include <cstddef>
++#include <limits>
+ #include <ostream>
+ #include <sstream>  // IWYU pragma: keep
+ #include <string>
+@@ -465,6 +466,17 @@ std::string LargeStringType::ToString() const { return "large_string"; }
+ 
+ int FixedSizeBinaryType::bit_width() const { return CHAR_BIT * byte_width(); }
+ 
++Result<std::shared_ptr<DataType>> FixedSizeBinaryType::Make(int32_t byte_width) {
++  if (byte_width < 0) {
++    return Status::Invalid("Negative FixedSizeBinaryType byte width");
++  }
++  if (byte_width > std::numeric_limits<int>::max() / CHAR_BIT) {
++    // bit_width() would overflow
++    return Status::Invalid("byte width of FixedSizeBinaryType too large");
++  }
++  return std::make_shared<FixedSizeBinaryType>(byte_width);
++}
++
+ std::string FixedSizeBinaryType::ToString() const {
+   std::stringstream ss;
+   ss << "fixed_size_binary[" << byte_width_ << "]";
+diff --git a/cpp/src/arrow/type.h b/cpp/src/arrow/type.h
+index e2532d2489f..e67cf284760 100644
+--- a/cpp/src/arrow/type.h
++++ b/cpp/src/arrow/type.h
+@@ -811,6 +811,9 @@ class ARROW_EXPORT FixedSizeBinaryType : public FixedWidthType, public Parametri
+   int32_t byte_width() const { return byte_width_; }
+   int bit_width() const override;
+ 
++  // Validating constructor
++  static Result<std::shared_ptr<DataType>> Make(int32_t byte_width);
++
+  protected:
+   std::string ComputeFingerprint() const override;
+ 
+diff --git a/testing b/testing
+index f552c4dcd2a..ef4ece6f1dd 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit f552c4dcd2ae3d14048abd20919748cce5276ade
++Subproject commit ef4ece6f1dddf6abb71ed429724adde330a4b78f

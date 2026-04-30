@@ -1,0 +1,1585 @@
+From 0cb7e7ca0c864e052bf49978f3bcd667c9e16930 Mon Sep 17 00:00:00 2001
+From: Vassil Vassilev <v.g.vassilev@gmail.com>
+Date: Wed, 17 Mar 2021 08:56:05 +0000
+Subject: [PATCH] Make iteration over the DeclContext::lookup_result safe.
+
+The idiom:
+```
+DeclContext::lookup_result R = DeclContext::lookup(Name);
+for (auto *D : R) {...}
+```
+
+is not safe when in the loop body we trigger deserialization from an AST file.
+The deserialization can insert new declarations in the StoredDeclsList whose
+underlying type is a vector. When the vector decides to reallocate its storage
+the pointer we hold becomes invalid.
+
+This patch replaces a SmallVector with an singly-linked list. The current
+approach stores a SmallVector<NamedDecl*, 4> which is around 8 pointers.
+The linked list is 3, 5, or 7. We do better in terms of memory usage for small
+cases (and worse in terms of locality -- the linked list entries won't be near
+each other, but will be near their corresponding declarations, and we were going
+to fetch those memory pages anyway). For larger cases: the vector uses a
+doubling strategy for reallocation, so will generally be between half-full and
+full. Let's say it's 75% full on average, so there's N * 4/3 + 4 pointers' worth
+of space allocated currently and will be 2N pointers with the linked list. So we
+break even when there are N=6 entries and slightly lose in terms of memory usage
+after that. We suspect that's still a win on average.
+
+Thanks to @rsmith!
+
+Differential revision: https://reviews.llvm.org/D91524
+---
+ clang-tools-extra/clangd/unittests/TestTU.cpp |   2 +-
+ clang/include/clang/AST/ASTContext.h          |  21 ++
+ clang/include/clang/AST/CXXInheritance.h      |   5 +-
+ clang/include/clang/AST/Decl.h                |  10 +
+ clang/include/clang/AST/DeclBase.h            | 137 ++++---
+ .../include/clang/AST/DeclContextInternals.h  | 354 ++++++++++--------
+ clang/include/clang/Serialization/ASTWriter.h |   2 +-
+ clang/lib/ARCMigrate/ObjCMT.cpp               |  22 +-
+ clang/lib/AST/ASTContext.cpp                  |   3 +
+ clang/lib/AST/CXXInheritance.cpp              |  13 +-
+ clang/lib/AST/Decl.cpp                        |   3 +-
+ clang/lib/AST/DeclBase.cpp                    |  57 +--
+ clang/lib/AST/ExternalASTMerger.cpp           |  28 +-
+ clang/lib/AST/TypePrinter.cpp                 |   3 +-
+ clang/lib/CodeGen/CodeGenFunction.h           |   1 -
+ .../lib/Sema/MultiplexExternalSemaSource.cpp  |   1 -
+ clang/lib/Sema/SemaDeclCXX.cpp                |  16 +-
+ clang/lib/Sema/SemaLookup.cpp                 |  33 +-
+ clang/lib/Sema/SemaObjCProperty.cpp           |  40 +-
+ clang/lib/Sema/SemaTemplateInstantiate.cpp    |   3 +-
+ clang/lib/Serialization/ASTReader.cpp         |   3 +-
+ clang/lib/Serialization/ASTWriterDecl.cpp     |   1 -
+ .../Checkers/StdLibraryFunctionsChecker.cpp   |   4 +-
+ clang/test/PCH/cxx-explicit-specifier.cpp     |   8 +-
+ clang/tools/libclang/CXType.cpp               |   2 +-
+ clang/unittests/AST/ASTImporterTest.cpp       |  40 +-
+ .../AppleObjCRuntime/AppleObjCDeclVendor.cpp  |   4 +-
+ .../Plugins/SymbolFile/PDB/PDBASTParser.cpp   |   2 +-
+ .../TypeSystem/Clang/TypeSystemClang.cpp      |  22 +-
+ .../TypeSystem/Clang/TypeSystemClang.h        |   2 +-
+ 30 files changed, 458 insertions(+), 384 deletions(-)
+
+diff --git a/clang-tools-extra/clangd/unittests/TestTU.cpp b/clang-tools-extra/clangd/unittests/TestTU.cpp
+index a36f2508cd313..1c6e54774c036 100644
+--- a/clang-tools-extra/clangd/unittests/TestTU.cpp
++++ b/clang-tools-extra/clangd/unittests/TestTU.cpp
+@@ -195,7 +195,7 @@ const NamedDecl &findDecl(ParsedAST &AST, llvm::StringRef QName) {
+                            llvm::StringRef Name) -> const NamedDecl & {
+     auto LookupRes = Scope.lookup(DeclarationName(&Ctx.Idents.get(Name)));
+     assert(!LookupRes.empty() && "Lookup failed");
+-    assert(LookupRes.size() == 1 && "Lookup returned multiple results");
++    assert(LookupRes.isSingleResult() && "Lookup returned multiple results");
+     return *LookupRes.front();
+   };
+ 
+diff --git a/clang/include/clang/AST/ASTContext.h b/clang/include/clang/AST/ASTContext.h
+index af2979d874382..d0ce47b6bbd51 100644
+--- a/clang/include/clang/AST/ASTContext.h
++++ b/clang/include/clang/AST/ASTContext.h
+@@ -604,6 +604,9 @@ class ASTContext : public RefCountedBase<ASTContext> {
+   std::unique_ptr<interp::Context> InterpContext;
+   std::unique_ptr<ParentMapContext> ParentMapCtx;
+ 
++  /// Keeps track of the deallocated DeclListNodes for future reuse.
++  DeclListNode *ListNodeFreeList = nullptr;
++
+ public:
+   IdentifierTable &Idents;
+   SelectorTable &Selectors;
+@@ -655,6 +658,24 @@ class ASTContext : public RefCountedBase<ASTContext> {
+   }
+   void Deallocate(void *Ptr) const {}
+ 
++  /// Allocates a \c DeclListNode or returns one from the \c ListNodeFreeList
++  /// pool.
++  DeclListNode *AllocateDeclListNode(clang::NamedDecl *ND) {
++    if (DeclListNode *Alloc = ListNodeFreeList) {
++      ListNodeFreeList = Alloc->Rest.dyn_cast<DeclListNode*>();
++      Alloc->D = ND;
++      Alloc->Rest = nullptr;
++      return Alloc;
++    }
++    return new (*this) DeclListNode(ND);
++  }
++  /// Deallcates a \c DeclListNode by returning it to the \c ListNodeFreeList
++  /// pool.
++  void DeallocateDeclListNode(DeclListNode *N) {
++    N->Rest = ListNodeFreeList;
++    ListNodeFreeList = N;
++  }
++
+   /// Return the total amount of physical memory allocated for representing
+   /// AST nodes and type information.
+   size_t getASTAllocatedMemory() const {
+diff --git a/clang/include/clang/AST/CXXInheritance.h b/clang/include/clang/AST/CXXInheritance.h
+index 709f08bff82ae..946b9e318baa2 100644
+--- a/clang/include/clang/AST/CXXInheritance.h
++++ b/clang/include/clang/AST/CXXInheritance.h
+@@ -76,9 +76,8 @@ class CXXBasePath : public SmallVector<CXXBasePathElement, 4> {
+ 
+   CXXBasePath() = default;
+ 
+-  /// The set of declarations found inside this base class
+-  /// subobject.
+-  DeclContext::lookup_result Decls;
++  /// The declarations found inside this base class subobject.
++  DeclContext::lookup_iterator Decls;
+ 
+   void clear() {
+     SmallVectorImpl<CXXBasePathElement>::clear();
+diff --git a/clang/include/clang/AST/Decl.h b/clang/include/clang/AST/Decl.h
+index 47c282f0a63dd..66dda5c9761ae 100644
+--- a/clang/include/clang/AST/Decl.h
++++ b/clang/include/clang/AST/Decl.h
+@@ -579,6 +579,16 @@ class NamespaceDecl : public NamedDecl, public DeclContext,
+     AnonOrFirstNamespaceAndInline.setInt(Inline);
+   }
+ 
++  /// Returns true if the inline qualifier for \c Name is redundant.
++  bool isRedundantInlineQualifierFor(DeclarationName Name) const {
++    if (!isInline())
++      return false;
++    auto X = lookup(Name);
++    auto Y = getParent()->lookup(Name);
++    return std::distance(X.begin(), X.end()) ==
++      std::distance(Y.begin(), Y.end());
++  }
++
+   /// Get the original (first) namespace declaration.
+   NamespaceDecl *getOriginalNamespace();
+ 
+diff --git a/clang/include/clang/AST/DeclBase.h b/clang/include/clang/AST/DeclBase.h
+index 15eb29f725397..084ecb5389cee 100644
+--- a/clang/include/clang/AST/DeclBase.h
++++ b/clang/include/clang/AST/DeclBase.h
+@@ -1220,65 +1220,110 @@ class PrettyStackTraceDecl : public llvm::PrettyStackTraceEntry {
+ 
+   void print(raw_ostream &OS) const override;
+ };
++} // namespace clang
+ 
+-/// The results of name lookup within a DeclContext. This is either a
+-/// single result (with no stable storage) or a collection of results (with
+-/// stable storage provided by the lookup table).
+-class DeclContextLookupResult {
+-  using ResultTy = ArrayRef<NamedDecl *>;
+-
+-  ResultTy Result;
+-
+-  // If there is only one lookup result, it would be invalidated by
+-  // reallocations of the name table, so store it separately.
+-  NamedDecl *Single = nullptr;
+-
+-  static NamedDecl *const SingleElementDummyList;
++// Required to determine the layout of the PointerUnion<NamedDecl*> before
++// seeing the NamedDecl definition being first used in DeclListNode::operator*.
++namespace llvm {
++  template <> struct PointerLikeTypeTraits<::clang::NamedDecl *> {
++    static inline void *getAsVoidPointer(::clang::NamedDecl *P) { return P; }
++    static inline ::clang::NamedDecl *getFromVoidPointer(void *P) {
++      return static_cast<::clang::NamedDecl *>(P);
++    }
++    static constexpr int NumLowBitsAvailable = 3;
++  };
++}
+ 
++namespace clang {
++/// A list storing NamedDecls in the lookup tables.
++class DeclListNode {
++  friend class ASTContext; // allocate, deallocate nodes.
++  friend class StoredDeclsList;
+ public:
+-  DeclContextLookupResult() = default;
+-  DeclContextLookupResult(ArrayRef<NamedDecl *> Result)
+-      : Result(Result) {}
+-  DeclContextLookupResult(NamedDecl *Single)
+-      : Result(SingleElementDummyList), Single(Single) {}
+-
+-  class iterator;
+-
+-  using IteratorBase =
+-      llvm::iterator_adaptor_base<iterator, ResultTy::iterator,
+-                                  std::random_access_iterator_tag, NamedDecl *>;
+-
+-  class iterator : public IteratorBase {
+-    value_type SingleElement;
++  using Decls = llvm::PointerUnion<NamedDecl*, DeclListNode*>;
++  class iterator {
++    friend class DeclContextLookupResult;
++    friend class StoredDeclsList;
+ 
++    Decls Ptr;
++    iterator(Decls Node) : Ptr(Node) { }
+   public:
+-    explicit iterator(pointer Pos, value_type Single = nullptr)
+-        : IteratorBase(Pos), SingleElement(Single) {}
++    using difference_type = ptrdiff_t;
++    using value_type = NamedDecl*;
++    using pointer = void;
++    using reference = value_type;
++    using iterator_category = std::forward_iterator_tag;
++
++    iterator() = default;
+ 
+     reference operator*() const {
+-      return SingleElement ? SingleElement : IteratorBase::operator*();
++      assert(Ptr && "dereferencing end() iterator");
++      if (DeclListNode *CurNode = Ptr.dyn_cast<DeclListNode*>())
++        return CurNode->D;
++      return Ptr.get<NamedDecl*>();
+     }
++    void operator->() const { } // Unsupported.
++    bool operator==(const iterator &X) const { return Ptr == X.Ptr; }
++    bool operator!=(const iterator &X) const { return Ptr != X.Ptr; }
++    inline iterator &operator++() { // ++It
++      assert(!Ptr.isNull() && "Advancing empty iterator");
++
++      if (DeclListNode *CurNode = Ptr.dyn_cast<DeclListNode*>())
++        Ptr = CurNode->Rest;
++      else
++        Ptr = nullptr;
++      return *this;
++    }
++    iterator operator++(int) { // It++
++      iterator temp = *this;
++      ++(*this);
++      return temp;
++    }
++    // Enables the pattern for (iterator I =..., E = I.end(); I != E; ++I)
++    iterator end() { return iterator(); }
+   };
++private:
++  NamedDecl *D = nullptr;
++  Decls Rest = nullptr;
++  DeclListNode(NamedDecl *ND) : D(ND) {}
++};
++
++/// The results of name lookup within a DeclContext.
++class DeclContextLookupResult {
++  using Decls = DeclListNode::Decls;
+ 
++  /// When in collection form, this is what the Data pointer points to.
++  Decls Result;
++
++public:
++  DeclContextLookupResult() = default;
++  DeclContextLookupResult(Decls Result) : Result(Result) {}
++
++  using iterator = DeclListNode::iterator;
+   using const_iterator = iterator;
+-  using pointer = iterator::pointer;
+   using reference = iterator::reference;
+ 
+-  iterator begin() const { return iterator(Result.begin(), Single); }
+-  iterator end() const { return iterator(Result.end(), Single); }
+-
+-  bool empty() const { return Result.empty(); }
+-  pointer data() const { return Single ? &Single : Result.data(); }
+-  size_t size() const { return Single ? 1 : Result.size(); }
+-  reference front() const { return Single ? Single : Result.front(); }
+-  reference back() const { return Single ? Single : Result.back(); }
+-  reference operator[](size_t N) const { return Single ? Single : Result[N]; }
+-
+-  // FIXME: Remove this from the interface
+-  DeclContextLookupResult slice(size_t N) const {
+-    DeclContextLookupResult Sliced = Result.slice(N);
+-    Sliced.Single = Single;
+-    return Sliced;
++  iterator begin() { return iterator(Result); }
++  iterator end() { return iterator(); }
++  const_iterator begin() const {
++    return const_cast<DeclContextLookupResult*>(this)->begin();
++  }
++  const_iterator end() const { return iterator(); }
++
++  bool empty() const { return Result.isNull();  }
++  bool isSingleResult() const { return Result.dyn_cast<NamedDecl*>(); }
++  reference front() const { return *begin(); }
++
++  // Find the first declaration of the given type in the list. Note that this
++  // is not in general the earliest-declared declaration, and should only be
++  // used when it's not possible for there to be more than one match or where
++  // it doesn't matter which one is found.
++  template<class T> T *find_first() const {
++    for (auto *D : *this)
++      if (T *Decl = dyn_cast<T>(D))
++        return Decl;
++
++    return nullptr;
+   }
+ };
+ 
+diff --git a/clang/include/clang/AST/DeclContextInternals.h b/clang/include/clang/AST/DeclContextInternals.h
+index e6a4cd4381e4a..3556044098c46 100644
+--- a/clang/include/clang/AST/DeclContextInternals.h
++++ b/clang/include/clang/AST/DeclContextInternals.h
+@@ -14,6 +14,7 @@
+ #ifndef LLVM_CLANG_AST_DECLCONTEXTINTERNALS_H
+ #define LLVM_CLANG_AST_DECLCONTEXTINTERNALS_H
+ 
++#include "clang/AST/ASTContext.h"
+ #include "clang/AST/Decl.h"
+ #include "clang/AST/DeclBase.h"
+ #include "clang/AST/DeclCXX.h"
+@@ -21,7 +22,6 @@
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/PointerIntPair.h"
+ #include "llvm/ADT/PointerUnion.h"
+-#include "llvm/ADT/SmallVector.h"
+ #include <algorithm>
+ #include <cassert>
+ 
+@@ -31,231 +31,287 @@ class DependentDiagnostic;
+ 
+ /// An array of decls optimized for the common case of only containing
+ /// one entry.
+-struct StoredDeclsList {
+-  /// When in vector form, this is what the Data pointer points to.
+-  using DeclsTy = SmallVector<NamedDecl *, 4>;
++class StoredDeclsList {
++  using Decls = DeclListNode::Decls;
+ 
+   /// A collection of declarations, with a flag to indicate if we have
+   /// further external declarations.
+-  using DeclsAndHasExternalTy = llvm::PointerIntPair<DeclsTy *, 1, bool>;
++  using DeclsAndHasExternalTy = llvm::PointerIntPair<Decls, 1, bool>;
+ 
+   /// The stored data, which will be either a pointer to a NamedDecl,
+-  /// or a pointer to a vector with a flag to indicate if there are further
++  /// or a pointer to a list with a flag to indicate if there are further
+   /// external declarations.
+-  llvm::PointerUnion<NamedDecl *, DeclsAndHasExternalTy> Data;
++  DeclsAndHasExternalTy Data;
++
++  template<typename Fn>
++  void erase_if(Fn ShouldErase) {
++    Decls List = Data.getPointer();
++    if (!List)
++      return;
++    ASTContext &C = getASTContext();
++    DeclListNode::Decls NewHead = nullptr;
++    DeclListNode::Decls *NewLast = nullptr;
++    DeclListNode::Decls *NewTail = &NewHead;
++    while (true) {
++      if (!ShouldErase(*DeclListNode::iterator(List))) {
++        NewLast = NewTail;
++        *NewTail = List;
++        if (auto *Node = List.dyn_cast<DeclListNode*>()) {
++          NewTail = &Node->Rest;
++          List = Node->Rest;
++        } else {
++          break;
++        }
++      } else if (DeclListNode *N = List.dyn_cast<DeclListNode*>()) {
++        List = N->Rest;
++        C.DeallocateDeclListNode(N);
++      } else {
++        // We're discarding the last declaration in the list. The last node we
++        // want to keep (if any) will be of the form DeclListNode(D, <rest>);
++        // replace it with just D.
++        if (NewLast) {
++          DeclListNode *Node = NewLast->get<DeclListNode*>();
++          *NewLast = Node->D;
++          C.DeallocateDeclListNode(Node);
++        }
++        break;
++      }
++    }
++    Data.setPointer(NewHead);
++
++    assert(llvm::find_if(getLookupResult(), ShouldErase) ==
++           getLookupResult().end() && "Still exists!");
++  }
++
++  void erase(NamedDecl *ND) {
++    erase_if([ND](NamedDecl *D) { return D == ND; });
++  }
+ 
+ public:
+   StoredDeclsList() = default;
+ 
+   StoredDeclsList(StoredDeclsList &&RHS) : Data(RHS.Data) {
+-    RHS.Data = (NamedDecl *)nullptr;
++    RHS.Data.setPointer(nullptr);
++    RHS.Data.setInt(0);
++  }
++
++  void MaybeDeallocList() {
++    if (isNull())
++      return;
++    // If this is a list-form, free the list.
++    ASTContext &C = getASTContext();
++    Decls List = Data.getPointer();
++    while (DeclListNode *ToDealloc = List.dyn_cast<DeclListNode *>()) {
++      List = ToDealloc->Rest;
++      C.DeallocateDeclListNode(ToDealloc);
++    }
+   }
+ 
+   ~StoredDeclsList() {
+-    // If this is a vector-form, free the vector.
+-    if (DeclsTy *Vector = getAsVector())
+-      delete Vector;
++    MaybeDeallocList();
+   }
+ 
+   StoredDeclsList &operator=(StoredDeclsList &&RHS) {
+-    if (DeclsTy *Vector = getAsVector())
+-      delete Vector;
++    MaybeDeallocList();
++
+     Data = RHS.Data;
+-    RHS.Data = (NamedDecl *)nullptr;
++    RHS.Data.setPointer(nullptr);
++    RHS.Data.setInt(0);
+     return *this;
+   }
+ 
+-  bool isNull() const { return Data.isNull(); }
++  bool isNull() const { return Data.getPointer().isNull(); }
+ 
+-  NamedDecl *getAsDecl() const {
+-    return Data.dyn_cast<NamedDecl *>();
++  ASTContext &getASTContext() {
++    assert(!isNull() && "No ASTContext.");
++    if (NamedDecl *ND = getAsDecl())
++      return ND->getASTContext();
++    return getAsList()->D->getASTContext();
+   }
+ 
+-  DeclsAndHasExternalTy getAsVectorAndHasExternal() const {
+-    return Data.dyn_cast<DeclsAndHasExternalTy>();
++  DeclsAndHasExternalTy getAsListAndHasExternal() const { return Data; }
++
++  NamedDecl *getAsDecl() const {
++    return getAsListAndHasExternal().getPointer().dyn_cast<NamedDecl *>();
+   }
+ 
+-  DeclsTy *getAsVector() const {
+-    return getAsVectorAndHasExternal().getPointer();
++  DeclListNode *getAsList() const {
++    return getAsListAndHasExternal().getPointer().dyn_cast<DeclListNode*>();
+   }
+ 
+   bool hasExternalDecls() const {
+-    return getAsVectorAndHasExternal().getInt();
++    return getAsListAndHasExternal().getInt();
+   }
+ 
+   void setHasExternalDecls() {
+-    if (DeclsTy *Vec = getAsVector())
+-      Data = DeclsAndHasExternalTy(Vec, true);
+-    else {
+-      DeclsTy *VT = new DeclsTy();
+-      if (NamedDecl *OldD = getAsDecl())
+-        VT->push_back(OldD);
+-      Data = DeclsAndHasExternalTy(VT, true);
+-    }
+-  }
+-
+-  void setOnlyValue(NamedDecl *ND) {
+-    assert(!getAsVector() && "Not inline");
+-    Data = ND;
+-    // Make sure that Data is a plain NamedDecl* so we can use its address
+-    // at getLookupResult.
+-    assert(*(NamedDecl **)&Data == ND &&
+-           "PointerUnion mangles the NamedDecl pointer!");
++    Data.setInt(1);
+   }
+ 
+   void remove(NamedDecl *D) {
+     assert(!isNull() && "removing from empty list");
+-    if (NamedDecl *Singleton = getAsDecl()) {
+-      assert(Singleton == D && "list is different singleton");
+-      (void)Singleton;
+-      Data = (NamedDecl *)nullptr;
+-      return;
+-    }
+-
+-    DeclsTy &Vec = *getAsVector();
+-    DeclsTy::iterator I = llvm::find(Vec, D);
+-    assert(I != Vec.end() && "list does not contain decl");
+-    Vec.erase(I);
+-
+-    assert(llvm::find(Vec, D) == Vec.end() && "list still contains decl");
++    erase(D);
+   }
+ 
+-  /// Remove any declarations which were imported from an external
+-  /// AST source.
++  /// Remove any declarations which were imported from an external AST source.
+   void removeExternalDecls() {
+-    if (isNull()) {
+-      // Nothing to do.
+-    } else if (NamedDecl *Singleton = getAsDecl()) {
+-      if (Singleton->isFromASTFile())
+-        *this = StoredDeclsList();
+-    } else {
+-      DeclsTy &Vec = *getAsVector();
+-      Vec.erase(std::remove_if(Vec.begin(), Vec.end(),
+-                               [](Decl *D) { return D->isFromASTFile(); }),
+-                Vec.end());
+-      // Don't have any external decls any more.
+-      Data = DeclsAndHasExternalTy(&Vec, false);
+-    }
++    erase_if([](NamedDecl *ND) { return ND->isFromASTFile(); });
++
++    // Don't have any pending external decls any more.
++    Data.setInt(0);
+   }
+ 
+-  /// getLookupResult - Return an array of all the decls that this list
+-  /// represents.
+-  DeclContext::lookup_result getLookupResult() {
+-    if (isNull())
+-      return DeclContext::lookup_result();
++  void replaceExternalDecls(ArrayRef<NamedDecl*> Decls) {
++    // Remove all declarations that are either external or are replaced with
++    // external declarations.
++    erase_if([Decls](NamedDecl *ND) {
++      if (ND->isFromASTFile())
++        return true;
++      for (NamedDecl *D : Decls)
++        if (D->declarationReplaces(ND, /*IsKnownNewer=*/false))
++          return true;
++      return false;
++    });
+ 
+-    // If we have a single NamedDecl, return it.
+-    if (NamedDecl *ND = getAsDecl()) {
+-      assert(!isNull() && "Empty list isn't allowed");
++    // Don't have any pending external decls any more.
++    Data.setInt(0);
++
++    if (Decls.empty())
++      return;
++
++    // Convert Decls into a list, in order.
++    ASTContext &C = Decls.front()->getASTContext();
++    DeclListNode::Decls DeclsAsList = Decls.back();
++    for (size_t I = Decls.size() - 1; I != 0; --I) {
++      DeclListNode *Node = C.AllocateDeclListNode(Decls[I - 1]);
++      Node->Rest = DeclsAsList;
++      DeclsAsList = Node;
++    }
+ 
+-      // Data is a raw pointer to a NamedDecl*, return it.
+-      return DeclContext::lookup_result(ND);
++    DeclListNode::Decls Head = Data.getPointer();
++    if (Head.isNull()) {
++      Data.setPointer(DeclsAsList);
++      return;
+     }
+ 
+-    assert(getAsVector() && "Must have a vector at this point");
+-    DeclsTy &Vector = *getAsVector();
++    // Find the end of the existing list.
++    // FIXME: It would be possible to preserve information from erase_if to
++    // avoid this rescan looking for the end of the list.
++    DeclListNode::Decls *Tail = &Head;
++    while (DeclListNode *Node = Tail->dyn_cast<DeclListNode *>())
++      Tail = &Node->Rest;
++
++    // Append the Decls.
++    DeclListNode *Node = C.AllocateDeclListNode(Tail->get<NamedDecl *>());
++    Node->Rest = DeclsAsList;
++    *Tail = Node;
++    Data.setPointer(Head);
++  }
+ 
+-    // Otherwise, we have a range result.
+-    return DeclContext::lookup_result(Vector);
++  /// Return an array of all the decls that this list represents.
++  DeclContext::lookup_result getLookupResult() const {
++    return DeclContext::lookup_result(Data.getPointer());
+   }
+ 
+-  /// HandleRedeclaration - If this is a redeclaration of an existing decl,
+-  /// replace the old one with D and return true.  Otherwise return false.
+-  bool HandleRedeclaration(NamedDecl *D, bool IsKnownNewer) {
++  /// If this is a redeclaration of an existing decl, replace the old one with
++  /// D. Otherwise, append D.
++  void addOrReplaceDecl(NamedDecl *D) {
++    const bool IsKnownNewer = true;
++
++    if (isNull()) {
++      Data.setPointer(D);
++      return;
++    }
++
+     // Most decls only have one entry in their list, special case it.
+     if (NamedDecl *OldD = getAsDecl()) {
+-      if (!D->declarationReplaces(OldD, IsKnownNewer))
+-        return false;
+-      setOnlyValue(D);
+-      return true;
++      if (D->declarationReplaces(OldD, IsKnownNewer)) {
++        Data.setPointer(D);
++        return;
++      }
++
++      // Add D after OldD.
++      ASTContext &C = D->getASTContext();
++      DeclListNode *Node = C.AllocateDeclListNode(OldD);
++      Node->Rest = D;
++      Data.setPointer(Node);
++      return;
+     }
+ 
++    // FIXME: Move the assert before the single decl case when we fix the
++    // duplication coming from the ASTReader reading builtin types.
++    assert(!llvm::is_contained(getLookupResult(), D) && "Already exists!");
+     // Determine if this declaration is actually a redeclaration.
+-    DeclsTy &Vec = *getAsVector();
+-    for (DeclsTy::iterator OD = Vec.begin(), ODEnd = Vec.end();
+-         OD != ODEnd; ++OD) {
+-      NamedDecl *OldD = *OD;
+-      if (D->declarationReplaces(OldD, IsKnownNewer)) {
+-        *OD = D;
+-        return true;
++    for (DeclListNode *N = getAsList(); /*return in loop*/;
++         N = N->Rest.dyn_cast<DeclListNode *>()) {
++      if (D->declarationReplaces(N->D, IsKnownNewer)) {
++        N->D = D;
++        return;
++      }
++      if (auto *ND = N->Rest.dyn_cast<NamedDecl *>()) {
++        if (D->declarationReplaces(ND, IsKnownNewer)) {
++          N->Rest = D;
++          return;
++        }
++
++        // Add D after ND.
++        ASTContext &C = D->getASTContext();
++        DeclListNode *Node = C.AllocateDeclListNode(ND);
++        N->Rest = Node;
++        Node->Rest = D;
++        return;
+       }
+     }
+-
+-    return false;
+   }
+ 
+-  /// AddSubsequentDecl - This is called on the second and later decl when it is
+-  /// not a redeclaration to merge it into the appropriate place in our list.
+-  void AddSubsequentDecl(NamedDecl *D) {
+-    assert(!isNull() && "don't AddSubsequentDecl when we have no decls");
++  /// Add a declaration to the list without checking if it replaces anything.
++  void prependDeclNoReplace(NamedDecl *D) {
++    if (isNull()) {
++      Data.setPointer(D);
++      return;
++    }
+ 
+-    // If this is the second decl added to the list, convert this to vector
+-    // form.
+-    if (NamedDecl *OldD = getAsDecl()) {
+-      DeclsTy *VT = new DeclsTy();
+-      VT->push_back(OldD);
+-      Data = DeclsAndHasExternalTy(VT, false);
++    ASTContext &C = D->getASTContext();
++    DeclListNode *Node = C.AllocateDeclListNode(D);
++    Node->Rest = Data.getPointer();
++    Data.setPointer(Node);
++  }
++
++  LLVM_DUMP_METHOD void dump() const {
++    Decls D = Data.getPointer();
++    if (!D) {
++      llvm::errs() << "<null>\n";
++      return;
+     }
+ 
+-    DeclsTy &Vec = *getAsVector();
+-
+-    // Using directives end up in a special entry which contains only
+-    // other using directives, so all this logic is wasted for them.
+-    // But avoiding the logic wastes time in the far-more-common case
+-    // that we're *not* adding a new using directive.
+-
+-    // Tag declarations always go at the end of the list so that an
+-    // iterator which points at the first tag will start a span of
+-    // decls that only contains tags.
+-    if (D->hasTagIdentifierNamespace())
+-      Vec.push_back(D);
+-
+-    // Resolved using declarations go at the front of the list so that
+-    // they won't show up in other lookup results.  Unresolved using
+-    // declarations (which are always in IDNS_Using | IDNS_Ordinary)
+-    // follow that so that the using declarations will be contiguous.
+-    else if (D->getIdentifierNamespace() & Decl::IDNS_Using) {
+-      DeclsTy::iterator I = Vec.begin();
+-      if (D->getIdentifierNamespace() != Decl::IDNS_Using) {
+-        while (I != Vec.end() &&
+-               (*I)->getIdentifierNamespace() == Decl::IDNS_Using)
+-          ++I;
++    while (true) {
++      if (auto *Node = D.dyn_cast<DeclListNode*>()) {
++        llvm::errs() << '[' << Node->D << "] -> ";
++        D = Node->Rest;
++      } else {
++        llvm::errs() << '[' << D.get<NamedDecl*>() << "]\n";
++        return;
+       }
+-      Vec.insert(I, D);
+-
+-    // All other declarations go at the end of the list, but before any
+-    // tag declarations.  But we can be clever about tag declarations
+-    // because there can only ever be one in a scope.
+-    } else if (!Vec.empty() && Vec.back()->hasTagIdentifierNamespace()) {
+-      NamedDecl *TagD = Vec.back();
+-      Vec.back() = D;
+-      Vec.push_back(TagD);
+-    } else
+-      Vec.push_back(D);
++    }
+   }
+ };
+ 
+ class StoredDeclsMap
+     : public llvm::SmallDenseMap<DeclarationName, StoredDeclsList, 4> {
+-public:
+-  static void DestroyAll(StoredDeclsMap *Map, bool Dependent);
+-
+-private:
+   friend class ASTContext; // walks the chain deleting these
+   friend class DeclContext;
+ 
+   llvm::PointerIntPair<StoredDeclsMap*, 1> Previous;
++public:
++  static void DestroyAll(StoredDeclsMap *Map, bool Dependent);
+ };
+ 
+ class DependentStoredDeclsMap : public StoredDeclsMap {
+-public:
+-  DependentStoredDeclsMap() = default;
+-
+-private:
+   friend class DeclContext; // iterates over diagnostics
+   friend class DependentDiagnostic;
+ 
+   DependentDiagnostic *FirstDiagnostic = nullptr;
++public:
++  DependentStoredDeclsMap() = default;
+ };
+ 
+ } // namespace clang
+diff --git a/clang/include/clang/Serialization/ASTWriter.h b/clang/include/clang/Serialization/ASTWriter.h
+index 12073a38a77a5..ea67d6990a8a0 100644
+--- a/clang/include/clang/Serialization/ASTWriter.h
++++ b/clang/include/clang/Serialization/ASTWriter.h
+@@ -84,7 +84,7 @@ class RecordDecl;
+ class Sema;
+ class SourceManager;
+ class Stmt;
+-struct StoredDeclsList;
++class StoredDeclsList;
+ class SwitchCase;
+ class TemplateParameterList;
+ class Token;
+diff --git a/clang/lib/ARCMigrate/ObjCMT.cpp b/clang/lib/ARCMigrate/ObjCMT.cpp
+index 68a51a49c7182..c8069b51567c2 100644
+--- a/clang/lib/ARCMigrate/ObjCMT.cpp
++++ b/clang/lib/ARCMigrate/ObjCMT.cpp
+@@ -613,7 +613,7 @@ ClassImplementsAllMethodsAndProperties(ASTContext &Ctx,
+         continue;
+       HasAtleastOneRequiredProperty = true;
+       DeclContext::lookup_result R = IDecl->lookup(Property->getDeclName());
+-      if (R.size() == 0) {
++      if (R.empty()) {
+         // Relax the rule and look into class's implementation for a synthesize
+         // or dynamic declaration. Class is implementing a property coming from
+         // another protocol. This still makes the target protocol as conforming.
+@@ -621,14 +621,12 @@ ClassImplementsAllMethodsAndProperties(ASTContext &Ctx,
+                                   Property->getDeclName().getAsIdentifierInfo(),
+                                   Property->getQueryKind()))
+           return false;
+-      }
+-      else if (ObjCPropertyDecl *ClassProperty = dyn_cast<ObjCPropertyDecl>(R[0])) {
+-          if ((ClassProperty->getPropertyAttributes()
+-              != Property->getPropertyAttributes()) ||
+-              !Ctx.hasSameType(ClassProperty->getType(), Property->getType()))
+-            return false;
+-      }
+-      else
++      } else if (auto *ClassProperty = R.find_first<ObjCPropertyDecl>()) {
++        if ((ClassProperty->getPropertyAttributes() !=
++             Property->getPropertyAttributes()) ||
++            !Ctx.hasSameType(ClassProperty->getType(), Property->getType()))
++          return false;
++      } else
+         return false;
+     }
+ 
+@@ -645,12 +643,12 @@ ClassImplementsAllMethodsAndProperties(ASTContext &Ctx,
+       if (MD->getImplementationControl() == ObjCMethodDecl::Optional)
+         continue;
+       DeclContext::lookup_result R = ImpDecl->lookup(MD->getDeclName());
+-      if (R.size() == 0)
++      if (R.empty())
+         return false;
+       bool match = false;
+       HasAtleastOneRequiredMethod = true;
+-      for (unsigned I = 0, N = R.size(); I != N; ++I)
+-        if (ObjCMethodDecl *ImpMD = dyn_cast<ObjCMethodDecl>(R[0]))
++      for (NamedDecl *ND : R)
++        if (ObjCMethodDecl *ImpMD = dyn_cast<ObjCMethodDecl>(ND))
+           if (Ctx.ObjCMethodsAreEqual(MD, ImpMD)) {
+             match = true;
+             break;
+diff --git a/clang/lib/AST/ASTContext.cpp b/clang/lib/AST/ASTContext.cpp
+index b8231f66908a9..d52aea88e092a 100644
+--- a/clang/lib/AST/ASTContext.cpp
++++ b/clang/lib/AST/ASTContext.cpp
+@@ -10892,6 +10892,9 @@ void ASTContext::forEachMultiversionedFunctionVersion(
+   assert(FD->isMultiVersion() && "Only valid for multiversioned functions");
+   llvm::SmallDenseSet<const FunctionDecl*, 4> SeenDecls;
+   FD = FD->getMostRecentDecl();
++  // FIXME: The order of traversal here matters and depends on the order of
++  // lookup results, which happens to be (mostly) oldest-to-newest, but we
++  // shouldn't rely on that.
+   for (auto *CurDecl :
+        FD->getDeclContext()->getRedeclContext()->lookup(FD->getDeclName())) {
+     FunctionDecl *CurFD = CurDecl->getAsFunction()->getMostRecentDecl();
+diff --git a/clang/lib/AST/CXXInheritance.cpp b/clang/lib/AST/CXXInheritance.cpp
+index c87bcf31d1209..9027fa7a7515d 100644
+--- a/clang/lib/AST/CXXInheritance.cpp
++++ b/clang/lib/AST/CXXInheritance.cpp
+@@ -386,9 +386,9 @@ static bool isOrdinaryMember(const NamedDecl *ND) {
+ 
+ static bool findOrdinaryMember(const CXXRecordDecl *RD, CXXBasePath &Path,
+                                DeclarationName Name) {
+-  Path.Decls = RD->lookup(Name);
+-  for (NamedDecl *ND : Path.Decls)
+-    if (isOrdinaryMember(ND))
++  Path.Decls = RD->lookup(Name).begin();
++  for (DeclContext::lookup_iterator I = Path.Decls, E = I.end(); I != E; ++I)
++    if (isOrdinaryMember(*I))
+       return true;
+ 
+   return false;
+@@ -453,9 +453,10 @@ std::vector<const NamedDecl *> CXXRecordDecl::lookupDependentName(
+           },
+           Paths, /*LookupInDependent=*/true))
+     return Results;
+-  for (const NamedDecl *ND : Paths.front().Decls) {
+-    if (isOrdinaryMember(ND) && Filter(ND))
+-      Results.push_back(ND);
++  for (DeclContext::lookup_iterator I = Paths.front().Decls, E = I.end();
++       I != E; ++I) {
++    if (isOrdinaryMember(*I) && Filter(*I))
++      Results.push_back(*I);
+   }
+   return Results;
+ }
+diff --git a/clang/lib/AST/Decl.cpp b/clang/lib/AST/Decl.cpp
+index cae092ac369d0..fcda07dab6045 100644
+--- a/clang/lib/AST/Decl.cpp
++++ b/clang/lib/AST/Decl.cpp
+@@ -1612,8 +1612,7 @@ void NamedDecl::printNestedNameSpecifier(raw_ostream &OS,
+ 
+     // Suppress inline namespace if it doesn't make the result ambiguous.
+     if (P.SuppressInlineNamespace && Ctx->isInlineNamespace() && NameInScope &&
+-        Ctx->lookup(NameInScope).size() ==
+-            Ctx->getParent()->lookup(NameInScope).size())
++        cast<NamespaceDecl>(Ctx)->isRedundantInlineQualifierFor(NameInScope))
+       continue;
+ 
+     // Skip non-named contexts such as linkage specifications and ExportDecls.
+diff --git a/clang/lib/AST/DeclBase.cpp b/clang/lib/AST/DeclBase.cpp
+index c26d6d1a42ea0..6d438cf05590a 100644
+--- a/clang/lib/AST/DeclBase.cpp
++++ b/clang/lib/AST/DeclBase.cpp
+@@ -1394,39 +1394,7 @@ ExternalASTSource::SetExternalVisibleDeclsForName(const DeclContext *DC,
+     DC->reconcileExternalVisibleStorage();
+ 
+   StoredDeclsList &List = (*Map)[Name];
+-
+-  // Clear out any old external visible declarations, to avoid quadratic
+-  // performance in the redeclaration checks below.
+-  List.removeExternalDecls();
+-
+-  if (!List.isNull()) {
+-    // We have both existing declarations and new declarations for this name.
+-    // Some of the declarations may simply replace existing ones. Handle those
+-    // first.
+-    llvm::SmallVector<unsigned, 8> Skip;
+-    for (unsigned I = 0, N = Decls.size(); I != N; ++I)
+-      if (List.HandleRedeclaration(Decls[I], /*IsKnownNewer*/false))
+-        Skip.push_back(I);
+-    Skip.push_back(Decls.size());
+-
+-    // Add in any new declarations.
+-    unsigned SkipPos = 0;
+-    for (unsigned I = 0, N = Decls.size(); I != N; ++I) {
+-      if (I == Skip[SkipPos])
+-        ++SkipPos;
+-      else
+-        List.AddSubsequentDecl(Decls[I]);
+-    }
+-  } else {
+-    // Convert the array to a StoredDeclsList.
+-    for (auto *D : Decls) {
+-      if (List.isNull())
+-        List.setOnlyValue(D);
+-      else
+-        List.AddSubsequentDecl(D);
+-    }
+-  }
+-
++  List.replaceExternalDecls(Decls);
+   return List.getLookupResult();
+ }
+ 
+@@ -1538,10 +1506,7 @@ void DeclContext::removeDecl(Decl *D) {
+       if (Map) {
+         StoredDeclsMap::iterator Pos = Map->find(ND->getDeclName());
+         assert(Pos != Map->end() && "no lookup entry for decl");
+-        // Remove the decl only if it is contained.
+-        StoredDeclsList::DeclsTy *Vec = Pos->second.getAsVector();
+-        if ((Vec && is_contained(*Vec, ND)) || Pos->second.getAsDecl() == ND)
+-          Pos->second.remove(ND);
++        Pos->second.remove(ND);
+       }
+     } while (DC->isTransparentContext() && (DC = DC->getParent()));
+   }
+@@ -1658,8 +1623,6 @@ void DeclContext::buildLookupImpl(DeclContext *DCtx, bool Internal) {
+   }
+ }
+ 
+-NamedDecl *const DeclContextLookupResult::SingleElementDummyList = nullptr;
+-
+ DeclContext::lookup_result
+ DeclContext::lookup(DeclarationName Name) const {
+   assert(getDeclKind() != Decl::LinkageSpec &&
+@@ -1935,23 +1898,11 @@ void DeclContext::makeDeclVisibleInContextImpl(NamedDecl *D, bool Internal) {
+     // In this case, we never try to replace an existing declaration; we'll
+     // handle that when we finalize the list of declarations for this name.
+     DeclNameEntries.setHasExternalDecls();
+-    DeclNameEntries.AddSubsequentDecl(D);
+-    return;
+-  }
+-
+-  if (DeclNameEntries.isNull()) {
+-    DeclNameEntries.setOnlyValue(D);
+-    return;
+-  }
+-
+-  if (DeclNameEntries.HandleRedeclaration(D, /*IsKnownNewer*/!Internal)) {
+-    // This declaration has replaced an existing one for which
+-    // declarationReplaces returns true.
++    DeclNameEntries.prependDeclNoReplace(D);
+     return;
+   }
+ 
+-  // Put this declaration into the appropriate slot.
+-  DeclNameEntries.AddSubsequentDecl(D);
++  DeclNameEntries.addOrReplaceDecl(D);
+ }
+ 
+ UsingDirectiveDecl *DeclContext::udir_iterator::operator*() const {
+diff --git a/clang/lib/AST/ExternalASTMerger.cpp b/clang/lib/AST/ExternalASTMerger.cpp
+index 88bbe90a4e909..c7789b707b219 100644
+--- a/clang/lib/AST/ExternalASTMerger.cpp
++++ b/clang/lib/AST/ExternalASTMerger.cpp
+@@ -64,24 +64,24 @@ LookupSameContext(Source<TranslationUnitDecl *> SourceTU, const DeclContext *DC,
+   Source<DeclarationName> SourceName = *SourceNameOrErr;
+   DeclContext::lookup_result SearchResult =
+       SourceParentDC.get()->lookup(SourceName.get());
+-  size_t SearchResultSize = SearchResult.size();
+-  if (SearchResultSize == 0 || SearchResultSize > 1) {
+-    // There are two cases here.  First, we might not find the name.
+-    // We might also find multiple copies, in which case we have no
+-    // guarantee that the one we wanted is the one we pick.  (E.g.,
+-    // if we have two specializations of the same template it is
+-    // very hard to determine which is the one you want.)
+-    //
+-    // The Origins map fixes this problem by allowing the origin to be
+-    // explicitly recorded, so we trigger that recording by returning
+-    // nothing (rather than a possibly-inaccurate guess) here.
+-    return nullptr;
+-  } else {
+-    NamedDecl *SearchResultDecl = SearchResult[0];
++
++  // There are two cases here. First, we might not find the name.
++  // We might also find multiple copies, in which case we have no
++  // guarantee that the one we wanted is the one we pick.  (E.g.,
++  // if we have two specializations of the same template it is
++  // very hard to determine which is the one you want.)
++  //
++  // The Origins map fixes this problem by allowing the origin to be
++  // explicitly recorded, so we trigger that recording by returning
++  // nothing (rather than a possibly-inaccurate guess) here.
++  if (SearchResult.isSingleResult()) {
++    NamedDecl *SearchResultDecl = SearchResult.front();
+     if (isa<DeclContext>(SearchResultDecl) &&
+         SearchResultDecl->getKind() == DC->getDeclKind())
+       return cast<DeclContext>(SearchResultDecl)->getPrimaryContext();
+     return nullptr; // This type of lookup is unsupported
++  } else {
++    return nullptr;
+   }
+ }
+ 
+diff --git a/clang/lib/AST/TypePrinter.cpp b/clang/lib/AST/TypePrinter.cpp
+index 3e8e94300caeb..17e9b3f6a023d 100644
+--- a/clang/lib/AST/TypePrinter.cpp
++++ b/clang/lib/AST/TypePrinter.cpp
+@@ -1235,8 +1235,7 @@ void TypePrinter::AppendScope(DeclContext *DC, raw_ostream &OS,
+     // Only suppress an inline namespace if the name has the same lookup
+     // results in the enclosing namespace.
+     if (Policy.SuppressInlineNamespace && NS->isInline() && NameInScope &&
+-        DC->getParent()->lookup(NameInScope).size() ==
+-            DC->lookup(NameInScope).size())
++        NS->isRedundantInlineQualifierFor(NameInScope))
+       return AppendScope(DC->getParent(), OS, NameInScope);
+ 
+     AppendScope(DC->getParent(), OS, NS->getDeclName());
+diff --git a/clang/lib/CodeGen/CodeGenFunction.h b/clang/lib/CodeGen/CodeGenFunction.h
+index fc342bbdbd711..4bca21a51f9c7 100644
+--- a/clang/lib/CodeGen/CodeGenFunction.h
++++ b/clang/lib/CodeGen/CodeGenFunction.h
+@@ -4673,7 +4673,6 @@ class CodeGenFunction : public CodeGenTypeCache {
+ 
+   struct MultiVersionResolverOption {
+     llvm::Function *Function;
+-    FunctionDecl *FD;
+     struct Conds {
+       StringRef Architecture;
+       llvm::SmallVector<StringRef, 8> Features;
+diff --git a/clang/lib/Sema/MultiplexExternalSemaSource.cpp b/clang/lib/Sema/MultiplexExternalSemaSource.cpp
+index 252008cda15d2..3a993e24b134d 100644
+--- a/clang/lib/Sema/MultiplexExternalSemaSource.cpp
++++ b/clang/lib/Sema/MultiplexExternalSemaSource.cpp
+@@ -10,7 +10,6 @@
+ //
+ //===----------------------------------------------------------------------===//
+ #include "clang/Sema/MultiplexExternalSemaSource.h"
+-#include "clang/AST/DeclContextInternals.h"
+ #include "clang/Sema/Lookup.h"
+ 
+ using namespace clang;
+diff --git a/clang/lib/Sema/SemaDeclCXX.cpp b/clang/lib/Sema/SemaDeclCXX.cpp
+index 0365d77cfc4e3..10f61d8c649e3 100644
+--- a/clang/lib/Sema/SemaDeclCXX.cpp
++++ b/clang/lib/Sema/SemaDeclCXX.cpp
+@@ -4130,13 +4130,9 @@ ValueDecl *Sema::tryLookupCtorInitMemberDecl(CXXRecordDecl *ClassDecl,
+                                              IdentifierInfo *MemberOrBase) {
+   if (SS.getScopeRep() || TemplateTypeTy)
+     return nullptr;
+-  DeclContext::lookup_result Result = ClassDecl->lookup(MemberOrBase);
+-  if (Result.empty())
+-    return nullptr;
+-  ValueDecl *Member;
+-  if ((Member = dyn_cast<FieldDecl>(Result.front())) ||
+-      (Member = dyn_cast<IndirectFieldDecl>(Result.front())))
+-    return Member;
++  for (auto *D : ClassDecl->lookup(MemberOrBase))
++    if (isa<FieldDecl>(D) || isa<IndirectFieldDecl>(D))
++      return cast<ValueDecl>(D);
+   return nullptr;
+ }
+ 
+@@ -9672,9 +9668,9 @@ struct FindHiddenVirtualMethod {
+ 
+     bool foundSameNameMethod = false;
+     SmallVector<CXXMethodDecl *, 8> overloadedMethods;
+-    for (Path.Decls = BaseRecord->lookup(Name); !Path.Decls.empty();
+-         Path.Decls = Path.Decls.slice(1)) {
+-      NamedDecl *D = Path.Decls.front();
++    for (Path.Decls = BaseRecord->lookup(Name).begin();
++         Path.Decls != DeclContext::lookup_iterator(); ++Path.Decls) {
++      NamedDecl *D = *Path.Decls;
+       if (CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(D)) {
+         MD = MD->getCanonicalDecl();
+         foundSameNameMethod = true;
+diff --git a/clang/lib/Sema/SemaLookup.cpp b/clang/lib/Sema/SemaLookup.cpp
+index b6bf88203745b..fef96b2eb11fd 100644
+--- a/clang/lib/Sema/SemaLookup.cpp
++++ b/clang/lib/Sema/SemaLookup.cpp
+@@ -638,8 +638,8 @@ void LookupResult::resolveKind() {
+ void LookupResult::addDeclsFromBasePaths(const CXXBasePaths &P) {
+   CXXBasePaths::const_paths_iterator I, E;
+   for (I = P.begin(), E = P.end(); I != E; ++I)
+-    for (DeclContext::lookup_iterator DI = I->Decls.begin(),
+-         DE = I->Decls.end(); DI != DE; ++DI)
++    for (DeclContext::lookup_iterator DI = I->Decls, DE = DI.end(); DI != DE;
++         ++DI)
+       addDecl(*DI);
+ }
+ 
+@@ -2230,9 +2230,9 @@ bool Sema::LookupQualifiedName(LookupResult &R, DeclContext *LookupCtx,
+     CXXRecordDecl *BaseRecord = Specifier->getType()->getAsCXXRecordDecl();
+     // Drop leading non-matching lookup results from the declaration list so
+     // we don't need to consider them again below.
+-    for (Path.Decls = BaseRecord->lookup(Name); !Path.Decls.empty();
+-         Path.Decls = Path.Decls.slice(1)) {
+-      if (Path.Decls.front()->isInIdentifierNamespace(IDNS))
++    for (Path.Decls = BaseRecord->lookup(Name).begin();
++         Path.Decls != Path.Decls.end(); ++Path.Decls) {
++      if ((*Path.Decls)->isInIdentifierNamespace(IDNS))
+         return true;
+     }
+     return false;
+@@ -2256,9 +2256,9 @@ bool Sema::LookupQualifiedName(LookupResult &R, DeclContext *LookupCtx,
+   AccessSpecifier SubobjectAccess = AS_none;
+ 
+   // Check whether the given lookup result contains only static members.
+-  auto HasOnlyStaticMembers = [&](DeclContextLookupResult Result) {
+-    for (NamedDecl *ND : Result)
+-      if (ND->isInIdentifierNamespace(IDNS) && ND->isCXXInstanceMember())
++  auto HasOnlyStaticMembers = [&](DeclContext::lookup_iterator Result) {
++    for (DeclContext::lookup_iterator I = Result, E = I.end(); I != E; ++I)
++      if ((*I)->isInIdentifierNamespace(IDNS) && (*I)->isCXXInstanceMember())
+         return false;
+     return true;
+   };
+@@ -2267,8 +2267,8 @@ bool Sema::LookupQualifiedName(LookupResult &R, DeclContext *LookupCtx,
+ 
+   // Determine whether two sets of members contain the same members, as
+   // required by C++ [class.member.lookup]p6.
+-  auto HasSameDeclarations = [&](DeclContextLookupResult A,
+-                                 DeclContextLookupResult B) {
++  auto HasSameDeclarations = [&](DeclContext::lookup_iterator A,
++                                 DeclContext::lookup_iterator B) {
+     using Iterator = DeclContextLookupResult::iterator;
+     using Result = const void *;
+ 
+@@ -2305,7 +2305,7 @@ bool Sema::LookupQualifiedName(LookupResult &R, DeclContext *LookupCtx,
+ 
+     // We'll often find the declarations are in the same order. Handle this
+     // case (and the special case of only one declaration) efficiently.
+-    Iterator AIt = A.begin(), BIt = B.begin(), AEnd = A.end(), BEnd = B.end();
++    Iterator AIt = A, BIt = B, AEnd, BEnd;
+     while (true) {
+       Result AResult = Next(AIt, AEnd);
+       Result BResult = Next(BIt, BEnd);
+@@ -2388,10 +2388,11 @@ bool Sema::LookupQualifiedName(LookupResult &R, DeclContext *LookupCtx,
+ 
+   // Lookup in a base class succeeded; return these results.
+ 
+-  for (auto *D : Paths.front().Decls) {
++  for (DeclContext::lookup_iterator I = Paths.front().Decls, E = I.end();
++       I != E; ++I) {
+     AccessSpecifier AS = CXXRecordDecl::MergeAccess(SubobjectAccess,
+-                                                    D->getAccess());
+-    if (NamedDecl *ND = R.getAcceptableDecl(D))
++                                                    (*I)->getAccess());
++    if (NamedDecl *ND = R.getAcceptableDecl(*I))
+       R.addDecl(ND, AS);
+   }
+   R.resolveKind();
+@@ -2534,7 +2535,7 @@ void Sema::DiagnoseAmbiguousLookup(LookupResult &Result) {
+       << Name << SubobjectType << getAmbiguousPathsDisplayString(*Paths)
+       << LookupRange;
+ 
+-    DeclContext::lookup_iterator Found = Paths->front().Decls.begin();
++    DeclContext::lookup_iterator Found = Paths->front().Decls;
+     while (isa<CXXMethodDecl>(*Found) &&
+            cast<CXXMethodDecl>(*Found)->isStatic())
+       ++Found;
+@@ -2552,7 +2553,7 @@ void Sema::DiagnoseAmbiguousLookup(LookupResult &Result) {
+     for (CXXBasePaths::paths_iterator Path = Paths->begin(),
+                                       PathEnd = Paths->end();
+          Path != PathEnd; ++Path) {
+-      const NamedDecl *D = Path->Decls.front();
++      const NamedDecl *D = *Path->Decls;
+       if (!D->isInIdentifierNamespace(Result.getIdentifierNamespace()))
+         continue;
+       if (DeclsPrinted.insert(D).second) {
+diff --git a/clang/lib/Sema/SemaObjCProperty.cpp b/clang/lib/Sema/SemaObjCProperty.cpp
+index fdc30fe6f6576..db999270219cb 100644
+--- a/clang/lib/Sema/SemaObjCProperty.cpp
++++ b/clang/lib/Sema/SemaObjCProperty.cpp
+@@ -112,12 +112,10 @@ CheckPropertyAgainstProtocol(Sema &S, ObjCPropertyDecl *Prop,
+     return;
+ 
+   // Look for a property with the same name.
+-  DeclContext::lookup_result R = Proto->lookup(Prop->getDeclName());
+-  for (unsigned I = 0, N = R.size(); I != N; ++I) {
+-    if (ObjCPropertyDecl *ProtoProp = dyn_cast<ObjCPropertyDecl>(R[I])) {
+-      S.DiagnosePropertyMismatch(Prop, ProtoProp, Proto->getIdentifier(), true);
+-      return;
+-    }
++  if (ObjCPropertyDecl *ProtoProp =
++      Proto->lookup(Prop->getDeclName()).find_first<ObjCPropertyDecl>()) {
++    S.DiagnosePropertyMismatch(Prop, ProtoProp, Proto->getIdentifier(), true);
++    return;
+   }
+ 
+   // Check this property against any protocols we inherit.
+@@ -233,18 +231,13 @@ Decl *Sema::ActOnProperty(Scope *S, SourceLocation AtLoc,
+     bool FoundInSuper = false;
+     ObjCInterfaceDecl *CurrentInterfaceDecl = IFace;
+     while (ObjCInterfaceDecl *Super = CurrentInterfaceDecl->getSuperClass()) {
+-      DeclContext::lookup_result R = Super->lookup(Res->getDeclName());
+-      for (unsigned I = 0, N = R.size(); I != N; ++I) {
+-        if (ObjCPropertyDecl *SuperProp = dyn_cast<ObjCPropertyDecl>(R[I])) {
+-          DiagnosePropertyMismatch(Res, SuperProp, Super->getIdentifier(), false);
+-          FoundInSuper = true;
+-          break;
+-        }
+-      }
+-      if (FoundInSuper)
++      if (ObjCPropertyDecl *SuperProp =
++          Super->lookup(Res->getDeclName()).find_first<ObjCPropertyDecl>()) {
++        DiagnosePropertyMismatch(Res, SuperProp, Super->getIdentifier(), false);
++        FoundInSuper = true;
+         break;
+-      else
+-        CurrentInterfaceDecl = Super;
++      }
++      CurrentInterfaceDecl = Super;
+     }
+ 
+     if (FoundInSuper) {
+@@ -1149,14 +1142,13 @@ Decl *Sema::ActOnPropertyImplDecl(Scope *S,
+       // redeclared 'readwrite', then no warning is to be issued.
+       for (auto *Ext : IDecl->known_extensions()) {
+         DeclContext::lookup_result R = Ext->lookup(property->getDeclName());
+-        if (!R.empty())
+-          if (ObjCPropertyDecl *ExtProp = dyn_cast<ObjCPropertyDecl>(R[0])) {
+-            PIkind = ExtProp->getPropertyAttributesAsWritten();
+-            if (PIkind & ObjCPropertyAttribute::kind_readwrite) {
+-              ReadWriteProperty = true;
+-              break;
+-            }
++        if (auto *ExtProp = R.find_first<ObjCPropertyDecl>()) {
++          PIkind = ExtProp->getPropertyAttributesAsWritten();
++          if (PIkind & ObjCPropertyAttribute::kind_readwrite) {
++            ReadWriteProperty = true;
++            break;
+           }
++        }
+       }
+ 
+       if (!ReadWriteProperty) {
+diff --git a/clang/lib/Sema/SemaTemplateInstantiate.cpp b/clang/lib/Sema/SemaTemplateInstantiate.cpp
+index 8bd812b39de4d..578a77aceeda5 100644
+--- a/clang/lib/Sema/SemaTemplateInstantiate.cpp
++++ b/clang/lib/Sema/SemaTemplateInstantiate.cpp
+@@ -3420,7 +3420,8 @@ Sema::InstantiateClassMembers(SourceLocation PointOfInstantiation,
+             Instantiation->getTemplateInstantiationPattern();
+         DeclContext::lookup_result Lookup =
+             ClassPattern->lookup(Field->getDeclName());
+-        FieldDecl *Pattern = cast<FieldDecl>(Lookup.front());
++        FieldDecl *Pattern = Lookup.find_first<FieldDecl>();
++        assert(Pattern);
+         InstantiateInClassInitializer(PointOfInstantiation, Field, Pattern,
+                                       TemplateArgs);
+       }
+diff --git a/clang/lib/Serialization/ASTReader.cpp b/clang/lib/Serialization/ASTReader.cpp
+index a4a0a5ced90be..bc390a696e9a9 100644
+--- a/clang/lib/Serialization/ASTReader.cpp
++++ b/clang/lib/Serialization/ASTReader.cpp
+@@ -7649,9 +7649,10 @@ ASTReader::FindExternalVisibleDeclsByName(const DeclContext *DC,
+ 
+   // Load the list of declarations.
+   SmallVector<NamedDecl *, 64> Decls;
++  llvm::SmallPtrSet<NamedDecl *, 8> Found;
+   for (DeclID ID : It->second.Table.find(Name)) {
+     NamedDecl *ND = cast<NamedDecl>(GetDecl(ID));
+-    if (ND->getDeclName() == Name)
++    if (ND->getDeclName() == Name && Found.insert(ND).second)
+       Decls.push_back(ND);
+   }
+ 
+diff --git a/clang/lib/Serialization/ASTWriterDecl.cpp b/clang/lib/Serialization/ASTWriterDecl.cpp
+index 2cb44bf9038b5..2b8278090b058 100644
+--- a/clang/lib/Serialization/ASTWriterDecl.cpp
++++ b/clang/lib/Serialization/ASTWriterDecl.cpp
+@@ -13,7 +13,6 @@
+ #include "ASTCommon.h"
+ #include "clang/AST/Attr.h"
+ #include "clang/AST/DeclCXX.h"
+-#include "clang/AST/DeclContextInternals.h"
+ #include "clang/AST/DeclTemplate.h"
+ #include "clang/AST/DeclVisitor.h"
+ #include "clang/AST/Expr.h"
+diff --git a/clang/lib/StaticAnalyzer/Checkers/StdLibraryFunctionsChecker.cpp b/clang/lib/StaticAnalyzer/Checkers/StdLibraryFunctionsChecker.cpp
+index 38a9d4ba65b6b..c8b2e3d915207 100644
+--- a/clang/lib/StaticAnalyzer/Checkers/StdLibraryFunctionsChecker.cpp
++++ b/clang/lib/StaticAnalyzer/Checkers/StdLibraryFunctionsChecker.cpp
+@@ -842,7 +842,7 @@ void StdLibraryFunctionsChecker::initFunctionSummaries(
+     llvm::Optional<QualType> operator()(StringRef Name) {
+       IdentifierInfo &II = ACtx.Idents.get(Name);
+       auto LookupRes = ACtx.getTranslationUnitDecl()->lookup(&II);
+-      if (LookupRes.size() == 0)
++      if (LookupRes.empty())
+         return None;
+ 
+       // Prioritze typedef declarations.
+@@ -994,7 +994,7 @@ void StdLibraryFunctionsChecker::initFunctionSummaries(
+         return false;
+       IdentifierInfo &II = ACtx.Idents.get(Name);
+       auto LookupRes = ACtx.getTranslationUnitDecl()->lookup(&II);
+-      if (LookupRes.size() == 0)
++      if (LookupRes.empty())
+         return false;
+       for (Decl *D : LookupRes) {
+         if (auto *FD = dyn_cast<FunctionDecl>(D)) {
+diff --git a/clang/test/PCH/cxx-explicit-specifier.cpp b/clang/test/PCH/cxx-explicit-specifier.cpp
+index ede0730f7c139..331c2e84c7815 100644
+--- a/clang/test/PCH/cxx-explicit-specifier.cpp
++++ b/clang/test/PCH/cxx-explicit-specifier.cpp
+@@ -1,8 +1,10 @@
++// RUN: %clang_cc1 -std=c++2a -include %s %s -ast-print -verify | FileCheck %s
++//
+ // RUN: %clang_cc1 -std=c++2a -emit-pch %s -o %t-cxx2a
+-// RUN: %clang_cc1 -std=c++2a -DUSE_PCH -include-pch %t-cxx2a %s -ast-print -verify | FileCheck %s
++// RUN: %clang_cc1 -std=c++2a -include-pch %t-cxx2a %s -ast-print -verify | FileCheck %s
+ 
+ // RUN: %clang_cc1 -std=c++2a -emit-pch -fpch-instantiate-templates %s -o %t-cxx2a
+-// RUN: %clang_cc1 -std=c++2a -DUSE_PCH -include-pch %t-cxx2a %s -ast-print -verify | FileCheck %s
++// RUN: %clang_cc1 -std=c++2a -include-pch %t-cxx2a %s -ast-print -verify | FileCheck %s
+ 
+ #ifndef USE_PCH
+ namespace inheriting_constructor {
+@@ -125,3 +127,5 @@ A a1 = { 0 };
+ #endif
+ 
+ }
++
++#define USE_PCH
+diff --git a/clang/tools/libclang/CXType.cpp b/clang/tools/libclang/CXType.cpp
+index 4b9620827002c..f8c36df35607e 100644
+--- a/clang/tools/libclang/CXType.cpp
++++ b/clang/tools/libclang/CXType.cpp
+@@ -1030,7 +1030,7 @@ long long clang_Type_getOffsetOf(CXType PT, const char *S) {
+   // and we would return InvalidFieldName instead of Incomplete.
+   // But this erroneous results does protects again a hidden assertion failure
+   // in the RecordLayoutBuilder
+-  if (Res.size() != 1)
++  if (!Res.isSingleResult())
+     return CXTypeLayoutError_InvalidFieldName;
+   if (const FieldDecl *FD = dyn_cast<FieldDecl>(Res.front()))
+     return Ctx.getFieldOffset(FD);
+diff --git a/clang/unittests/AST/ASTImporterTest.cpp b/clang/unittests/AST/ASTImporterTest.cpp
+index 193523f2fc516..39612d43799b8 100644
+--- a/clang/unittests/AST/ASTImporterTest.cpp
++++ b/clang/unittests/AST/ASTImporterTest.cpp
+@@ -2561,9 +2561,9 @@ TEST_P(ImportFriendFunctions, Lookup) {
+     auto FromName = FromD->getDeclName();
+     auto *Class = FirstDeclMatcher<CXXRecordDecl>().match(FromTU, ClassPattern);
+     auto LookupRes = Class->noload_lookup(FromName);
+-    ASSERT_EQ(LookupRes.size(), 0u);
++    ASSERT_TRUE(LookupRes.empty());
+     LookupRes = FromTU->noload_lookup(FromName);
+-    ASSERT_EQ(LookupRes.size(), 1u);
++    ASSERT_TRUE(LookupRes.isSingleResult());
+   }
+ 
+   auto *ToD = cast<FunctionDecl>(Import(FromD, Lang_CXX03));
+@@ -2572,9 +2572,9 @@ TEST_P(ImportFriendFunctions, Lookup) {
+   TranslationUnitDecl *ToTU = ToAST->getASTContext().getTranslationUnitDecl();
+   auto *Class = FirstDeclMatcher<CXXRecordDecl>().match(ToTU, ClassPattern);
+   auto LookupRes = Class->noload_lookup(ToName);
+-  EXPECT_EQ(LookupRes.size(), 0u);
++  EXPECT_TRUE(LookupRes.empty());
+   LookupRes = ToTU->noload_lookup(ToName);
+-  EXPECT_EQ(LookupRes.size(), 1u);
++  EXPECT_TRUE(LookupRes.isSingleResult());
+ 
+   EXPECT_EQ(DeclCounter<FunctionDecl>().match(ToTU, FunctionPattern), 1u);
+   auto *To0 = FirstDeclMatcher<FunctionDecl>().match(ToTU, FunctionPattern);
+@@ -2608,9 +2608,9 @@ TEST_P(ImportFriendFunctions, LookupWithProtoAfter) {
+   auto *FromClass =
+       FirstDeclMatcher<CXXRecordDecl>().match(FromTU, ClassPattern);
+   auto LookupRes = FromClass->noload_lookup(FromName);
+-  ASSERT_EQ(LookupRes.size(), 0u);
++  ASSERT_TRUE(LookupRes.empty());
+   LookupRes = FromTU->noload_lookup(FromName);
+-  ASSERT_EQ(LookupRes.size(), 1u);
++  ASSERT_TRUE(LookupRes.isSingleResult());
+ 
+   auto *ToFriend = cast<FunctionDecl>(Import(FromFriend, Lang_CXX03));
+   auto ToName = ToFriend->getDeclName();
+@@ -2618,10 +2618,10 @@ TEST_P(ImportFriendFunctions, LookupWithProtoAfter) {
+   TranslationUnitDecl *ToTU = ToAST->getASTContext().getTranslationUnitDecl();
+   auto *ToClass = FirstDeclMatcher<CXXRecordDecl>().match(ToTU, ClassPattern);
+   LookupRes = ToClass->noload_lookup(ToName);
+-  EXPECT_EQ(LookupRes.size(), 0u);
++  EXPECT_TRUE(LookupRes.empty());
+   LookupRes = ToTU->noload_lookup(ToName);
+   // Test is disabled because this result is 2.
+-  EXPECT_EQ(LookupRes.size(), 1u);
++  EXPECT_TRUE(LookupRes.isSingleResult());
+ 
+   ASSERT_EQ(DeclCounter<FunctionDecl>().match(ToTU, FunctionPattern), 2u);
+   ToFriend = FirstDeclMatcher<FunctionDecl>().match(ToTU, FunctionPattern);
+@@ -2652,9 +2652,9 @@ TEST_P(ImportFriendFunctions, LookupWithProtoBefore) {
+   auto *FromClass =
+       FirstDeclMatcher<CXXRecordDecl>().match(FromTU, ClassPattern);
+   auto LookupRes = FromClass->noload_lookup(FromName);
+-  ASSERT_EQ(LookupRes.size(), 0u);
++  ASSERT_TRUE(LookupRes.empty());
+   LookupRes = FromTU->noload_lookup(FromName);
+-  ASSERT_EQ(LookupRes.size(), 1u);
++  ASSERT_TRUE(LookupRes.isSingleResult());
+ 
+   auto *ToNormal = cast<FunctionDecl>(Import(FromNormal, Lang_CXX03));
+   auto ToName = ToNormal->getDeclName();
+@@ -2662,9 +2662,9 @@ TEST_P(ImportFriendFunctions, LookupWithProtoBefore) {
+ 
+   auto *ToClass = FirstDeclMatcher<CXXRecordDecl>().match(ToTU, ClassPattern);
+   LookupRes = ToClass->noload_lookup(ToName);
+-  EXPECT_EQ(LookupRes.size(), 0u);
++  EXPECT_TRUE(LookupRes.empty());
+   LookupRes = ToTU->noload_lookup(ToName);
+-  EXPECT_EQ(LookupRes.size(), 1u);
++  EXPECT_TRUE(LookupRes.isSingleResult());
+ 
+   EXPECT_EQ(DeclCounter<FunctionDecl>().match(ToTU, FunctionPattern), 2u);
+   ToNormal = FirstDeclMatcher<FunctionDecl>().match(ToTU, FunctionPattern);
+@@ -2694,9 +2694,9 @@ TEST_P(ImportFriendFunctions, ImportFriendChangesLookup) {
+   ASSERT_FALSE(FromFriendF->isInIdentifierNamespace(Decl::IDNS_Ordinary));
+   ASSERT_TRUE(FromFriendF->isInIdentifierNamespace(Decl::IDNS_OrdinaryFriend));
+   auto LookupRes = FromNormalTU->noload_lookup(FromNormalName);
+-  ASSERT_EQ(LookupRes.size(), 1u);
++  ASSERT_TRUE(LookupRes.isSingleResult());
+   LookupRes = FromFriendTU->noload_lookup(FromFriendName);
+-  ASSERT_EQ(LookupRes.size(), 1u);
++  ASSERT_TRUE(LookupRes.isSingleResult());
+ 
+   auto *ToNormalF = cast<FunctionDecl>(Import(FromNormalF, Lang_CXX03));
+   TranslationUnitDecl *ToTU = ToAST->getASTContext().getTranslationUnitDecl();
+@@ -2704,12 +2704,12 @@ TEST_P(ImportFriendFunctions, ImportFriendChangesLookup) {
+   EXPECT_TRUE(ToNormalF->isInIdentifierNamespace(Decl::IDNS_Ordinary));
+   EXPECT_FALSE(ToNormalF->isInIdentifierNamespace(Decl::IDNS_OrdinaryFriend));
+   LookupRes = ToTU->noload_lookup(ToName);
+-  EXPECT_EQ(LookupRes.size(), 1u);
++  EXPECT_TRUE(LookupRes.isSingleResult());
+   EXPECT_EQ(DeclCounter<FunctionDecl>().match(ToTU, Pattern), 1u);
+ 
+   auto *ToFriendF = cast<FunctionDecl>(Import(FromFriendF, Lang_CXX03));
+   LookupRes = ToTU->noload_lookup(ToName);
+-  EXPECT_EQ(LookupRes.size(), 1u);
++  EXPECT_TRUE(LookupRes.isSingleResult());
+   EXPECT_EQ(DeclCounter<FunctionDecl>().match(ToTU, Pattern), 2u);
+ 
+   EXPECT_TRUE(ToNormalF->isInIdentifierNamespace(Decl::IDNS_Ordinary));
+@@ -4031,11 +4031,11 @@ TEST_P(DeclContextTest,
+ 
+   ASSERT_TRUE(L.getAsDecl());
+   // Simulate the private function DeclContext::reconcileExternalVisibleStorage.
+-  // The point here is to have a Vec with only one element, which is not the
+-  // one we are going to delete from the DC later.
++  // We do not have a list with one element.
+   L.setHasExternalDecls();
+-  ASSERT_TRUE(L.getAsVector());
+-  ASSERT_EQ(1u, L.getAsVector()->size());
++  ASSERT_FALSE(L.getAsList());
++  auto Results = L.getLookupResult();
++  ASSERT_EQ(1u, std::distance(Results.begin(), Results.end()));
+ 
+   // This asserts in the old implementation.
+   DC->removeDecl(A0);
+diff --git a/lldb/source/Plugins/LanguageRuntime/ObjC/AppleObjCRuntime/AppleObjCDeclVendor.cpp b/lldb/source/Plugins/LanguageRuntime/ObjC/AppleObjCRuntime/AppleObjCDeclVendor.cpp
+index 7b331307c0f78..9bc40c16e5d05 100644
+--- a/lldb/source/Plugins/LanguageRuntime/ObjC/AppleObjCRuntime/AppleObjCDeclVendor.cpp
++++ b/lldb/source/Plugins/LanguageRuntime/ObjC/AppleObjCRuntime/AppleObjCDeclVendor.cpp
+@@ -59,7 +59,7 @@ class lldb_private::AppleObjCExternalASTSource
+       clang::DeclContext::lookup_result result =
+           non_const_interface_decl->lookup(name);
+ 
+-      return (result.size() != 0);
++      return (!result.empty());
+     } while (false);
+ 
+     SetNoExternalVisibleDeclsForName(decl_ctx, name);
+@@ -555,7 +555,7 @@ uint32_t AppleObjCDeclVendor::FindDecls(ConstString name, bool append,
+ 
+     if (!lookup_result.empty()) {
+       if (clang::ObjCInterfaceDecl *result_iface_decl =
+-              llvm::dyn_cast<clang::ObjCInterfaceDecl>(lookup_result[0])) {
++             llvm::dyn_cast<clang::ObjCInterfaceDecl>(*lookup_result.begin())) {
+         if (log) {
+           clang::QualType result_iface_type =
+               ast_ctx.getObjCInterfaceType(result_iface_decl);
+diff --git a/lldb/source/Plugins/SymbolFile/PDB/PDBASTParser.cpp b/lldb/source/Plugins/SymbolFile/PDB/PDBASTParser.cpp
+index f9c12e6341407..ef80d764eb495 100644
+--- a/lldb/source/Plugins/SymbolFile/PDB/PDBASTParser.cpp
++++ b/lldb/source/Plugins/SymbolFile/PDB/PDBASTParser.cpp
+@@ -326,7 +326,7 @@ GetDeclFromContextByName(const clang::ASTContext &ast,
+   if (result.empty())
+     return nullptr;
+ 
+-  return result[0];
++  return *result.begin();
+ }
+ 
+ static bool IsAnonymousNamespaceName(llvm::StringRef name) {
+diff --git a/lldb/source/Plugins/TypeSystem/Clang/TypeSystemClang.cpp b/lldb/source/Plugins/TypeSystem/Clang/TypeSystemClang.cpp
+index c94cb8d16ee9e..a61666adebaad 100644
+--- a/lldb/source/Plugins/TypeSystem/Clang/TypeSystemClang.cpp
++++ b/lldb/source/Plugins/TypeSystem/Clang/TypeSystemClang.cpp
+@@ -163,7 +163,6 @@ void addOverridesForMethod(clang::CXXMethodDecl *decl) {
+           if (name.getNameKind() == clang::DeclarationName::CXXDestructorName)
+             if (auto *baseDtorDecl = base_record->getDestructor()) {
+               if (baseDtorDecl->isVirtual()) {
+-                path.Decls = baseDtorDecl;
+                 decls.push_back(baseDtorDecl);
+                 return true;
+               } else
+@@ -171,12 +170,11 @@ void addOverridesForMethod(clang::CXXMethodDecl *decl) {
+             }
+ 
+           // Otherwise, search for name in the base class.
+-          for (path.Decls = base_record->lookup(name); !path.Decls.empty();
+-               path.Decls = path.Decls.slice(1)) {
++          for (path.Decls = base_record->lookup(name).begin();
++               path.Decls != path.Decls.end(); ++path.Decls) {
+             if (auto *method_decl =
+-                    llvm::dyn_cast<clang::CXXMethodDecl>(path.Decls.front()))
++                    llvm::dyn_cast<clang::CXXMethodDecl>(*path.Decls))
+               if (method_decl->isVirtual() && !isOverload(decl, method_decl)) {
+-                path.Decls = method_decl;
+                 decls.push_back(method_decl);
+                 return true;
+               }
+@@ -6605,10 +6603,11 @@ size_t TypeSystemClang::GetIndexOfChildMemberWithName(
+           if (cxx_record_decl->lookupInBases(
+                   [decl_name](const clang::CXXBaseSpecifier *specifier,
+                               clang::CXXBasePath &path) {
+-                    path.Decls =
+-                        specifier->getType()->getAsCXXRecordDecl()->lookup(
+-                            decl_name);
+-                    return !path.Decls.empty();
++                    CXXRecordDecl *record =
++                      specifier->getType()->getAsCXXRecordDecl();
++                    auto r = record->lookup(decl_name);
++                    path.Decls = r.begin();
++                    return !r.empty();
+                   },
+                   paths)) {
+             clang::CXXBasePaths::const_paths_iterator path,
+@@ -6631,9 +6630,10 @@ size_t TypeSystemClang::GetIndexOfChildMemberWithName(
+                           ->getDecl());
+                 }
+               }
+-              for (clang::NamedDecl *path_decl : path->Decls) {
++              for (clang::DeclContext::lookup_iterator I = path->Decls, E;
++                   I != E; ++I) {
+                 child_idx = GetIndexForRecordChild(
+-                    parent_record_decl, path_decl, omit_empty_base_classes);
++                    parent_record_decl, *I, omit_empty_base_classes);
+                 if (child_idx == UINT32_MAX) {
+                   child_indexes.clear();
+                   return 0;
+diff --git a/lldb/source/Plugins/TypeSystem/Clang/TypeSystemClang.h b/lldb/source/Plugins/TypeSystem/Clang/TypeSystemClang.h
+index f37652ff477a6..45c84e7447acb 100644
+--- a/lldb/source/Plugins/TypeSystem/Clang/TypeSystemClang.h
++++ b/lldb/source/Plugins/TypeSystem/Clang/TypeSystemClang.h
+@@ -265,7 +265,7 @@ class TypeSystemClang : public TypeSystem {
+       clang::DeclContext::lookup_result result = decl_context->lookup(myName);
+ 
+       if (!result.empty()) {
+-        clang::NamedDecl *named_decl = result[0];
++        clang::NamedDecl *named_decl = *result.begin();
+         if (const RecordDeclType *record_decl =
+                 llvm::dyn_cast<RecordDeclType>(named_decl))
+           compiler_type.SetCompilerType(

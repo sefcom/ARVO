@@ -1,0 +1,83 @@
+From 7e08e1f1fd8d220f16d347e5c351ddeb56ef5524 Mon Sep 17 00:00:00 2001
+From: Leandro Pereira <leandro@hardinfo.org>
+Date: Tue, 16 Apr 2019 21:50:24 -0700
+Subject: [PATCH] Do not advance pointer past end of buffer when parsing header
+
+Define an HEADER_LENGTH() macro that returns the string length of a
+string literal/header name, only if it's within the request buffer
+bounds.
+
+Credit to OSS-Fuzz: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=14232
+---
+ ...se-minimized-request_fuzzer-5717480481226752 | Bin 0 -> 32765 bytes
+ src/lib/lwan-request.c                          |  15 ++++++++++-----
+ 2 files changed, 10 insertions(+), 5 deletions(-)
+ create mode 100644 fuzz/clusterfuzz-testcase-minimized-request_fuzzer-5717480481226752
+
+diff --git a/fuzz/clusterfuzz-testcase-minimized-request_fuzzer-5717480481226752 b/fuzz/clusterfuzz-testcase-minimized-request_fuzzer-5717480481226752
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8fdd14923a1a523bf666a5a1b8554b8db5bd082
+GIT binary patch
+literal 32765
+zcmeI)u}Z^G6b9gQ=n@F{2myCXpFu=N!90R<x;RR85uAJl7vD3s=+Grl;lz8Iei<(1
+z63+SWmq6e`@9j<3uG+h<yI-xZ)=ldoK!5-N0t5&UAV7cs0RjXF5Fk)epmz}<K!CtG
+z3Jldbu6oinUm%^-S8)Oa3JW~`^nWNEW2F6NWZv`<0<Tr&3wDH)TL=&!K!8AEflc2v
+z&Gmk)cjMFVczG~$_`7cE#A^|a0D;*HY)^58pQjjFW&#9a1-@d-6{_}9r0;SVmPHzC
+zIv0VV%$qwGKI<SrfB=EC0`F;)2}Xbb0RjmGK1MP;kIb7U&@UJeAdp?)Eqg%u2oNAZ
+zfB*pk1i}UUbu*k)K>`E_5FqeB0zTs5&dy&5CsmLDflLC<U&!<{LbEu3A(T@w0t5&U
+zAW%ZU`3oh~^&~)mz?1^^Zo_r$-G-AYNPs{l0eiQZo<?LATep##Y7rnnfB=Ca0)O7R
+F{RT1oG-?0<
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/lib/lwan-request.c b/src/lib/lwan-request.c
+index 3c9fc9fe8..3bcd00d42 100644
+--- a/src/lib/lwan-request.c
++++ b/src/lib/lwan-request.c
+@@ -503,11 +503,16 @@ identify_http_path(struct lwan_request *request, char *buffer)
+     return end_of_line + 1;
+ }
+ 
+-#define HEADER(hdr)                                                            \
++#define HEADER_LENGTH(hdr)                                                     \
+     ({                                                                         \
+         if (UNLIKELY(end - sizeof(hdr) + 1 < p))                               \
+             continue;                                                          \
+-        p += sizeof(hdr) - 1;                                                  \
++        sizeof(hdr) - 1;                                                       \
++    })
++
++#define HEADER(hdr)                                                            \
++    ({                                                                         \
++        p += HEADER_LENGTH(hdr);                                               \
+         if (UNLIKELY(string_as_int16(p) !=                                     \
+                      MULTICHAR_CONSTANT_SMALL(':', ' ')))                      \
+             continue;                                                          \
+@@ -553,7 +558,7 @@ static bool parse_headers(struct lwan_request_parser_helper *helper,
+ 
+         STRING_SWITCH_L(p) {
+         case MULTICHAR_CONSTANT_L('A','c','c','e'):
+-            p += sizeof("Accept") - 1;
++            p += HEADER_LENGTH("Accept");
+ 
+             STRING_SWITCH_L(p) {
+             case MULTICHAR_CONSTANT_L('-','E','n','c'):
+@@ -568,7 +573,7 @@ static bool parse_headers(struct lwan_request_parser_helper *helper,
+             helper->connection = HEADER("Connection");
+             break;
+         case MULTICHAR_CONSTANT_L('C','o','n','t'):
+-            p += sizeof("Content") - 1;
++            p += HEADER_LENGTH("Content");
+ 
+             STRING_SWITCH_L(p) {
+             case MULTICHAR_CONSTANT_L('-','T','y','p'):
+@@ -602,7 +607,7 @@ static bool parse_headers(struct lwan_request_parser_helper *helper,
+     return ret;
+ }
+ 
+-#undef HEADER_RAW
++#undef HEADER_LENGTH
+ #undef HEADER
+ 
+ static void

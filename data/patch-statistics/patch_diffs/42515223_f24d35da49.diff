@@ -1,0 +1,368 @@
+From e515daaa2259657319eb9f07181d02af24b4e7fe Mon Sep 17 00:00:00 2001
+From: Marti Maria <marti.maria@littlecms.com>
+Date: Wed, 31 Aug 2022 23:28:59 +0200
+Subject: [PATCH] An old function was returning a wrong value
+
+It makes no sense that cmsChannelsOf() returns 3 when colorspace is bugus. Added a new function that returns -1 instead. Will document that in 2.15.
+It is in the API now, but not in docs.
+---
+ Projects/VC2022/testbed/testbed.vcxproj       |  1 +
+ .../VC2022/testbed/testbed.vcxproj.filters    |  3 +++
+ include/lcms2.h                               |  4 ++++
+ src/cmscnvrt.c                                |  2 +-
+ src/cmsgmt.c                                  |  6 ++---
+ src/cmspack.c                                 |  2 +-
+ src/cmspcs.c                                  | 14 +++++++++--
+ src/cmsvirt.c                                 | 17 ++++++-------
+ src/cmsxform.c                                |  4 ++--
+ src/lcms2.def                                 |  1 +
+ testbed/testcms2.c                            |  6 ++---
+ utils/transicc/transicc.c                     | 24 +++++++++----------
+ 12 files changed, 51 insertions(+), 33 deletions(-)
+
+diff --git a/Projects/VC2022/testbed/testbed.vcxproj b/Projects/VC2022/testbed/testbed.vcxproj
+index c2b51ba0e..05cb6a68a 100644
+--- a/Projects/VC2022/testbed/testbed.vcxproj
++++ b/Projects/VC2022/testbed/testbed.vcxproj
+@@ -281,6 +281,7 @@
+     </Link>
+   </ItemDefinitionGroup>
+   <ItemGroup>
++    <ClCompile Include="..\..\..\testbed\fuzzer.c" />
+     <ClCompile Include="..\..\..\testbed\testcms2.c" />
+     <ClCompile Include="..\..\..\testbed\testplugin.c" />
+     <ClCompile Include="..\..\..\testbed\zoo_icc.c" />
+diff --git a/Projects/VC2022/testbed/testbed.vcxproj.filters b/Projects/VC2022/testbed/testbed.vcxproj.filters
+index 993ee1511..ece88ca6d 100644
+--- a/Projects/VC2022/testbed/testbed.vcxproj.filters
++++ b/Projects/VC2022/testbed/testbed.vcxproj.filters
+@@ -24,5 +24,8 @@
+     <ClCompile Include="..\..\..\testbed\zoo_icc.c">
+       <Filter>Source Files</Filter>
+     </ClCompile>
++    <ClCompile Include="..\..\..\testbed\fuzzer.c">
++      <Filter>Source Files</Filter>
++    </ClCompile>
+   </ItemGroup>
+ </Project>
+\ No newline at end of file
+diff --git a/include/lcms2.h b/include/lcms2.h
+index 331a16ffe..b7dc88605 100644
+--- a/include/lcms2.h
++++ b/include/lcms2.h
+@@ -1532,8 +1532,12 @@ CMSAPI cmsBool           CMSEXPORT cmsIsCLUT(cmsHPROFILE hProfile, cmsUInt32Numb
+ CMSAPI cmsColorSpaceSignature   CMSEXPORT _cmsICCcolorSpace(int OurNotation);
+ CMSAPI int                      CMSEXPORT _cmsLCMScolorSpace(cmsColorSpaceSignature ProfileSpace);
+ 
++// Deprecated, use cmsChannelsOfColorSpace instead
+ CMSAPI cmsUInt32Number   CMSEXPORT cmsChannelsOf(cmsColorSpaceSignature ColorSpace);
+ 
++// Get number of channels of color space or -1 if color space is not listed/supported
++CMSAPI cmsInt32Number CMSEXPORT cmsChannelsOfColorSpace(cmsColorSpaceSignature ColorSpace);
++
+ // Build a suitable formatter for the colorspace of this profile. nBytes=1 means 8 bits, nBytes=2 means 16 bits. 
+ CMSAPI cmsUInt32Number   CMSEXPORT cmsFormatterForColorspaceOfProfile(cmsHPROFILE hProfile, cmsUInt32Number nBytes, cmsBool lIsFloat);
+ CMSAPI cmsUInt32Number   CMSEXPORT cmsFormatterForPCSOfProfile(cmsHPROFILE hProfile, cmsUInt32Number nBytes, cmsBool lIsFloat);
+diff --git a/src/cmscnvrt.c b/src/cmscnvrt.c
+index abac021f1..50e5a1eb7 100644
+--- a/src/cmscnvrt.c
++++ b/src/cmscnvrt.c
+@@ -630,7 +630,7 @@ cmsPipeline* DefaultICCintents(cmsContext       ContextID,
+                   ColorSpaceOut == cmsSigRgbData ||
+                   ColorSpaceOut == cmsSigCmykData) {
+ 
+-                  cmsStage* clip = _cmsStageClipNegatives(Result->ContextID, cmsChannelsOf(ColorSpaceOut));
++                  cmsStage* clip = _cmsStageClipNegatives(Result->ContextID, cmsChannelsOfColorSpace(ColorSpaceOut));
+                   if (clip == NULL) goto Error;
+ 
+                   if (!cmsPipelineInsertStage(Result, cmsAT_END, clip))
+diff --git a/src/cmsgmt.c b/src/cmsgmt.c
+index ddcfb52a3..e6c27c15f 100644
+--- a/src/cmsgmt.c
++++ b/src/cmsgmt.c
+@@ -297,7 +297,8 @@ cmsPipeline* _cmsCreateGamutCheckPipeline(cmsContext ContextID,
+     cmsStage* CLUT;
+     cmsUInt32Number dwFormat;
+     GAMUTCHAIN Chain;
+-    cmsUInt32Number nChannels, nGridpoints;
++    cmsUInt32Number nGridpoints;
++    cmsInt32Number nChannels;
+     cmsColorSpaceSignature ColorSpace;
+     cmsUInt32Number i;
+     cmsHPROFILE ProfileList[256];
+@@ -346,8 +347,7 @@ cmsPipeline* _cmsCreateGamutCheckPipeline(cmsContext ContextID,
+ 
+ 
+     ColorSpace  = cmsGetColorSpace(hGamut);
+-
+-    nChannels   = cmsChannelsOf(ColorSpace);
++    nChannels   = cmsChannelsOfColorSpace(ColorSpace);
+     nGridpoints = _cmsReasonableGridpointsByColorspace(ColorSpace, cmsFLAGS_HIGHRESPRECALC);
+     dwFormat    = (CHANNELS_SH(nChannels)|BYTES_SH(2));
+ 
+diff --git a/src/cmspack.c b/src/cmspack.c
+index 955687c69..5ab45253d 100644
+--- a/src/cmspack.c
++++ b/src/cmspack.c
+@@ -3833,7 +3833,7 @@ cmsUInt32Number CMSEXPORT cmsFormatterForColorspaceOfProfile(cmsHPROFILE hProfil
+ 
+     cmsColorSpaceSignature ColorSpace      = cmsGetColorSpace(hProfile);
+     cmsUInt32Number        ColorSpaceBits  = (cmsUInt32Number) _cmsLCMScolorSpace(ColorSpace);
+-    cmsUInt32Number        nOutputChans    = cmsChannelsOf(ColorSpace);
++    cmsInt32Number         nOutputChans    = cmsChannelsOfColorSpace(ColorSpace);
+     cmsUInt32Number        Float           = lIsFloat ? 1U : 0;
+ 
+     // Create a fake formatter for result
+diff --git a/src/cmspcs.c b/src/cmspcs.c
+index 3d6323a5a..a0f195260 100644
+--- a/src/cmspcs.c
++++ b/src/cmspcs.c
+@@ -874,7 +874,7 @@ int CMSEXPORT _cmsLCMScolorSpace(cmsColorSpaceSignature ProfileSpace)
+ }
+ 
+ 
+-cmsUInt32Number CMSEXPORT cmsChannelsOf(cmsColorSpaceSignature ColorSpace)
++cmsInt32Number CMSEXPORT cmsChannelsOfColorSpace(cmsColorSpaceSignature ColorSpace)
+ {
+     switch (ColorSpace) {
+ 
+@@ -935,6 +935,16 @@ cmsUInt32Number CMSEXPORT cmsChannelsOf(cmsColorSpaceSignature ColorSpace)
+     case cmsSigMCHFData:
+     case cmsSig15colorData: return 15;
+ 
+-    default: return 3;
++    default: return -1;
+     }
+ }
++
++/**
++* DEPRECATED: Provided for compatibility only
++*/
++cmsUInt32Number CMSEXPORT cmsChannelsOf(cmsColorSpaceSignature ColorSpace)
++{
++    int n = cmsChannelsOfColorSpace(ColorSpace);
++    if (n < 0) return 3;
++    return (cmsUInt32Number)n;
++}
+\ No newline at end of file
+diff --git a/src/cmsvirt.c b/src/cmsvirt.c
+index 4900a8374..b8ef607f6 100644
+--- a/src/cmsvirt.c
++++ b/src/cmsvirt.c
+@@ -291,7 +291,7 @@ cmsHPROFILE CMSEXPORT cmsCreateLinearizationDeviceLinkTHR(cmsContext ContextID,
+ {
+     cmsHPROFILE hICC;
+     cmsPipeline* Pipeline;
+-    cmsUInt32Number nChannels;
++    cmsInt32Number nChannels;
+ 
+     hICC = cmsCreateProfilePlaceholder(ContextID);
+     if (!hICC)
+@@ -306,7 +306,7 @@ cmsHPROFILE CMSEXPORT cmsCreateLinearizationDeviceLinkTHR(cmsContext ContextID,
+     cmsSetHeaderRenderingIntent(hICC,  INTENT_PERCEPTUAL);
+ 
+     // Set up channels
+-    nChannels = cmsChannelsOf(ColorSpace);
++    nChannels = cmsChannelsOfColorSpace(ColorSpace);
+ 
+     // Creates a Pipeline with prelinearization step only
+     Pipeline = cmsPipelineAlloc(ContextID, nChannels, nChannels);
+@@ -397,7 +397,7 @@ cmsHPROFILE CMSEXPORT cmsCreateInkLimitingDeviceLinkTHR(cmsContext ContextID,
+     cmsHPROFILE hICC;
+     cmsPipeline* LUT;
+     cmsStage* CLUT;
+-    cmsUInt32Number nChannels;
++    cmsInt32Number nChannels;
+ 
+     if (ColorSpace != cmsSigCmykData) {
+         cmsSignalError(ContextID, cmsERROR_COLORSPACE_CHECK, "InkLimiting: Only CMYK currently supported");
+@@ -974,7 +974,7 @@ cmsHPROFILE CreateNamedColorDevicelink(cmsHTRANSFORM xform)
+     // Make sure we have proper formatters
+     cmsChangeBuffersFormat(xform, TYPE_NAMED_COLOR_INDEX,
+         FLOAT_SH(0) | COLORSPACE_SH(_cmsLCMScolorSpace(v ->ExitColorSpace))
+-        | BYTES_SH(2) | CHANNELS_SH(cmsChannelsOf(v ->ExitColorSpace)));
++        | BYTES_SH(2) | CHANNELS_SH(cmsChannelsOfColorSpace(v ->ExitColorSpace)));
+ 
+     // Apply the transfor to colorants.
+     for (i=0; i < nColors; i++) {
+@@ -1062,8 +1062,9 @@ const cmsAllowedLUT* FindCombination(const cmsPipeline* Lut, cmsBool IsV4, cmsTa
+ cmsHPROFILE CMSEXPORT cmsTransform2DeviceLink(cmsHTRANSFORM hTransform, cmsFloat64Number Version, cmsUInt32Number dwFlags)
+ {
+     cmsHPROFILE hProfile = NULL;
+-    cmsUInt32Number FrmIn, FrmOut, ChansIn, ChansOut;
+-    int ColorSpaceBitsIn, ColorSpaceBitsOut;
++	cmsUInt32Number FrmIn, FrmOut;
++	cmsInt32Number ChansIn, ChansOut;
++	int ColorSpaceBitsIn, ColorSpaceBitsOut;
+     _cmsTRANSFORM* xform = (_cmsTRANSFORM*) hTransform;
+     cmsPipeline* LUT = NULL;
+     cmsStage* mpe;
+@@ -1114,8 +1115,8 @@ cmsHPROFILE CMSEXPORT cmsTransform2DeviceLink(cmsHTRANSFORM hTransform, cmsFloat
+ 
+     // Optimize the LUT and precalculate a devicelink
+ 
+-    ChansIn  = cmsChannelsOf(xform -> EntryColorSpace);
+-    ChansOut = cmsChannelsOf(xform -> ExitColorSpace);
++    ChansIn  = cmsChannelsOfColorSpace(xform -> EntryColorSpace);
++    ChansOut = cmsChannelsOfColorSpace(xform -> ExitColorSpace);
+ 
+     ColorSpaceBitsIn  = _cmsLCMScolorSpace(xform -> EntryColorSpace);
+     ColorSpaceBitsOut = _cmsLCMScolorSpace(xform -> ExitColorSpace);
+diff --git a/src/cmsxform.c b/src/cmsxform.c
+index 7f6636e10..b7903885f 100644
+--- a/src/cmsxform.c
++++ b/src/cmsxform.c
+@@ -1137,8 +1137,8 @@ cmsHTRANSFORM CMSEXPORT cmsCreateExtendedTransform(cmsContext ContextID,
+     }
+ 
+     // Check channel count
+-    if ((cmsChannelsOf(EntryColorSpace) != cmsPipelineInputChannels(Lut)) ||
+-        (cmsChannelsOf(ExitColorSpace)  != cmsPipelineOutputChannels(Lut))) {
++    if ((cmsChannelsOfColorSpace(EntryColorSpace) != (cmsInt32Number) cmsPipelineInputChannels(Lut)) ||
++        (cmsChannelsOfColorSpace(ExitColorSpace)  != (cmsInt32Number) cmsPipelineOutputChannels(Lut))) {
+         cmsPipelineFree(Lut);
+         cmsSignalError(ContextID, cmsERROR_NOT_SUITABLE, "Channel count doesn't match. Profile is corrupted");
+         return NULL;
+diff --git a/src/lcms2.def b/src/lcms2.def
+index b03943c52..f3e47793d 100644
+--- a/src/lcms2.def
++++ b/src/lcms2.def
+@@ -19,6 +19,7 @@ cmsBuildTabulatedToneCurve16             =   cmsBuildTabulatedToneCurve16
+ cmsBuildTabulatedToneCurveFloat          =   cmsBuildTabulatedToneCurveFloat
+ _cmsCalloc                               =   _cmsCalloc
+ cmsChannelsOf                            =    cmsChannelsOf
++cmsChannelsOfColorSpace                  =    cmsChannelsOfColorSpace
+ cmsCIE2000DeltaE                         =    cmsCIE2000DeltaE
+ cmsCIE94DeltaE                           =    cmsCIE94DeltaE
+ cmsCIECAM02Done                          =    cmsCIECAM02Done
+diff --git a/testbed/testcms2.c b/testbed/testcms2.c
+index de753d234..0513e0919 100644
+--- a/testbed/testcms2.c
++++ b/testbed/testcms2.c
+@@ -8184,7 +8184,7 @@ int CheckForgedMPE(void)
+     }
+ 
+     srcCS = cmsGetColorSpace(srcProfile);
+-    nSrcComponents = cmsChannelsOf(srcCS);
++    nSrcComponents = cmsChannelsOfColorSpace(srcCS);
+     
+     if (srcCS == cmsSigLabData) {
+         srcFormat =
+@@ -9218,8 +9218,6 @@ void PrintSupportedIntents(void)
+     printf("\n");
+ }
+ 
+-
+-
+ // ---------------------------------------------------------------------------------------
+ 
+ int main(int argc, char* argv[])
+@@ -9265,7 +9263,7 @@ int main(int argc, char* argv[])
+     printf("Installing error logger ... ");
+     cmsSetLogErrorHandler(FatalErrorQuit);
+     printf("done.\n");
+-           
++             
+     PrintSupportedIntents();
+     
+     Check("Base types", CheckBaseTypes);
+diff --git a/utils/transicc/transicc.c b/utils/transicc/transicc.c
+index 77787d66f..5b1304c37 100644
+--- a/utils/transicc/transicc.c
++++ b/utils/transicc/transicc.c
+@@ -399,7 +399,7 @@ cmsNAMEDCOLORLIST* ComponentNames(cmsColorSpaceSignature space, cmsBool IsInput)
+ 
+         SetRange(1, IsInput);
+ 
+-        n = cmsChannelsOf(space);
++        n = cmsChannelsOfColorSpace(space);
+ 
+         for (i=0; i < n; i++) {
+ 
+@@ -665,7 +665,7 @@ void PrintFloatResults(cmsFloat64Number Value[])
+     char ChannelName[cmsMAX_PATH];
+     cmsFloat64Number v;
+ 
+-    n = cmsChannelsOf(OutputColorSpace);
++    n = cmsChannelsOfColorSpace(OutputColorSpace);
+     for (i=0; i < n; i++) {
+ 
+         if (OutputColorant != NULL) {
+@@ -745,7 +745,7 @@ void TakeFloatValues(cmsFloat64Number Float[])
+         return;
+     }
+ 
+-    n = cmsChannelsOf(InputColorSpace);
++    n = cmsChannelsOfColorSpace(InputColorSpace);
+     for (i=0; i < n; i++) {
+ 
+         if (InputColorant) {
+@@ -794,7 +794,7 @@ void PrintEncodedResults(cmsUInt16Number Encoded[])
+     char ChannelName[cmsMAX_PATH];
+     cmsUInt32Number v;
+ 
+-    n = cmsChannelsOf(OutputColorSpace);
++    n = cmsChannelsOfColorSpace(OutputColorSpace);
+     for (i=0; i < n; i++) {
+ 
+         if (OutputColorant != NULL) {
+@@ -960,7 +960,7 @@ void TakeCGATSValues(int nPatch, cmsFloat64Number Float[])
+         {
+             cmsUInt32Number i, n;
+ 
+-            n = cmsChannelsOf(InputColorSpace);
++            n = cmsChannelsOfColorSpace(InputColorSpace);
+             for (i=0; i < n; i++) { 
+ 
+                 char Buffer[255];
+@@ -976,7 +976,7 @@ void TakeCGATSValues(int nPatch, cmsFloat64Number Float[])
+         {
+             cmsUInt32Number i, n;
+ 
+-            n = cmsChannelsOf(InputColorSpace);
++            n = cmsChannelsOfColorSpace(InputColorSpace);
+             for (i=0; i < n; i++) { 
+ 
+                 char Buffer[255];
+@@ -1067,9 +1067,9 @@ void PutCGATSValues(cmsFloat64Number Float[])
+     case cmsSig15colorData:
+         {
+ 
+-            cmsUInt32Number i, n;
++            cmsInt32Number i, n;
+ 
+-            n = cmsChannelsOf(InputColorSpace);
++            n = cmsChannelsOfColorSpace(InputColorSpace);
+             for (i=0; i < n; i++) { 
+ 
+                 char Buffer[255];
+@@ -1084,9 +1084,9 @@ void PutCGATSValues(cmsFloat64Number Float[])
+     default: 
+         {
+ 
+-            cmsUInt32Number i, n;
++            cmsInt32Number i, n;
+ 
+-            n = cmsChannelsOf(InputColorSpace);
++            n = cmsChannelsOfColorSpace(InputColorSpace);
+             for (i=0; i < n; i++) { 
+ 
+                 char Buffer[255];
+@@ -1187,7 +1187,7 @@ void SetOutputDataFormat(void)
+             int i, n;
+             char Buffer[255];
+ 
+-            n = cmsChannelsOf(OutputColorSpace);
++            n = cmsChannelsOfColorSpace(OutputColorSpace);
+             cmsIT8SetPropertyDbl(hIT8out, "NUMBER_OF_FIELDS", n+1);
+             cmsIT8SetDataFormat(hIT8out, 0, "SAMPLE_ID");
+ 
+@@ -1203,7 +1203,7 @@ void SetOutputDataFormat(void)
+         int i, n;
+         char Buffer[255];
+ 
+-        n = cmsChannelsOf(OutputColorSpace);
++        n = cmsChannelsOfColorSpace(OutputColorSpace);
+         cmsIT8SetPropertyDbl(hIT8out, "NUMBER_OF_FIELDS", n+1);
+         cmsIT8SetDataFormat(hIT8out, 0, "SAMPLE_ID");
+ 

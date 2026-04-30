@@ -1,0 +1,57 @@
+From cf9cd35aa9d1db9d7b6b3e9207b47432fdb6fe5e Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Thu, 27 Jul 2023 00:14:15 +0200
+Subject: [PATCH] avcodec/evc_ps: Check num_ref_pic_list_in_sps
+
+Fixes: out of array write
+Fixes: 60798/clusterfuzz-testcase-minimized-ffmpeg_BSF_EVC_FRAME_MERGE_fuzzer-4633529766772736
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Reviewed-by: James Almer <jamrial@gmail.com>
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/evc.h    | 2 +-
+ libavcodec/evc_ps.c | 9 +++++++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/evc.h b/libavcodec/evc.h
+index d1fdb4fac6..9711c760fe 100644
+--- a/libavcodec/evc.h
++++ b/libavcodec/evc.h
+@@ -126,7 +126,7 @@ enum {
+ 
+     EVC_MAX_NUM_REF_PICS = 21,
+ 
+-    EVC_MAX_NUM_RPLS = 32,
++    EVC_MAX_NUM_RPLS = 64,
+ 
+     // A.4.1: pic_width_in_luma_samples and pic_height_in_luma_samples are
+     // constrained to be not greater than sqrt(MaxLumaPs * 8).  Hence height/
+diff --git a/libavcodec/evc_ps.c b/libavcodec/evc_ps.c
+index 04ee6a45e6..64384a392c 100644
+--- a/libavcodec/evc_ps.c
++++ b/libavcodec/evc_ps.c
+@@ -243,11 +243,20 @@ int ff_evc_parse_sps(GetBitContext *gb, EVCParamSets *ps)
+         sps->rpl1_same_as_rpl0_flag = get_bits1(gb);
+         sps->num_ref_pic_list_in_sps[0] = get_ue_golomb(gb);
+ 
++        if ((unsigned)sps->num_ref_pic_list_in_sps[0] >= EVC_MAX_NUM_RPLS) {
++            ret = AVERROR_INVALIDDATA;
++            goto fail;
++        }
++
+         for (int i = 0; i < sps->num_ref_pic_list_in_sps[0]; ++i)
+             ref_pic_list_struct(gb, &sps->rpls[0][i]);
+ 
+         if (!sps->rpl1_same_as_rpl0_flag) {
+             sps->num_ref_pic_list_in_sps[1] = get_ue_golomb(gb);
++            if ((unsigned)sps->num_ref_pic_list_in_sps[1] >= EVC_MAX_NUM_RPLS) {
++                ret = AVERROR_INVALIDDATA;
++                goto fail;
++            }
+             for (int i = 0; i < sps->num_ref_pic_list_in_sps[1]; ++i)
+                 ref_pic_list_struct(gb, &sps->rpls[1][i]);
+         }
+-- 
+2.25.1
+

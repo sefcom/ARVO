@@ -1,0 +1,103 @@
+From eddb87b2f0828320f3a05bd4bdbee12f25270251 Mon Sep 17 00:00:00 2001
+From: Brian Kelley <fustigator@gmail.com>
+Date: Sat, 18 Jun 2022 03:06:08 -0400
+Subject: [PATCH] Fixes #5324 (#5355)
+
+---
+ Code/GraphMol/ChemReactions/catch_tests.cpp | 18 ++++++++++++-
+ Code/GraphMol/SmilesParse/CXSmilesOps.cpp   | 28 +++------------------
+ 2 files changed, 20 insertions(+), 26 deletions(-)
+
+diff --git a/Code/GraphMol/ChemReactions/catch_tests.cpp b/Code/GraphMol/ChemReactions/catch_tests.cpp
+index 09b2b4ecd92..2e5a8bf6aba 100644
+--- a/Code/GraphMol/ChemReactions/catch_tests.cpp
++++ b/Code/GraphMol/ChemReactions/catch_tests.cpp
+@@ -13,6 +13,8 @@
+ #include <GraphMol/QueryOps.h>
+ #include <GraphMol/QueryAtom.h>
+ #include <GraphMol/MonomerInfo.h>
++#include <GraphMol/FileParsers/FileParsers.h>
++#include <GraphMol/FileParsers/MolSupplier.h>
+ #include <GraphMol/SmilesParse/SmilesParse.h>
+ #include <GraphMol/SmilesParse/SmilesWrite.h>
+ #include <GraphMol/FileParsers/SequenceParsers.h>
+@@ -21,6 +23,7 @@
+ #include <GraphMol/ChemReactions/ReactionRunner.h>
+ #include <GraphMol/ChemReactions/ReactionUtils.h>
+ #include <GraphMol/FileParsers/PNGParser.h>
++#include <GraphMol/FileParsers/FileParserUtils.h>
+ 
+ using namespace RDKit;
+ using std::unique_ptr;
+@@ -1180,6 +1183,7 @@ TEST_CASE("CXSMILES for reactions", "[cxsmiles]") {
+ }
+ 
+ TEST_CASE("V3K rxn blocks") {
++    
+   SECTION("writing basics") {
+     // clang-format off
+     auto rxn =
+@@ -1198,5 +1202,17 @@ TEST_CASE("V3K rxn blocks") {
+     CHECK(rxn->getNumReactantTemplates()==rxn2->getNumReactantTemplates());
+     CHECK(rxn->getNumProductTemplates()==rxn2->getNumProductTemplates());   
+   }
++     
++  SECTION("github5324") {
++    // Test sgroup in a ring - this example failed with improperr tail crossings
++    auto mol = "C-1-C-C-C-C-O-1 |Sg:n:4:n:ht|"_smarts;
++    MolOps::findSSSR(*mol);
++    auto mbk = FileParserUtils::getV3000CTAB(*mol, -1);
++    CHECK(mbk.find("ATOMS=(1 5) XBONDS=(2 4 5) XBHEAD=(1 4) XBCORR=(2 4 5)")!=std::string::npos);
++    std::unique_ptr<ChemicalReaction> rxn(RxnSmartsToChemicalReaction(
++      				          ">>C-1-C-C-C-C-O-1 |Sg:n:4:n:ht|"));
++    auto rxnb = ChemicalReactionToV3KRxnBlock(*rxn);
++    CHECK(rxnb.find("ATOMS=(1 5) XBONDS=(2 4 5) XBHEAD=(1 4) XBCORR=(2 4 5)")!=std::string::npos);
++  }
++}
+ 
+-}
+\ No newline at end of file
+diff --git a/Code/GraphMol/SmilesParse/CXSmilesOps.cpp b/Code/GraphMol/SmilesParse/CXSmilesOps.cpp
+index 4c6e47bf67e..e95137e936d 100644
+--- a/Code/GraphMol/SmilesParse/CXSmilesOps.cpp
++++ b/Code/GraphMol/SmilesParse/CXSmilesOps.cpp
+@@ -272,36 +272,14 @@ void finalizePolymerSGroup(RWMol &mol, SubstanceGroup &sgroup) {
+     // we tried... nothing more we can do
+     return;
+   }
+-  // bondIndexMap uses the position in the vector for the SMILES index and
+-  // the value in that position as the actual bond index.
+-  std::vector<int> bondIndexMap(mol.getNumBonds(), -1);
+-  for (const auto bond : mol.bonds()) {
+-    unsigned int smilesIdx;
+-    if (bond->getPropIfPresent("_cxsmilesBondIdx", smilesIdx)) {
+-      bondIndexMap[smilesIdx] = bond->getIdx();
+-    }
+-  }
+-  for (auto &smilesIdx : headCrossings) {
+-    int bondIdx = bondIndexMap[smilesIdx];
+-    if (bondIdx < 0) {
+-      throw RDKit::SmilesParseException(
+-          "could not find SGroup bond index in molecule");
+-    }
++
++  for (auto &bondIdx : headCrossings) {
+     sgroup.addBondWithIdx(bondIdx);
+-    // and replace the original value
+-    smilesIdx = bondIdx;
+   }
+   sgroup.setProp("XBHEAD", headCrossings);
+ 
+-  for (auto &smilesIdx : tailCrossings) {
+-    int bondIdx = bondIndexMap[smilesIdx];
+-    if (bondIdx < 0) {
+-      throw RDKit::SmilesParseException(
+-          "could not find SGroup bond index in molecule");
+-    }
++  for (auto &bondIdx : tailCrossings) {
+     sgroup.addBondWithIdx(bondIdx);
+-    // and replace the original value
+-    smilesIdx = bondIdx;
+   }
+ 
+   // now we can setup XBCORR

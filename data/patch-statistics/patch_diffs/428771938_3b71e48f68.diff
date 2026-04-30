@@ -1,0 +1,146 @@
+From 6f5a49da5db207a149a3f0cc43fd850502017012 Mon Sep 17 00:00:00 2001
+From: Mallikarjun Kamble <mallikarjun.kamble@ittiam.com>
+Date: Mon, 11 Aug 2025 15:20:00 +0530
+Subject: [PATCH] svcdec: Fixed heap use after free by initilizing dpb ref
+ buffers
+
+Bug: 428771938
+Test: ./svc_dec_fuzzer
+---
+ decoder/svc/isvcd_api.c   | 24 +-----------------
+ decoder/svc/isvcd_utils.c | 53 +++++++++++++++++++++++++++++++++++++++
+ decoder/svc/isvcd_utils.h |  2 ++
+ 3 files changed, 56 insertions(+), 23 deletions(-)
+
+diff --git a/decoder/svc/isvcd_api.c b/decoder/svc/isvcd_api.c
+index b436cb4f..2befebdb 100644
+--- a/decoder/svc/isvcd_api.c
++++ b/decoder/svc/isvcd_api.c
+@@ -1079,29 +1079,7 @@ void isvcd_init_decoder(svc_dec_lyr_struct_t *ps_dec_svc_lyr_params)
+     /* Free any dynamic buffers that are allocated */
+     isvcd_free_dynamic_bufs(ps_svc_lyr_dec);
+ 
+-    {
+-        UWORD8 i;
+-        struct pic_buffer_t *ps_init_dpb;
+-        ps_init_dpb = ps_dec->ps_dpb_mgr->ps_init_dpb[0][0];
+-        for(i = 0; i < 2 * MAX_REF_BUFS; i++)
+-        {
+-            ps_init_dpb->pu1_buf1 = NULL;
+-            ps_init_dpb->u1_long_term_frm_idx = MAX_REF_BUFS + 1;
+-            ps_dec->ps_dpb_mgr->ps_init_dpb[0][i] = ps_init_dpb;
+-            ps_dec->ps_dpb_mgr->ps_mod_dpb[0][i] = ps_init_dpb;
+-            ps_init_dpb++;
+-        }
+-
+-        ps_init_dpb = ps_dec->ps_dpb_mgr->ps_init_dpb[1][0];
+-        for(i = 0; i < 2 * MAX_REF_BUFS; i++)
+-        {
+-            ps_init_dpb->pu1_buf1 = NULL;
+-            ps_init_dpb->u1_long_term_frm_idx = MAX_REF_BUFS + 1;
+-            ps_dec->ps_dpb_mgr->ps_init_dpb[1][i] = ps_init_dpb;
+-            ps_dec->ps_dpb_mgr->ps_mod_dpb[1][i] = ps_init_dpb;
+-            ps_init_dpb++;
+-        }
+-    }
++    isvcd_init_dpb_ref_bufs(ps_dec);
+ 
+     ps_cur_slice = ps_dec->ps_cur_slice;
+     ps_dec->init_done = 0;
+diff --git a/decoder/svc/isvcd_utils.c b/decoder/svc/isvcd_utils.c
+index e8e9f1b6..94661c55 100644
+--- a/decoder/svc/isvcd_utils.c
++++ b/decoder/svc/isvcd_utils.c
+@@ -82,6 +82,7 @@ WORD32 ih264d_init_dec_mb_grp(dec_struct_t *ps_dec);
+ */
+ WORD16 isvcd_free_dynamic_bufs(svc_dec_lyr_struct_t *ps_svc_lyr_dec)
+ {
++    WORD32 i;
+     dec_struct_t *ps_dec = &ps_svc_lyr_dec->s_dec;
+     /* Free any avc dynamic buffers that are allocated */
+     ih264d_free_dynamic_bufs(ps_dec);
+@@ -93,6 +94,12 @@ WORD16 isvcd_free_dynamic_bufs(svc_dec_lyr_struct_t *ps_svc_lyr_dec)
+     PS_DEC_ALIGNED_FREE(ps_dec, ps_svc_lyr_dec->ps_svc_frm_mb_info);
+     PS_DEC_ALIGNED_FREE(ps_dec, ps_svc_lyr_dec->pu2_frm_res_luma_csbp);
+     PS_DEC_ALIGNED_FREE(ps_dec, ps_svc_lyr_dec->pu1_svc_base_mode_flag);
++
++    memset(ps_dec->ps_pic_buf_base, 0, sizeof(struct pic_buffer_t) * (H264_MAX_REF_PICS * 2));
++    for(i = 0; i < MAX_DISP_BUFS_NEW; i++)
++    {
++        ps_dec->apv_buf_id_pic_buf_map[i] = NULL;
++    }
+     return 0;
+ }
+ 
+@@ -734,6 +741,49 @@ WORD32 isvcd_decode_gaps_in_frame_num(dec_struct_t *ps_dec, UWORD16 u2_frame_num
+     return OK;
+ }
+ 
++/*!
++****************************************************************************
++*                                                                           
++*  \if Function name : isvcd_init_dpb_ref_bufs \endif
++*
++*  \brief
++*    Initializes the reference buffers
++*
++*  \return
++*    None
++*
++*  \note
++*    This function is called to initialize the reference buffers.
++****************************************************************************
++*/
++
++void isvcd_init_dpb_ref_bufs(dec_struct_t *ps_dec)
++{
++    UWORD8 i;
++    struct pic_buffer_t *ps_init_dpb;
++    ps_init_dpb = ps_dec->ps_dpb_mgr->ps_init_dpb[0][0];
++    for(i = 0; i < 2 * MAX_REF_BUFS; i++)
++    {
++        memset(ps_init_dpb, 0, sizeof(struct pic_buffer_t));
++        ps_init_dpb->pu1_buf1 = NULL;
++        ps_init_dpb->u1_long_term_frm_idx = MAX_REF_BUFS + 1;
++        ps_dec->ps_dpb_mgr->ps_init_dpb[0][i] = ps_init_dpb;
++        ps_dec->ps_dpb_mgr->ps_mod_dpb[0][i] = ps_init_dpb;
++        ps_init_dpb++;
++    }
++
++    ps_init_dpb = ps_dec->ps_dpb_mgr->ps_init_dpb[1][0];
++    for(i = 0; i < 2 * MAX_REF_BUFS; i++)
++    {
++        memset(ps_init_dpb, 0, sizeof(struct pic_buffer_t));
++        ps_init_dpb->pu1_buf1 = NULL;
++        ps_init_dpb->u1_long_term_frm_idx = MAX_REF_BUFS + 1;
++        ps_dec->ps_dpb_mgr->ps_init_dpb[1][i] = ps_init_dpb;
++        ps_dec->ps_dpb_mgr->ps_mod_dpb[1][i] = ps_init_dpb;
++        ps_init_dpb++;
++    }
++}
++
+ /*!
+ **************************************************************************
+ * \if Function name : isvcd_init_pic \endif
+@@ -850,6 +900,9 @@ WORD32 isvcd_init_pic(svc_dec_lyr_struct_t *ps_svc_lyr_dec, UWORD16 u2_frame_num
+             return IVD_MEM_ALLOC_FAILED;
+         }
+ 
++        ih264d_init_ref_bufs((dpb_manager_t *)ps_dec->ps_dpb_mgr);
++        isvcd_init_dpb_ref_bufs(ps_dec);
++
+         ret = ih264d_create_pic_buffers(ps_dec->u1_pic_bufs, ps_dec);
+         if(ret != OK) return ret;
+ 
+diff --git a/decoder/svc/isvcd_utils.h b/decoder/svc/isvcd_utils.h
+index 56c03229..f7966879 100644
+--- a/decoder/svc/isvcd_utils.h
++++ b/decoder/svc/isvcd_utils.h
+@@ -60,4 +60,6 @@ WORD32 isvcd_decode_pic_order_cnt(
+     dec_pic_params_t *ps_pps, UWORD8 u1_nal_ref_idc, UWORD8 u1_bottom_field_flag,
+     UWORD8 u1_field_pic_flag, WORD32 *pi4_poc, dec_struct_t *ps_dec);
+ 
++void isvcd_init_dpb_ref_bufs(dpb_manager_t *ps_dpb_mgr);
++
+ #endif /*_ISVCD_UTILS_H_*/
+\ No newline at end of file

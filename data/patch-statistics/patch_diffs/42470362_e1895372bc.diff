@@ -1,0 +1,494 @@
+From 85a921f46184dace4b4f3d968830991eff218e3f Mon Sep 17 00:00:00 2001
+From: hwren <hwrenx@126.com>
+Date: Mon, 10 Sep 2018 11:59:02 +0800
+Subject: [PATCH] lavc, doc, configure: add libxavs2 video encoder wrapper
+
+Signed-off-by: hwren <hwrenx@126.com>
+---
+ Changelog              |   1 +
+ configure              |   4 +
+ doc/encoders.texi      |  49 +++++++
+ doc/general.texi       |  14 ++
+ libavcodec/Makefile    |   1 +
+ libavcodec/allcodecs.c |   1 +
+ libavcodec/libxavs2.c  | 297 +++++++++++++++++++++++++++++++++++++++++
+ libavcodec/version.h   |   2 +-
+ 8 files changed, 368 insertions(+), 1 deletion(-)
+ create mode 100644 libavcodec/libxavs2.c
+
+diff --git a/Changelog b/Changelog
+index a117ad4d2e..59ea36d08b 100644
+--- a/Changelog
++++ b/Changelog
+@@ -26,6 +26,7 @@ version <next>:
+ - cue and acue filters
+ - support for AV1 in MP4
+ - transpose_npp filter
++- AVS2 video encoder via libxavs2
+ 
+ 
+ version 4.0:
+diff --git a/configure b/configure
+index ef97c6b500..14aa311ffd 100755
+--- a/configure
++++ b/configure
+@@ -281,6 +281,7 @@ External library support:
+   --enable-libx264         enable H.264 encoding via x264 [no]
+   --enable-libx265         enable HEVC encoding via x265 [no]
+   --enable-libxavs         enable AVS encoding via xavs [no]
++  --enable-libxavs2        enable AVS2 encoding via xavs2 [no]
+   --enable-libxcb          enable X11 grabbing using XCB [autodetect]
+   --enable-libxcb-shm      enable X11 grabbing shm communication [autodetect]
+   --enable-libxcb-xfixes   enable X11 grabbing mouse rendering [autodetect]
+@@ -1667,6 +1668,7 @@ EXTERNAL_LIBRARY_GPL_LIST="
+     libx264
+     libx265
+     libxavs
++    libxavs2
+     libxvid
+ "
+ 
+@@ -3135,6 +3137,7 @@ libx264rgb_encoder_deps="libx264 x264_csp_bgr"
+ libx264rgb_encoder_select="libx264_encoder"
+ libx265_encoder_deps="libx265"
+ libxavs_encoder_deps="libxavs"
++libxavs2_encoder_deps="libxavs2"
+ libxvid_encoder_deps="libxvid"
+ libzvbi_teletext_decoder_deps="libzvbi"
+ vapoursynth_demuxer_deps="vapoursynth"
+@@ -6171,6 +6174,7 @@ enabled libx264           && { check_pkg_config libx264 x264 "stdint.h x264.h" x
+ enabled libx265           && require_pkg_config libx265 x265 x265.h x265_api_get &&
+                              require_cpp_condition libx265 x265.h "X265_BUILD >= 68"
+ enabled libxavs           && require libxavs "stdint.h xavs.h" xavs_encoder_encode "-lxavs $pthreads_extralibs $libm_extralibs"
++enabled libxavs2          && require_pkg_config libxavs2 "xavs2 >= 1.2.77" "stdint.h xavs2.h" xavs2_api_get
+ enabled libxvid           && require libxvid xvid.h xvid_global -lxvidcore
+ enabled libzimg           && require_pkg_config libzimg "zimg >= 2.7.0" zimg.h zimg_get_api_version
+ enabled libzmq            && require_pkg_config libzmq libzmq zmq.h zmq_ctx_new
+diff --git a/doc/encoders.texi b/doc/encoders.texi
+index 7b095754d1..4623f38969 100644
+--- a/doc/encoders.texi
++++ b/doc/encoders.texi
+@@ -2726,6 +2726,55 @@ Reduces detail but attempts to preserve color at extremely low bitrates.
+ 
+ @end table
+ 
++@section libxavs2
++
++xavs2 AVS2-P2/IEEE1857.4 encoder wrapper.
++
++This encoder requires the presence of the libxavs2 headers and library
++during configuration. You need to explicitly configure the build with
++@option{--enable-libxavs2}.
++
++@subsection Options
++
++@table @option
++@item lcu_row_threads
++Set the number of parallel threads for rows from 1 to 8 (default 5).
++
++@item initial_qp
++Set the xavs2 quantization parameter from 1 to 63 (default 34). This is
++used to set the initial qp for the first frame.
++
++@item qp
++Set the xavs2 quantization parameter from 1 to 63 (default 34). This is
++used to set the qp value under constant-QP mode.
++
++@item max_qp
++Set the max qp for rate control from 1 to 63 (default 55).
++
++@item min_qp
++Set the min qp for rate control from 1 to 63 (default 20).
++
++@item speed_level
++Set the Speed level from 0 to 9 (default 0). Higher is better but slower.
++
++@item log_level
++Set the log level from -1 to 3 (default 0). -1: none, 0: error,
++1: warning, 2: info, 3: debug.
++
++@item hierarchical_ref
++Set the hierarchical reference or not (default true).
++
++@item xavs2-params
++Set xavs2 options using a list of @var{key}=@var{value} couples separated
++by ":".
++
++For example to specify libxavs2 encoding options with @option{-xavs2-params}:
++
++@example
++ffmpeg -i input -c:v libxavs2 -xavs2-params preset_level=5 output.avs2
++@end example
++@end table
++
+ @c man end VIDEO ENCODERS
+ 
+ @chapter Subtitles Encoders
+diff --git a/doc/general.texi b/doc/general.texi
+index 06f7a78d8a..05f7bcd9fc 100644
+--- a/doc/general.texi
++++ b/doc/general.texi
+@@ -17,6 +17,20 @@ for more formats. None of them are used by default, their use has to be
+ explicitly requested by passing the appropriate flags to
+ @command{./configure}.
+ 
++@section libxavs2
++
++FFmpeg can make use of the xavs2 library for AVS2-P2/IEEE1857.4 video encoding.
++
++Go to @url{https://github.com/pkuvcl/xavs2} and follow the instructions for
++installing the library. Then pass @code{--enable-libxavs2} to configure to
++enable it.
++
++@float NOTE
++libxavs2 is under the GNU Public License Version 2 or later
++(see @url{http://www.gnu.org/licenses/old-licenses/gpl-2.0.html} for
++details), you must upgrade FFmpeg's license to GPL in order to use it.
++@end float
++
+ @section libdavs2
+ 
+ FFmpeg can make use of the davs2 library for AVS2-P2/IEEE1857.4 video decoding.
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index ceec1df972..3e16a13004 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -993,6 +993,7 @@ OBJS-$(CONFIG_LIBX262_ENCODER)            += libx264.o
+ OBJS-$(CONFIG_LIBX264_ENCODER)            += libx264.o
+ OBJS-$(CONFIG_LIBX265_ENCODER)            += libx265.o
+ OBJS-$(CONFIG_LIBXAVS_ENCODER)            += libxavs.o
++OBJS-$(CONFIG_LIBXAVS2_ENCODER)           += libxavs2.o
+ OBJS-$(CONFIG_LIBXVID_ENCODER)            += libxvid.o
+ OBJS-$(CONFIG_LIBZVBI_TELETEXT_DECODER)   += libzvbi-teletextdec.o ass.o
+ 
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index 8fc1aeab79..7dbfcb3dda 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -712,6 +712,7 @@ extern AVCodec ff_libx264_encoder;
+ extern AVCodec ff_libx264rgb_encoder;
+ extern AVCodec ff_libx265_encoder;
+ extern AVCodec ff_libxavs_encoder;
++extern AVCodec ff_libxavs2_encoder;
+ extern AVCodec ff_libxvid_encoder;
+ extern AVCodec ff_libzvbi_teletext_decoder;
+ 
+diff --git a/libavcodec/libxavs2.c b/libavcodec/libxavs2.c
+new file mode 100644
+index 0000000000..e26c90a8c6
+--- /dev/null
++++ b/libavcodec/libxavs2.c
+@@ -0,0 +1,297 @@
++/*
++ * AVS2 encoding using the xavs2 library
++ *
++ * Copyright (C) 2018 Yiqun Xu,   <yiqun.xu@vipl.ict.ac.cn>
++ *                    Falei Luo,  <falei.luo@gmail.com>
++ *                    Huiwen Ren, <hwrenx@gmail.com>
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "xavs2.h"
++#include "mpeg12.h"
++#include "libavutil/avstring.h"
++
++#define xavs2_opt_set2(name, format, ...) do{ \
++    char opt_str[16] = {0}; \
++    int err; \
++    av_strlcatf(opt_str, sizeof(opt_str), format, __VA_ARGS__); \
++    err = cae->api->opt_set2(cae->param, name, opt_str); \
++    if (err) {\
++        av_log(avctx, AV_LOG_WARNING, "Invalid value for %s: %s\n", name, opt_str);\
++    }\
++} while(0);
++
++typedef struct XAVS2EContext {
++    AVClass *class;
++
++    int lcu_row_threads;
++    int initial_qp;
++    int qp;
++    int max_qp;
++    int min_qp;
++    int preset_level;
++    int log_level;
++    int hierarchical_reference;
++
++    void *encoder;
++    char *xavs2_opts;
++
++    xavs2_outpacket_t packet;
++    xavs2_param_t *param;
++
++    const xavs2_api_t *api;
++
++} XAVS2EContext;
++
++static av_cold int xavs2_init(AVCodecContext *avctx)
++{
++    XAVS2EContext *cae= avctx->priv_data;
++    int bit_depth, code;
++
++    bit_depth = avctx->pix_fmt == AV_PIX_FMT_YUV420P ? 8 : 10;
++
++    /* get API handler */
++    cae->api = xavs2_api_get(bit_depth);
++    if (!cae->api) {
++        av_log(avctx, AV_LOG_ERROR, "api get failed\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    cae->param = cae->api->opt_alloc();
++    if (!cae->param) {
++        av_log(avctx, AV_LOG_ERROR, "param alloc failed\n");
++        return AVERROR(ENOMEM);
++    }
++
++    xavs2_opt_set2("rec",   "%d", 0);
++
++    xavs2_opt_set2("width",     "%d", avctx->width);
++    xavs2_opt_set2("height",    "%d", avctx->height);
++    xavs2_opt_set2("bframes",   "%d", avctx->max_b_frames);
++    xavs2_opt_set2("bitdepth",  "%d", bit_depth);
++    xavs2_opt_set2("log",       "%d", cae->log_level);
++    xavs2_opt_set2("preset",    "%d", cae->preset_level);
++
++    /* not the same parameter as the IntraPeriod in xavs2 log */
++    xavs2_opt_set2("intraperiod",       "%d", avctx->gop_size);
++
++    xavs2_opt_set2("thread_frames",     "%d", avctx->thread_count);
++    xavs2_opt_set2("thread_rows",       "%d", cae->lcu_row_threads);
++    xavs2_opt_set2("hierarchical_ref",  "%d", cae->hierarchical_reference);
++
++    xavs2_opt_set2("OpenGOP",  "%d", 1);
++
++    if (cae->xavs2_opts) {
++        AVDictionary *dict    = NULL;
++        AVDictionaryEntry *en = NULL;
++
++        if (!av_dict_parse_string(&dict, cae->xavs2_opts, "=", ":", 0)) {
++            while ((en = av_dict_get(dict, "", en, AV_DICT_IGNORE_SUFFIX))) {
++                xavs2_opt_set2(en->key, "%s", en->value);
++            }
++            av_dict_free(&dict);
++        }
++    }
++
++    /* Rate control */
++    if (avctx->bit_rate > 0) {
++        xavs2_opt_set2("RateControl",   "%d", 1);
++        xavs2_opt_set2("TargetBitRate", "%"PRId64"", avctx->bit_rate);
++        xavs2_opt_set2("initial_qp",    "%d", cae->initial_qp);
++        xavs2_opt_set2("max_qp",        "%d", cae->max_qp);
++        xavs2_opt_set2("min_qp",        "%d", cae->min_qp);
++    } else {
++        xavs2_opt_set2("initial_qp",    "%d", cae->qp);
++    }
++
++
++    ff_mpeg12_find_best_frame_rate(avctx->framerate, &code, NULL, NULL, 0);
++
++    xavs2_opt_set2("FrameRate",   "%d", code);
++
++    cae->encoder = cae->api->encoder_create(cae->param);
++
++    if (!cae->encoder) {
++        av_log(avctx,AV_LOG_ERROR, "Can not create encoder. Null pointer returned\n");
++        return AVERROR(EINVAL);
++    }
++
++    return 0;
++}
++
++static void xavs2_copy_frame_with_shift(xavs2_picture_t *pic, const AVFrame *frame, const int shift_in)
++{
++    int j, k;
++    for (k = 0; k < 3; k++) {
++        int i_stride = pic->img.i_stride[k];
++        for (j = 0; j < pic->img.i_lines[k]; j++) {
++            uint16_t *p_plane = (uint16_t *)&pic->img.img_planes[k][j * i_stride];
++            int i;
++            uint8_t *p_buffer = frame->data[k] + frame->linesize[k] * j;
++            memset(p_plane, 0, i_stride);
++            for (i = 0; i < pic->img.i_width[k]; i++) {
++                p_plane[i] = p_buffer[i] << shift_in;
++            }
++        }
++    }
++}
++
++static void xavs2_copy_frame(xavs2_picture_t *pic, const AVFrame *frame)
++{
++    int j, k;
++    for (k = 0; k < 3; k++) {
++        for (j = 0; j < pic->img.i_lines[k]; j++) {
++            memcpy( pic->img.img_planes[k] + pic->img.i_stride[k] * j,
++                    frame->data[k]+frame->linesize[k] * j,
++                    pic->img.i_width[k] * pic->img.in_sample_size);
++        }
++    }
++}
++
++static int xavs2_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
++                      const AVFrame *frame, int *got_packet)
++{
++    XAVS2EContext *cae = avctx->priv_data;
++    xavs2_picture_t pic;
++    int ret;
++
++    /* create the XAVS2 video encoder */
++    /* read frame data and send to the XAVS2 video encoder */
++    if (cae->api->encoder_get_buffer(cae->encoder, &pic) < 0) {
++        av_log(avctx,AV_LOG_ERROR, "failed to get frame buffer\n");
++        return AVERROR_EXTERNAL;
++    }
++    if (frame) {
++        switch (frame->format) {
++            case AV_PIX_FMT_YUV420P:
++                if (pic.img.in_sample_size == pic.img.enc_sample_size) {
++                    xavs2_copy_frame(&pic, frame);
++                } else {
++                    const int shift_in = atoi(cae->api->opt_get(cae->param, "SampleShift"));
++                    xavs2_copy_frame_with_shift(&pic, frame, shift_in);
++                }
++            break;
++            case AV_PIX_FMT_YUV420P10:
++                if (pic.img.in_sample_size == pic.img.enc_sample_size) {
++                    xavs2_copy_frame(&pic, frame);
++                    break;
++                }
++            default:
++                av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format\n");
++                return AVERROR(EINVAL);
++            break;
++        }
++
++        pic.i_state = 0;
++        pic.i_pts   = frame->pts;
++        pic.i_type  = XAVS2_TYPE_AUTO;
++
++        ret = cae->api->encoder_encode(cae->encoder, &pic, &cae->packet);
++
++        if (ret) {
++            av_log(avctx, AV_LOG_ERROR, "encode failed\n");
++            return AVERROR_EXTERNAL;
++        }
++
++    } else {
++        cae->api->encoder_encode(cae->encoder, NULL, &cae->packet);
++    }
++
++    if ((cae->packet.len) && (cae->packet.state != XAVS2_STATE_FLUSH_END)){
++
++        if (av_new_packet(pkt, cae->packet.len) < 0){
++            av_log(avctx, AV_LOG_ERROR, "packet alloc failed\n");
++            cae->api->encoder_packet_unref(cae->encoder, &cae->packet);
++            return AVERROR(ENOMEM);
++        }
++
++        pkt->pts = cae->packet.pts;
++        pkt->dts = cae->packet.dts;
++
++        memcpy(pkt->data, cae->packet.stream, cae->packet.len);
++        pkt->size = cae->packet.len;
++
++        cae->api->encoder_packet_unref(cae->encoder, &cae->packet);
++
++        *got_packet = 1;
++    } else {
++        *got_packet = 0;
++    }
++
++    return 0;
++}
++
++static av_cold int xavs2_close(AVCodecContext *avctx)
++{
++    XAVS2EContext *cae = avctx->priv_data;
++    /* destroy the encoder */
++    if (cae->api) {
++        cae->api->encoder_destroy(cae->encoder);
++
++        if (cae->param) {
++            cae->api->opt_destroy(cae->param);
++        }
++    }
++    return 0;
++}
++
++#define OFFSET(x) offsetof(XAVS2EContext, x)
++#define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
++
++static const AVOption options[] = {
++    { "lcu_row_threads" ,   "number of parallel threads for rows" ,     OFFSET(lcu_row_threads) , AV_OPT_TYPE_INT, {.i64 =  0 },  0, INT_MAX,  VE },
++    { "initial_qp"      ,   "Quantization initial parameter"      ,     OFFSET(initial_qp)      , AV_OPT_TYPE_INT, {.i64 = 34 },  1,      63,  VE },
++    { "qp"              ,   "Quantization parameter"  ,                 OFFSET(qp)              , AV_OPT_TYPE_INT, {.i64 = 34 },  1,      63,  VE },
++    { "max_qp"          ,   "max qp for rate control" ,                 OFFSET(max_qp)          , AV_OPT_TYPE_INT, {.i64 = 55 },  0,      63,  VE },
++    { "min_qp"          ,   "min qp for rate control" ,                 OFFSET(min_qp)          , AV_OPT_TYPE_INT, {.i64 = 20 },  0,      63,  VE },
++    { "speed_level"     ,   "Speed level, higher is better but slower", OFFSET(preset_level)    , AV_OPT_TYPE_INT, {.i64 =  0 },  0,       9,  VE },
++    { "log_level"       ,   "log level: -1: none, 0: error, 1: warning, 2: info, 3: debug", OFFSET(log_level)    , AV_OPT_TYPE_INT, {.i64 =  0 },  -1,       3,  VE },
++    { "hierarchical_ref",   "hierarchical reference" ,                  OFFSET(hierarchical_reference)    , AV_OPT_TYPE_BOOL,    {.i64 =  1 }, 0, 1,  VE },
++    { "xavs2-params"    ,   "set the xavs2 configuration using a :-separated list of key=value parameters", OFFSET(xavs2_opts), AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
++    { NULL },
++};
++
++static const AVClass libxavs2 = {
++    .class_name = "XAVS2EContext",
++    .item_name  = av_default_item_name,
++    .option     = options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
++static const AVCodecDefault xavs2_defaults[] = {
++    { "b",                "0" },
++    { "g",                "48" },
++    { "bf",               "7" },
++    { NULL },
++};
++
++AVCodec ff_libxavs2_encoder = {
++    .name           = "libxavs2",
++    .long_name      = NULL_IF_CONFIG_SMALL("libxavs2 AVS2-P2/IEEE1857.4"),
++    .type           = AVMEDIA_TYPE_VIDEO,
++    .id             = AV_CODEC_ID_AVS2,
++    .priv_data_size = sizeof(XAVS2EContext),
++    .init           = xavs2_init,
++    .encode2        = xavs2_encode_frame,
++    .close          = xavs2_close,
++    .capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AUTO_THREADS,
++    .pix_fmts       = (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV420P10, AV_PIX_FMT_NONE },
++    .priv_class     = &libxavs2,
++    .defaults       = xavs2_defaults,
++    .wrapper_name   = "libxavs2",
++} ;
+diff --git a/libavcodec/version.h b/libavcodec/version.h
+index 9aaa24b092..dbaf531d23 100644
+--- a/libavcodec/version.h
++++ b/libavcodec/version.h
+@@ -28,7 +28,7 @@
+ #include "libavutil/version.h"
+ 
+ #define LIBAVCODEC_VERSION_MAJOR  58
+-#define LIBAVCODEC_VERSION_MINOR  29
++#define LIBAVCODEC_VERSION_MINOR  30
+ #define LIBAVCODEC_VERSION_MICRO 100
+ 
+ #define LIBAVCODEC_VERSION_INT  AV_VERSION_INT(LIBAVCODEC_VERSION_MAJOR, \
+-- 
+2.25.1
+

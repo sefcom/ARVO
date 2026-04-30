@@ -1,0 +1,67 @@
+From 3fcf319378f9396a9ca840cd63b96a441818e1f1 Mon Sep 17 00:00:00 2001
+From: Nick Wellnhofer <wellnhofer@aevum.de>
+Date: Sat, 22 Aug 2020 00:43:18 +0200
+Subject: [PATCH] Fix regression introduced with commit d88df4b
+
+Revert the commit and use a different approach.
+
+Found by OSS-Fuzz.
+---
+ xinclude.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/xinclude.c b/xinclude.c
+index c92b32bc8..f48e0af58 100644
+--- a/xinclude.c
++++ b/xinclude.c
+@@ -59,8 +59,8 @@ struct _xmlXIncludeRef {
+     xmlNodePtr            inc; /* the included copy */
+     int                   xml; /* xml or txt */
+     int                 count; /* how many refs use that specific doc */
+-    int		         skip; /* skip in case of errors */
+     int	             fallback; /* fallback was loaded */
++    int		      emptyFb; /* flag to show fallback empty */
+ };
+ 
+ struct _xmlXIncludeCtxt {
+@@ -1988,8 +1988,11 @@ xmlXIncludeLoadFallback(xmlXIncludeCtxtPtr ctxt, xmlNodePtr fallback, int nr) {
+ 
+ 	ctxt->incTab[nr]->inc = xmlDocCopyNodeList(ctxt->doc,
+ 	                                           fallback->children);
++        if (ctxt->incTab[nr]->inc == NULL)
++            ctxt->incTab[nr]->emptyFb = 1;
+     } else {
+         ctxt->incTab[nr]->inc = NULL;
++	ctxt->incTab[nr]->emptyFb = 1;	/* flag empty callback */
+     }
+     ctxt->incTab[nr]->fallback = 1;
+     return(ret);
+@@ -2153,7 +2156,6 @@ xmlXIncludeLoadNode(xmlXIncludeCtxtPtr ctxt, int nr) {
+ 	}
+     }
+     if (ret < 0) {
+-        ctxt->incTab[nr]->skip = 1;
+ 	xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref,
+ 	               XML_XINCLUDE_NO_FALLBACK,
+ 		       "could not load %s, and no fallback was found\n",
+@@ -2197,6 +2199,7 @@ xmlXIncludeIncludeNode(xmlXIncludeCtxtPtr ctxt, int nr) {
+ 
+     list = ctxt->incTab[nr]->inc;
+     ctxt->incTab[nr]->inc = NULL;
++    ctxt->incTab[nr]->emptyFb = 0;
+ 
+     /*
+      * Check against the risk of generating a multi-rooted document
+@@ -2459,7 +2462,8 @@ xmlXIncludeDoProcess(xmlXIncludeCtxtPtr ctxt, xmlDocPtr doc, xmlNodePtr tree,
+      *
+      */
+     for (i = ctxt->incBase;i < ctxt->incNr; i++) {
+-	if (ctxt->incTab[i]->skip == 0)
++	if ((ctxt->incTab[i]->inc != NULL) ||
++	    (ctxt->incTab[i]->emptyFb != 0))	/* (empty fallback) */
+ 	    xmlXIncludeIncludeNode(ctxt, i);
+     }
+ 
+-- 
+GitLab
+

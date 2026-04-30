@@ -1,0 +1,63 @@
+From ceed720ee84d0229d19a3183fb7b67bd2042cef5 Mon Sep 17 00:00:00 2001
+From: "L. Pereira" <l@tia.mat.br>
+Date: Tue, 30 Jul 2024 13:32:59 -0700
+Subject: [PATCH] Revert "Use a branch-free binary search for post and query
+ params, and cookies"
+
+This reverts commit 29a64cecc78d96b9bf164c4bc8fd4da17acf6378.
+---
+ src/lib/lwan-request.c | 34 ++++++----------------------------
+ 1 file changed, 6 insertions(+), 28 deletions(-)
+
+diff --git a/src/lib/lwan-request.c b/src/lib/lwan-request.c
+index 8f7aa1d66..d4fc6df4a 100644
+--- a/src/lib/lwan-request.c
++++ b/src/lib/lwan-request.c
+@@ -1730,41 +1730,19 @@ void lwan_process_request(struct lwan *l, struct lwan_request *request)
+ static inline const char *value_lookup(const struct lwan_key_value_array *array,
+                                        const char *key)
+ {
+-    /* Based on https://orlp.net/blog/bitwise-binary-search/ */
+     const struct lwan_array *la = (const struct lwan_array *)array;
+     struct lwan_key_value *base = (struct lwan_key_value *)la->base;
+     struct lwan_key_value k = { .key = (char *)key };
+ 
+     if (LIKELY(la->elements)) {
+-        size_t n = la->elements;
+-        size_t b = 0;
+-        size_t bit;
+-
+-        /*
+-         * Determine highest power of 2 <= size of array, ensure n is non-zero.
+-         * We use __builtin_clz* to calculate the position of highest set bit.
+-         */
+-#if __SIZEOF_SIZE_T__ == 8
+-        bit = 1ull << (63 - __builtin_clzll(n | 1));  // 64-bit systems
+-#else
+-        bit = 1u << (31 - __builtin_clz(n | 1));      // 32-bit systems
+-#endif
++        struct lwan_key_value k = { .key = (char *)key };
++        struct lwan_key_value *entry;
+ 
+-        /*
+-         * Bitwise search for the key using a modified lower bound approach.
+-         * The loop uses a bitmask to converge on the index of the correct key.
+-         */
+-        for (; bit != 0; bit >>= 1) {
+-            size_t i = b | bit;
+-            // Check boundary and compare
+-            if (i <= n && key_value_compare(&k, &base[i - 1]) >= 0)
+-                b = i; // Update index
+-        }
+-        // Final match check
+-        if (b <= n && key_value_compare(&k, &base[b - 1]) == 0)
+-            return base[b - 1].value; // Return value
++        entry = bsearch(&k, la->base, la->elements, sizeof(k), key_value_compare);
++        if (LIKELY(entry))
++            return entry->value;
+     }
+-    // If no match, return NULL.
++
+     return NULL;
+ }
+ 

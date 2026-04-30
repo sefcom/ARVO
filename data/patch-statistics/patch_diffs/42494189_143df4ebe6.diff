@@ -1,0 +1,219 @@
+From 2dca1322b1d429a043b63ba05e2db7effbf5be19 Mon Sep 17 00:00:00 2001
+From: Dan Bloomberg <dan.bloomberg@gmail.com>
+Date: Sun, 7 Mar 2021 14:47:12 -0800
+Subject: [PATCH] Fix oss-fuzz issue 31787, uninitialized data in
+ pixAddSingleTextblock()
+
+---
+ src/allheaders.h |  3 +-
+ src/enhance.c    | 18 +++++++--
+ src/pix1.c       | 97 +++++++++++++++++++++++++++++++++---------------
+ 3 files changed, 84 insertions(+), 34 deletions(-)
+
+diff --git a/src/allheaders.h b/src/allheaders.h
+index 102eedd76..4478cd997 100644
+--- a/src/allheaders.h
++++ b/src/allheaders.h
+@@ -1464,7 +1464,6 @@ LEPT_DLL extern void pixDestroy ( PIX **ppix );
+ LEPT_DLL extern PIX * pixCopy ( PIX *pixd, const PIX *pixs );
+ LEPT_DLL extern l_ok pixResizeImageData ( PIX *pixd, const PIX *pixs );
+ LEPT_DLL extern l_ok pixCopyColormap ( PIX *pixd, const PIX *pixs );
+-LEPT_DLL extern l_int32 pixSizesEqual ( const PIX *pix1, const PIX *pix2 );
+ LEPT_DLL extern l_ok pixTransferAllData ( PIX *pixd, PIX **ppixs, l_int32 copytext, l_int32 copyformat );
+ LEPT_DLL extern l_ok pixSwapAndDestroy ( PIX **ppixd, PIX **ppixs );
+ LEPT_DLL extern l_int32 pixGetWidth ( const PIX *pix );
+@@ -1509,6 +1508,8 @@ LEPT_DLL extern l_int32 pixSetData ( PIX *pix, l_uint32 *data );
+ LEPT_DLL extern l_uint32 * pixExtractData ( PIX *pixs );
+ LEPT_DLL extern l_int32 pixFreeData ( PIX *pix );
+ LEPT_DLL extern void ** pixGetLinePtrs ( PIX *pix, l_int32 *psize );
++LEPT_DLL extern l_int32 pixSizesEqual ( const PIX *pix1, const PIX *pix2 );
++LEPT_DLL extern l_ok pixMaxAspectRatio ( PIX *pixs, l_float32 *pratio );
+ LEPT_DLL extern l_ok pixPrintStreamInfo ( FILE *fp, const PIX *pix, const char *text );
+ LEPT_DLL extern l_ok pixGetPixel ( PIX *pix, l_int32 x, l_int32 y, l_uint32 *pval );
+ LEPT_DLL extern l_ok pixSetPixel ( PIX *pix, l_int32 x, l_int32 y, l_uint32 val );
+diff --git a/src/enhance.c b/src/enhance.c
+index 9d4bf000d..cd23bda72 100644
+--- a/src/enhance.c
++++ b/src/enhance.c
+@@ -1825,7 +1825,9 @@ l_uint32  *data, *line;
+  *          and the deviations from this are shown separately for deltas
+  *          in r, g and b.  For each component, we show 2 * %nincr + 1
+  *          images.
+- *      (3) Usage: color prints differ from the original due to three factors:
++ *      (3) The pix must have minimum dimensions of 100 and an aspect
++ *          ratio not exceeding 5.0.
++ *      (4) Usage: color prints differ from the original due to three factors:
+  *          illumination, calibration of the camera in acquisition,
+  *          and calibration of the printer.  This function can be used
+  *          to iteratively match a color print to the original.  On each
+@@ -1842,8 +1844,8 @@ pixMosaicColorShiftRGB(PIX       *pixs,
+                        l_int32    nincr)
+ {
+ char       buf[64];
+-l_int32    i;
+-l_float32  del;
++l_int32    i, w, h;
++l_float32  del, ratio;
+ L_BMF     *bmf;
+ PIX       *pix1, *pix2, *pix3;
+ PIXA      *pixa;
+@@ -1865,6 +1867,16 @@ PIXA      *pixa;
+         return (PIX *)ERROR_PTR("nincr not in [0, 6]", procName, NULL);
+     if (nincr == 0) nincr = 2;
+ 
++        /* Require width and height to be >= 100, and the aspect ratio <= 5.0 */
++    pixGetDimensions(pixs, &w, &h, NULL);
++    if (w < 100 || h < 100)
++        return (PIX *)ERROR_PTR("w and h not both >= 100", procName, NULL);
++    pixMaxAspectRatio(pixs, &ratio);
++    if (ratio < 1.0 || ratio > 5.0) {
++        L_ERROR("invalid aspect ratio %5.1f\n", procName, ratio);
++        return NULL;
++    }
++
+     pixa = pixaCreate(3 * (2 * nincr + 1));
+     bmf = bmfCreate(NULL, 8);
+     pix1 = pixScaleToSize(pixs, 400, 0);
+diff --git a/src/pix1.c b/src/pix1.c
+index 22589c0e9..35fa8832f 100644
+--- a/src/pix1.c
++++ b/src/pix1.c
+@@ -62,7 +62,6 @@
+  *          PIX          *pixCopy()
+  *          l_int32       pixResizeImageData()
+  *          l_int32       pixCopyColormap()
+- *          l_int32       pixSizesEqual()
+  *          l_int32       pixTransferAllData()
+  *          l_int32       pixSwapAndDestroy()
+  *
+@@ -112,6 +111,10 @@
+  *    Pix line ptrs
+  *          void        **pixGetLinePtrs()
+  *
++ *    Pix size comparisons
++ *          l_int32       pixSizesEqual()
++ *          l_int32       pixMaxAspectRatio()
++ *
+  *    Pix debug
+  *          l_int32       pixPrintStreamInfo()
+  *
+@@ -299,7 +302,7 @@ setPixMemoryManager(alloc_fn   allocator,
+ 
+ 
+ /*--------------------------------------------------------------------*
+- *                              Pix Creation                          *
++ *                             Pix Creation                           *
+  *--------------------------------------------------------------------*/
+ /*!
+  * \brief   pixCreate()
+@@ -835,33 +838,6 @@ PIXCMAP        *cmapd;
+ }
+ 
+ 
+-/*!
+- * \brief   pixSizesEqual()
+- *
+- * \param[in]    pix1, pix2
+- * \return  1 if the two pix have same {h, w, d}; 0 otherwise.
+- */
+-l_int32
+-pixSizesEqual(const PIX  *pix1,
+-              const PIX  *pix2)
+-{
+-    PROCNAME("pixSizesEqual");
+-
+-    if (!pix1 || !pix2)
+-        return ERROR_INT("pix1 and pix2 not both defined", procName, 0);
+-
+-    if (pix1 == pix2)
+-        return 1;
+-
+-    if ((pixGetWidth(pix1) != pixGetWidth(pix2)) ||
+-        (pixGetHeight(pix1) != pixGetHeight(pix2)) ||
+-        (pixGetDepth(pix1) != pixGetDepth(pix2)))
+-        return 0;
+-    else
+-        return 1;
+-}
+-
+-
+ /*!
+  * \brief   pixTransferAllData()
+  *
+@@ -1029,7 +1005,7 @@ pixSwapAndDestroy(PIX  **ppixd,
+ 
+ 
+ /*--------------------------------------------------------------------*
+- *                                Accessors                           *
++ *                              Pix Accessors                         *
+  *--------------------------------------------------------------------*/
+ l_int32
+ pixGetWidth(const PIX  *pix)
+@@ -1989,6 +1965,67 @@ void     **lines;
+ }
+ 
+ 
++/*--------------------------------------------------------------------*
++ *                         Pix Size Comparisons                       *
++ *--------------------------------------------------------------------*/
++/*!
++ * \brief   pixSizesEqual()
++ *
++ * \param[in]    pix1, pix2
++ * \return  1 if the two pix have same {h, w, d}; 0 otherwise.
++ */
++l_int32
++pixSizesEqual(const PIX  *pix1,
++              const PIX  *pix2)
++{
++    PROCNAME("pixSizesEqual");
++
++    if (!pix1 || !pix2)
++        return ERROR_INT("pix1 and pix2 not both defined", procName, 0);
++
++    if (pix1 == pix2)
++        return 1;
++
++    if ((pixGetWidth(pix1) != pixGetWidth(pix2)) ||
++        (pixGetHeight(pix1) != pixGetHeight(pix2)) ||
++        (pixGetDepth(pix1) != pixGetDepth(pix2)))
++        return 0;
++    else
++        return 1;
++}
++
++
++/*!
++ * \brief   pixMaxAspectRatio()
++ *
++ * \param[in]    pixs      32 bpp rgb
++ * \param[out]   pratio    max aspect ratio, >= 1.0; -1.0 on error
++ * \return  0 if OK, 1 on error
++ */
++l_ok
++pixMaxAspectRatio(PIX        *pixs,
++                  l_float32  *pratio)
++{
++l_int32  w, h;
++
++    PROCNAME("pixMaxAspectRatio");
++
++    if (!pratio)
++        return ERROR_INT("&ratio not defined", procName, 1);
++    *pratio = -1.0;
++    if (!pixs)
++        return ERROR_INT("pixs not defined", procName, 1);
++    pixGetDimensions(pixs, &w, &h, NULL);
++    if (w == 0 || h == 0) {
++        L_ERROR("invalid size: w = %d, h = %d\n", procName, w, h);
++        return 1;
++    }
++
++    *pratio = L_MAX((l_float32)h / (l_float32)w, (l_float32)w / (l_float32)h);
++    return 0;
++}
++
++
+ /*--------------------------------------------------------------------*
+  *                    Print output for debugging                      *
+  *--------------------------------------------------------------------*/

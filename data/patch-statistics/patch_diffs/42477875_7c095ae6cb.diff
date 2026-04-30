@@ -1,0 +1,98 @@
+From 78fae97f6c480b942ef06d537c0a784c076bf7ad Mon Sep 17 00:00:00 2001
+From: "Philip.Hazel" <Philip.Hazel@gmail.com>
+Date: Tue, 10 Sep 2019 13:22:08 +0000
+Subject: [PATCH] Mend bug introduced in previous patch. Fixes crash detected
+ by ClusterFuzz 17101.
+
+---
+ src/pcre2_compile.c    | 18 +++++++++++++-----
+ src/pcre2_intmodedep.h |  7 +++----
+ 2 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/src/pcre2_compile.c b/src/pcre2_compile.c
+index 8ab10b505..7e44fc8f9 100644
+--- a/src/pcre2_compile.c
++++ b/src/pcre2_compile.c
+@@ -5585,7 +5585,7 @@ for (;; pptr++)
+     they are case partners. This can be optimized to generate a caseless single
+     character match (which also sets first/required code units if relevant). */
+ 
+-    if (meta == META_CLASS && pptr[1] < META_END && pptr[2] < META_END && 
++    if (meta == META_CLASS && pptr[1] < META_END && pptr[2] < META_END &&
+         pptr[3] == META_CLASS_END)
+       {
+       uint32_t c = pptr[1];
+@@ -5594,10 +5594,18 @@ for (;; pptr++)
+       if (UCD_CASESET(c) == 0)
+ #endif
+         {
+-        uint32_t d = TABLE_GET(c, cb->fcc, c);
++        uint32_t d;
++        
+ #ifdef SUPPORT_UNICODE
+-        if (utf && c > 127) d = UCD_OTHERCASE(c);
++        if (utf && c > 127) d = UCD_OTHERCASE(c); else
+ #endif
++          {
++#if PCRE2_CODE_UNIT_WIDTH != 8
++          if (c > 255) d = c; else
++#endif 
++          d = TABLE_GET(c, cb->fcc, c);
++          }  
++
+         if (c != d && pptr[2] == d)
+           {
+           pptr += 3;                 /* Move on to class end */
+@@ -5607,7 +5615,7 @@ for (;; pptr++)
+             reset_caseful = TRUE;
+             options |= PCRE2_CASELESS;
+             req_caseopt = REQ_CASELESS;
+-            } 
++            }
+           goto CLASS_CASELESS_CHAR;
+           }
+         }
+@@ -7892,7 +7900,7 @@ for (;; pptr++)
+       zeroreqcuflags = reqcuflags;
+ 
+       /* If the character is more than one code unit long, we can set a single
+-      firstcu only if it is not to be matched caselessly. Multiple possible 
++      firstcu only if it is not to be matched caselessly. Multiple possible
+       starting code units may be picked up later in the studying code. */
+ 
+       if (mclength == 1 || req_caseopt == 0)
+diff --git a/src/pcre2_intmodedep.h b/src/pcre2_intmodedep.h
+index b03d5c2e8..15ade47b4 100644
+--- a/src/pcre2_intmodedep.h
++++ b/src/pcre2_intmodedep.h
+@@ -205,19 +205,19 @@ whether its argument, which is assumed to be one code unit, is less than 256.
+ The CHMAX_255 macro does not assume one code unit. The maximum length of a MARK
+ name must fit in one code unit; currently it is set to 255 or 65535. The
+ TABLE_GET macro is used to access elements of tables containing exactly 256
+-items. When code points can be greater than 255, a check is needed before
+-accessing these tables. */
++items. Its argument is a code unit. When code points can be greater than 255, a
++check is needed before accessing these tables. */
+ 
+ #if PCRE2_CODE_UNIT_WIDTH == 8
+ #define MAX_255(c) TRUE
+ #define MAX_MARK ((1u << 8) - 1)
++#define TABLE_GET(c, table, default) ((table)[c])
+ #ifdef SUPPORT_UNICODE
+ #define SUPPORT_WIDE_CHARS
+ #define CHMAX_255(c) ((c) <= 255u)
+ #else
+ #define CHMAX_255(c) TRUE
+ #endif  /* SUPPORT_UNICODE */
+-#define TABLE_GET(c, table, default) ((table)[c])
+ 
+ #else  /* Code units are 16 or 32 bits */
+ #define CHMAX_255(c) ((c) <= 255u)
+@@ -228,7 +228,6 @@ accessing these tables. */
+ #endif
+ 
+ 
+-
+ /* ----------------- Character-handling macros ----------------- */
+ 
+ /* There is a proposed future special "UTF-21" mode, in which only the lowest

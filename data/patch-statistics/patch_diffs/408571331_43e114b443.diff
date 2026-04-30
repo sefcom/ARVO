@@ -1,0 +1,134 @@
+From ad2f3014e66e3ecec06b7d683edb5ea105c22d9b Mon Sep 17 00:00:00 2001
+From: Mike Pall <mike>
+Date: Wed, 28 May 2025 21:13:17 +0200
+Subject: [PATCH] Fix JIT slot overflow during up-recursion.
+
+Reported by Sergey Kaplun.
+
+(cherry picked from commit 048972dbfdb6b441fe8a9bfe4d1f048966579ba8)
+
+In the case when LuaJIT is recording the side trace after the
+up-recursion call, there is no check that the updated `maxslot` value
+doesn't overflow the `LJ_MAX_JSLOTS` limit. If it records several huge
+returns in a row, the overflow of the aforementioned limit may occur.
+This triggers an assertion failure in `rec_check_slots()`.
+
+This patch fixes it by adding the corresponding check in the
+`lj_record_ret()`.
+
+Sergey Kaplun:
+* added the description and the test for the problem
+
+Resolves tarantool/security#145
+Part of tarantool/tarantool#11278
+
+Reviewed-by: Sergey Bronnikov <sergeyb@tarantool.org>
+Signed-off-by: Sergey Kaplun <skaplun@tarantool.org>
+---
+ src/lj_record.c                               |  3 +-
+ ...j-1358-jslot-overflow-uprecursion.test.lua | 82 +++++++++++++++++++
+ 2 files changed, 84 insertions(+), 1 deletion(-)
+ create mode 100644 test/tarantool-tests/lj-1358-jslot-overflow-uprecursion.test.lua
+
+diff --git a/src/lj_record.c b/src/lj_record.c
+index d83fa38f8b..1dd22dac72 100644
+--- a/src/lj_record.c
++++ b/src/lj_record.c
+@@ -889,7 +889,8 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
+       lj_trace_err(J, LJ_TRERR_LLEAVE);
+     } else if (J->needsnap) {  /* Tailcalled to ff with side-effects. */
+       lj_trace_err(J, LJ_TRERR_NYIRETL);  /* No way to insert snapshot here. */
+-    } else if (1 + pt->framesize >= LJ_MAX_JSLOTS) {
++    } else if (1 + pt->framesize >= LJ_MAX_JSLOTS ||
++	       J->baseslot + J->maxslot >= LJ_MAX_JSLOTS) {
+       lj_trace_err(J, LJ_TRERR_STACKOV);
+     } else {  /* Return to lower frame. Guard for the target we return to. */
+       TRef trpt = lj_ir_kgc(J, obj2gco(pt), IRT_PROTO);
+diff --git a/test/tarantool-tests/lj-1358-jslot-overflow-uprecursion.test.lua b/test/tarantool-tests/lj-1358-jslot-overflow-uprecursion.test.lua
+new file mode 100644
+index 0000000000..1b151b5621
+--- /dev/null
++++ b/test/tarantool-tests/lj-1358-jslot-overflow-uprecursion.test.lua
+@@ -0,0 +1,82 @@
++local tap = require('tap')
++
++-- The test file to demonstrate JIT slots overflow when compiling
++-- the return from the trace with up-recursion.
++-- See also: https://github.com/LuaJIT/LuaJIT/issues/1358.
++
++local test = tap.test('lj-1358-jslot-overflow-uprecursion'):skipcond({
++  ['Test requires JIT enabled'] = not jit.status(),
++})
++
++test:plan(1)
++
++-- The test generates the functions with the following workload:
++--
++-- | local uprec_func()
++-- |   if cond then return end
++-- |   return 'x', --[[...]] 'x', uprec_func()
++-- | end
++-- |
++-- | local function empty() end
++-- | empty('x', --[[...]] 'x', uprec_func())
++--
++-- The recording of the return from `uprec_func()` before the call
++-- to `empty()` causes the assertion failure in the
++-- `rec_check_slots()`.
++
++-- Generate a function with many return values plus up-recursion.
++local function generate_uprec_payload(n_returns)
++  local str_func = [[
++  local counter = 0
++  local function payload_f()
++    counter = counter + 1
++    if counter > 5 then return end
++    return
++  ]]
++  for _ = 1, n_returns do
++    str_func = str_func .. '"x", '
++  end
++  str_func = str_func .. [[
++    payload_f()
++  end
++  return payload_f
++  ]]
++  local f = assert(loadstring(str_func))
++  return f()
++end
++
++-- Generate the necessary number of locals for a huge enough
++-- `cbase`.
++local function generate_nloc_payload(n_locals)
++  local str_func = [[
++  -- Function to be called after return with all stack slots used.
++  local function empty() end
++  empty(
++  ]]
++  for _ = 1, n_locals do
++    str_func = str_func .. '"x", '
++  end
++  str_func = str_func .. [[
++    _G.uprec_func()
++  )
++  ]]
++  local f = assert(loadstring(str_func))
++  return f
++end
++
++-- Avoid an unrelated JIT output.
++jit.off()
++-- 30 * 5 = 150 returned values for the first call.
++_G.uprec_func = generate_uprec_payload(30)
++-- Plus 100 slots for locals, plus a slot for the function to be
++-- called causes JIT stack slots overflow.
++local test_func = generate_nloc_payload(100)
++
++jit.on()
++jit.opt.start('hotloop=1', 'hotexit=1', 'recunroll=1')
++
++test_func()
++
++test:ok(true, 'no assertion on JIT slots overflow')
++
++test:done(true)

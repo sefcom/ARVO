@@ -1,0 +1,52 @@
+From 43006e3eaf712f9e5f39e9cd11cf0fcec0ba0237 Mon Sep 17 00:00:00 2001
+From: Nickolay Olshevsky <o.nickolay@gmail.com>
+Date: Mon, 31 Aug 2020 13:03:40 +0300
+Subject: [PATCH] Fix issue 25292 in oss-fuzz: rnp:fuzz_keyring:
+ Stack-buffer-overflow in stream_write_key
+
+---
+ src/librepgp/stream-packet.cpp                     |   4 +++-
+ .../crash-8619144979e56d07ab4890bf564b90271ae9b1c9 | Bin 0 -> 56 bytes
+ src/tests/fuzz_keyring.cpp                         |   4 ++++
+ 3 files changed, 7 insertions(+), 1 deletion(-)
+ create mode 100644 src/tests/data/test_fuzz_keyring/crash-8619144979e56d07ab4890bf564b90271ae9b1c9
+
+diff --git a/src/librepgp/stream-packet.cpp b/src/librepgp/stream-packet.cpp
+index 19e7abaf0..168a1912f 100644
+--- a/src/librepgp/stream-packet.cpp
++++ b/src/librepgp/stream-packet.cpp
+@@ -409,8 +409,10 @@ add_packet_body_s2k(pgp_packet_body_t *body, const pgp_s2k_t *s2k)
+             return false;
+         }
+         if (s2k->gpg_ext_num == PGP_S2K_GPG_SMARTCARD) {
++            static_assert(sizeof(s2k->gpg_serial) == 16, "invalid gpg serial length");
++            size_t slen = s2k->gpg_serial_len > 16 ? 16 : s2k->gpg_serial_len;
+             return add_packet_body_byte(body, s2k->gpg_serial_len) &&
+-                   add_packet_body(body, s2k->gpg_serial, s2k->gpg_serial_len);
++                   add_packet_body(body, s2k->gpg_serial, slen);
+         }
+         return true;
+     }
+diff --git a/src/tests/data/test_fuzz_keyring/crash-8619144979e56d07ab4890bf564b90271ae9b1c9 b/src/tests/data/test_fuzz_keyring/crash-8619144979e56d07ab4890bf564b90271ae9b1c9
+new file mode 100644
+index 0000000000000000000000000000000000000000..dada7b93f6b48e03bd08f6ecd60a4a6fbf06f2b5
+GIT binary patch
+literal 56
+kcmbQsV9KNb28;|W3Jd`t=6@(iRdDwUW%~agB9BS}0OuSKaR2}S
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/tests/fuzz_keyring.cpp b/src/tests/fuzz_keyring.cpp
+index 3d43f6a76..92b61c815 100644
+--- a/src/tests/fuzz_keyring.cpp
++++ b/src/tests/fuzz_keyring.cpp
+@@ -40,4 +40,8 @@ TEST_F(rnp_tests, test_fuzz_keyring)
+ 
+     data = file_to_vec(DATA_PATH "crash-7ff10f10a95b78461d6f3578f5f99e870c792b9f");
+     assert_int_equal(keyring_LLVMFuzzerTestOneInput(data.data(), data.size()), 0);
++
++    /* Issue 25292 in oss-fuzz: rnp:fuzz_keyring: Stack-buffer-overflow in stream_write_key */
++    data = file_to_vec(DATA_PATH "crash-8619144979e56d07ab4890bf564b90271ae9b1c9");
++    assert_int_equal(keyring_LLVMFuzzerTestOneInput(data.data(), data.size()), 0);
+ }

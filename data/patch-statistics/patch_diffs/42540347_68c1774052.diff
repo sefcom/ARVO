@@ -1,0 +1,143 @@
+# HG changeset patch
+# User Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+# Date 1528586226 18000
+#      Sat Jun 09 18:17:06 2018 -0500
+# Node ID 41f29273fcff496b22af9f21a9fbbe42a072b471
+# Parent  6c6abb417afb501c94be77678dfb32c6d731c1e4
+ImportViewPixelArea(): Use appropriate bits_per_sample validations for FloatQuantumSampleType. (Credit to OSS-Fuzz)
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,6 +1,14 @@
+-2018-06-09   Fojtik Jaroslav  <JaFojtik@seznam.cz>
++2018-06-09  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
+-        * coders/mat.c More than 4GiB are not supported in MAT!
++	* magick/import.c (ImportViewPixelArea): Use appropriate
++	bits_per_sample validations for FloatQuantumSampleType. Fixes
++	oss-fuzz 8780 "graphicsmagick/coder_PTIF_fuzzer:
++	Use-of-uninitialized-value in HorizontalFilter". (Credit to
++	OSS-Fuzz)
++
++2018-06-09  Fojtik Jaroslav  <JaFojtik@seznam.cz>
++
++	* coders/mat.c More than 4GiB are not supported in MAT!
+ 
+ 2018-06-09  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
+ 
+diff --git a/coders/fits.c b/coders/fits.c
+--- a/coders/fits.c
++++ b/coders/fits.c
+@@ -250,6 +250,7 @@
+ 
+   ImportPixelAreaOptionsInit(&import_options);
+   import_options.endian = MSBEndian;
++  import_options.sample_type = UnsignedQuantumSampleType;
+ 
+   /*
+     Decode image header.
+diff --git a/coders/tiff.c b/coders/tiff.c
+--- a/coders/tiff.c
++++ b/coders/tiff.c
+@@ -1514,7 +1514,10 @@
+           }
+         }
+     }
+-  /* fprintf(stderr,"Quantum Type: %d Quantum Samples: %d\n",(int) *quantum_type,*quantum_samples); */
++  if (image->logging)
++    (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                          "Quantum Type: %s, Quantum Samples: %d",
++                          QuantumTypeToString(*quantum_type),*quantum_samples);
+   /* FIXME: We do need to support YCbCr! */
+ 
+   if (*quantum_samples != 0)
+@@ -2544,6 +2547,9 @@
+             QuantumType
+               quantum_type;
+ 
++            ImportPixelAreaInfo
++              import_info;
++
+             if (logging)
+               (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+                                     "Using stripped read method with %u bits per sample",
+@@ -2675,7 +2681,7 @@
+                       Import strip row into image.
+                     */
+                     if (ImportImagePixelArea(image,quantum_type,bits_per_sample,p,
+-                                             &import_options,0) == MagickFail)
++                                             &import_options,&import_info) == MagickFail)
+                       {
+                         CopyException(exception,&image->exception);
+                         status=MagickFail;
+diff --git a/magick/import.c b/magick/import.c
+--- a/magick/import.c
++++ b/magick/import.c
+@@ -3531,17 +3531,6 @@
+   assert((options == (const ImportPixelAreaOptions *) NULL) ||
+          (options->signature == MagickSignature));
+ 
+-  if ((quantum_size == 0U) ||
+-      ((quantum_size > 32U) && (quantum_size != 64U)))
+-    {
+-      char quantum_size_str[MaxTextExtent];
+-      FormatString(quantum_size_str,"%u",quantum_size);
+-      status=0;
+-      ThrowException(&GetCacheViewImage(view)->exception,CoderError,
+-                     UnsupportedBitsPerSample,quantum_size_str);
+-      return MagickFail;
+-    }
+-
+   /*
+     Transfer any special options.
+   */
+@@ -3583,6 +3572,22 @@
+       import_info->bytes_imported=0;
+     }
+ 
++  if (!(((sample_type == FloatQuantumSampleType) &&
++         ((quantum_size == 16) || (quantum_size == 24) ||
++          (quantum_size == 32) || (quantum_size == 64))) ||
++        ((sample_type == UnsignedQuantumSampleType) &&
++         (((quantum_size > 0) && (quantum_size <= 32)) ||
++          (quantum_size == 64)))))
++    {
++      char quantum_size_str[MaxTextExtent];
++      FormatString(quantum_size_str,"%u",quantum_size);
++      status=0;
++      ThrowException(&GetCacheViewImage(view)->exception,CoderError,
++                     UnsupportedBitsPerSample,quantum_size_str);
++      return MagickFail;
++    }
++
++
+   /* printf("quantum_type=%d  quantum_size=%u\n",(int) quantum_type, quantum_size); */
+ 
+   {
+diff --git a/www/Changelog.html b/www/Changelog.html
+--- a/www/Changelog.html
++++ b/www/Changelog.html
+@@ -38,6 +38,22 @@
+ <p>2018-06-09  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
+ <blockquote>
+ <ul class="simple">
++<li>magick/import.c (ImportViewPixelArea): Use appropriate
++bits_per_sample validations for FloatQuantumSampleType. Fixes
++oss-fuzz 8780 &quot;graphicsmagick/coder_PTIF_fuzzer:
++Use-of-uninitialized-value in HorizontalFilter&quot;. (Credit to
++OSS-Fuzz)</li>
++</ul>
++</blockquote>
++<p>2018-06-09  Fojtik Jaroslav  &lt;<a class="reference external" href="mailto:JaFojtik&#37;&#52;&#48;seznam&#46;cz">JaFojtik<span>&#64;</span>seznam<span>&#46;</span>cz</a>&gt;</p>
++<blockquote>
++<ul class="simple">
++<li>coders/mat.c More than 4GiB are not supported in MAT!</li>
++</ul>
++</blockquote>
++<p>2018-06-09  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
++<blockquote>
++<ul class="simple">
+ <li>coders/mat.c (ReadMATImage): Add casts to avoid arithmetic
+ overflow when computing size and offsets.  Fixes oss-fuzz 8801
+ &quot;graphicsmagick/coder_MAT_fuzzer: Timeout in

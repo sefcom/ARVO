@@ -1,0 +1,56 @@
+From c012d1f2bb8735f2b17ce88cd8181d2ffc989b02 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sat, 10 Jun 2023 01:11:48 +0200
+Subject: [PATCH] avcodec/jpeg2000dec: jpeg2000 has its own lowres option
+
+jpeg2000 overrides the global lowres variable with a lowres field called reduction_factor
+ffmpeg -lowres X causes the reduction_factor to be set
+ffplay -lowres X causes both lowres and the reduction_factor to be set
+ossfuss sets only lowres
+
+only the ffmpeg variant works. This patch tries to make the other 2 work.
+
+Alternative we could just error out if things are inconsistent.
+More complex restructuring should be limited to the master branch
+to keep this reasonably easy to backport
+
+Fixes: out of array access
+Fixes: 59672/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_JPEG2000
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/jpeg2000dec.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/jpeg2000dec.c b/libavcodec/jpeg2000dec.c
+index 7d1a222f71..eda959e558 100644
+--- a/libavcodec/jpeg2000dec.c
++++ b/libavcodec/jpeg2000dec.c
+@@ -308,7 +308,7 @@ static int get_siz(Jpeg2000DecoderContext *s)
+         dimy = FFMAX(dimy, ff_jpeg2000_ceildiv(o_dimy, s->cdy[i]));
+     }
+ 
+-    ret = ff_set_dimensions(s->avctx, dimx, dimy);
++    ret = ff_set_dimensions(s->avctx, dimx << s->avctx->lowres, dimy << s->avctx->lowres);
+     if (ret < 0)
+         return ret;
+ 
+@@ -2426,6 +2426,14 @@ static av_cold int jpeg2000_decode_init(AVCodecContext *avctx)
+ {
+     Jpeg2000DecoderContext *s = avctx->priv_data;
+ 
++    if (avctx->lowres)
++        av_log(avctx, AV_LOG_WARNING, "lowres is overriden by reduction_factor but set anyway\n");
++    if (!s->reduction_factor && avctx->lowres < JPEG2000_MAX_RESLEVELS) {
++        s->reduction_factor = avctx->lowres;
++    }
++    if (avctx->lowres != s->reduction_factor && avctx->lowres)
++        return AVERROR(EINVAL);
++
+     ff_jpeg2000dsp_init(&s->dsp);
+     ff_jpeg2000_init_tier1_luts();
+ 
+-- 
+2.25.1
+

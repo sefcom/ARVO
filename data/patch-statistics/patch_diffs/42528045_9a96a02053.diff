@@ -1,0 +1,40 @@
+From 0f2e82e9cb4d8377b12e16ccc319b47d26382288 Mon Sep 17 00:00:00 2001
+From: James Bonfield <jkb@sanger.ac.uk>
+Date: Tue, 12 Sep 2023 09:33:07 +0100
+Subject: [PATCH] Fix a 1 byte heap buffer overflow read.
+
+There is similar logic in var_get_u32, but that appeared to already
+account for the 1 extra loop.  The bug is caused by either "n-- > 0"
+vs "--n > 0", or for consistency with the u32 code, by accounting for
+this in the size check.
+
+Existed since 6a87ead2 (Oct 2021).
+
+Severity: low.  If this data is the very end of a data stream then
+there is potential to steal 1 byte of memory that doesn't belong to
+us.  If malloced this is likely to be malloc meta-data (eg "size" in
+glibc).  If not, it could be something secure, but it would need to be
+part of a packed data structure with no intervening heap structures.
+Given concatenating confidential and non-confidential in a single
+memory allocation is an unlikely scenario and the limited scope of 1
+byte only, the likelihood of an exploit being possible is small.
+
+Credit to OSS-Fuzz
+Fixes oss-fuzz 62270
+---
+ htscodecs/varint.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/htscodecs/varint.h b/htscodecs/varint.h
+index a9c4391..c4a5168 100644
+--- a/htscodecs/varint.h
++++ b/htscodecs/varint.h
+@@ -241,7 +241,7 @@ int var_get_u64(uint8_t *cp, const uint8_t *endp, uint64_t *i) {
+     uint8_t *op = cp, c;
+     uint64_t j = 0;
+ 
+-    if (!endp || endp - cp >= 10) {
++    if (!endp || endp - cp >= 11) {
+         int n = 10;
+         do {
+             c = *cp++;

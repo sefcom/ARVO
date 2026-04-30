@@ -1,0 +1,97 @@
+diff --git a/common/ivd.h b/common/ivd.h
+index fe39a78..a3dae2d 100644
+--- a/common/ivd.h
++++ b/common/ivd.h
+@@ -484,6 +484,17 @@
+      * disp_buf_id
+      */
+     UWORD32                                 u4_disp_buf_id;
++
++    /**
++     * reorder_depth
++     */
++    WORD32                                  i4_reorder_depth;
++
++    /**
++     * display index
++     */
++    WORD32                                  i4_display_index;
++
+ }ivd_video_decode_op_t;
+ 
+ 
+diff --git a/decoder/ihevcd_decode.c b/decoder/ihevcd_decode.c
+index 1295687..16ed36b 100644
+--- a/decoder/ihevcd_decode.c
++++ b/decoder/ihevcd_decode.c
+@@ -207,6 +207,8 @@
+ 
+     ps_dec_op->u4_output_present = 0;
+     ps_dec_op->u4_progressive_frame_flag = 1;
++    ps_dec_op->i4_display_index = -1;
++    ps_dec_op->i4_reorder_depth = -1;
+     if(ps_codec->i4_sps_done)
+     {
+         sps_t *ps_sps = (ps_codec->s_parse.ps_sps_base + ps_codec->i4_sps_id);
+@@ -217,6 +219,8 @@
+         {
+             ps_dec_op->u4_progressive_frame_flag = 0;
+         }
++        ps_dec_op->i4_reorder_depth =
++                        ps_sps->ai1_sps_max_num_reorder_pics[ps_sps->i1_sps_max_sub_layers - 1];
+     }
+ 
+     ps_dec_op->u4_is_ref_flag = 1;
+@@ -224,7 +228,6 @@
+     ps_dec_op->u4_is_ref_flag = 1;
+ 
+     ps_dec_op->e4_fld_type = IV_FLD_TYPE_DEFAULT;
+-
+     ps_dec_op->u4_ts = (UWORD32)(-1);
+     ps_dec_op->u4_disp_buf_id = ps_codec->i4_disp_buf_id;
+     if(ps_codec->i4_flush_mode)
+@@ -264,6 +267,7 @@
+                     break;
+             }
+         }
++        ps_dec_op->i4_display_index = ps_disp_buf->i4_abs_poc;
+         ps_dec_op->u4_output_present = 1;
+         ps_dec_op->u4_ts = ps_disp_buf->u4_ts;
+         if((ps_codec->i4_flush_mode == 0) && (ps_codec->s_parse.i4_end_of_frame == 0))
+diff --git a/decoder/ihevcd_parse_headers.c b/decoder/ihevcd_parse_headers.c
+index 2d1f567..e16a9e6 100644
+--- a/decoder/ihevcd_parse_headers.c
++++ b/decoder/ihevcd_parse_headers.c
+@@ -1675,6 +1675,19 @@
+     {
+         return IHEVCD_INVALID_PARAMETER;
+     }
++    /* Check if CTB size is different in case of multiple SPS with same ID */
++    {
++        sps_t *ps_sps_old = (ps_codec->s_parse.ps_sps_base + sps_id);
++        if(ps_sps_old->i1_sps_valid && ps_sps_old->i1_log2_ctb_size != ctb_log2_size_y)
++        {
++            if(0 == ps_codec->i4_first_pic_done)
++            {
++                return IHEVCD_INVALID_PARAMETER;
++            }
++            ps_codec->i4_reset_flag = 1;
++            return (IHEVCD_ERROR_T)IVD_RES_CHANGED;
++        }
++    }
+     ps_sps->i1_log2_ctb_size = ctb_log2_size_y;
+ 
+     UEV_PARSE("log2_min_transform_block_size_minus2", value, ps_bitstrm);
+diff --git a/decoder/ihevcd_parse_slice_header.c b/decoder/ihevcd_parse_slice_header.c
+index ba2c5e8..c161fc4 100644
+--- a/decoder/ihevcd_parse_slice_header.c
++++ b/decoder/ihevcd_parse_slice_header.c
+@@ -318,7 +318,7 @@
+     }
+ 
+     ps_slice_hdr = ps_codec->s_parse.ps_slice_hdr_base + (ps_codec->s_parse.i4_cur_slice_idx & (MAX_SLICE_HDR_CNT - 1));
+-
++    memset(ps_slice_hdr, 0, sizeof(*ps_slice_hdr));
+ 
+     if((ps_pps->i1_dependent_slice_enabled_flag) &&
+        (!first_slice_in_pic_flag))

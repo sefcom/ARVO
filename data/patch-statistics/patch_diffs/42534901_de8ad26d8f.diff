@@ -1,0 +1,803 @@
+diff --git a/crypto/fipsmodule/sha/asm/sha512-586.pl b/crypto/fipsmodule/sha/asm/sha512-586.pl
+index 67ad8a3..7f12ec5 100644
+--- a/crypto/fipsmodule/sha/asm/sha512-586.pl
++++ b/crypto/fipsmodule/sha/asm/sha512-586.pl
+@@ -66,8 +66,6 @@
+ 
+ $sse2=1;
+ 
+-&external_label("OPENSSL_ia32cap_P") if ($sse2);
+-
+ $Tlo=&DWP(0,"esp");	$Thi=&DWP(4,"esp");
+ $Alo=&DWP(8,"esp");	$Ahi=&DWP(8+4,"esp");
+ $Blo=&DWP(16,"esp");	$Bhi=&DWP(16+4,"esp");
+@@ -290,8 +288,9 @@
+ 	&lea	($K512,&DWP(8,$K512));		# K++
+ }
+ 
++&static_label("K512");
+ 
+-&function_begin("sha512_block_data_order");
++&function_begin("sha512_block_data_order_nohw");
+ 	&mov	("esi",wparam(0));	# ctx
+ 	&mov	("edi",wparam(1));	# inp
+ 	&mov	("eax",wparam(2));	# num
+@@ -313,27 +312,24 @@
+ 	&mov	(&DWP(12,"esp"),"ebx");	# saved sp
+ 
+ if ($sse2) {
+-	&picmeup("edx","OPENSSL_ia32cap_P",$K512,&label("K512"));
+-	&mov	("ecx",&DWP(0,"edx"));
+-	&mov	("edx",&DWP(4,"edx"));
+-
+ 	# load ctx->h[0-7]
+ 	&movq	($A,&QWP(0,"esi"));
+-	 &and	("ecx",1<<24);		# XMM registers availability
+ 	&movq	("mm1",&QWP(8,"esi"));
+-	 &and	("edx",1<<9);		# SSSE3 bit
+ 	&movq	($BxC,&QWP(16,"esi"));
+-	 &or	("ecx","edx");
+ 	&movq	("mm3",&QWP(24,"esi"));
+ 	&movq	($E,&QWP(32,"esi"));
+ 	&movq	("mm5",&QWP(40,"esi"));
+ 	&movq	("mm6",&QWP(48,"esi"));
+ 	&movq	("mm7",&QWP(56,"esi"));
+-	&cmp	("ecx",1<<24|1<<9);
+-	&je	(&label("SSSE3"));
+ 	&sub	("esp",8*10);
+ 	&jmp	(&label("loop_sse2"));
+ 
++	# TODO(davidben): The preamble above this point comes from the original
++	# merged sha512_block_data_order function, which performed some common
++	# setup and then jumped to the particular SHA-512 implementation. The
++	# parts of the preamble that do not apply to this function can be
++	# removed.
++
+ &set_label("loop_sse2",16);
+ 	#&movq	($Asse2,$A);
+ 	&movq	($Bsse2,"mm1");
+@@ -458,14 +454,50 @@
+ 
+ 	&mov	("esp",&DWP(8*10+12,"esp"));	# restore sp
+ 	&emms	();
+-&function_end_A();
++&function_end("sha512_block_data_order_nohw");
+ 
+-&set_label("SSSE3",32);
+ { my ($cnt,$frame)=("ecx","edx");
+   my @X=map("xmm$_",(0..7));
+   my $j;
+   my $i=0;
+ 
++&function_begin("sha512_block_data_order_ssse3");
++	&mov	("esi",wparam(0));	# ctx
++	&mov	("edi",wparam(1));	# inp
++	&mov	("eax",wparam(2));	# num
++	&mov	("ebx","esp");		# saved sp
++
++	&call	(&label("pic_point"));	# make it PIC!
++&set_label("pic_point");
++	&blindpop($K512);
++	&lea	($K512,&DWP(&label("K512")."-".&label("pic_point"),$K512));
++
++	&sub	("esp",16);
++	&and	("esp",-64);
++
++	&shl	("eax",7);
++	&add	("eax","edi");
++	&mov	(&DWP(0,"esp"),"esi");	# ctx
++	&mov	(&DWP(4,"esp"),"edi");	# inp
++	&mov	(&DWP(8,"esp"),"eax");	# inp+num*128
++	&mov	(&DWP(12,"esp"),"ebx");	# saved sp
++
++	# load ctx->h[0-7]
++	&movq	($A,&QWP(0,"esi"));
++	&movq	("mm1",&QWP(8,"esi"));
++	&movq	($BxC,&QWP(16,"esi"));
++	&movq	("mm3",&QWP(24,"esi"));
++	&movq	($E,&QWP(32,"esi"));
++	&movq	("mm5",&QWP(40,"esi"));
++	&movq	("mm6",&QWP(48,"esi"));
++	&movq	("mm7",&QWP(56,"esi"));
++
++	# TODO(davidben): The preamble above this point comes from the original
++	# merged sha512_block_data_order function, which performed some common
++	# setup and then jumped to the particular SHA-512 implementation. The
++	# parts of the preamble that do not apply to this function can be
++	# removed.
++
+ 	&lea	($frame,&DWP(-64,"esp"));
+ 	&sub	("esp",256);
+ 
+@@ -683,7 +715,7 @@
+ 	&mov	("esp",&DWP(64+12,$frame));	# restore sp
+ 	&emms	();
+ }
+-&function_end_A();
++&function_end("sha512_block_data_order_ssse3");
+ }
+ 
+ &set_label("K512",64);	# Yes! I keep it in the code segment!
+@@ -770,7 +802,6 @@
+ 
+ 	&data_word(0x04050607,0x00010203);	# byte swap
+ 	&data_word(0x0c0d0e0f,0x08090a0b);	# mask
+-&function_end_B("sha512_block_data_order");
+ &asciz("SHA512 block transform for x86, CRYPTOGAMS by <appro\@openssl.org>");
+ 
+ &asm_finish();
+diff --git a/crypto/fipsmodule/sha/internal.h b/crypto/fipsmodule/sha/internal.h
+index d1ebbb8..d2a4269 100644
+--- a/crypto/fipsmodule/sha/internal.h
++++ b/crypto/fipsmodule/sha/internal.h
+@@ -80,6 +80,7 @@
+ 
+ #define SHA1_ASM_NOHW
+ #define SHA256_ASM_NOHW
++#define SHA512_ASM_NOHW
+ 
+ #define SHA1_ASM_SSSE3
+ OPENSSL_INLINE int sha1_ssse3_capable(void) {
+@@ -127,10 +128,14 @@
+ void sha256_block_data_order_avx(uint32_t state[8], const uint8_t *data,
+                                  size_t num);
+ 
+-// TODO(crbug.com/boringssl/673): Move the remaining CPU dispatch to C.
+-#define SHA512_ASM
+-void sha512_block_data_order(uint64_t state[8], const uint8_t *data,
+-                             size_t num_blocks);
++#define SHA512_ASM_SSSE3
++OPENSSL_INLINE int sha512_ssse3_capable(void) {
++  // TODO(davidben): Do we need to check the FXSR bit? The Intel manual does not
++  // say to.
++  return CRYPTO_is_SSSE3_capable() && CRYPTO_is_FXSR_capable();
++}
++void sha512_block_data_order_ssse3(uint64_t state[8], const uint8_t *data,
++                                   size_t num);
+ 
+ #elif !defined(OPENSSL_NO_ASM) && defined(OPENSSL_X86_64)
+ 
+diff --git a/crypto/fipsmodule/sha/sha512.c b/crypto/fipsmodule/sha/sha512.c
+index ba9d42d..f9f7be8 100644
+--- a/crypto/fipsmodule/sha/sha512.c
++++ b/crypto/fipsmodule/sha/sha512.c
+@@ -516,6 +516,12 @@
+     return;
+   }
+ #endif
++#if defined(SHA512_ASM_SSSE3)
++  if (sha512_ssse3_capable()) {
++    sha512_block_data_order_ssse3(state, data, num);
++    return;
++  }
++#endif
+ #if defined(SHA512_ASM_NEON)
+   if (CRYPTO_is_NEON_capable()) {
+     sha512_block_data_order_neon(state, data, num);
+diff --git a/gen/bcm/sha512-586-apple.S b/gen/bcm/sha512-586-apple.S
+index d4d05cb..785eaf5 100644
+--- a/gen/bcm/sha512-586-apple.S
++++ b/gen/bcm/sha512-586-apple.S
+@@ -5,11 +5,11 @@
+ 
+ #if !defined(OPENSSL_NO_ASM) && defined(OPENSSL_X86) && defined(__APPLE__)
+ .text
+-.globl	_sha512_block_data_order
+-.private_extern	_sha512_block_data_order
++.globl	_sha512_block_data_order_nohw
++.private_extern	_sha512_block_data_order_nohw
+ .align	4
+-_sha512_block_data_order:
+-L_sha512_block_data_order_begin:
++_sha512_block_data_order_nohw:
++L_sha512_block_data_order_nohw_begin:
+ 	pushl	%ebp
+ 	pushl	%ebx
+ 	pushl	%esi
+@@ -21,7 +21,7 @@
+ 	call	L000pic_point
+ L000pic_point:
+ 	popl	%ebp
+-	leal	L001K512-L000pic_point(%ebp),%ebp
++	leal	LK512-L000pic_point(%ebp),%ebp
+ 	subl	$16,%esp
+ 	andl	$-64,%esp
+ 	shll	$7,%eax
+@@ -30,26 +30,18 @@
+ 	movl	%edi,4(%esp)
+ 	movl	%eax,8(%esp)
+ 	movl	%ebx,12(%esp)
+-	movl	L_OPENSSL_ia32cap_P$non_lazy_ptr-L001K512(%ebp),%edx
+-	movl	(%edx),%ecx
+-	movl	4(%edx),%edx
+ 	movq	(%esi),%mm0
+-	andl	$16777216,%ecx
+ 	movq	8(%esi),%mm1
+-	andl	$512,%edx
+ 	movq	16(%esi),%mm2
+-	orl	%edx,%ecx
+ 	movq	24(%esi),%mm3
+ 	movq	32(%esi),%mm4
+ 	movq	40(%esi),%mm5
+ 	movq	48(%esi),%mm6
+ 	movq	56(%esi),%mm7
+-	cmpl	$16777728,%ecx
+-	je	L002SSSE3
+ 	subl	$80,%esp
+-	jmp	L003loop_sse2
++	jmp	L001loop_sse2
+ .align	4,0x90
+-L003loop_sse2:
++L001loop_sse2:
+ 	movq	%mm1,8(%esp)
+ 	movq	%mm2,16(%esp)
+ 	movq	%mm3,24(%esp)
+@@ -64,9 +56,9 @@
+ 	movl	$15,%edx
+ 	bswap	%eax
+ 	bswap	%ebx
+-	jmp	L00400_14_sse2
++	jmp	L00200_14_sse2
+ .align	4,0x90
+-L00400_14_sse2:
++L00200_14_sse2:
+ 	movd	%eax,%mm1
+ 	movl	(%edi),%eax
+ 	movd	%ebx,%mm7
+@@ -127,7 +119,7 @@
+ 	paddq	%mm6,%mm3
+ 	movq	48(%esp),%mm6
+ 	decl	%edx
+-	jnz	L00400_14_sse2
++	jnz	L00200_14_sse2
+ 	movd	%eax,%mm1
+ 	movd	%ebx,%mm7
+ 	punpckldq	%mm1,%mm7
+@@ -183,9 +175,9 @@
+ 	paddq	%mm6,%mm3
+ 	pxor	%mm0,%mm0
+ 	movl	$32,%edx
+-	jmp	L00516_79_sse2
++	jmp	L00316_79_sse2
+ .align	4,0x90
+-L00516_79_sse2:
++L00316_79_sse2:
+ 	movq	88(%esp),%mm5
+ 	movq	%mm7,%mm1
+ 	psrlq	$1,%mm7
+@@ -339,7 +331,7 @@
+ 	paddq	%mm6,%mm0
+ 	addl	$8,%ebp
+ 	decl	%edx
+-	jnz	L00516_79_sse2
++	jnz	L00316_79_sse2
+ 	paddq	%mm3,%mm0
+ 	movq	8(%esp),%mm1
+ 	movq	24(%esp),%mm3
+@@ -367,7 +359,7 @@
+ 	leal	(%esp,%eax,1),%esp
+ 	subl	%eax,%ebp
+ 	cmpl	88(%esp),%edi
+-	jb	L003loop_sse2
++	jb	L001loop_sse2
+ 	movl	92(%esp),%esp
+ 	emms
+ 	popl	%edi
+@@ -375,8 +367,39 @@
+ 	popl	%ebx
+ 	popl	%ebp
+ 	ret
+-.align	5,0x90
+-L002SSSE3:
++.globl	_sha512_block_data_order_ssse3
++.private_extern	_sha512_block_data_order_ssse3
++.align	4
++_sha512_block_data_order_ssse3:
++L_sha512_block_data_order_ssse3_begin:
++	pushl	%ebp
++	pushl	%ebx
++	pushl	%esi
++	pushl	%edi
++	movl	20(%esp),%esi
++	movl	24(%esp),%edi
++	movl	28(%esp),%eax
++	movl	%esp,%ebx
++	call	L004pic_point
++L004pic_point:
++	popl	%ebp
++	leal	LK512-L004pic_point(%ebp),%ebp
++	subl	$16,%esp
++	andl	$-64,%esp
++	shll	$7,%eax
++	addl	%edi,%eax
++	movl	%esi,(%esp)
++	movl	%edi,4(%esp)
++	movl	%eax,8(%esp)
++	movl	%ebx,12(%esp)
++	movq	(%esi),%mm0
++	movq	8(%esi),%mm1
++	movq	16(%esi),%mm2
++	movq	24(%esi),%mm3
++	movq	32(%esi),%mm4
++	movq	40(%esi),%mm5
++	movq	48(%esi),%mm6
++	movq	56(%esi),%mm7
+ 	leal	-64(%esp),%edx
+ 	subl	$256,%esp
+ 	movdqa	640(%ebp),%xmm1
+@@ -433,7 +456,7 @@
+ 	movdqa	%xmm2,-16(%edx)
+ 	nop
+ .align	5,0x90
+-L006loop_ssse3:
++L005loop_ssse3:
+ 	movdqa	16(%edx),%xmm2
+ 	movdqa	%xmm3,48(%edx)
+ 	leal	128(%ebp),%ebp
+@@ -450,9 +473,9 @@
+ 	pxor	%mm1,%mm2
+ 	movq	%mm7,56(%esp)
+ 	pxor	%mm3,%mm3
+-	jmp	L00700_47_ssse3
++	jmp	L00600_47_ssse3
+ .align	5,0x90
+-L00700_47_ssse3:
++L00600_47_ssse3:
+ 	movdqa	%xmm5,%xmm3
+ 	movdqa	%xmm2,%xmm1
+ .byte	102,15,58,15,208,8
+@@ -1471,7 +1494,7 @@
+ 	movdqa	%xmm1,-16(%edx)
+ 	leal	128(%ebp),%ebp
+ 	decl	%ecx
+-	jnz	L00700_47_ssse3
++	jnz	L00600_47_ssse3
+ 	movdqa	(%ebp),%xmm1
+ 	leal	-640(%ebp),%ebp
+ 	movdqu	(%ebx),%xmm0
+@@ -2283,7 +2306,7 @@
+ 	movq	%mm6,48(%esi)
+ 	movq	%mm7,56(%esi)
+ 	cmpl	%eax,%edi
+-	jb	L006loop_ssse3
++	jb	L005loop_ssse3
+ 	movl	76(%edx),%esp
+ 	emms
+ 	popl	%edi
+@@ -2292,7 +2315,7 @@
+ 	popl	%ebp
+ 	ret
+ .align	6,0x90
+-L001K512:
++LK512:
+ .long	3609767458,1116352408
+ .long	602891725,1899447441
+ .long	3964484399,3049323471
+@@ -2380,8 +2403,4 @@
+ .byte	67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,97
+ .byte	112,112,114,111,64,111,112,101,110,115,115,108,46,111,114,103
+ .byte	62,0
+-.section __IMPORT,__pointers,non_lazy_symbol_pointers
+-L_OPENSSL_ia32cap_P$non_lazy_ptr:
+-.indirect_symbol	_OPENSSL_ia32cap_P
+-.long	0
+ #endif  // !defined(OPENSSL_NO_ASM) && defined(OPENSSL_X86) && defined(__APPLE__)
+diff --git a/gen/bcm/sha512-586-linux.S b/gen/bcm/sha512-586-linux.S
+index 3dc0ecb..e82bd00 100644
+--- a/gen/bcm/sha512-586-linux.S
++++ b/gen/bcm/sha512-586-linux.S
+@@ -5,12 +5,12 @@
+ 
+ #if !defined(OPENSSL_NO_ASM) && defined(OPENSSL_X86) && defined(__ELF__)
+ .text
+-.globl	sha512_block_data_order
+-.hidden	sha512_block_data_order
+-.type	sha512_block_data_order,@function
++.globl	sha512_block_data_order_nohw
++.hidden	sha512_block_data_order_nohw
++.type	sha512_block_data_order_nohw,@function
+ .align	16
+-sha512_block_data_order:
+-.L_sha512_block_data_order_begin:
++sha512_block_data_order_nohw:
++.L_sha512_block_data_order_nohw_begin:
+ 	pushl	%ebp
+ 	pushl	%ebx
+ 	pushl	%esi
+@@ -22,7 +22,7 @@
+ 	call	.L000pic_point
+ .L000pic_point:
+ 	popl	%ebp
+-	leal	.L001K512-.L000pic_point(%ebp),%ebp
++	leal	.LK512-.L000pic_point(%ebp),%ebp
+ 	subl	$16,%esp
+ 	andl	$-64,%esp
+ 	shll	$7,%eax
+@@ -31,26 +31,18 @@
+ 	movl	%edi,4(%esp)
+ 	movl	%eax,8(%esp)
+ 	movl	%ebx,12(%esp)
+-	leal	OPENSSL_ia32cap_P-.L001K512(%ebp),%edx
+-	movl	(%edx),%ecx
+-	movl	4(%edx),%edx
+ 	movq	(%esi),%mm0
+-	andl	$16777216,%ecx
+ 	movq	8(%esi),%mm1
+-	andl	$512,%edx
+ 	movq	16(%esi),%mm2
+-	orl	%edx,%ecx
+ 	movq	24(%esi),%mm3
+ 	movq	32(%esi),%mm4
+ 	movq	40(%esi),%mm5
+ 	movq	48(%esi),%mm6
+ 	movq	56(%esi),%mm7
+-	cmpl	$16777728,%ecx
+-	je	.L002SSSE3
+ 	subl	$80,%esp
+-	jmp	.L003loop_sse2
++	jmp	.L001loop_sse2
+ .align	16
+-.L003loop_sse2:
++.L001loop_sse2:
+ 	movq	%mm1,8(%esp)
+ 	movq	%mm2,16(%esp)
+ 	movq	%mm3,24(%esp)
+@@ -65,9 +57,9 @@
+ 	movl	$15,%edx
+ 	bswap	%eax
+ 	bswap	%ebx
+-	jmp	.L00400_14_sse2
++	jmp	.L00200_14_sse2
+ .align	16
+-.L00400_14_sse2:
++.L00200_14_sse2:
+ 	movd	%eax,%mm1
+ 	movl	(%edi),%eax
+ 	movd	%ebx,%mm7
+@@ -128,7 +120,7 @@
+ 	paddq	%mm6,%mm3
+ 	movq	48(%esp),%mm6
+ 	decl	%edx
+-	jnz	.L00400_14_sse2
++	jnz	.L00200_14_sse2
+ 	movd	%eax,%mm1
+ 	movd	%ebx,%mm7
+ 	punpckldq	%mm1,%mm7
+@@ -184,9 +176,9 @@
+ 	paddq	%mm6,%mm3
+ 	pxor	%mm0,%mm0
+ 	movl	$32,%edx
+-	jmp	.L00516_79_sse2
++	jmp	.L00316_79_sse2
+ .align	16
+-.L00516_79_sse2:
++.L00316_79_sse2:
+ 	movq	88(%esp),%mm5
+ 	movq	%mm7,%mm1
+ 	psrlq	$1,%mm7
+@@ -340,7 +332,7 @@
+ 	paddq	%mm6,%mm0
+ 	addl	$8,%ebp
+ 	decl	%edx
+-	jnz	.L00516_79_sse2
++	jnz	.L00316_79_sse2
+ 	paddq	%mm3,%mm0
+ 	movq	8(%esp),%mm1
+ 	movq	24(%esp),%mm3
+@@ -368,7 +360,7 @@
+ 	leal	(%esp,%eax,1),%esp
+ 	subl	%eax,%ebp
+ 	cmpl	88(%esp),%edi
+-	jb	.L003loop_sse2
++	jb	.L001loop_sse2
+ 	movl	92(%esp),%esp
+ 	emms
+ 	popl	%edi
+@@ -376,8 +368,41 @@
+ 	popl	%ebx
+ 	popl	%ebp
+ 	ret
+-.align	32
+-.L002SSSE3:
++.size	sha512_block_data_order_nohw,.-.L_sha512_block_data_order_nohw_begin
++.globl	sha512_block_data_order_ssse3
++.hidden	sha512_block_data_order_ssse3
++.type	sha512_block_data_order_ssse3,@function
++.align	16
++sha512_block_data_order_ssse3:
++.L_sha512_block_data_order_ssse3_begin:
++	pushl	%ebp
++	pushl	%ebx
++	pushl	%esi
++	pushl	%edi
++	movl	20(%esp),%esi
++	movl	24(%esp),%edi
++	movl	28(%esp),%eax
++	movl	%esp,%ebx
++	call	.L004pic_point
++.L004pic_point:
++	popl	%ebp
++	leal	.LK512-.L004pic_point(%ebp),%ebp
++	subl	$16,%esp
++	andl	$-64,%esp
++	shll	$7,%eax
++	addl	%edi,%eax
++	movl	%esi,(%esp)
++	movl	%edi,4(%esp)
++	movl	%eax,8(%esp)
++	movl	%ebx,12(%esp)
++	movq	(%esi),%mm0
++	movq	8(%esi),%mm1
++	movq	16(%esi),%mm2
++	movq	24(%esi),%mm3
++	movq	32(%esi),%mm4
++	movq	40(%esi),%mm5
++	movq	48(%esi),%mm6
++	movq	56(%esi),%mm7
+ 	leal	-64(%esp),%edx
+ 	subl	$256,%esp
+ 	movdqa	640(%ebp),%xmm1
+@@ -434,7 +459,7 @@
+ 	movdqa	%xmm2,-16(%edx)
+ 	nop
+ .align	32
+-.L006loop_ssse3:
++.L005loop_ssse3:
+ 	movdqa	16(%edx),%xmm2
+ 	movdqa	%xmm3,48(%edx)
+ 	leal	128(%ebp),%ebp
+@@ -451,9 +476,9 @@
+ 	pxor	%mm1,%mm2
+ 	movq	%mm7,56(%esp)
+ 	pxor	%mm3,%mm3
+-	jmp	.L00700_47_ssse3
++	jmp	.L00600_47_ssse3
+ .align	32
+-.L00700_47_ssse3:
++.L00600_47_ssse3:
+ 	movdqa	%xmm5,%xmm3
+ 	movdqa	%xmm2,%xmm1
+ .byte	102,15,58,15,208,8
+@@ -1472,7 +1497,7 @@
+ 	movdqa	%xmm1,-16(%edx)
+ 	leal	128(%ebp),%ebp
+ 	decl	%ecx
+-	jnz	.L00700_47_ssse3
++	jnz	.L00600_47_ssse3
+ 	movdqa	(%ebp),%xmm1
+ 	leal	-640(%ebp),%ebp
+ 	movdqu	(%ebx),%xmm0
+@@ -2284,7 +2309,7 @@
+ 	movq	%mm6,48(%esi)
+ 	movq	%mm7,56(%esi)
+ 	cmpl	%eax,%edi
+-	jb	.L006loop_ssse3
++	jb	.L005loop_ssse3
+ 	movl	76(%edx),%esp
+ 	emms
+ 	popl	%edi
+@@ -2292,8 +2317,9 @@
+ 	popl	%ebx
+ 	popl	%ebp
+ 	ret
++.size	sha512_block_data_order_ssse3,.-.L_sha512_block_data_order_ssse3_begin
+ .align	64
+-.L001K512:
++.LK512:
+ .long	3609767458,1116352408
+ .long	602891725,1899447441
+ .long	3964484399,3049323471
+@@ -2376,7 +2402,6 @@
+ .long	1246189591,1816402316
+ .long	67438087,66051
+ .long	202182159,134810123
+-.size	sha512_block_data_order,.-.L_sha512_block_data_order_begin
+ .byte	83,72,65,53,49,50,32,98,108,111,99,107,32,116,114,97
+ .byte	110,115,102,111,114,109,32,102,111,114,32,120,56,54,44,32
+ .byte	67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,97
+diff --git a/gen/bcm/sha512-586-win.asm b/gen/bcm/sha512-586-win.asm
+index ba55f7d..2f43a1c 100644
+--- a/gen/bcm/sha512-586-win.asm
++++ b/gen/bcm/sha512-586-win.asm
+@@ -13,11 +13,10 @@
+ %else
+ section	.text	code
+ %endif
+-;extern	_OPENSSL_ia32cap_P
+-global	_sha512_block_data_order
++global	_sha512_block_data_order_nohw
+ align	16
+-_sha512_block_data_order:
+-L$_sha512_block_data_order_begin:
++_sha512_block_data_order_nohw:
++L$_sha512_block_data_order_nohw_begin:
+ 	push	ebp
+ 	push	ebx
+ 	push	esi
+@@ -29,7 +28,7 @@
+ 	call	L$000pic_point
+ L$000pic_point:
+ 	pop	ebp
+-	lea	ebp,[(L$001K512-L$000pic_point)+ebp]
++	lea	ebp,[(L$K512-L$000pic_point)+ebp]
+ 	sub	esp,16
+ 	and	esp,-64
+ 	shl	eax,7
+@@ -38,26 +37,18 @@
+ 	mov	DWORD [4+esp],edi
+ 	mov	DWORD [8+esp],eax
+ 	mov	DWORD [12+esp],ebx
+-	lea	edx,[_OPENSSL_ia32cap_P]
+-	mov	ecx,DWORD [edx]
+-	mov	edx,DWORD [4+edx]
+ 	movq	mm0,[esi]
+-	and	ecx,16777216
+ 	movq	mm1,[8+esi]
+-	and	edx,512
+ 	movq	mm2,[16+esi]
+-	or	ecx,edx
+ 	movq	mm3,[24+esi]
+ 	movq	mm4,[32+esi]
+ 	movq	mm5,[40+esi]
+ 	movq	mm6,[48+esi]
+ 	movq	mm7,[56+esi]
+-	cmp	ecx,16777728
+-	je	NEAR L$002SSSE3
+ 	sub	esp,80
+-	jmp	NEAR L$003loop_sse2
++	jmp	NEAR L$001loop_sse2
+ align	16
+-L$003loop_sse2:
++L$001loop_sse2:
+ 	movq	[8+esp],mm1
+ 	movq	[16+esp],mm2
+ 	movq	[24+esp],mm3
+@@ -72,9 +63,9 @@
+ 	mov	edx,15
+ 	bswap	eax
+ 	bswap	ebx
+-	jmp	NEAR L$00400_14_sse2
++	jmp	NEAR L$00200_14_sse2
+ align	16
+-L$00400_14_sse2:
++L$00200_14_sse2:
+ 	movd	mm1,eax
+ 	mov	eax,DWORD [edi]
+ 	movd	mm7,ebx
+@@ -135,7 +126,7 @@
+ 	paddq	mm3,mm6
+ 	movq	mm6,[48+esp]
+ 	dec	edx
+-	jnz	NEAR L$00400_14_sse2
++	jnz	NEAR L$00200_14_sse2
+ 	movd	mm1,eax
+ 	movd	mm7,ebx
+ 	punpckldq	mm7,mm1
+@@ -191,9 +182,9 @@
+ 	paddq	mm3,mm6
+ 	pxor	mm0,mm0
+ 	mov	edx,32
+-	jmp	NEAR L$00516_79_sse2
++	jmp	NEAR L$00316_79_sse2
+ align	16
+-L$00516_79_sse2:
++L$00316_79_sse2:
+ 	movq	mm5,[88+esp]
+ 	movq	mm1,mm7
+ 	psrlq	mm7,1
+@@ -347,7 +338,7 @@
+ 	paddq	mm0,mm6
+ 	add	ebp,8
+ 	dec	edx
+-	jnz	NEAR L$00516_79_sse2
++	jnz	NEAR L$00316_79_sse2
+ 	paddq	mm0,mm3
+ 	movq	mm1,[8+esp]
+ 	movq	mm3,[24+esp]
+@@ -375,7 +366,7 @@
+ 	lea	esp,[eax*1+esp]
+ 	sub	ebp,eax
+ 	cmp	edi,DWORD [88+esp]
+-	jb	NEAR L$003loop_sse2
++	jb	NEAR L$001loop_sse2
+ 	mov	esp,DWORD [92+esp]
+ 	emms
+ 	pop	edi
+@@ -383,8 +374,38 @@
+ 	pop	ebx
+ 	pop	ebp
+ 	ret
+-align	32
+-L$002SSSE3:
++global	_sha512_block_data_order_ssse3
++align	16
++_sha512_block_data_order_ssse3:
++L$_sha512_block_data_order_ssse3_begin:
++	push	ebp
++	push	ebx
++	push	esi
++	push	edi
++	mov	esi,DWORD [20+esp]
++	mov	edi,DWORD [24+esp]
++	mov	eax,DWORD [28+esp]
++	mov	ebx,esp
++	call	L$004pic_point
++L$004pic_point:
++	pop	ebp
++	lea	ebp,[(L$K512-L$004pic_point)+ebp]
++	sub	esp,16
++	and	esp,-64
++	shl	eax,7
++	add	eax,edi
++	mov	DWORD [esp],esi
++	mov	DWORD [4+esp],edi
++	mov	DWORD [8+esp],eax
++	mov	DWORD [12+esp],ebx
++	movq	mm0,[esi]
++	movq	mm1,[8+esi]
++	movq	mm2,[16+esi]
++	movq	mm3,[24+esi]
++	movq	mm4,[32+esi]
++	movq	mm5,[40+esi]
++	movq	mm6,[48+esi]
++	movq	mm7,[56+esi]
+ 	lea	edx,[esp-64]
+ 	sub	esp,256
+ 	movdqa	xmm1,[640+ebp]
+@@ -441,7 +462,7 @@
+ 	movdqa	[edx-16],xmm2
+ 	nop
+ align	32
+-L$006loop_ssse3:
++L$005loop_ssse3:
+ 	movdqa	xmm2,[16+edx]
+ 	movdqa	[48+edx],xmm3
+ 	lea	ebp,[128+ebp]
+@@ -458,9 +479,9 @@
+ 	pxor	mm2,mm1
+ 	movq	[56+esp],mm7
+ 	pxor	mm3,mm3
+-	jmp	NEAR L$00700_47_ssse3
++	jmp	NEAR L$00600_47_ssse3
+ align	32
+-L$00700_47_ssse3:
++L$00600_47_ssse3:
+ 	movdqa	xmm3,xmm5
+ 	movdqa	xmm1,xmm2
+ db	102,15,58,15,208,8
+@@ -1479,7 +1500,7 @@
+ 	movdqa	[edx-16],xmm1
+ 	lea	ebp,[128+ebp]
+ 	dec	ecx
+-	jnz	NEAR L$00700_47_ssse3
++	jnz	NEAR L$00600_47_ssse3
+ 	movdqa	xmm1,[ebp]
+ 	lea	ebp,[ebp-640]
+ 	movdqu	xmm0,[ebx]
+@@ -2291,7 +2312,7 @@
+ 	movq	[48+esi],mm6
+ 	movq	[56+esi],mm7
+ 	cmp	edi,eax
+-	jb	NEAR L$006loop_ssse3
++	jb	NEAR L$005loop_ssse3
+ 	mov	esp,DWORD [76+edx]
+ 	emms
+ 	pop	edi
+@@ -2300,7 +2321,7 @@
+ 	pop	ebp
+ 	ret
+ align	64
+-L$001K512:
++L$K512:
+ dd	3609767458,1116352408
+ dd	602891725,1899447441
+ dd	3964484399,3049323471
+@@ -2388,8 +2409,6 @@
+ db	67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,97
+ db	112,112,114,111,64,111,112,101,110,115,115,108,46,111,114,103
+ db	62,0
+-segment	.bss
+-common	_OPENSSL_ia32cap_P 16
+ %else
+ ; Work around https://bugzilla.nasm.us/show_bug.cgi?id=3392738
+ ret

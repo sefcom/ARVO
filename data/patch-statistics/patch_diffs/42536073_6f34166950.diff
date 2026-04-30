@@ -1,0 +1,118 @@
+From 208e7a33043784d4b9939fb236c84f56cd58e6f5 Mon Sep 17 00:00:00 2001
+From: Benoit Blanchon <git@benoitblanchon.fr>
+Date: Sat, 8 Jun 2024 18:49:42 +0200
+Subject: [PATCH] Fix integer overflow in MsgPackDeserializer
+
+---
+ .../MixedConfiguration/string_length_size_2.cpp | 11 ++++++++++-
+ .../MixedConfiguration/string_length_size_4.cpp | 17 +++++++++++++++++
+ src/ArduinoJson/Memory/StringNode.hpp           |  6 ++++--
+ src/ArduinoJson/MsgPack/MsgPackDeserializer.hpp | 13 +++++++++++--
+ 4 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/extras/tests/MixedConfiguration/string_length_size_2.cpp b/extras/tests/MixedConfiguration/string_length_size_2.cpp
+index a9a24cbfd..2c1315b08 100644
+--- a/extras/tests/MixedConfiguration/string_length_size_2.cpp
++++ b/extras/tests/MixedConfiguration/string_length_size_2.cpp
+@@ -112,6 +112,15 @@ TEST_CASE("ARDUINOJSON_STRING_LENGTH_SIZE == 2") {
+       REQUIRE(err == DeserializationError::NoMemory);
+     }
+ 
++    // https://oss-fuzz.com/testcase?key=5354792971993088
++    SECTION("doesn't overflow if binary size == 0xFFFF") {
++      auto input = "\xc5\xff\xff"_s;
++
++      auto err = deserializeMsgPack(doc, input);
++
++      REQUIRE(err == DeserializationError::NoMemory);
++    }
++
+     SECTION("returns Ok if extension size <= 65531") {
+       auto input = "\xc8\xff\xfb\x01" + std::string(65531, '?');
+ 
+@@ -120,7 +129,7 @@ TEST_CASE("ARDUINOJSON_STRING_LENGTH_SIZE == 2") {
+       REQUIRE(err == DeserializationError::Ok);
+     }
+ 
+-    SECTION("returns NoMemory if binary size >= 65532") {
++    SECTION("returns NoMemory if extension size >= 65532") {
+       auto input = "\xc8\xff\xfc\x01" + std::string(65532, '?');
+ 
+       auto err = deserializeMsgPack(doc, input);
+diff --git a/extras/tests/MixedConfiguration/string_length_size_4.cpp b/extras/tests/MixedConfiguration/string_length_size_4.cpp
+index 36c69f366..4059c3d48 100644
+--- a/extras/tests/MixedConfiguration/string_length_size_4.cpp
++++ b/extras/tests/MixedConfiguration/string_length_size_4.cpp
+@@ -72,6 +72,23 @@ TEST_CASE("ARDUINOJSON_STRING_LENGTH_SIZE == 4") {
+ 
+       REQUIRE(err == DeserializationError::Ok);
+     }
++
++    // https://oss-fuzz.com/testcase?key=5354792971993088
++    SECTION("doesn't overflow if binary size == 0xFFFFFFFF") {
++      auto input = "\xc6\xff\xff\xff\xff"_s;
++
++      auto err = deserializeMsgPack(doc, input);
++
++      REQUIRE(err == DeserializationError::NoMemory);
++    }
++
++    SECTION("doesn't overflow if string size == 0xFFFFFFFF") {
++      auto input = "\xdb\xff\xff\xff\xff???????????????????"_s;
++
++      auto err = deserializeMsgPack(doc, input);
++
++      REQUIRE(err != DeserializationError::Ok);
++    }
+   }
+ 
+   SECTION("bin 32 deserialization") {
+diff --git a/src/ArduinoJson/Memory/StringNode.hpp b/src/ArduinoJson/Memory/StringNode.hpp
+index 7b8f6af39..f60cc2e64 100644
+--- a/src/ArduinoJson/Memory/StringNode.hpp
++++ b/src/ArduinoJson/Memory/StringNode.hpp
+@@ -35,8 +35,10 @@ struct StringNode {
+   static StringNode* create(size_t length, Allocator* allocator) {
+     if (length > maxLength)
+       return nullptr;
+-    auto node = reinterpret_cast<StringNode*>(
+-        allocator->allocate(sizeForLength(length)));
++    auto size = sizeForLength(length);
++    if (size < length)  // integer overflow
++      return nullptr;   // (not testable on 64-bit)
++    auto node = reinterpret_cast<StringNode*>(allocator->allocate(size));
+     if (node) {
+       node->length = length_type(length);
+       node->references = 1;
+diff --git a/src/ArduinoJson/MsgPack/MsgPackDeserializer.hpp b/src/ArduinoJson/MsgPack/MsgPackDeserializer.hpp
+index f94e2ed05..4d30629c6 100644
+--- a/src/ArduinoJson/MsgPack/MsgPackDeserializer.hpp
++++ b/src/ArduinoJson/MsgPack/MsgPackDeserializer.hpp
+@@ -198,8 +198,13 @@ class MsgPackDeserializer {
+       if (err)
+         return err;
+ 
++      uint32_t size32 = 0;
+       for (size_t i = 0; i < sizeBytes; i++)
+-        size = (size << 8) | header[i + 1];
++        size32 = (size32 << 8) | header[i + 1];
++
++      size = size_t(size32);
++      if (size < size32)                        // integer overflow
++        return DeserializationError::NoMemory;  // (not testable on 32/64-bit)
+     }
+ 
+     // array 16, 32 and fixarray
+@@ -366,7 +371,11 @@ class MsgPackDeserializer {
+   DeserializationError::Code readRawString(VariantData* variant,
+                                            const void* header,
+                                            uint8_t headerSize, size_t n) {
+-    char* p = stringBuffer_.reserve(headerSize + n);
++    auto totalSize = size_t(headerSize + n);
++    if (totalSize < n)                        // integer overflow
++      return DeserializationError::NoMemory;  // (not testable on 64-bit)
++
++    char* p = stringBuffer_.reserve(totalSize);
+     if (!p)
+       return DeserializationError::NoMemory;
+ 

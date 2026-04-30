@@ -1,0 +1,93 @@
+From 03704c7704870a0e6cbb0eae99488d544c4adb30 Mon Sep 17 00:00:00 2001
+From: Alan Modra <amodra@gmail.com>
+Date: Sun, 22 Mar 2020 18:15:41 +1030
+Subject: [PATCH] NS32K arg_bufs uninitialised
+
+git commit d1e304bc27 was aimed at stopping uninitialised memory
+access to the index_offset array.  Unfortunately that patch resulted
+in a different array being uninitialised for all instructions with
+more than two arguments.
+
+	* ns32k-dis.c (print_insn_arg): Update comment.
+	(print_insn_ns32k): Reduce size of index_offset array, and
+	initialize, passing -1 to print_insn_arg for args that are not
+	an index.  Don't exit arg loop early.  Abort on bad arg number.
+---
+ opcodes/ChangeLog   |  7 +++++++
+ opcodes/ns32k-dis.c | 19 ++++++++++---------
+ 2 files changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/opcodes/ChangeLog b/opcodes/ChangeLog
+index 7ca7a644cdc..06b81d7b547 100644
+--- a/opcodes/ChangeLog
++++ b/opcodes/ChangeLog
+@@ -1,3 +1,10 @@
++2020-03-22  Alan Modra  <amodra@gmail.com>
++
++	* ns32k-dis.c (print_insn_arg): Update comment.
++	(print_insn_ns32k): Reduce size of index_offset array, and
++	initialize, passing -1 to print_insn_arg for args that are not
++	an index.  Don't exit arg loop early.  Abort on bad arg number.
++
+ 2020-03-22  Alan Modra  <amodra@gmail.com>
+ 
+ 	* s12z-dis.c (abstract_read_memory): Don't print error on EOI.
+diff --git a/opcodes/ns32k-dis.c b/opcodes/ns32k-dis.c
+index d505edd7742..12df182d0a4 100644
+--- a/opcodes/ns32k-dis.c
++++ b/opcodes/ns32k-dis.c
+@@ -446,7 +446,7 @@ invalid_float (float_type_u *p, int len)
+    bit position of the addressing extension.  BUFFER contains the
+    instruction.  ADDR is where BUFFER was read from.  Put the disassembled
+    version of the operand in RESULT.  INDEX_OFFSET is the bit position
+-   of the index byte (it contains garbage if this operand is not a
++   of the index byte (it contains -1 if this operand is not a
+    general operand using scaled indexed addressing mode).  */
+ 
+ static int
+@@ -790,10 +790,8 @@ print_insn_ns32k (bfd_vma memaddr, disassemble_info *info)
+   if (*d)
+     {
+       /* Offset in bits of the first thing beyond each index byte.
+-	 Element 0 is for operand A and element 1 is for operand B.
+-	 The rest are irrelevant, but we put them here so we don't
+-	 index outside the array.  */
+-      int index_offset[MAX_ARGS];
++	 Element 0 is for operand A and element 1 is for operand B.  */
++      int index_offset[2];
+ 
+       /* 0 for operand A, 1 for operand B, greater for other args.  */
+       int whicharg = 0;
+@@ -806,6 +804,8 @@ print_insn_ns32k (bfd_vma memaddr, disassemble_info *info)
+ 	 if we are using scaled indexed addressing mode, since the index
+ 	 bytes occur right after the basic instruction, not as part
+ 	 of the addressing extension.  */
++      index_offset[0] = -1;
++      index_offset[1] = -1;
+       if (Is_gen (d[1]))
+ 	{
+ 	  int bitoff = d[1] == 'f' ? 10 : 5;
+@@ -832,15 +832,16 @@ print_insn_ns32k (bfd_vma memaddr, disassemble_info *info)
+       while (*d)
+ 	{
+ 	  argnum = *d - '1';
++	  if (argnum >= MAX_ARGS)
++	    abort ();
+ 	  d++;
+-	  if (argnum > maxarg && argnum < MAX_ARGS)
++	  if (argnum > maxarg)
+ 	    maxarg = argnum;
+ 	  ioffset = print_insn_arg (*d, ioffset, &aoffset, buffer,
+ 				    memaddr, arg_bufs[argnum],
+-				    index_offset[whicharg]);
++				    whicharg > 1 ? -1 : index_offset[whicharg]);
+ 	  d++;
+-	  if (whicharg++ >= 1)
+-	    break;
++	  whicharg++;
+ 	}
+ 
+       for (argnum = 0; argnum <= maxarg; argnum++)
+-- 
+GitLab
+

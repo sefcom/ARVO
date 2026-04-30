@@ -1,0 +1,65 @@
+From f4ae3cce64bd46b1d539bdeac39753f83015f114 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sat, 6 May 2017 01:42:53 +0200
+Subject: [PATCH] avcodec/htmlsubtitles: Check for string truncation and return
+ error
+
+Fixes out of array access
+Fixes: 1354/clusterfuzz-testcase-minimized-5520132195483648
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/targets/ffmpeg
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/htmlsubtitles.c | 12 +++++++++---
+ libavcodec/htmlsubtitles.h |  2 +-
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/libavcodec/htmlsubtitles.c b/libavcodec/htmlsubtitles.c
+index 8b57febd26..16295daa0c 100644
+--- a/libavcodec/htmlsubtitles.c
++++ b/libavcodec/htmlsubtitles.c
+@@ -46,11 +46,12 @@ typedef struct SrtStack {
+ 
+ static void rstrip_spaces_buf(AVBPrint *buf)
+ {
+-    while (buf->len > 0 && buf->str[buf->len - 1] == ' ')
+-        buf->str[--buf->len] = 0;
++    if (av_bprint_is_complete(buf))
++        while (buf->len > 0 && buf->str[buf->len - 1] == ' ')
++            buf->str[--buf->len] = 0;
+ }
+ 
+-void ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in)
++int ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in)
+ {
+     char *param, buffer[128], tmp[128];
+     int len, tag_close, sptr = 1, line_start = 1, an = 0, end = 0;
+@@ -171,8 +172,13 @@ void ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in)
+             line_start = 0;
+     }
+ 
++    if (!av_bprint_is_complete(dst))
++        return AVERROR(ENOMEM);
++
+     while (dst->len >= 2 && !strncmp(&dst->str[dst->len - 2], "\\N", 2))
+         dst->len -= 2;
+     dst->str[dst->len] = 0;
+     rstrip_spaces_buf(dst);
++
++    return 0;
+ }
+diff --git a/libavcodec/htmlsubtitles.h b/libavcodec/htmlsubtitles.h
+index e10cdda241..f3a8ef5d8b 100644
+--- a/libavcodec/htmlsubtitles.h
++++ b/libavcodec/htmlsubtitles.h
+@@ -23,6 +23,6 @@
+ 
+ #include "libavutil/bprint.h"
+ 
+-void ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in);
++int ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in);
+ 
+ #endif /* AVCODEC_HTMLSUBTITLES_H */
+-- 
+2.25.1
+

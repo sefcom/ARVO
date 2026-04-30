@@ -1,0 +1,53 @@
+From d7ec310436ce4bae87a94d912f1d8b5ece20f9c5 Mon Sep 17 00:00:00 2001
+From: Frank Tang <ftang@chromium.org>
+Date: Tue, 28 Jul 2020 17:05:26 -0700
+Subject: [PATCH] ICU-20684 Fix uninitialized in isMatchAtCPBoundary
+
+Downstream bug https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=15505
+Fix Fuzzer-detected Use-of-uninitialized-value in isMatchAtCPBoundary
+
+To test to show the bug in the new test case, configure and build with
+CFLAGS="-fsanitize=memory" CXXFLAGS="-fsanitize=memory" ./runConfigureICU \
+  --enable-debug --disable-release  Linux  --disable-layoutex
+
+Test with
+cintltst /tsutil/custrtst
+---
+ icu4c/source/common/ustring.cpp       |  2 +-
+ icu4c/source/test/cintltst/custrtst.c | 10 ++++++++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/icu4c/source/common/ustring.cpp b/icu4c/source/common/ustring.cpp
+index de43d22ccca1..7ab2e1bf891d 100644
+--- a/icu4c/source/common/ustring.cpp
++++ b/icu4c/source/common/ustring.cpp
+@@ -45,7 +45,7 @@ isMatchAtCPBoundary(const UChar *start, const UChar *match, const UChar *matchLi
+         /* the leading edge of the match is in the middle of a surrogate pair */
+         return FALSE;
+     }
+-    if(U16_IS_LEAD(*(matchLimit-1)) && match!=limit && U16_IS_TRAIL(*matchLimit)) {
++    if(U16_IS_LEAD(*(matchLimit-1)) && matchLimit!=limit && U16_IS_TRAIL(*matchLimit)) {
+         /* the trailing edge of the match is in the middle of a surrogate pair */
+         return FALSE;
+     }
+diff --git a/icu4c/source/test/cintltst/custrtst.c b/icu4c/source/test/cintltst/custrtst.c
+index 6d9b067ee15b..70bdb1a10443 100644
+--- a/icu4c/source/test/cintltst/custrtst.c
++++ b/icu4c/source/test/cintltst/custrtst.c
+@@ -962,6 +962,16 @@ TestSurrogateSearching() {
+     ) {
+         log_err("error: one of the u_str[str etc](\"aba\") incorrectly finds something\n");
+     }
++    /* Regression test for ICU-20684 Use-of-uninitialized-value in isMatchAtCPBoundary
++     * Condition: search the same string while the first char is not an
++     * surrogate and the last char is the leading surragte.
++     */
++    {
++        static const UChar s[]={ 0x0020, 0xD9C1 };
++        if (u_strFindFirst(s, 2, s, 2) != s) {
++            log_err("error: ending with a partial supplementary code point should match\n");
++        }
++    }
+ }
+ 
+ static void TestStringCopy()

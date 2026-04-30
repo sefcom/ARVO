@@ -1,0 +1,114 @@
+From 82d534f8f69fd4939faf4b7f20df5cc2462973d8 Mon Sep 17 00:00:00 2001
+From: Chris Liddell <chris.liddell@artifex.com>
+Date: Thu, 16 Dec 2021 16:02:08 +0000
+Subject: oss-fuzz 42485, 42536: validate the object type (string) for CFF
+ (g)subrs
+
+The font contained errors, meaning the (Global)Subrs array was incomplete, and
+one or more entries ended up as null objects instead of strings.
+
+Also, exposed a mistake in the error cleanup in the CFF font to CIDFont
+"conversion" code.
+---
+ pdf/pdf_fapi.c   | 42 ++++++++++++++++++++++++++----------------
+ pdf/pdf_font1C.c |  6 +++---
+ 2 files changed, 29 insertions(+), 19 deletions(-)
+
+diff --git a/pdf/pdf_fapi.c b/pdf/pdf_fapi.c
+index 0ca0a6e7e..3f8688f3e 100644
+--- a/pdf/pdf_fapi.c
++++ b/pdf/pdf_fapi.c
+@@ -688,19 +688,24 @@ pdfi_fapi_get_gsubr(gs_fapi_font *ff, int index, byte *buf, int buf_length)
+         }
+         else {
+             int leniv = (pfont->data.lenIV > 0 ? pfont->data.lenIV : 0);
+-            pdf_string *subrstring;
++            pdf_string *subrstring = NULL;
+ 
+             code = pdfi_array_get(pdffont2->ctx, pdffont2->GlobalSubrs, index, (pdf_obj **)&subrstring);
+             if (code >= 0) {
+-                code = subrstring->length - leniv;
+-                if (buf && buf_length >= code) {
+-                    if (ff->need_decrypt && pfont->data.lenIV >= 0) {
+-                        decode_bytes(buf, subrstring->data, code + leniv, pfont->data.lenIV);
+-                    }
+-                    else {
+-                        memcpy(buf, subrstring->data, code);
++                if (subrstring->type == PDF_STRING) {
++                    code = subrstring->length - leniv;
++                    if (buf && buf_length >= code) {
++                        if (ff->need_decrypt && pfont->data.lenIV >= 0) {
++                            decode_bytes(buf, subrstring->data, code + leniv, pfont->data.lenIV);
++                        }
++                        else {
++                            memcpy(buf, subrstring->data, code);
++                        }
+                     }
+                 }
++                else {
++                    code = gs_note_error(gs_error_invalidfont);
++                }
+                 pdfi_countdown(subrstring);
+             }
+         }
+@@ -751,17 +756,22 @@ pdfi_fapi_get_subr(gs_fapi_font *ff, int index, byte *buf, int buf_length)
+             else
+                 code = pdfi_array_get(pdffont2->ctx, pdffont2->Subrs, index, (pdf_obj **)&subrstring);
+             if (code >= 0) {
+-                if (subrstring->length > 0) {
+-                    code = subrstring->length - leniv;
+-                    if (buf && buf_length >= code) {
+-                        if (ff->need_decrypt && pfont->data.lenIV >= 0) {
+-                            decode_bytes(buf, subrstring->data, code + leniv, pfont->data.lenIV);
+-                        }
+-                        else {
+-                            memcpy(buf, subrstring->data, code);
++                if (subrstring->type == PDF_STRING) {
++                    if (subrstring->length > 0) {
++                        code = subrstring->length - leniv;
++                        if (buf && buf_length >= code) {
++                            if (ff->need_decrypt && pfont->data.lenIV >= 0) {
++                                decode_bytes(buf, subrstring->data, code + leniv, pfont->data.lenIV);
++                            }
++                            else {
++                                memcpy(buf, subrstring->data, code);
++                            }
+                         }
+                     }
+                 }
++                else {
++                    code = gs_note_error(gs_error_invalidfont);
++                }
+                 pdfi_countdown(subrstring);
+             }
+         }
+diff --git a/pdf/pdf_font1C.c b/pdf/pdf_font1C.c
+index b0cbec4fb..0cbe3a270 100644
+--- a/pdf/pdf_font1C.c
++++ b/pdf/pdf_font1C.c
+@@ -2415,9 +2415,12 @@ pdfi_read_cff_font(pdf_context *ctx, pdf_dict *font_dict, pdf_dict *stream_dict,
+                 cffpriv.pdfcffpriv.Encoding = NULL;
+ 
+                 fdcfffont->CharStrings = cffpriv.pdfcffpriv.CharStrings;
++                cffpriv.pdfcffpriv.CharStrings = NULL;
+                 fdcfffont->Subrs = cffpriv.pdfcffpriv.Subrs;
++                cffpriv.pdfcffpriv.Subrs = NULL;
+                 fdcfffont->NumSubrs = cffpriv.pdfcffpriv.NumSubrs;
+                 fdcfffont->GlobalSubrs = cffpriv.pdfcffpriv.GlobalSubrs;
++                cffpriv.pdfcffpriv.GlobalSubrs = NULL;
+                 fdcfffont->NumGlobalSubrs = cffpriv.pdfcffpriv.NumGlobalSubrs;
+ 
+                 cffcid->CharStrings = fdcfffont->CharStrings;
+@@ -2464,9 +2467,6 @@ pdfi_read_cff_font(pdf_context *ctx, pdf_dict *font_dict, pdf_dict *stream_dict,
+ 
+                 cffcid->PDF_font = font_dict;
+                 pdfi_countup(font_dict);
+-                cffcid->CharStrings = cffpriv.pdfcffpriv.CharStrings;
+-                cffcid->Subrs = cffpriv.pdfcffpriv.Subrs;
+-                cffcid->GlobalSubrs = cffpriv.pdfcffpriv.GlobalSubrs;
+ 
+                 cffcid->cidtogidmap.data = NULL;
+                 cffcid->cidtogidmap.size = 0;
+-- 
+cgit v1.2.3
+

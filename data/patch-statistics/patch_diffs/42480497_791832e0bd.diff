@@ -1,0 +1,53 @@
+From 66d12eb98aba10948f829d08b4144969ead5ddbb Mon Sep 17 00:00:00 2001
+From: Andrew Bartlett <abartlet@samba.org>
+Date: Fri, 13 Dec 2019 22:41:10 +1300
+Subject: [PATCH] lib/fuzzing: Initialise st buffer in fuzz_ndr_X
+
+An NDR pull of a function will fill in either the in. or out.
+elements of this structure, but never both.
+
+However, some structures have size_is() in the out. that reference
+the in. elements.  This is the reason for the --context-file option
+in ndrdump.
+
+We have a special handler in the fuzzing case embedded in the
+pidl-generated output to cope with this, by filling in pointers
+for elements declared [ref,in] but it relies on the in-side
+(at least) of the buffer being zeroed.
+
+So zero the buffer before we start.  Sadly this means things
+like valgrind can not find a use of uninitialised data, but that
+is a price we have to pay.
+
+Credit to OSS-Fuzz
+
+Signed-off-by: Andrew Bartlett <abartlet@samba.org>
+Reviewed-by: Gary Lockyer <gary@catalyst.net.nz>
+---
+ lib/fuzzing/fuzz_ndr_X.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/lib/fuzzing/fuzz_ndr_X.c b/lib/fuzzing/fuzz_ndr_X.c
+index 5fc21dcef26..e8c3bb4cf76 100644
+--- a/lib/fuzzing/fuzz_ndr_X.c
++++ b/lib/fuzzing/fuzz_ndr_X.c
+@@ -251,6 +251,16 @@ int LLVMFuzzerTestOneInput(uint8_t *data, size_t size) {
+ 			TALLOC_FREE(mem_ctx);
+ 			return 0;
+ 		}
++
++		/*
++		 * We must initialise the buffer (even if we would
++		 * prefer not to for the sake of eg valgrind) as
++		 * otherwise the special handler for 'out pointer with
++		 * [size_is()] refers to in value with [ref]' fails to
++		 * trigger
++		 */
++		memset(st, '\0', sizeof(st));
++
+ 		ndr_pull->flags |= LIBNDR_FLAG_REF_ALLOC;
+ 
+ 		if (type == TYPE_OUT) {
+-- 
+GitLab
+

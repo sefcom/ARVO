@@ -1,0 +1,103 @@
+From 2c7708a03edf0495fb83fe5fcf1c16bfbae25a6e Mon Sep 17 00:00:00 2001
+From: Nikita Taranov <nikita.taranov@clickhouse.com>
+Date: Fri, 4 Nov 2022 22:12:36 +0100
+Subject: [PATCH] Add bound check to lz4 decompression (#42868)
+
+* impl
+
+* add test
+
+* fix bullshit tidy error
+---
+ src/Compression/LZ4_decompress_faster.cpp     |  7 +++-
+ .../tests/gtest_compressionCodec.cpp          | 39 +++++++++++++++++--
+ 2 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/src/Compression/LZ4_decompress_faster.cpp b/src/Compression/LZ4_decompress_faster.cpp
+index f2084f34274a..34bb440c19cf 100644
+--- a/src/Compression/LZ4_decompress_faster.cpp
++++ b/src/Compression/LZ4_decompress_faster.cpp
+@@ -3,10 +3,10 @@
+ #include <cstring>
+ #include <iostream>
+ #include <Core/Defines.h>
+-#include <Common/Stopwatch.h>
+-#include <Common/TargetSpecific.h>
+ #include <base/types.h>
+ #include <base/unaligned.h>
++#include <Common/Stopwatch.h>
++#include <Common/TargetSpecific.h>
+ 
+ #ifdef __SSE2__
+ #include <emmintrin.h>
+@@ -599,6 +599,9 @@ bool NO_INLINE decompressImpl(const char * const source, char * const dest, size
+ 
+         copy_end = op + length;
+ 
++        if (unlikely(copy_end > output_end))
++            return false;
++
+         /** Here we can write up to copy_amount - 1 - 4 * 2 bytes after buffer.
+           * The worst case when offset = 1 and length = 4
+           */
+diff --git a/src/Compression/tests/gtest_compressionCodec.cpp b/src/Compression/tests/gtest_compressionCodec.cpp
+index 9b44c60cd815..4765aeb45ed4 100644
+--- a/src/Compression/tests/gtest_compressionCodec.cpp
++++ b/src/Compression/tests/gtest_compressionCodec.cpp
+@@ -1,8 +1,5 @@
+ #include <Compression/CompressionFactory.h>
+ 
+-#include <Common/PODArray.h>
+-#include <Common/Stopwatch.h>
+-#include <base/types.h>
+ #include <DataTypes/DataTypesNumber.h>
+ #include <DataTypes/IDataType.h>
+ #include <IO/ReadBufferFromMemory.h>
+@@ -10,6 +7,12 @@
+ #include <Parsers/ExpressionElementParsers.h>
+ #include <Parsers/IParser.h>
+ #include <Parsers/TokenIterator.h>
++#include <base/types.h>
++#include <Common/PODArray.h>
++#include <Common/Stopwatch.h>
++
++#include <Compression/LZ4_decompress_faster.h>
++#include <IO/BufferWithOwnMemory.h>
+ 
+ #include <random>
+ #include <bitset>
+@@ -1319,4 +1322,34 @@ INSTANTIATE_TEST_SUITE_P(Gorilla,
+ //    ),
+ //);
+ 
++TEST(LZ4Test, DecompressMalformedInput)
++{
++    /// This malformed input was initially found by lz4_decompress_fuzzer and causes failure under UBSAN.
++    constexpr unsigned char data[]
++        = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00,
++           0x00, 0x20, 0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0xff, 0xff, 0xff, 0x17, 0xff, 0xff, 0x0f, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
++           0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++           0xfe, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
++
++    const char * const source = reinterpret_cast<const char * const>(data);
++    const uint32_t source_size = std::size(data);
++    constexpr uint32_t uncompressed_size = 80;
++
++    DB::Memory<> memory;
++    memory.resize(ICompressionCodec::getHeaderSize() + uncompressed_size + LZ4::ADDITIONAL_BYTES_AT_END_OF_BUFFER);
++    unalignedStoreLE<uint8_t>(memory.data(), static_cast<uint8_t>(CompressionMethodByte::LZ4));
++    unalignedStoreLE<uint32_t>(&memory[1], source_size);
++    unalignedStoreLE<uint32_t>(&memory[5], uncompressed_size);
++
++    auto codec = CompressionCodecFactory::instance().get("LZ4", {});
++    ASSERT_THROW(codec->decompress(source, source_size, memory.data()), Exception);
++}
++
+ }

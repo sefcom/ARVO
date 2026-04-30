@@ -1,0 +1,131 @@
+From 383a29a924af973e4cf9d5d2054a60f7d718f0d3 Mon Sep 17 00:00:00 2001
+From: Niels Lohmann <niels.lohmann@gmail.com>
+Date: Thu, 29 Dec 2016 16:14:15 +0100
+Subject: [PATCH] :ambulance: fix for #407
+
+---
+ src/json.hpp                 |  5 +++++
+ src/json.hpp.re2c            |  5 +++++
+ test/src/unit-regression.cpp | 23 +++++++++++++++++++++++
+ 3 files changed, 33 insertions(+)
+
+diff --git a/src/json.hpp b/src/json.hpp
+index 76824cf850..aab3b34f42 100644
+--- a/src/json.hpp
++++ b/src/json.hpp
+@@ -6981,6 +6981,7 @@ class basic_json
+                 case 0xca: // float 32
+                 {
+                     // copy bytes in reverse order into the double variable
++                    check_length(v.size(), sizeof(float), 1);
+                     float res;
+                     for (size_t byte = 0; byte < sizeof(float); ++byte)
+                     {
+@@ -6993,6 +6994,7 @@ class basic_json
+                 case 0xcb: // float 64
+                 {
+                     // copy bytes in reverse order into the double variable
++                    check_length(v.size(), sizeof(double), 1);
+                     double res;
+                     for (size_t byte = 0; byte < sizeof(double); ++byte)
+                     {
+@@ -7558,6 +7560,7 @@ class basic_json
+ 
+             case 0xf9: // Half-Precision Float (two-byte IEEE 754)
+             {
++                check_length(v.size(), 2, 1);
+                 idx += 2; // skip two content bytes
+ 
+                 // code from RFC 7049, Appendix D, Figure 3:
+@@ -7589,6 +7592,7 @@ class basic_json
+             case 0xfa: // Single-Precision Float (four-byte IEEE 754)
+             {
+                 // copy bytes in reverse order into the float variable
++                check_length(v.size(), sizeof(float), 1);
+                 float res;
+                 for (size_t byte = 0; byte < sizeof(float); ++byte)
+                 {
+@@ -7600,6 +7604,7 @@ class basic_json
+ 
+             case 0xfb: // Double-Precision Float (eight-byte IEEE 754)
+             {
++                check_length(v.size(), sizeof(double), 1);
+                 // copy bytes in reverse order into the double variable
+                 double res;
+                 for (size_t byte = 0; byte < sizeof(double); ++byte)
+diff --git a/src/json.hpp.re2c b/src/json.hpp.re2c
+index 10bfaf575f..7b6b7ec4a2 100644
+--- a/src/json.hpp.re2c
++++ b/src/json.hpp.re2c
+@@ -6981,6 +6981,7 @@ class basic_json
+                 case 0xca: // float 32
+                 {
+                     // copy bytes in reverse order into the double variable
++                    check_length(v.size(), sizeof(float), 1);
+                     float res;
+                     for (size_t byte = 0; byte < sizeof(float); ++byte)
+                     {
+@@ -6993,6 +6994,7 @@ class basic_json
+                 case 0xcb: // float 64
+                 {
+                     // copy bytes in reverse order into the double variable
++                    check_length(v.size(), sizeof(double), 1);
+                     double res;
+                     for (size_t byte = 0; byte < sizeof(double); ++byte)
+                     {
+@@ -7558,6 +7560,7 @@ class basic_json
+ 
+             case 0xf9: // Half-Precision Float (two-byte IEEE 754)
+             {
++                check_length(v.size(), 2, 1);
+                 idx += 2; // skip two content bytes
+ 
+                 // code from RFC 7049, Appendix D, Figure 3:
+@@ -7589,6 +7592,7 @@ class basic_json
+             case 0xfa: // Single-Precision Float (four-byte IEEE 754)
+             {
+                 // copy bytes in reverse order into the float variable
++                check_length(v.size(), sizeof(float), 1);
+                 float res;
+                 for (size_t byte = 0; byte < sizeof(float); ++byte)
+                 {
+@@ -7600,6 +7604,7 @@ class basic_json
+ 
+             case 0xfb: // Double-Precision Float (eight-byte IEEE 754)
+             {
++                check_length(v.size(), sizeof(double), 1);
+                 // copy bytes in reverse order into the double variable
+                 double res;
+                 for (size_t byte = 0; byte < sizeof(double); ++byte)
+diff --git a/test/src/unit-regression.cpp b/test/src/unit-regression.cpp
+index 033041ab9a..6123352d78 100644
+--- a/test/src/unit-regression.cpp
++++ b/test/src/unit-regression.cpp
+@@ -547,4 +547,27 @@ TEST_CASE("regression tests")
+         std::vector<uint8_t> vec {0x65, 0xf5, 0x0a, 0x48, 0x21};
+         CHECK_THROWS_AS(json::from_cbor(vec), std::out_of_range);
+     }
++
++    SECTION("issue #407 - Heap-buffer-overflow (OSS-Fuzz issue 343)")
++    {
++        // original test case: incomplete float64
++        std::vector<uint8_t> vec1 {0xcb, 0x8f, 0x0a};
++        CHECK_THROWS_AS(json::from_msgpack(vec1), std::out_of_range);
++
++        // related test case: incomplete float32
++        std::vector<uint8_t> vec2 {0xca, 0x8f, 0x0a};
++        CHECK_THROWS_AS(json::from_msgpack(vec2), std::out_of_range);
++
++        // related test case: incomplete Half-Precision Float (CBOR)
++        std::vector<uint8_t> vec3 {0xf9, 0x8f};
++        CHECK_THROWS_AS(json::from_cbor(vec3), std::out_of_range);
++
++        // related test case: incomplete Single-Precision Float (CBOR)
++        std::vector<uint8_t> vec4 {0xfa, 0x8f, 0x0a};
++        CHECK_THROWS_AS(json::from_cbor(vec4), std::out_of_range);
++
++        // related test case: incomplete Double-Precision Float (CBOR)
++        std::vector<uint8_t> vec5 {0xfb, 0x8f, 0x0a};
++        CHECK_THROWS_AS(json::from_cbor(vec5), std::out_of_range);
++    }
+ }

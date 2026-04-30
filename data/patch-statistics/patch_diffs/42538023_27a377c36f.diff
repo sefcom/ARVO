@@ -1,0 +1,204 @@
+From 1c7d9d606c44e45fa384efc812a89f1ecaf42fe9 Mon Sep 17 00:00:00 2001
+From: Ken Sharp <Ken.Sharp@artifex.com>
+Date: Sat, 17 Aug 2024 15:05:51 +0100
+Subject: PDF interpreter & pdfwrite - don't write Metadata for Marked Content
+
+Bug #70788 " Regression: Conversion to PDF/A-3b fails VeraPDF Validation, clause 6.6.2.3.1"
+
+This is not, exactly, a regression. Older versions of the pdfwrite
+device and the PDF interpreter did not preserve Marked Content, new
+versions do. The problem arises because the Marked Content Properties
+dictionary associated with a /BMC contains a /Metadata key. In order
+for that to be valid we would haev to extend the XMP metadata and we
+don't.
+
+My first thought was to use Acrobat to convert the file to PDF/A-3 and
+then see how it modified the XMP metadata. Amusingly, it doesn't and the
+file it produces fails VeraPDF validation in exactly the same way. This
+does make me wonder if the VeraPDF test is actually correct.
+
+However, in order to work around the problem, I've modified the pdfwrite
+device so that if we are producing PDF/A and we get a /BMC marked
+content pdfmark, and the Properties dictionary contains a /Metadata key,
+then we do the usual PDFACompatibilityPolicy dance to decide what to
+do.
+
+However, because of the way that these constructs are assembled using
+pdfmarks, this still ends up leaving the actual Metadata written to the
+file. It isn't referenced, and as a result VeraPDF is happy to have it
+there, but it is wasteful. Nothing we can do about that if the source
+is PostScript, but when the source is PDF we can do better, so....
+
+Modify the PDF interpreter so that it knows about PDFA, PDFX and
+PDFACompatibilityPolicy. When we encounter a BMC in the input PDF file,
+examine its Properties dictionary to see if it contains a Metadata key.
+If it does, delete the key/value pair from the dictionary and continue.
+This means we don't write the Metadata itself to the file.
+---
+ Resource/Init/pdf_main.ps |  2 +-
+ devices/vector/gdevpdfm.c | 31 ++++++++++++++++++++++++++++++-
+ pdf/ghostpdf.h            |  2 ++
+ pdf/pdf_optcontent.c      | 33 +++++++++++++++++++++++++++++++++
+ psi/zpdfops.c             | 18 ++++++++++++++++++
+ 5 files changed, 84 insertions(+), 2 deletions(-)
+
+diff --git a/Resource/Init/pdf_main.ps b/Resource/Init/pdf_main.ps
+index 5aef240f9..7ca51f464 100644
+--- a/Resource/Init/pdf_main.ps
++++ b/Resource/Init/pdf_main.ps
+@@ -678,7 +678,7 @@ systemdict /NEWPDF known {
+ % so here we should only handle parameters which control the behaviour of the interpreter.
+ %
+ /PDFSwitches [ /QUIET /PDFPassword /PDFDEBUG /PDFSTOPONERROR /PDFSTOPONWARNING /NOTRANSPARENCY /FirstPage /LastPage
+-               /PDFNOCIDFALLBACK /NO_PDFMARK_OUTLINES /NO_PDFMARK_DESTS /PDFFitPage /Printed /UsePDFX3Profile
++               /PDFA /PDFACompatibilityPolicy /PDFNOCIDFALLBACK /NO_PDFMARK_OUTLINES /NO_PDFMARK_DESTS /PDFFitPage /Printed /UsePDFX3Profile
+                /UseBleedBox /UseCropBox /UseArtBox /UseTrimBox /ShowAcroForm /ShowAnnots /PreserveAnnots
+                /NoUserUnit /RENDERTTNOTDEF /DOPDFMARKS /PDFINFO /ShowAnnotTypes /PreserveAnnotTypes
+                /CIDFSubstPath /CIDFSubstFont /SUBSTFONT /IgnoreToUnicode /NONATIVEFONTMAP /PreserveMarkedContent /OutputFile
+diff --git a/devices/vector/gdevpdfm.c b/devices/vector/gdevpdfm.c
+index 154a3fd26..9543f605d 100644
+--- a/devices/vector/gdevpdfm.c
++++ b/devices/vector/gdevpdfm.c
+@@ -2331,12 +2331,41 @@ pdfmark_PUTDICT(gx_device_pdf * pdev, gs_param_string * pairs, uint count,
+     /* If this is a stream, and we are doing PDF/A output, and the stream
+      * is a Metadata stream, then we must not write it compressed. Bizarrely PDF/A
+      * excludes this.
++     * Actually, we cna't write Metadata streams at all. Because we don't know how to extend
++     * the XMP Metadata to include them.
+      */
+     if (cos_type(pco) == cos_type_stream && pdev->PDFA) {
+         for (i=0;i<count;i++) {
+             if (pairs[i].size == 9 && strncmp((const char *)pairs[i].data, "/Metadata", 9) == 0) {
+                 cos_dict_t *pcd = (cos_dict_t *)pco;
+ 
++                if (pdev->PDFA) {
++                    switch (pdev->PDFACompatibilityPolicy) {
++                        case 0:
++                            emprintf(pdev->memory,
++                                     "Cannot preserve Marked Content in PDF/A, reverting to normal PDF output\n\n");
++                            pdev->AbortPDFAX = true;
++                            pdev->PDFA = 0;
++                            break;
++                        case 1:
++                            emprintf(pdev->memory,
++                                     "Cannot preserve Marked Content in PDF/A, dropping feature to preserve PDF/A compatibility\n");
++                            return 0;
++                            break;
++                        case 2:
++                            emprintf(pdev->memory,
++                                     "Cannot preserve Marked Content in PDF/A, aborting conversion\n");
++                            return_error (gs_error_typecheck);
++                            break;
++                        default:
++                            emprintf(pdev->memory,
++                                     "Cannot preserve Marked Content in PDF/A, unrecognised PDFACompatibilityLevel,\nreverting to normal PDF output\n");
++                            pdev->AbortPDFAX = true;
++                            pdev->PDFA = 0;
++                            break;
++                    }
++                }
++
+                 /* Close the compressed stream */
+                 gs_free_object(pdev->pdf_memory, pco->input_strm, "free old stream, replacing with new stream");
+                 /* And create a new uncompressed stream */
+@@ -2351,10 +2380,10 @@ pdfmark_PUTDICT(gx_device_pdf * pdev, gs_param_string * pairs, uint count,
+                  */
+                 cos_dict_delete_c_key(pcd, "/Filter");
+                 cos_dict_delete_c_key(pcd, "/DecodeParams");
++
+             }
+         }
+     }
+-
+     return pdfmark_put_pairs((cos_dict_t *)pco, pairs + 1, count - 1);
+ }
+ 
+diff --git a/pdf/ghostpdf.h b/pdf/ghostpdf.h
+index 47d49c345..37232787d 100644
+--- a/pdf/ghostpdf.h
++++ b/pdf/ghostpdf.h
+@@ -136,6 +136,8 @@ typedef struct cmd_args_s {
+     bool pdfstoponwarning;
+     bool notransparency;
+     bool nocidfallback;
++    int PDFA;
++    int PDFX;
+     bool no_pdfmark_outlines; /* can be overridden to true if multi-page output */
+     bool no_pdfmark_dests;    /* can be overridden to true if multi-page output */
+     bool pdffitpage;
+diff --git a/pdf/pdf_optcontent.c b/pdf/pdf_optcontent.c
+index 2ccbc8238..7463355de 100644
+--- a/pdf/pdf_optcontent.c
++++ b/pdf/pdf_optcontent.c
+@@ -698,6 +698,39 @@ int pdfi_op_BDC(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict)
+                     code = gs_note_error(gs_error_typecheck);
+                     goto exit;
+                 }
++                /* If we are producing PDF/A we must not include any Metadata, as that
++                 * requires us to modify the XMP Metadata, which we don't know how to do.
++                 */
++                if (ctx->args.PDFA > 0) {
++                    uint64_t index = 0;
++                    pdf_name *Key = NULL;
++                    pdf_obj *Value = NULL;
++
++                    code = pdfi_dict_first(ctx, oc_dict, (pdf_obj **)&Key, &Value, &index);
++                    if (code < 0) {
++                        if (code == gs_error_undefined)
++                            code = 0;
++                        goto exit;
++                    }
++                    while (code >= 0) {
++                        if (pdfi_name_is(Key, "Metadata")) {
++                            pdfi_dict_delete_pair(ctx, oc_dict, Key);
++                        }
++                        pdfi_countdown(Key);
++                        Key = NULL;
++                        pdfi_countdown(Value);
++                        Value = NULL;
++
++                        code = pdfi_dict_next(ctx, oc_dict, (pdf_obj **)&Key, &Value, &index);
++                        if (code == gs_error_undefined) {
++                            code = 0;
++                            break;
++                        }
++                    }
++                }
++                if (pdfi_dict_entries(oc_dict) == 0)
++                    goto exit;
++
+                 code = pdfi_pdfmark_dict(ctx, oc_dict);
+                 if (code < 0)
+                     goto exit;
+diff --git a/psi/zpdfops.c b/psi/zpdfops.c
+index dd2ac5644..14c990e5c 100644
+--- a/psi/zpdfops.c
++++ b/psi/zpdfops.c
+@@ -1128,6 +1128,24 @@ static int apply_interpreter_params(i_ctx_t *i_ctx_p, pdfctx_t *pdfctx, ref *pdi
+         pdfctx->ctx->args.no_pdfmark_outlines = pvalueref->value.boolval;
+     }
+ 
++    if (dict_find_string(pdictref, "PDFA", &pvalueref) > 0) {
++        if (!r_has_type(pvalueref, t_integer))
++            goto error;
++        pdfctx->ctx->args.PDFA = pvalueref->value.intval;
++    }
++
++    if (dict_find_string(pdictref, "PDFX", &pvalueref) > 0) {
++        if (!r_has_type(pvalueref, t_integer))
++            goto error;
++        pdfctx->ctx->args.PDFX = pvalueref->value.intval;
++    }
++
++    if (dict_find_string(pdictref, "PDFACompatibilityPolicy", &pvalueref) > 0) {
++        if (!r_has_type(pvalueref, t_integer))
++            goto error;
++        pdfctx->ctx->args.PDFA = pvalueref->value.intval;
++    }
++
+     /* This one can be a boolean OR an integer */
+     if (dict_find_string(pdictref, "UsePDFX3Profile", &pvalueref) > 0) {
+         if (!r_has_type(pvalueref, t_boolean)) {
+-- 
+cgit v1.2.3
+

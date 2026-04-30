@@ -1,0 +1,49 @@
+From 37384f31bc8b854683c5a9c18b96b29e568d6ddf Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Sun, 13 Aug 2017 13:24:47 +0000
+Subject: [PATCH] OSM: avoid potential write heap buffer overflow on corrupted
+ PBF files. Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=3022.
+ Credit to OSS Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@39806 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/ogr/ogrsf_frmts/osm/osm_parser.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/gdal/ogr/ogrsf_frmts/osm/osm_parser.cpp b/gdal/ogr/ogrsf_frmts/osm/osm_parser.cpp
+index 8476ef40afee..209e87723e5c 100644
+--- a/gdal/ogr/ogrsf_frmts/osm/osm_parser.cpp
++++ b/gdal/ogr/ogrsf_frmts/osm/osm_parser.cpp
+@@ -543,6 +543,7 @@ bool ReadDenseNodes( GByte* pabyData, GByte* pabyDataLimit,
+     GByte* pabyDataLon = NULL;
+     GByte* apabyData[DENSEINFO_IDX_VISIBLE] = {NULL, NULL, NULL, NULL, NULL, NULL};
+     GByte* pabyDataKeyVal = NULL;
++    unsigned int nMaxTags = 0;
+ 
+     /* printf(">ReadDenseNodes\n"); */
+     while(pabyData < pabyDataLimit)
+@@ -632,12 +633,13 @@ bool ReadDenseNodes( GByte* pabyData, GByte* pabyDataLimit,
+             READ_SIZE(pabyData, pabyDataLimit, nSize);
+ 
+             pabyDataKeyVal = pabyData;
++            nMaxTags = nSize / 2;
+ 
+-            if( nSize > psCtxt->nTagsAllocated )
++            if( nMaxTags > psCtxt->nTagsAllocated )
+             {
+ 
+                 psCtxt->nTagsAllocated = std::max(
+-                    psCtxt->nTagsAllocated * 2, nSize);
++                    psCtxt->nTagsAllocated * 2, nMaxTags);
+                 OSMTag* pasTagsNew = (OSMTag*) VSI_REALLOC_VERBOSE(
+                     psCtxt->pasTags,
+                     psCtxt->nTagsAllocated * sizeof(OSMTag));
+@@ -731,7 +733,7 @@ bool ReadDenseNodes( GByte* pabyData, GByte* pabyDataLimit,
+ 
+             if( pabyDataKeyVal != NULL && pasTags != NULL )
+             {
+-                while( true )
++                while( static_cast<unsigned>(nTags) < nMaxTags )
+                 {
+                     unsigned int nKey, nVal;
+                     READ_VARUINT32(pabyDataKeyVal, pabyDataLimit, nKey);

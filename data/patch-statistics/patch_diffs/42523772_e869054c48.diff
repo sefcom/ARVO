@@ -1,0 +1,64 @@
+From 1e2dc072cd7c71620e5e2810566f3996945b02e5 Mon Sep 17 00:00:00 2001
+From: Ken Sharp <ken.sharp@artifex.com>
+Date: Wed, 3 May 2023 15:05:18 +0100
+Subject: Graphics library - cleanup properly on failure to push pdf14 device
+
+OSS-fuzz bug #58423
+
+The problem is reported as a use-after-free, what I see is a colour
+space persisting until long after the PDF interpreter has been freed,
+and being cleaned up by the end of job restore.
+
+Because the colour space was created by the PDF interpreter it has a
+custom callback to free associated objects. But by the time we call that
+callback the PDF interpreter has vanished.
+
+This happens because in gx_pattern_load() we try to push the pdf14
+compositor (the pattern has transparency) which fails. Instead of
+cleaning up we were immediately returning, which was leaving the colour
+space counted up, which is why it was not counted down and freed before
+the interpreter exits.
+
+Fix that here by using a 'goto' the cleanup code instead of returning
+the error code immediately.
+
+Also, noted in passing, we don't need to set the callback in
+pdfi_create_DeviceRGB(), because that is done in pdfi_gs_setrgbcolor.
+Not only that, but there are circumstances under which we do not want
+to set the callback (if the space came from PostScript not created by
+the PDF interpreter) and that is catered for in pdfi_gs_setrgbcolor()
+whereas it wasn't in pdfi_create_DeviceRGB. So remove the callback
+assignment.
+---
+ base/gxpcmap.c   | 2 +-
+ pdf/pdf_colour.c | 1 -
+ 2 files changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/base/gxpcmap.c b/base/gxpcmap.c
+index efb51ed69..0dbe5fd12 100644
+--- a/base/gxpcmap.c
++++ b/base/gxpcmap.c
+@@ -1530,7 +1530,7 @@ gx_pattern_load(gx_device_color * pdc, const gs_gstate * pgs,
+     if (pinst->templat.uses_transparency) {
+         if_debug1m('v', mem, "gx_pattern_load: pushing the pdf14 compositor device into this graphics state pat_id = %ld\n", pinst->id);
+         if ((code = gs_push_pdf14trans_device(saved, true, false, 0, 0)) < 0)   /* spot_color_count taken from pdf14 target values */
+-            return code;
++            goto fail;
+         saved->device->is_open = true;
+     } else {
+         /* For colored patterns we clear the pattern device's
+diff --git a/pdf/pdf_colour.c b/pdf/pdf_colour.c
+index cdbc73700..dbd14d145 100644
+--- a/pdf/pdf_colour.c
++++ b/pdf/pdf_colour.c
+@@ -2611,7 +2611,6 @@ static int pdfi_create_DeviceRGB(pdf_context *ctx, gs_color_space **ppcs)
+         }
+     } else {
+         code = pdfi_gs_setrgbcolor(ctx, 0, 0, 0);
+-        pdfi_set_colour_callback(ctx->pgs->color[0].color_space, ctx, pdfi_cspace_free_callback);
+     }
+     return code;
+ }
+-- 
+cgit v1.2.3
+

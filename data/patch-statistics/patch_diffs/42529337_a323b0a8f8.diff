@@ -1,0 +1,75 @@
+From fb54c89a0df3d63198678b17d64aef4dbb599109 Mon Sep 17 00:00:00 2001
+From: Leo Izen <leo.izen@gmail.com>
+Date: Fri, 22 Dec 2023 21:50:44 -0500
+Subject: [PATCH] avcodec/jpegxl_parser: check ANS cluster alphabet size vs
+ bundle size
+
+The specification doesn't mention that clusters cannot have alphabet
+sizes greater than 1 << bundle->log_alphabet_size, but the reference
+implementation rejects these entropy streams as invalid, so we should
+too. Refusing to do so can overflow a stack variable that should be
+large enough otherwise.
+
+Fixes #10738.
+
+Found-by: Zeng Yunxiang and Li Zeyuan
+Signed-off-by: Leo Izen <leo.izen@gmail.com>
+---
+ libavcodec/jpegxl_parser.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/jpegxl_parser.c b/libavcodec/jpegxl_parser.c
+index 006eb6b295..f87ec6d35a 100644
+--- a/libavcodec/jpegxl_parser.c
++++ b/libavcodec/jpegxl_parser.c
+@@ -384,11 +384,11 @@ static int populate_distribution(GetBitContext *gb, JXLSymbolDistribution *dist,
+     uint32_t total_count = 0;
+     uint8_t logcounts[258] = { 0 };
+     uint8_t same[258] = { 0 };
++    const int table_size = 1 << log_alphabet_size;
+     dist->uniq_pos = -1;
+ 
+     if (get_bits1(gb)) {
+         /* simple code */
+-        dist->alphabet_size = 256;
+         if (get_bits1(gb)) {
+             uint8_t v1 = jxl_u8(gb);
+             uint8_t v2 = jxl_u8(gb);
+@@ -398,17 +398,24 @@ static int populate_distribution(GetBitContext *gb, JXLSymbolDistribution *dist,
+             dist->freq[v2] = (1 << 12) - dist->freq[v1];
+             if (!dist->freq[v1])
+                 dist->uniq_pos = v2;
++            dist->alphabet_size = 1 + FFMAX(v1, v2);
+         } else {
+             uint8_t x = jxl_u8(gb);
+             dist->freq[x] = 1 << 12;
+             dist->uniq_pos = x;
++            dist->alphabet_size = 1 + x;
+         }
++        if (dist->alphabet_size > table_size)
++            return AVERROR_INVALIDDATA;
++
+         return 0;
+     }
+ 
+     if (get_bits1(gb)) {
+         /* flat code */
+         dist->alphabet_size = jxl_u8(gb) + 1;
++        if (dist->alphabet_size > table_size)
++            return AVERROR_INVALIDDATA;
+         for (int i = 0; i < dist->alphabet_size; i++)
+             dist->freq[i] = (1 << 12) / dist->alphabet_size;
+         for (int i = 0; i < (1 << 12) % dist->alphabet_size; i++)
+@@ -426,6 +433,9 @@ static int populate_distribution(GetBitContext *gb, JXLSymbolDistribution *dist,
+         return AVERROR_INVALIDDATA;
+ 
+     dist->alphabet_size = jxl_u8(gb) + 3;
++    if (dist->alphabet_size > table_size)
++        return AVERROR_INVALIDDATA;
++
+     for (int i = 0; i < dist->alphabet_size; i++) {
+         logcounts[i] = get_vlc2(gb, dist_prefix_table, 7, 1);
+         if (logcounts[i] == 13) {
+-- 
+2.25.1
+

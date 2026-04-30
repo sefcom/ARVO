@@ -1,0 +1,379 @@
+From a1837c354628e6ed368fb8085858a15a7c9a0db9 Mon Sep 17 00:00:00 2001
+From: Reini Urban <rurban@cpan.org>
+Date: Thu, 9 Feb 2023 15:52:18 +0100
+Subject: [PATCH] spec: add DWG_TABLE, fix dwg_decode_<TABLE> visibility
+
+the tables are non-static for r11 decoding, the DWG_OBJECT stays static
+---
+ src/dec_macros.h | 86 ++++++++++++++++++++++++++++++++++++++++++++++--
+ src/decode.h     | 11 +++++++
+ src/decode_r11.c | 85 ++++++++++++++++++++++-------------------------
+ src/dwg.spec     | 20 +++++------
+ src/spec.h       |  2 ++
+ 5 files changed, 146 insertions(+), 58 deletions(-)
+
+diff --git a/src/dec_macros.h b/src/dec_macros.h
+index bc6e6da71f..d6fd5110df 100644
+--- a/src/dec_macros.h
++++ b/src/dec_macros.h
+@@ -1632,7 +1632,7 @@
+     return error;                                                             \
+   }                                                                           \
+                                                                               \
+-  GCC30_DIAG_IGNORE (-Wformat-nonliteral)                                   \
++  GCC30_DIAG_IGNORE (-Wformat-nonliteral)                                     \
+   static int dwg_decode_##token##_private (                                   \
+       Bit_Chain *dat, Bit_Chain *hdl_dat, Bit_Chain *str_dat,                 \
+       Dwg_Object *restrict obj)                                               \
+@@ -1728,7 +1728,7 @@
+       Bit_Chain *obj_dat, Bit_Chain *hdl_dat, Bit_Chain *str_dat,             \
+       Dwg_Object *restrict obj);                                              \
+                                                                               \
+-  int dwg_decode_##token (Bit_Chain *restrict dat,                            \
++  static int dwg_decode_##token (Bit_Chain *restrict dat,                     \
+                           Dwg_Object *restrict obj)                           \
+   {                                                                           \
+     int error = dwg_setup_##token (obj);                                      \
+@@ -1768,4 +1768,86 @@
+ 
+ #define DWG_OBJECT_END DWG_ENTITY_END
+ 
++// only for exported BLOCK_HEADER, LAYER, STYLE, LTYPE, VIEW, UCS, VPORT,
++// APPID, DIMSTYLE, VX_TABLE_RECORD table records, needed for the r11 add API.
++#define DWG_TABLE(token)                                                      \
++  EXPORT int dwg_setup_##token (Dwg_Object *obj)                              \
++  {                                                                           \
++    Dwg_Object_##token *_obj;                                                 \
++    LOG_INFO ("Add table record " #token " [%d] ", obj->index)                \
++    obj->supertype = DWG_SUPERTYPE_OBJECT;                                    \
++    obj->tio.object                                                           \
++        = (Dwg_Object_Object *)calloc (1, sizeof (Dwg_Object_Object));        \
++    if (!obj->tio.object)                                                     \
++      return DWG_ERR_OUTOFMEM;                                                \
++    _obj = obj->tio.object->tio.token                                         \
++        = (Dwg_Object_##token *)calloc (1, sizeof (Dwg_Object_##token));      \
++    if (!_obj)                                                                \
++      {                                                                       \
++        free (obj->tio.object);                                               \
++        obj->tio.object = NULL;                                               \
++        obj->fixedtype = DWG_TYPE_FREED;                                      \
++        return DWG_ERR_OUTOFMEM;                                              \
++      }                                                                       \
++    if (!(int)obj->fixedtype)                                                 \
++      {                                                                       \
++        obj->fixedtype = DWG_TYPE_##token;                                    \
++        obj->name = (char *)#token;                                           \
++      }                                                                       \
++    if (!(int)obj->type && obj->fixedtype <= DWG_TYPE_LAYOUT)                 \
++      {                                                                       \
++        obj->type = DWG_TYPE_##token;                                         \
++      }                                                                       \
++    obj->dxfname = (char *)#token;                                            \
++    if (obj->parent->opts & DWG_OPTS_IN)                                      \
++      {                                                                       \
++        obj->dxfname = strdup (obj->dxfname);                                 \
++        if (obj->parent->opts & DWG_OPTS_INJSON)                              \
++          obj->name = strdup (obj->name);                                     \
++      }                                                                       \
++    _obj->parent = obj->tio.object;                                           \
++    obj->tio.object->dwg = obj->parent;                                       \
++    obj->tio.object->objid = obj->index; /* obj ptr itself might move */      \
++    return 0;                                                                 \
++  }                                                                           \
++  static int dwg_decode_##token##_private (                                   \
++      Bit_Chain *obj_dat, Bit_Chain *hdl_dat, Bit_Chain *str_dat,             \
++      Dwg_Object *restrict obj);                                              \
++                                                                              \
++  int dwg_decode_##token (Bit_Chain *restrict dat,                            \
++                          Dwg_Object *restrict obj)                           \
++  {                                                                           \
++    int error = dwg_setup_##token (obj);                                      \
++    Bit_Chain hdl_dat = *dat;                                                 \
++    if (error)                                                                \
++      return error;                                                           \
++    SINCE (R_2007)                                                            \
++    {                                                                         \
++      Bit_Chain obj_dat = *dat, str_dat = *dat;                               \
++      error                                                                   \
++          = dwg_decode_##token##_private (&obj_dat, &hdl_dat, &str_dat, obj); \
++    }                                                                         \
++    else                                                                      \
++    {                                                                         \
++      error = dwg_decode_##token##_private (dat, &hdl_dat, dat, obj);         \
++    }                                                                         \
++    return error;                                                             \
++  }                                                                           \
++                                                                              \
++  GCC30_DIAG_IGNORE (-Wformat-nonliteral)                                     \
++  static int dwg_decode_##token##_private (                                   \
++      Bit_Chain *dat, Bit_Chain *hdl_dat, Bit_Chain *str_dat,                 \
++      Dwg_Object *restrict obj)                                               \
++  {                                                                           \
++    BITCODE_BL vcount, rcount3, rcount4;                                      \
++    int error = 0;                                                            \
++    Dwg_Object_##token *_obj = NULL;                                          \
++    Dwg_Data *dwg = obj->parent;                                              \
++    LOG_INFO ("Decode table record " #token "\n")                             \
++    _obj = obj->tio.object->tio.token;                                        \
++    error = dwg_decode_object (dat, hdl_dat, str_dat, obj->tio.object);       \
++    if (error >= DWG_ERR_CRITICAL || dat->byte > dat->size)                   \
++      return error;
++
++
+ #endif
+diff --git a/src/decode.h b/src/decode.h
+index 64b8fa6d70..6bbaefeb80 100644
+--- a/src/decode.h
++++ b/src/decode.h
+@@ -43,6 +43,17 @@ int dwg_decode_unknown (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+ Dwg_Object_Ref *dwg_find_objectref (const Dwg_Data *restrict dwg,
+                                     const Dwg_Object *restrict obj);
+ 
++int dwg_decode_BLOCK_HEADER (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_LAYER (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_STYLE (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_LTYPE (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_VIEW (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_UCS (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_VPORT (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_APPID (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_DIMSTYLE (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++int dwg_decode_VX_TABLE_RECORD (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
++
+ // reused with the importers
+ void decode_BACKGROUND_type (const Dwg_Object *obj);
+ 
+diff --git a/src/decode_r11.c b/src/decode_r11.c
+index 036e0ab5e2..da7c40baa9 100644
+--- a/src/decode_r11.c
++++ b/src/decode_r11.c
+@@ -79,16 +79,6 @@ static unsigned int errors = 0;
+ 
+ void dwg_set_next_hdl (Dwg_Data *dwg, unsigned long value);
+ 
+-int dwg_decode_BLOCK_HEADER (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-int dwg_decode_LAYER (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-int dwg_decode_STYLE (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-int dwg_decode_LTYPE (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-int dwg_decode_VIEW (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-int dwg_decode_UCS (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-int dwg_decode_VPORT (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-int dwg_decode_APPID (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-int dwg_decode_DIMSTYLE (Bit_Chain *restrict dat, Dwg_Object *restrict obj);
+-
+ /*------------------------------------------------------------------------------
+  * Private functions
+  */
+@@ -257,7 +247,7 @@ decode_preR13_section (Dwg_Section_Type_r11 id, Bit_Chain *restrict dat,
+   SINCE (R_11)
+     {
+ #define DECODE_PRER13_SENTINEL(ID) \
+-      error |= decode_preR13_sentinel(ID, #ID, dat, dwg)
++      error |= decode_preR13_sentinel (ID, #ID, dat, dwg)
+ 
+       switch (id)
+         {
+@@ -429,42 +419,46 @@ decode_preR13_section (Dwg_Section_Type_r11 id, Bit_Chain *restrict dat,
+ 
+     // SINCE R_11
+     case SECTION_VX:
++      for (i = 0; i < tbl->number; i++)
+         {
+-          for (i = 0; i < tbl->number; i++)
++#if 1
++          NEW_OBJECT;
++          error |= dwg_decode_VX_TABLE_RECORD (dat, obj);
++          CHK_ENDPOS;
++#else
++          //Dwg_Object *obj;
++          Dwg_Object_VX_TABLE_RECORD *_obj;
++          Dwg_Object *ctrl;
++          Dwg_Object_VX_CONTROL *_ctrl;
++          LOG_TRACE ("\n-- table entry VX_TABLE_RECORD [%d]: 0x%lx\n", i, pos);
++          flag = bit_read_RC (dat);
++          name = bit_read_TF (dat, 32);
++          _obj = dwg_add_VX (dwg, (const char *)name);
++          _obj->flag = flag;
++          LOG_TRACE ("name: \"%s\" [TF 32 2]\n", name);
++          LOG_TRACE ("flag: %u [RC 70]\n", flag);
++          //LOG_FLAG_VX
++          free (name);
++          obj = dwg_obj_generic_to_object (_obj, &error);
++          if (obj)
+             {
+-              Dwg_Object *obj;
+-              Dwg_Object_VX_TABLE_RECORD *_obj;
+-              Dwg_Object *ctrl;
+-              Dwg_Object_VX_CONTROL *_ctrl;
+-              LOG_TRACE ("\n-- table entry VX_TABLE_RECORD [%d]: 0x%lx\n", i, pos);
+-              flag = bit_read_RC (dat);
+-              name = bit_read_TF (dat, 32);
+-              _obj = dwg_add_VX (dwg, (const char *)name);
+-              _obj->flag = flag;
+-              LOG_TRACE ("name: \"%s\" [TF 32 2]\n", name);
+-              LOG_TRACE ("flag: %u [RC 70]\n", flag);
+-              //LOG_FLAG_VX
+-              free (name);
+-              obj = dwg_obj_generic_to_object (_obj, &error);
+-              if (obj)
+-                {
+-                  obj->size = tbl->size;
+-                  obj->address = pos;
+-                }
+-              ctrl = dwg_get_first_object (dwg, DWG_TYPE_VX_CONTROL);
+-              if (ctrl)
+-                {
+-                  _ctrl = ctrl->tio.object->tio.VX_CONTROL;
+-                  _ctrl->entries[i]
+-                      = dwg_add_handleref (dwg, 2, obj->handle.value, obj);
+-                }
+-              SINCE (R_11)
+-                FIELD_RSd (used, 0);
+-              FIELD_RS (vport_entity_address, 0);
+-              FIELD_RSd (unknown1, 0);
+-              FIELD_RS (unknown2, 0);
+-              CHK_ENDPOS;
++              obj->size = tbl->size;
++              obj->address = pos;
+             }
++          ctrl = dwg_get_first_object (dwg, DWG_TYPE_VX_CONTROL);
++          if (ctrl)
++            {
++              _ctrl = ctrl->tio.object->tio.VX_CONTROL;
++              _ctrl->entries[i]
++                = dwg_add_handleref (dwg, 2, obj->handle.value, obj);
++            }
++          SINCE (R_11)
++            FIELD_RSd (used, 0);
++          FIELD_RS (vport_entity_address, 0);
++          FIELD_RSd (unknown1, 0);
++          FIELD_RS (unknown2, 0);
++          CHK_ENDPOS;
++#endif
+         }
+         break;
+ 
+@@ -473,7 +467,6 @@ decode_preR13_section (Dwg_Section_Type_r11 id, Bit_Chain *restrict dat,
+         LOG_ERROR ("Invalid table id %d", id);
+         tbl->number = 0;
+         break;
+-      }
+     }
+ 
+   if (tbl->address && tbl->number && tbl->size)
+@@ -641,7 +634,7 @@ decode_preR13 (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+       return DWG_ERR_INVALIDDWG;
+     }
+ 
+-  LOG_INFO ("==========================================\n")
++  LOG_TRACE ("==========================================\n")
+   error |= decode_preR13_header_variables (dat, dwg);
+   LOG_TRACE ("@0x%lx\n", dat->byte);
+   if (error >= DWG_ERR_CRITICAL)
+diff --git a/src/dwg.spec b/src/dwg.spec
+index 4db0c9b708..2e03ae8420 100644
+--- a/src/dwg.spec
++++ b/src/dwg.spec
+@@ -3467,7 +3467,7 @@ DWG_OBJECT (BLOCK_CONTROL)
+ DWG_OBJECT_END
+ 
+ /* (49/T1) */
+-DWG_OBJECT (BLOCK_HEADER)
++DWG_TABLE (BLOCK_HEADER)
+ 
+   //DXF: the name must be from the block_entity!
+   COMMON_TABLE_FLAGS (Block)
+@@ -3609,7 +3609,7 @@ DWG_OBJECT (LAYER_CONTROL)
+ DWG_OBJECT_END
+ 
+ /* (51/T2) */
+-DWG_OBJECT (LAYER)
++DWG_TABLE (LAYER)
+ 
+   COMMON_TABLE_FLAGS (Layer);
+   PRE (R_13b1) {
+@@ -3724,7 +3724,7 @@ DWG_OBJECT (STYLE_CONTROL)
+ DWG_OBJECT_END
+ 
+ /* (53/T3) preR13+DXF: STYLE, documented as SHAPEFILE */
+-DWG_OBJECT (STYLE)
++DWG_TABLE (STYLE)
+ 
+   COMMON_TABLE_FLAGS (TextStyle)
+ 
+@@ -3813,7 +3813,7 @@ DWG_OBJECT_END
+ /* (57/T4)
+  * Unstable, ACAD import errors
+  */
+-DWG_OBJECT (LTYPE)
++DWG_TABLE (LTYPE)
+ 
+   COMMON_TABLE_FLAGS (Linetype)
+ 
+@@ -3951,7 +3951,7 @@ DWG_OBJECT (VIEW_CONTROL)
+ DWG_OBJECT_END
+ 
+ /* (61/T5) */
+-DWG_OBJECT (VIEW)
++DWG_TABLE (VIEW)
+ 
+   COMMON_TABLE_FLAGS (View)
+ 
+@@ -4069,7 +4069,7 @@ DWG_OBJECT (UCS_CONTROL)
+ DWG_OBJECT_END
+ 
+ /* (63/T6) */
+-DWG_OBJECT (UCS)
++DWG_TABLE (UCS)
+ 
+   COMMON_TABLE_FLAGS (UCS)
+   PRE (R_13b1)
+@@ -4121,7 +4121,7 @@ DWG_OBJECT (VPORT_CONTROL)
+ DWG_OBJECT_END
+ 
+ /* (65) */
+-DWG_OBJECT (VPORT)
++DWG_TABLE (VPORT)
+ 
+   COMMON_TABLE_FLAGS (Viewport)
+ 
+@@ -4316,7 +4316,7 @@ DWG_OBJECT (APPID_CONTROL)
+ DWG_OBJECT_END
+ 
+ /* (67/T8) Registered Apps */
+-DWG_OBJECT (APPID)
++DWG_TABLE (APPID)
+ 
+   COMMON_TABLE_FLAGS (RegApp)
+   SINCE (R_13b1) {
+@@ -4347,7 +4347,7 @@ DWG_OBJECT (DIMSTYLE_CONTROL)
+ DWG_OBJECT_END
+ 
+ /* (69/T9) */
+-DWG_OBJECT (DIMSTYLE)
++DWG_TABLE (DIMSTYLE)
+ 
+   DXF {
+     FIELD_VALUE (flag) = FIELD_VALUE (flag0);
+@@ -4628,7 +4628,7 @@ DWG_OBJECT_END
+ 
+ /* (71/T10)
+ */
+-DWG_OBJECT (VX_TABLE_RECORD)
++DWG_TABLE (VX_TABLE_RECORD)
+ 
+   COMMON_TABLE_FLAGS (VX)
+   PRE (R_13b1)
+diff --git a/src/spec.h b/src/spec.h
+index 32d3129c68..6087ae298a 100644
+--- a/src/spec.h
++++ b/src/spec.h
+@@ -1175,6 +1175,8 @@
+ #elif defined IS_ENCODER
+ #  define PRER13_SECTION_HDR(name) \
+     encode_preR13_section_hdr (#name, SECTION_##name, dat, dwg)
++#  define DWG_TABLE(token) DWG_OBJECT (token)
+ #else
+ #  define PRER13_SECTION_HDR(name)
++#  define DWG_TABLE(token) DWG_OBJECT (token)
+ #endif

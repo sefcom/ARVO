@@ -1,0 +1,100 @@
+From 46ac878f6a0c19514085b81b185a574084f244cf Mon Sep 17 00:00:00 2001
+From: Niels Dossche <7771979+nielsdos@users.noreply.github.com>
+Date: Sun, 18 May 2025 14:30:35 +0200
+Subject: [PATCH] Fix OSS-Fuzz #417078295
+
+If the variable_ptr and fetched value are the same or overlap, then we
+get a UAF. Prevent this by delaying destruction.
+
+Closes GH-18588.
+---
+ NEWS                               |  1 +
+ Zend/tests/oss_fuzz_417078295.phpt | 17 +++++++++++++++++
+ Zend/zend_vm_def.h                 |  3 ++-
+ Zend/zend_vm_execute.h             |  3 ++-
+ 4 files changed, 22 insertions(+), 2 deletions(-)
+ create mode 100644 Zend/tests/oss_fuzz_417078295.phpt
+
+diff --git a/NEWS b/NEWS
+index 25651e5ca7709..4a4259867a3fc 100644
+--- a/NEWS
++++ b/NEWS
+@@ -7,6 +7,7 @@ PHP                                                                        NEWS
+     (nielsdos/David Carlier)
+   . Partially fixed GH-18572 (nested object comparisons leading to stack overflow).
+     (David Carlier)
++  . Fixed OSS-Fuzz #417078295. (nielsdos)
+ 
+ - Curl:
+   . Fixed GH-18460 (curl_easy_setopt with CURLOPT_USERPWD/CURLOPT_USERNAME/
+diff --git a/Zend/tests/oss_fuzz_417078295.phpt b/Zend/tests/oss_fuzz_417078295.phpt
+new file mode 100644
+index 0000000000000..6e53f9478e137
+--- /dev/null
++++ b/Zend/tests/oss_fuzz_417078295.phpt
+@@ -0,0 +1,17 @@
++--TEST--
++OSS-Fuzz #417078295
++--FILE--
++<?php
++
++function foo() {
++    $a = new stdClass();
++    static $a = $a;
++    debug_zval_dump($a);
++}
++
++foo();
++
++?>
++--EXPECT--
++object(stdClass)#1 (0) refcount(2){
++}
+diff --git a/Zend/zend_vm_def.h b/Zend/zend_vm_def.h
+index 19422fe5eebfd..0eacdfe145d49 100644
+--- a/Zend/zend_vm_def.h
++++ b/Zend/zend_vm_def.h
+@@ -8981,7 +8981,6 @@ ZEND_VM_HANDLER(183, ZEND_BIND_STATIC, CV, ANY, REF)
+ 	value = (zval*)((char*)ht->arData + (opline->extended_value & ~(ZEND_BIND_REF|ZEND_BIND_IMPLICIT|ZEND_BIND_EXPLICIT)));
+ 
+ 	if (opline->extended_value & ZEND_BIND_REF) {
+-		i_zval_ptr_dtor(variable_ptr);
+ 		if (UNEXPECTED(!Z_ISREF_P(value))) {
+ 			zend_reference *ref = (zend_reference*)emalloc(sizeof(zend_reference));
+ 			GC_SET_REFCOUNT(ref, 2);
+@@ -8996,9 +8995,11 @@ ZEND_VM_HANDLER(183, ZEND_BIND_STATIC, CV, ANY, REF)
+ 			ref->sources.ptr = NULL;
+ 			Z_REF_P(value) = ref;
+ 			Z_TYPE_INFO_P(value) = IS_REFERENCE_EX;
++			i_zval_ptr_dtor(variable_ptr);
+ 			ZVAL_REF(variable_ptr, ref);
+ 		} else {
+ 			Z_ADDREF_P(value);
++			i_zval_ptr_dtor(variable_ptr);
+ 			ZVAL_REF(variable_ptr, Z_REF_P(value));
+ 			if (OP2_TYPE != IS_UNUSED) {
+ 				FREE_OP2();
+diff --git a/Zend/zend_vm_execute.h b/Zend/zend_vm_execute.h
+index 209e6cdbe7dfe..4ea6b302c8cfc 100644
+--- a/Zend/zend_vm_execute.h
++++ b/Zend/zend_vm_execute.h
+@@ -40564,7 +40564,6 @@ static ZEND_OPCODE_HANDLER_RET ZEND_FASTCALL ZEND_BIND_STATIC_SPEC_CV_HANDLER(ZE
+ 	value = (zval*)((char*)ht->arData + (opline->extended_value & ~(ZEND_BIND_REF|ZEND_BIND_IMPLICIT|ZEND_BIND_EXPLICIT)));
+ 
+ 	if (opline->extended_value & ZEND_BIND_REF) {
+-		i_zval_ptr_dtor(variable_ptr);
+ 		if (UNEXPECTED(!Z_ISREF_P(value))) {
+ 			zend_reference *ref = (zend_reference*)emalloc(sizeof(zend_reference));
+ 			GC_SET_REFCOUNT(ref, 2);
+@@ -40579,9 +40578,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_FASTCALL ZEND_BIND_STATIC_SPEC_CV_HANDLER(ZE
+ 			ref->sources.ptr = NULL;
+ 			Z_REF_P(value) = ref;
+ 			Z_TYPE_INFO_P(value) = IS_REFERENCE_EX;
++			i_zval_ptr_dtor(variable_ptr);
+ 			ZVAL_REF(variable_ptr, ref);
+ 		} else {
+ 			Z_ADDREF_P(value);
++			i_zval_ptr_dtor(variable_ptr);
+ 			ZVAL_REF(variable_ptr, Z_REF_P(value));
+ 			if (opline->op2_type != IS_UNUSED) {
+ 				FREE_OP(opline->op2_type, opline->op2.var);

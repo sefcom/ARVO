@@ -1,0 +1,179 @@
+From 2c15c9ce80b0c8779a3d5cc5ad1c3452e620d084 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Fri, 28 Aug 2020 16:43:22 +0200
+Subject: [PATCH] Rehash function table after disabling functions
+
+To perform fast shutdown without full table cleanup we need all
+internal functions to be in one continuous chunk. This was
+violated when functions were deleted via disable_functions.
+
+This drops the zend_disable_function() API in favor of
+zend_disable_functions(), which disables the given list of
+functions and performs the necessary rehash afterwards.
+
+Also drop PG(disabled_functions), which is no longer used.
+---
+ Zend/zend_API.c        | 38 ++++++++++++++++++++++++++++++++++++--
+ Zend/zend_API.h        |  2 +-
+ main/main.c            | 42 +-----------------------------------------
+ main/php_globals.h     |  1 -
+ sapi/fpm/fpm/fpm_php.c |  4 +---
+ 5 files changed, 39 insertions(+), 48 deletions(-)
+
+diff --git a/Zend/zend_API.c b/Zend/zend_API.c
+index ae33bf30220f0..139e11e937ffb 100644
+--- a/Zend/zend_API.c
++++ b/Zend/zend_API.c
+@@ -2790,9 +2790,43 @@ ZEND_API zend_result zend_set_hash_symbol(zval *symbol, const char *name, size_t
+ 
+ /* Disabled functions support */
+ 
+-ZEND_API zend_result zend_disable_function(const char *function_name, size_t function_name_length) /* {{{ */
++static void zend_disable_function(const char *function_name, size_t function_name_length)
+ {
+-	return zend_hash_str_del(CG(function_table), function_name, function_name_length);
++	zend_hash_str_del(CG(function_table), function_name, function_name_length);
++}
++
++ZEND_API void zend_disable_functions(const char *function_list) /* {{{ */
++{
++	if (!function_list || !*function_list) {
++		return;
++	}
++
++	const char *s = NULL, *e = function_list;
++	while (*e) {
++		switch (*e) {
++			case ' ':
++			case ',':
++				if (s) {
++					zend_disable_function(s, e - s);
++					s = NULL;
++				}
++				break;
++			default:
++				if (!s) {
++					s = e;
++				}
++				break;
++		}
++		e++;
++	}
++	if (s) {
++		zend_disable_function(s, e - s);
++	}
++
++	/* Rehash the function table after deleting functions. This ensures that all internal
++	 * functions are contiguous, which means we don't need to perform full table cleanup
++	 * on shutdown. */
++	zend_hash_rehash(CG(function_table));
+ }
+ /* }}} */
+ 
+diff --git a/Zend/zend_API.h b/Zend/zend_API.h
+index 6f028ae65ee17..d46fe6968a17f 100644
+--- a/Zend/zend_API.h
++++ b/Zend/zend_API.h
+@@ -341,7 +341,7 @@ ZEND_API zend_result zend_register_class_alias_ex(const char *name, size_t name_
+ #define zend_register_ns_class_alias(ns, name, ce) \
+ 	zend_register_class_alias_ex(ZEND_NS_NAME(ns, name), sizeof(ZEND_NS_NAME(ns, name))-1, ce, 1)
+ 
+-ZEND_API zend_result zend_disable_function(const char *function_name, size_t function_name_length);
++ZEND_API void zend_disable_functions(const char *function_list);
+ ZEND_API zend_result zend_disable_class(const char *class_name, size_t class_name_length);
+ 
+ ZEND_API ZEND_COLD void zend_wrong_param_count(void);
+diff --git a/main/main.c b/main/main.c
+index c9cb9b2d8563b..9a92447f4196e 100644
+--- a/main/main.c
++++ b/main/main.c
+@@ -299,43 +299,6 @@ static PHP_INI_MH(OnSetLogFilter)
+ }
+ /* }}} */
+ 
+-/* {{{ php_disable_functions */
+-static void php_disable_functions(void)
+-{
+-	char *s = NULL, *e;
+-
+-	if (!*(INI_STR("disable_functions"))) {
+-		return;
+-	}
+-
+-	e = PG(disable_functions) = strdup(INI_STR("disable_functions"));
+-	if (e == NULL) {
+-		return;
+-	}
+-	while (*e) {
+-		switch (*e) {
+-			case ' ':
+-			case ',':
+-				if (s) {
+-					*e = '\0';
+-					zend_disable_function(s, e-s);
+-					s = NULL;
+-				}
+-				break;
+-			default:
+-				if (!s) {
+-					s = e;
+-				}
+-				break;
+-		}
+-		e++;
+-	}
+-	if (s) {
+-		zend_disable_function(s, e-s);
+-	}
+-}
+-/* }}} */
+-
+ /* {{{ php_disable_classes */
+ static void php_disable_classes(void)
+ {
+@@ -1924,9 +1887,6 @@ static void core_globals_dtor(php_core_globals *core_globals)
+ 	ZEND_ASSERT(!core_globals->last_error_message);
+ 	ZEND_ASSERT(!core_globals->last_error_file);
+ 
+-	if (core_globals->disable_functions) {
+-		free(core_globals->disable_functions);
+-	}
+ 	if (core_globals->disable_classes) {
+ 		free(core_globals->disable_classes);
+ 	}
+@@ -2274,7 +2234,7 @@ int php_module_startup(sapi_module_struct *sf, zend_module_entry *additional_mod
+ 	}
+ 
+ 	/* disable certain classes and functions as requested by php.ini */
+-	php_disable_functions();
++	zend_disable_functions(INI_STR("disable_functions"));
+ 	php_disable_classes();
+ 
+ 	/* make core report what it should */
+diff --git a/main/php_globals.h b/main/php_globals.h
+index 42337e5b9bd10..e079866645eb2 100644
+--- a/main/php_globals.h
++++ b/main/php_globals.h
+@@ -139,7 +139,6 @@ struct _php_core_globals {
+ 
+ 	char *php_sys_temp_dir;
+ 
+-	char *disable_functions;
+ 	char *disable_classes;
+ 	zend_bool allow_url_include;
+ #ifdef PHP_WIN32
+diff --git a/sapi/fpm/fpm/fpm_php.c b/sapi/fpm/fpm/fpm_php.c
+index 18d5dae0860a7..96648f44372db 100644
+--- a/sapi/fpm/fpm/fpm_php.c
++++ b/sapi/fpm/fpm/fpm_php.c
+@@ -96,9 +96,7 @@ int fpm_php_apply_defines_ex(struct key_value_s *kv, int mode) /* {{{ */
+ 	}
+ 
+ 	if (!strcmp(name, "disable_functions") && *value) {
+-		char *v = strdup(value);
+-		PG(disable_functions) = v;
+-		fpm_php_disable(v, zend_disable_function);
++		zend_disable_functions(value);
+ 		return 1;
+ 	}
+ 

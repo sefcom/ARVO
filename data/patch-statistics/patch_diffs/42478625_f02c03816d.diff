@@ -1,0 +1,61 @@
+From 256ce79d3122ce92d73edb2d46f8eb6da664aa69 Mon Sep 17 00:00:00 2001
+From: Michael Tuexen <tuexen@fh-muenster.de>
+Date: Mon, 30 Sep 2019 14:11:10 +0200
+Subject: [PATCH] Don't use stack memory which is not initialized.
+
+Thanks to Mark Wodrich for reporting this issue for the userland stack in
+https://github.com/sctplab/usrsctp/issues/380
+This issue was also found for usrsctp by OSS-fuzz in
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=17778
+---
+ usrsctplib/netinet/sctp_asconf.c | 19 +++++++++++--------
+ 1 file changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/usrsctplib/netinet/sctp_asconf.c b/usrsctplib/netinet/sctp_asconf.c
+index b4d5f18f3..d81e1aa79 100755
+--- a/usrsctplib/netinet/sctp_asconf.c
++++ b/usrsctplib/netinet/sctp_asconf.c
+@@ -34,7 +34,7 @@
+ 
+ #ifdef __FreeBSD__
+ #include <sys/cdefs.h>
+-__FBSDID("$FreeBSD: head/sys/netinet/sctp_asconf.c 352550 2019-09-20 08:20:20Z tuexen $");
++__FBSDID("$FreeBSD: head/sys/netinet/sctp_asconf.c 352894 2019-09-30 12:06:57Z tuexen $");
+ #endif
+ 
+ #include <netinet/sctp_os.h>
+@@ -245,6 +245,7 @@ sctp_process_asconf_add_ip(struct sockaddr *src, struct sctp_asconf_paramhdr *ap
+ 		        "process_asconf_add_ip: using source addr ");
+ 		SCTPDBG_ADDR(SCTP_DEBUG_ASCONF1, src);
+ 	}
++	net = NULL;
+ 	/* add the address */
+ 	if (bad_address) {
+ 		m_reply = sctp_asconf_error_response(aph->correlation_id,
+@@ -259,17 +260,19 @@ sctp_process_asconf_add_ip(struct sockaddr *src, struct sctp_asconf_paramhdr *ap
+ 		    SCTP_CAUSE_RESOURCE_SHORTAGE, (uint8_t *) aph,
+ 		    aparam_length);
+ 	} else {
+-		/* notify upper layer */
+-		sctp_ulp_notify(SCTP_NOTIFY_ASCONF_ADD_IP, stcb, 0, sa, SCTP_SO_NOT_LOCKED);
+ 		if (response_required) {
+ 			m_reply =
+ 			    sctp_asconf_success_response(aph->correlation_id);
+ 		}
+-		sctp_timer_start(SCTP_TIMER_TYPE_PATHMTURAISE, stcb->sctp_ep, stcb, net);
+-		sctp_timer_start(SCTP_TIMER_TYPE_HEARTBEAT, stcb->sctp_ep,
+-		                 stcb, net);
+-		if (send_hb) {
+-			sctp_send_hb(stcb, net, SCTP_SO_NOT_LOCKED);
++		if (net != NULL) {
++			/* notify upper layer */
++			sctp_ulp_notify(SCTP_NOTIFY_ASCONF_ADD_IP, stcb, 0, sa, SCTP_SO_NOT_LOCKED);
++			sctp_timer_start(SCTP_TIMER_TYPE_PATHMTURAISE, stcb->sctp_ep, stcb, net);
++			sctp_timer_start(SCTP_TIMER_TYPE_HEARTBEAT, stcb->sctp_ep,
++					 stcb, net);
++			if (send_hb) {
++				sctp_send_hb(stcb, net, SCTP_SO_NOT_LOCKED);
++			}
+ 		}
+ 	}
+ 	return (m_reply);

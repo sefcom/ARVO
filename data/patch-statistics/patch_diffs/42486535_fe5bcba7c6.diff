@@ -1,0 +1,335 @@
+From 6f2e8b7f63d4dec0f19130ff9383680d3b7dc16e Mon Sep 17 00:00:00 2001
+From: apriestman <apriestman@basistech.com>
+Date: Tue, 11 Jan 2022 13:11:24 -0500
+Subject: [PATCH 1/3] Add prepared statements for inserts
+
+---
+ .../datamodel/CaseDbAccessManager.java        | 153 ++++++++++++++++--
+ 1 file changed, 141 insertions(+), 12 deletions(-)
+
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java b/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
+index c009c77b00..d732b98575 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
+@@ -629,7 +629,7 @@ public void select(final String sql, final CaseDbAccessQueryCallback queryCallba
+ 	public CaseDbPreparedStatement prepareSelect(String sql) throws TskCoreException {
+ 		String selectSQL = "SELECT " + sql; // NON-NLS
+ 		try {
+-			return new CaseDbPreparedStatement(selectSQL, false);
++			return new CaseDbPreparedStatement(StatementType.SELECT, selectSQL, false);
+ 		} catch (SQLException ex) {
+ 			throw new TskCoreException("Error creating select prepared statement for query:\n" + selectSQL, ex);
+ 		}
+@@ -645,12 +645,90 @@ public CaseDbPreparedStatement prepareSelect(String sql) throws TskCoreException
+ 	 */
+ 	@Beta
+ 	public void select(CaseDbPreparedStatement preparedStatement, CaseDbAccessQueryCallback queryCallback) throws TskCoreException {
++		if (!preparedStatement.getType().equals(StatementType.SELECT)) {
++			throw new TskCoreException("CaseDbPreparedStatement has incorrect type for select operation");
++		}
++		
+ 		try (ResultSet resultSet = preparedStatement.getStatement().executeQuery()) {
+ 			queryCallback.process(resultSet);
+ 		} catch (SQLException ex) {
+ 			throw new TskCoreException(MessageFormat.format("Error running SELECT query:\n{0}", preparedStatement.getOriginalSql()), ex);
+ 		}
+ 	}
++	
++	/**
++	 * Creates a prepared statement object for the purposes of running an insert
++	 * statement. The given SQL should not include the starting "INSERT INTO" 
++	 * or the name of the table.
++	 * 
++	 * For PostGreSQL, the caller must include the ON CONFLICT DO NOTHING clause
++	 *
++	 * @param tableName The name of the table being updated.
++	 * @param sql       The insert statement without the starting "INSERT INTO (table name)" part.
++	 * @param trans     The open transaction.
++	 *
++	 * @return The prepared statement object.
++	 *
++	 * @throws TskCoreException
++	 */
++	@Beta
++	public CaseDbPreparedStatement prepareInsert(String tableName, String sql, CaseDbTransaction trans) throws TskCoreException {
++		validateTableName(tableName);
++		validateSQL(sql);
++		
++		String insertSQL = "INSERT";
++		if (DbType.SQLITE == tskDB.getDatabaseType()) {
++			insertSQL += " OR IGNORE";
++		}
++		insertSQL = insertSQL + " INTO " + tableName + " " + sql; // NON-NLS
++	
++		try {
++			return new CaseDbPreparedStatement(StatementType.INSERT, insertSQL, trans);
++		} catch (SQLException ex) {
++			throw new TskCoreException("Error creating insert prepared statement for query:\n" + insertSQL, ex);
++		}
++	}
++	
++	/**
++	 * Performs a insert statement query with the given case prepared statement.
++	 *
++	 * @param preparedStatement The case prepared statement.
++	 *
++	 * @return Row ID of inserted row.
++	 * 
++	 * @throws TskCoreException
++	 */
++	@Beta
++	public long insert(CaseDbPreparedStatement preparedStatement) throws TskCoreException {
++		
++		if (!preparedStatement.getType().equals(StatementType.INSERT)) {
++			throw new TskCoreException("CaseDbPreparedStatement has incorrect type for insert operation");
++		}
++		
++		long rowId = 0;
++		ResultSet resultSet = null;
++		try {
++			preparedStatement.getStatement().executeUpdate();
++			
++			resultSet = preparedStatement.getStatement().getGeneratedKeys();
++			if (resultSet.next()) {
++				rowId = resultSet.getLong(1); //last_insert_rowid()
++			}
++		} catch (SQLException ex) {
++			throw new TskCoreException("Error inserting row in table " + "" + " with sql = "+ "", ex);
++		} finally {
++			if (resultSet != null) {
++				try {
++					resultSet.close();
++				} catch (Exception ex) {
++					ex.printStackTrace();
++				}
++			}
++			//closeStatement(statement);
++		}
++
++		return rowId;
++	}
+ 
+ 	/**
+ 	 * Deletes a row in the specified table.
+@@ -726,6 +804,22 @@ private void validateSQL(String sql) throws TskCoreException {
+ 		 */
+ 	}
+ 	
++	/**
++	 * Enum to track which type of lock the CaseDbPreparedStatement holds.
++	 */
++	private enum LockType {
++		READ,
++		WRITE,
++		NONE;
++	}
++	
++	/**
++	 * Enum to track which type of statement the CaseDbPreparedStatement holds.
++	 */
++	private enum StatementType {
++		SELECT,
++		INSERT;
++	}
+ 	
+ 	/**
+ 	 * A wrapper around a PreparedStatement to execute queries against the
+@@ -737,10 +831,12 @@ public class CaseDbPreparedStatement implements AutoCloseable {
+ 		private final CaseDbConnection connection;
+ 		private final PreparedStatement preparedStatement;
+ 		private final String originalSql;
+-		private final boolean hasWriteLock;
+-
++		private final LockType lockType;
++		private final StatementType type;
++		
+ 		/**
+-		 * Main constructor.
++		 * Construct a prepared statement. This should not be used if a transaction
++		 * is already open.
+ 		 *
+ 		 * NOTE: Creating the CaseDbPreparedStatement opens a connection and
+ 		 * acquires a read lock on the case database. For this reason, it is
+@@ -750,6 +846,7 @@ public class CaseDbPreparedStatement implements AutoCloseable {
+ 		 * the database should be avoided while the prepared statement is open
+ 		 * to prevent possible deadlocks.
+ 		 *
++		 * @param type                The type of statement.
+ 		 * @param query               The query string.
+ 		 * @param isWriteLockRequired Whether or not a write lock is required.
+ 		 *                            If a write lock is not required, just a
+@@ -758,18 +855,36 @@ public class CaseDbPreparedStatement implements AutoCloseable {
+ 		 * @throws SQLException
+ 		 * @throws TskCoreException
+ 		 */
+-		private CaseDbPreparedStatement(String query, boolean isWriteLockRequired) throws SQLException, TskCoreException {		
++		private CaseDbPreparedStatement(StatementType type, String query, boolean isWriteLockRequired) throws SQLException, TskCoreException {		
+ 			if (isWriteLockRequired) {
+-				CaseDbAccessManager.this.tskDB.acquireSingleUserCaseWriteLock();	
++				CaseDbAccessManager.this.tskDB.acquireSingleUserCaseWriteLock();
++				this.lockType = LockType.WRITE;
+ 			} else {
+-				CaseDbAccessManager.this.tskDB.acquireSingleUserCaseReadLock();	
++				CaseDbAccessManager.this.tskDB.acquireSingleUserCaseReadLock();
++				this.lockType = LockType.READ;
+ 			}
+-			
+-			this.hasWriteLock = isWriteLockRequired;
+ 			this.connection = tskDB.getConnection();
+ 			this.preparedStatement = connection.getPreparedStatement(query, Statement.NO_GENERATED_KEYS);
+ 			this.originalSql = query;
+-			
++			this.type = type;
++		}
++		
++		/**
++		 * Construct a prepared statement using an already open transaction.
++		 *
++		 * @param type                The type of statement.
++		 * @param query               The query string.
++		 * @param trans               The open transaction.
++		 *
++		 * @throws SQLException
++		 * @throws TskCoreException
++		 */
++		private CaseDbPreparedStatement(StatementType type, String query, CaseDbTransaction trans) throws SQLException, TskCoreException {		
++			this.lockType = LockType.NONE;
++			this.connection = trans.getConnection();
++			this.preparedStatement = connection.getPreparedStatement(query, Statement.NO_GENERATED_KEYS);
++			this.originalSql = query;
++			this.type = type;
+ 		}
+ 
+ 		/**
+@@ -780,6 +895,15 @@ private CaseDbPreparedStatement(String query, boolean isWriteLockRequired) throw
+ 		private PreparedStatement getStatement() {
+ 			return preparedStatement;
+ 		}
++		
++		/**
++		 * Get the type of statement.
++		 * 
++		 * @return The statement type (select or insert).
++		 */
++		private StatementType getType() {
++			return type;
++		}
+ 
+ 		/**
+ 		 * Returns the original sql query.
+@@ -969,9 +1093,14 @@ public void setObject(int parameterIndex, Object x) throws TskCoreException {
+ 		public void close() throws SQLException {
+ 
+ 			preparedStatement.close();
++			
++			// Don't close the connection or release a lock if we were supplied a transaction.
++			if (lockType.equals(LockType.NONE)) {
++				return;
++			}
++			
+ 			connection.close();
+-
+-			if (hasWriteLock) {
++			if (lockType.equals(LockType.WRITE)) {
+ 				CaseDbAccessManager.this.tskDB.releaseSingleUserCaseWriteLock();
+ 			} else {
+ 				CaseDbAccessManager.this.tskDB.releaseSingleUserCaseReadLock();
+
+From 9eb3c51f0501057d66515963238aabdb6b882f1c Mon Sep 17 00:00:00 2001
+From: apriestman <apriestman@basistech.com>
+Date: Tue, 11 Jan 2022 13:28:43 -0500
+Subject: [PATCH 2/3] Cleanup
+
+---
+ .../datamodel/CaseDbAccessManager.java        | 22 +------------------
+ 1 file changed, 1 insertion(+), 21 deletions(-)
+
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java b/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
+index d732b98575..9f2d8cfae1 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
+@@ -693,41 +693,21 @@ public CaseDbPreparedStatement prepareInsert(String tableName, String sql, CaseD
+ 	 * Performs a insert statement query with the given case prepared statement.
+ 	 *
+ 	 * @param preparedStatement The case prepared statement.
+-	 *
+-	 * @return Row ID of inserted row.
+ 	 * 
+ 	 * @throws TskCoreException
+ 	 */
+ 	@Beta
+-	public long insert(CaseDbPreparedStatement preparedStatement) throws TskCoreException {
++	public void insert(CaseDbPreparedStatement preparedStatement) throws TskCoreException {
+ 		
+ 		if (!preparedStatement.getType().equals(StatementType.INSERT)) {
+ 			throw new TskCoreException("CaseDbPreparedStatement has incorrect type for insert operation");
+ 		}
+ 		
+-		long rowId = 0;
+-		ResultSet resultSet = null;
+ 		try {
+ 			preparedStatement.getStatement().executeUpdate();
+-			
+-			resultSet = preparedStatement.getStatement().getGeneratedKeys();
+-			if (resultSet.next()) {
+-				rowId = resultSet.getLong(1); //last_insert_rowid()
+-			}
+ 		} catch (SQLException ex) {
+ 			throw new TskCoreException("Error inserting row in table " + "" + " with sql = "+ "", ex);
+-		} finally {
+-			if (resultSet != null) {
+-				try {
+-					resultSet.close();
+-				} catch (Exception ex) {
+-					ex.printStackTrace();
+-				}
+-			}
+-			//closeStatement(statement);
+ 		}
+-
+-		return rowId;
+ 	}
+ 
+ 	/**
+
+From 9034f1c9f34673c70cdf2e6878a0ffc44ebf593f Mon Sep 17 00:00:00 2001
+From: apriestman <apriestman@basistech.com>
+Date: Wed, 12 Jan 2022 07:53:44 -0500
+Subject: [PATCH 3/3] Don't close statement when given a transaction. Add
+ protection against returning closed statements.
+
+---
+ .../src/org/sleuthkit/datamodel/CaseDbAccessManager.java     | 5 ++---
+ bindings/java/src/org/sleuthkit/datamodel/SleuthkitCase.java | 2 +-
+ 2 files changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java b/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
+index 9f2d8cfae1..8e417fdf39 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/CaseDbAccessManager.java
+@@ -1071,10 +1071,9 @@ public void setObject(int parameterIndex, Object x) throws TskCoreException {
+ 
+ 		@Override
+ 		public void close() throws SQLException {
+-
+-			preparedStatement.close();
+ 			
+-			// Don't close the connection or release a lock if we were supplied a transaction.
++			// Don't close the statement/connection or release a lock if we were supplied a transaction.
++			// Everything will be handled when the transaction is closed.
+ 			if (lockType.equals(LockType.NONE)) {
+ 				return;
+ 			}
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/SleuthkitCase.java b/bindings/java/src/org/sleuthkit/datamodel/SleuthkitCase.java
+index 16d0cfc456..5e14f322bb 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/SleuthkitCase.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/SleuthkitCase.java
+@@ -13228,7 +13228,7 @@ PreparedStatement getPreparedStatement(PREPARED_STATEMENT statementKey, int gene
+ 		PreparedStatement getPreparedStatement(String sqlStatement, int generateKeys) throws SQLException {
+ 			PreparedStatement statement;
+ 			String statementKey = "SQL:" + sqlStatement + " Key:" + generateKeys;
+-			if (adHocPreparedStatements.containsKey(statementKey)) {
++			if (adHocPreparedStatements.containsKey(statementKey) && !adHocPreparedStatements.get(statementKey).isClosed()) {
+ 				statement = this.adHocPreparedStatements.get(statementKey);
+ 			} else {
+ 				statement = prepareStatement(sqlStatement, generateKeys);

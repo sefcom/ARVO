@@ -1,0 +1,61 @@
+From 6a3097e2262b61a953651b6280247705945f4c82 Mon Sep 17 00:00:00 2001
+From: Chris Liddell <chris.liddell@artifex.com>
+Date: Mon, 9 Oct 2023 14:25:28 +0100
+Subject: oss-fuzz 63013: pdfwrite clean up on type 3 image error
+
+This highlighted two problems cleaning up after an error initialising to handle
+a type 3 image.
+
+First, only one of two interim devices was being freed, and as the remaining
+device was a forwarding device that forwarded to the freed device, when the
+garbage collector freed that remaining device, accessing the target device
+caused use-after-free problems.
+
+Secondly, the streams for the compression filter(s) were not being freed, and
+left in an unknown state (by the error).
+
+This fixes both those problems.
+---
+ base/stream.c             | 5 ++++-
+ devices/vector/gdevpdfi.c | 7 ++++++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/base/stream.c b/base/stream.c
+index 51350c6e1..793d4c5b6 100644
+--- a/base/stream.c
++++ b/base/stream.c
+@@ -1284,8 +1284,11 @@ s_add_filter(stream **ps, const stream_template *templat,
+     ess->templat = templat;
+     ess->memory = mem;
+     es->memory = mem;
+-    if (s_init_filter(es, ess, buf, bsize, *ps) < 0)
++    if (s_init_filter(es, ess, buf, bsize, *ps) < 0) {
++        gs_free_object(mem, buf, "s_add_filter(buf)");
++        gs_free_object(mem, es, "s_add_filter(stream)");
+         return 0;
++    }
+     *ps = es;
+     return es;
+ }
+diff --git a/devices/vector/gdevpdfi.c b/devices/vector/gdevpdfi.c
+index f71d4c4ce..f4b03a6af 100644
+--- a/devices/vector/gdevpdfi.c
++++ b/devices/vector/gdevpdfi.c
+@@ -2184,8 +2184,13 @@ pdf_image3_make_mcde(gx_device *dev, const gs_gstate *pgs,
+         code = pdf_begin_typed_image
+             ((gx_device_pdf *)dev, pgs, pmat, pic, prect, pdcolor, pcpath, mem,
+             pinfo, PDF_IMAGE_TYPE3_DATA);
+-        if (code < 0)
++        if (code < 0) {
++            gx_device_set_target((gx_device_forward *)(*pmcdev), NULL);
++            gs_closedevice((*pmcdev));
++            gs_free_object(mem, (*pmcdev), "pdf_image3_make_mcde(*pmcdev)");
++            *pmcdev = NULL;
+             return code;
++        }
+     }
+     /* Due to equal image merging, we delay the adding of the "Mask" entry into
+        a type 3 image dictionary until the mask is completed.
+-- 
+cgit v1.2.3
+

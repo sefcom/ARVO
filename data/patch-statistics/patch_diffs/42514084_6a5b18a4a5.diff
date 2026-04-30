@@ -1,0 +1,139 @@
+From 91351759b7e8619d9a5436600ea902ed3d6f0266 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshnikov <polimax at mail.ru>
+Date: Fri, 5 Jan 2018 13:34:06 +0000
+Subject: [PATCH] Fix Bad-cast
+ (https://oss-fuzz.com/v2/testcase-detail/6413960052998144). Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@41199 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ .../ogrsf_frmts/cad/libopencad/cadlayer.cpp   | 45 ++++++++++++-------
+ .../ogrsf_frmts/cad/libopencad/cadtables.cpp  |  9 ++--
+ 2 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/gdal/ogr/ogrsf_frmts/cad/libopencad/cadlayer.cpp b/gdal/ogr/ogrsf_frmts/cad/libopencad/cadlayer.cpp
+index f5a74c02c1d7..18fc6e208df6 100644
+--- a/gdal/ogr/ogrsf_frmts/cad/libopencad/cadlayer.cpp
++++ b/gdal/ogr/ogrsf_frmts/cad/libopencad/cadlayer.cpp
+@@ -8,7 +8,7 @@
+  *  The MIT License (MIT)
+  *
+  *  Copyright (c) 2016 Alexandr Borzykh
+- *  Copyright (c) 2016 NextGIS, <info@nextgis.com>
++ *  Copyright (c) 2016-2018 NextGIS, <info@nextgis.com>
+  *
+  *  Permission is hereby granted, free of charge, to any person obtaining a copy
+  *  of this software and associated documentation files (the "Software"), to deal
+@@ -156,9 +156,17 @@ void CADLayer::addHandle( long handle, CADObject::ObjectType type, long cadinser
+ #endif //_DEBUG
+     if( type == CADObject::ATTRIB || type == CADObject::ATTDEF )
+     {
+-        std::unique_ptr<CADAttdef> attdef( static_cast< CADAttdef *>(
+-                         pCADFile->GetGeometry( this->getId() - 1, handle ) ) );
+-        attributesNames.insert( attdef->getTag() );
++        CADGeometry* pCADGeometry = pCADFile->GetGeometry( this->getId() - 1,
++                                                           handle );
++        std::unique_ptr<CADAttdef> attdef( dynamic_cast<CADAttdef*>(pCADGeometry) );
++        if(attdef)
++        {
++            attributesNames.insert( attdef->getTag() );
++        }
++        else
++        {
++            delete pCADGeometry;
++        }
+     }
+ 
+     if( type == CADObject::INSERT )
+@@ -166,13 +174,13 @@ void CADLayer::addHandle( long handle, CADObject::ObjectType type, long cadinser
+         // TODO: transform insert to block of objects (do we need to transform
+         // coordinates according to insert point)?
+         std::unique_ptr<CADObject> insert( pCADFile->GetObject( handle, false ) );
+-        CADInsertObject * pInsert = static_cast<CADInsertObject *>(insert.get());
++        CADInsertObject * pInsert = dynamic_cast<CADInsertObject *>(insert.get());
+         if( nullptr != pInsert )
+         {
+             std::unique_ptr<CADObject> blockHeader( pCADFile->GetObject(
+                                     pInsert->hBlockHeader.getAsLong(), false ) );
+             CADBlockHeaderObject * pBlockHeader =
+-                          static_cast<CADBlockHeaderObject *>(blockHeader.get());
++                          dynamic_cast<CADBlockHeaderObject *>(blockHeader.get());
+             if( nullptr != pBlockHeader )
+             {
+ #ifdef _DEBUG
+@@ -189,15 +197,16 @@ void CADLayer::addHandle( long handle, CADObject::ObjectType type, long cadinser
+ 
+                 while( true )
+                 {
+-                    std::unique_ptr<CADEntityObject> entity(
+-                        static_cast< CADEntityObject * >( pCADFile->GetObject(
+-                                                    dCurrentEntHandle, true ) ) );
++                    std::unique_ptr<CADObject> entity(pCADFile->GetObject(
++                                                       dCurrentEntHandle, true ));
++                    CADEntityObject* pEntity =
++                            dynamic_cast<CADEntityObject *>( entity.get() );
+ 
+                     if( dCurrentEntHandle == dLastEntHandle )
+                     {
+-                        if( entity != nullptr )
++                        if( nullptr != pEntity )
+                         {
+-                            addHandle( dCurrentEntHandle, entity->getType(), handle );
++                            addHandle( dCurrentEntHandle, pEntity->getType(), handle );
+                             Matrix mat;
+                             mat.translate( pInsert->vertInsertionPoint );
+                             mat.scale( pInsert->vertScales );
+@@ -211,21 +220,25 @@ void CADLayer::addHandle( long handle, CADObject::ObjectType type, long cadinser
+                         }
+                     }
+ 
+-                    if( entity != nullptr )
++                    if( nullptr != pEntity )
+                     {
+-                        addHandle( dCurrentEntHandle, entity->getType(), handle );
++                        addHandle( dCurrentEntHandle, pEntity->getType(), handle );
+                         Matrix mat;
+                         mat.translate( pInsert->vertInsertionPoint );
+                         mat.scale( pInsert->vertScales );
+                         mat.rotate( pInsert->dfRotation );
+                         transformations[dCurrentEntHandle] = mat;
+ 
+-                        if( entity->stCed.bNoLinks )
++                        if( pEntity->stCed.bNoLinks )
++                        {
+                             ++dCurrentEntHandle;
++                        }
+                         else
++                        {
+                             dCurrentEntHandle =
+-                                entity->stChed.hNextEntity.getAsLong(
+-                                    entity->stCed.hObjectHandle );
++                                pEntity->stChed.hNextEntity.getAsLong(
++                                    pEntity->stCed.hObjectHandle );
++                        }
+                     }
+                     else
+                     {
+diff --git a/gdal/ogr/ogrsf_frmts/cad/libopencad/cadtables.cpp b/gdal/ogr/ogrsf_frmts/cad/libopencad/cadtables.cpp
+index ad5b057e60a4..6baec842cbc8 100644
+--- a/gdal/ogr/ogrsf_frmts/cad/libopencad/cadtables.cpp
++++ b/gdal/ogr/ogrsf_frmts/cad/libopencad/cadtables.cpp
+@@ -193,12 +193,15 @@ void CADTables::FillLayer( const CADEntityObject * pEntityObject )
+ 
+     for( CADLayer& oLayer : aLayers )
+     {
+-        if( pEntityObject->stChed.hLayer.getAsLong( pEntityObject->stCed.hObjectHandle ) == oLayer.getHandle() )
++        if( pEntityObject->stChed.hLayer.getAsLong(
++                    pEntityObject->stCed.hObjectHandle ) == oLayer.getHandle() )
+         {
+             DebugMsg( "Object with type: %s is attached to layer named: %s\n",
+-                      getNameByType( pEntityObject->getType() ).c_str(), oLayer.getName().c_str() );
++                      getNameByType( pEntityObject->getType() ).c_str(),
++                      oLayer.getName().c_str() );
+ 
+-            oLayer.addHandle( pEntityObject->stCed.hObjectHandle.getAsLong(), pEntityObject->getType() );
++            oLayer.addHandle( pEntityObject->stCed.hObjectHandle.getAsLong(),
++                              pEntityObject->getType() );
+             break;
+         }
+     }

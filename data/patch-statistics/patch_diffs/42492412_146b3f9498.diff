@@ -1,0 +1,50 @@
+From 8c07aafc43f8712bbe22bfe233e50502301c2cb2 Mon Sep 17 00:00:00 2001
+From: Juliusz Sosinowicz <juliusz@wolfssl.com>
+Date: Mon, 28 Dec 2020 22:33:01 +0100
+Subject: [PATCH] Fix memory leaks
+
+- Freeing the session object depends on the callback return
+- The session object is malloc'ed when ssl->options.internalCacheOff
+- wolfSSL_CTX_use_certificate needs to own the cert when KEEP_OUR_CERT because either it is up ref'ed or copied
+---
+ src/ssl.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/ssl.c b/src/ssl.c
+index 19d36795e61..fb27cb13c64 100644
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -13407,6 +13407,9 @@ int AddSession(WOLFSSL* ssl)
+     WOLFSSL_SESSION* session;
+     int i;
+     int overwrite = 0;
++#ifdef HAVE_EXT_CACHE
++    int cbRet = 0;
++#endif
+ 
+     if (ssl->options.sessionCacheOff)
+         return 0;
+@@ -13673,9 +13676,9 @@ int AddSession(WOLFSSL* ssl)
+ 
+ #ifdef HAVE_EXT_CACHE
+     if (error == 0 && ssl->ctx->new_sess_cb != NULL)
+-        ssl->ctx->new_sess_cb(ssl, session);
+-    if (ssl->options.internalCacheOff)
+-        FreeSession(session, 0);
++        cbRet = ssl->ctx->new_sess_cb(ssl, session);
++    if (ssl->options.internalCacheOff && cbRet == 0)
++        FreeSession(session, 1);
+ #endif
+ 
+     return error;
+@@ -42157,7 +42160,9 @@ void* wolfSSL_GetDhAgreeCtx(WOLFSSL* ssl)
+         }
+         #endif
+ 
+-        ctx->ownOurCert = 0;
++        /* We own the cert because either we up its reference counter
++         * or we create our own copy of the cert object. */
++        ctx->ownOurCert = 1;
+ #endif
+ 
+         /* Update the available options with public keys. */

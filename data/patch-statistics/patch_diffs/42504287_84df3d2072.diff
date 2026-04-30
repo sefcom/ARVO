@@ -1,0 +1,55 @@
+From 8eed9cb11e28728a58e265fde5c13f519ccbdb4e Mon Sep 17 00:00:00 2001
+From: Behdad Esfahbod <behdad@behdad.org>
+Date: Thu, 9 Nov 2017 18:09:40 -0800
+Subject: [PATCH] [kern] Fix invalid memory access if offset is zero
+
+If offset is zero, we return Null() object.  Wasn't prepared for that.
+
+Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=4088
+---
+ src/hb-ot-kern-table.hh                           |   9 +++++----
+ .../243798dd281c1c77c065958e1ff467420faa9bde.ttf  | Bin 0 -> 225 bytes
+ test/shaping/tests/fuzzed.tests                   |   1 +
+ 3 files changed, 6 insertions(+), 4 deletions(-)
+ create mode 100644 test/shaping/fonts/sha1sum/243798dd281c1c77c065958e1ff467420faa9bde.ttf
+
+diff --git a/src/hb-ot-kern-table.hh b/src/hb-ot-kern-table.hh
+index 074eba32a26..5fd2e20e67d 100644
+--- a/src/hb-ot-kern-table.hh
++++ b/src/hb-ot-kern-table.hh
+@@ -117,10 +117,11 @@ struct KernSubTableFormat2
+     unsigned int l = (this+leftClassTable).get_class (left);
+     unsigned int r = (this+leftClassTable).get_class (left);
+     unsigned int offset = l * rowWidth + r * sizeof (FWORD);
+-    const FWORD *v = &StructAtOffset<FWORD> (&(this+array), offset);
+-    /* Untested code, as I have not been able to find ANY kern table format-2 yet. */
+-    assert (&(this+array) <= v);
+-    if (unlikely (v + 1 > (const FWORD *) end))
++    const FWORD *arr = &(this+array);
++    if (unlikely ((const void *) arr < (const void *) this || (const void *) arr >= (const void *) end))
++      return 0;
++    const FWORD *v = &StructAtOffset<FWORD> (arr, offset);
++    if (unlikely ((const void *) v < (const void *) arr || (const void *) (v + 1) > (const void *) end))
+       return 0;
+     return *v;
+   }
+diff --git a/test/shaping/fonts/sha1sum/243798dd281c1c77c065958e1ff467420faa9bde.ttf b/test/shaping/fonts/sha1sum/243798dd281c1c77c065958e1ff467420faa9bde.ttf
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd8506eff2d450dfe9f908816591a2df5d627cce
+GIT binary patch
+literal 225
+zcmZQzWME+6RzL^;(FLf%&rU7M1DOM~aR;U5F@W67045a}n82nAFmN(3z{~~8fkhPn
+D)s7nT
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/shaping/tests/fuzzed.tests b/test/shaping/tests/fuzzed.tests
+index 1f51e4412fd..53e9187e602 100644
+--- a/test/shaping/tests/fuzzed.tests
++++ b/test/shaping/tests/fuzzed.tests
+@@ -15,3 +15,4 @@ fonts/sha1sum/a34a9191d9376bda419836effeef7e75c1386016.ttf:--font-funcs=ot:U+004
+ fonts/sha1sum/a69118c2c2ada48ff803d9149daa54c9ebdae30e.ttf:--font-funcs=ot:U+0041:[gid0=0+1229]
+ fonts/sha1sum/b6acef662e0beb8d5fcf5b61c6b0ca69537b7402.ttf:--font-funcs=ot:U+0041:[gid0=0+1000]
+ fonts/sha1sum/e88c339237f52d21e01c55f01b9c1b4cc14a0467.ttf:--font-funcs=ot:U+0041:[gid0=0+1000]
++fonts/sha1sum/243798dd281c1c77c065958e1ff467420faa9bde.ttf:--font-funcs=ot:U+0041:[gid0=0+1000]

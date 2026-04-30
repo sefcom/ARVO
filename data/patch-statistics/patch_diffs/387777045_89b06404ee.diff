@@ -1,0 +1,49 @@
+From 02683d2eed275e4207bcd7fd964bc62c93806a15 Mon Sep 17 00:00:00 2001
+From: "liang.he" <liang.he@intel.com>
+Date: Thu, 9 Jan 2025 13:11:25 +0800
+Subject: [PATCH] Improve stack consistency by ensuring sufficient space for
+ dummy offsets (#4011)
+
+One more corner case: if the `frame_offset` increases and becomes equal to
+the `frame_offset_boundary` after the last assignment within the for loop.
+---
+ core/iwasm/interpreter/wasm_loader.c | 20 +++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/core/iwasm/interpreter/wasm_loader.c b/core/iwasm/interpreter/wasm_loader.c
+index 8065173a43..bb34e29f01 100644
+--- a/core/iwasm/interpreter/wasm_loader.c
++++ b/core/iwasm/interpreter/wasm_loader.c
+@@ -11228,21 +11228,23 @@ wasm_loader_prepare_bytecode(WASMModule *module, WASMFunction *func,
+                         uint32 cell_num =
+                             wasm_value_type_cell_num(func_type->types[i]);
+                         if (i >= available_params) {
++                            /* make sure enough space */
++                            if (loader_ctx->p_code_compiled == NULL) {
++                                loader_ctx->frame_offset += cell_num;
++                                if (!check_offset_push(loader_ctx, error_buf,
++                                                       error_buf_size))
++                                    goto fail;
++                                /* for following dummy value assignemnt */
++                                loader_ctx->frame_offset -= cell_num;
++                            }
++
+                             /* If there isn't enough data on stack, push a dummy
+                              * offset to keep the stack consistent with
+                              * frame_ref.
+                              * Since the stack is already in polymorphic state,
+                              * the opcode will not be executed, so the dummy
+                              * offset won't cause any error */
+-                            uint32 n;
+-
+-                            for (n = 0; n < cell_num; n++) {
+-                                if (loader_ctx->p_code_compiled == NULL) {
+-                                    if (!check_offset_push(loader_ctx,
+-                                                           error_buf,
+-                                                           error_buf_size))
+-                                        goto fail;
+-                                }
++                            for (uint32 n = 0; n < cell_num; n++) {
+                                 *loader_ctx->frame_offset++ = 0;
+                             }
+                         }

@@ -1,0 +1,553 @@
+From 1806ce9cb019ee74ddb540cbc07daf121dcb5537 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <nikita.ppv@gmail.com>
+Date: Tue, 24 Sep 2019 11:50:26 +0200
+Subject: [PATCH] Add max_depth option to unserialize()
+
+Add a max_depth option to unserialize and an unserialize_max_depth
+ini setting, which can be used to control the depth limit. The
+default value is 4096.
+
+This option is intended to prevent stack overflows during the
+unserialization of deeply nested structures.
+
+This fixes bug #78549 and addresses oss-fuzz #17581, #17589, #17664,
+and #17788.
+---
+ NEWS                                        |   3 +
+ UPGRADING                                   |   6 +
+ ext/standard/basic_functions.c              |   1 +
+ ext/standard/basic_functions.h              |   1 +
+ ext/standard/php_var.h                      |   5 +
+ ext/standard/tests/serialize/max_depth.phpt | 159 ++++++++++++++++++++
+ ext/standard/var.c                          |  53 +++++--
+ ext/standard/var_unserializer.re            |  53 ++++++-
+ php.ini-development                         |   7 +
+ php.ini-production                          |   7 +
+ 10 files changed, 279 insertions(+), 16 deletions(-)
+ create mode 100644 ext/standard/tests/serialize/max_depth.phpt
+
+diff --git a/NEWS b/NEWS
+index 35292bbcad9fe..9e0e0cbc5f5b9 100644
+--- a/NEWS
++++ b/NEWS
+@@ -12,6 +12,9 @@ PHP                                                                        NEWS
+   . Fixed bug #78579 (mb_decode_numericentity: args number inconsistency).
+     (cmb)
+ 
++- Standard:
++  . Fixed bug #78549 (Stack overflow due to nested serialized input). (Nikita)
++
+ 19 Sep 2019, PHP 7.4.0RC2
+ 
+ - Core:
+diff --git a/UPGRADING b/UPGRADING
+index 2cce650c6a461..ec651de3faab0 100644
+--- a/UPGRADING
++++ b/UPGRADING
+@@ -316,6 +316,12 @@ PHP 7.4 UPGRADE NOTES
+ 
+     RFC: https://wiki.php.net/rfc/custom_object_serialization
+ 
++  . A new 'max_depth' option for unserialize(), as well as a
++    unserialize_max_depth ini setting have been added. These control the
++    maximum depth of structures permitted during unserialization, and are
++    intended to prevent stack overflows. The default depth limit is 4096 and
++    can be disabled by setting unserialize_max_depth=0.
++
+   . array_merge() and array_merge_recursive() may now be called without any
+     arguments, in which case they will return an empty array. This is useful
+     in conjunction with the spread operator, e.g. array_merge(...$arrays).
+diff --git a/ext/standard/basic_functions.c b/ext/standard/basic_functions.c
+index 9b937319c26d0..cb9be32852608 100644
+--- a/ext/standard/basic_functions.c
++++ b/ext/standard/basic_functions.c
+@@ -3667,6 +3667,7 @@ PHP_MINIT_FUNCTION(basic) /* {{{ */
+ 	register_html_constants(INIT_FUNC_ARGS_PASSTHRU);
+ 	register_string_constants(INIT_FUNC_ARGS_PASSTHRU);
+ 
++	BASIC_MINIT_SUBMODULE(var)
+ 	BASIC_MINIT_SUBMODULE(file)
+ 	BASIC_MINIT_SUBMODULE(pack)
+ 	BASIC_MINIT_SUBMODULE(browscap)
+diff --git a/ext/standard/basic_functions.h b/ext/standard/basic_functions.h
+index 2fff4e736e70f..7e0fa6b7f0813 100644
+--- a/ext/standard/basic_functions.h
++++ b/ext/standard/basic_functions.h
+@@ -235,6 +235,7 @@ typedef struct _php_basic_globals {
+ #endif
+ 
+ 	int umask;
++	zend_long unserialize_max_depth;
+ } php_basic_globals;
+ 
+ #ifdef ZTS
+diff --git a/ext/standard/php_var.h b/ext/standard/php_var.h
+index e8bd9406b834a..1342ae2565f62 100644
+--- a/ext/standard/php_var.h
++++ b/ext/standard/php_var.h
+@@ -22,6 +22,7 @@
+ #include "ext/standard/basic_functions.h"
+ #include "zend_smart_str_public.h"
+ 
++PHP_MINIT_FUNCTION(var);
+ PHP_FUNCTION(var_dump);
+ PHP_FUNCTION(var_export);
+ PHP_FUNCTION(debug_zval_dump);
+@@ -50,6 +51,10 @@ PHPAPI php_unserialize_data_t php_var_unserialize_init(void);
+ PHPAPI void php_var_unserialize_destroy(php_unserialize_data_t d);
+ PHPAPI HashTable *php_var_unserialize_get_allowed_classes(php_unserialize_data_t d);
+ PHPAPI void php_var_unserialize_set_allowed_classes(php_unserialize_data_t d, HashTable *classes);
++PHPAPI void php_var_unserialize_set_max_depth(php_unserialize_data_t d, zend_long max_depth);
++PHPAPI zend_long php_var_unserialize_get_max_depth(php_unserialize_data_t d);
++PHPAPI void php_var_unserialize_set_cur_depth(php_unserialize_data_t d, zend_long cur_depth);
++PHPAPI zend_long php_var_unserialize_get_cur_depth(php_unserialize_data_t d);
+ 
+ #define PHP_VAR_SERIALIZE_INIT(d) \
+ 	(d) = php_var_serialize_init()
+diff --git a/ext/standard/tests/serialize/max_depth.phpt b/ext/standard/tests/serialize/max_depth.phpt
+new file mode 100644
+index 0000000000000..4f605d284e252
+--- /dev/null
++++ b/ext/standard/tests/serialize/max_depth.phpt
+@@ -0,0 +1,159 @@
++--TEST--
++Bug #78549: Stack overflow due to nested serialized input
++--FILE--
++<?php
++
++function create_nested_data($depth, $prefix, $suffix, $inner = 'i:0;') {
++    return str_repeat($prefix, $depth) . $inner . str_repeat($suffix, $depth);
++}
++
++echo "Invalid max_depth:\n";
++var_dump(unserialize('i:0;', ['max_depth' => 'foo']));
++var_dump(unserialize('i:0;', ['max_depth' => -1]));
++
++echo "Array:\n";
++var_dump(unserialize(
++    create_nested_data(128, 'a:1:{i:0;', '}'),
++    ['max_depth' => 128]
++) !== false);
++var_dump(unserialize(
++    create_nested_data(129, 'a:1:{i:0;', '}'),
++    ['max_depth' => 128]
++));
++
++echo "Object:\n";
++var_dump(unserialize(
++    create_nested_data(128, 'O:8:"stdClass":1:{i:0;', '}'),
++    ['max_depth' => 128]
++) !== false);
++var_dump(unserialize(
++    create_nested_data(129, 'O:8:"stdClass":1:{i:0;', '}'),
++    ['max_depth' => 128]
++));
++
++// Default depth is 4096
++echo "Default depth:\n";
++var_dump(unserialize(create_nested_data(4096, 'a:1:{i:0;', '}')) !== false);
++var_dump(unserialize(create_nested_data(4097, 'a:1:{i:0;', '}')));
++
++// Depth can also be adjusted using ini setting
++echo "Ini setting:\n";
++ini_set("unserialize_max_depth", 128);
++var_dump(unserialize(create_nested_data(128, 'a:1:{i:0;', '}')) !== false);
++var_dump(unserialize(create_nested_data(129, 'a:1:{i:0;', '}')));
++
++// But an explicitly specified depth still takes precedence
++echo "Ini setting overridden:\n";
++var_dump(unserialize(
++    create_nested_data(256, 'a:1:{i:0;', '}'),
++    ['max_depth' => 256]
++) !== false);
++var_dump(unserialize(
++    create_nested_data(257, 'a:1:{i:0;', '}'),
++    ['max_depth' => 256]
++));
++
++// Reset ini setting to a large value,
++// so it's clear that it won't be used in the following.
++ini_set("unserialize_max_depth", 4096);
++
++class Test implements Serializable {
++    public function serialize() {
++        return '';
++    }
++    public function unserialize($str) {
++        // Should fail, due to combined nesting level
++        var_dump(unserialize(create_nested_data(129, 'a:1:{i:0;', '}')));
++        // Should succeeed, below combined nesting level
++        var_dump(unserialize(create_nested_data(128, 'a:1:{i:0;', '}')) !== false);
++    }
++}
++echo "Nested unserialize combined depth limit:\n";
++var_dump(is_array(unserialize(
++    create_nested_data(128, 'a:1:{i:0;', '}', 'C:4:"Test":0:{}'),
++    ['max_depth' => 256]
++)));
++
++class Test2 implements Serializable {
++    public function serialize() {
++        return '';
++    }
++    public function unserialize($str) {
++        // If depth limit is overridden, the depth should be counted
++        // from zero again.
++        var_dump(unserialize(
++            create_nested_data(257, 'a:1:{i:0;', '}'),
++            ['max_depth' => 256]
++        ));
++        var_dump(unserialize(
++            create_nested_data(256, 'a:1:{i:0;', '}'),
++            ['max_depth' => 256]
++        ) !== false);
++    }
++}
++echo "Nested unserialize overridden depth limit:\n";
++var_dump(is_array(unserialize(
++    create_nested_data(64, 'a:1:{i:0;', '}', 'C:5:"Test2":0:{}'),
++    ['max_depth' => 128]
++)));
++
++?>
++--EXPECTF--
++Invalid max_depth:
++
++Warning: unserialize(): max_depth should be int in %s on line %d
++bool(false)
++
++Warning: unserialize(): max_depth cannot be negative in %s on line %d
++bool(false)
++Array:
++bool(true)
++
++Warning: unserialize(): Maximum depth of 128 exceeded. The depth limit can be changed using the max_depth unserialize() option or the unserialize_max_depth ini setting in %s on line %d
++
++Notice: unserialize(): Error at offset 1157 of 1294 bytes in %s on line %d
++bool(false)
++Object:
++bool(true)
++
++Warning: unserialize(): Maximum depth of 128 exceeded. The depth limit can be changed using the max_depth unserialize() option or the unserialize_max_depth ini setting in %s on line %d
++
++Notice: unserialize(): Error at offset 2834 of 2971 bytes in %s on line %d
++bool(false)
++Default depth:
++bool(true)
++
++Warning: unserialize(): Maximum depth of 4096 exceeded. The depth limit can be changed using the max_depth unserialize() option or the unserialize_max_depth ini setting in %s on line %d
++
++Notice: unserialize(): Error at offset 36869 of 40974 bytes in %s on line %d
++bool(false)
++Ini setting:
++bool(true)
++
++Warning: unserialize(): Maximum depth of 128 exceeded. The depth limit can be changed using the max_depth unserialize() option or the unserialize_max_depth ini setting in %s on line %d
++
++Notice: unserialize(): Error at offset 1157 of 1294 bytes in %s on line %d
++bool(false)
++Ini setting overridden:
++bool(true)
++
++Warning: unserialize(): Maximum depth of 256 exceeded. The depth limit can be changed using the max_depth unserialize() option or the unserialize_max_depth ini setting in %s on line %d
++
++Notice: unserialize(): Error at offset 2309 of 2574 bytes in %s on line %d
++bool(false)
++Nested unserialize combined depth limit:
++
++Warning: unserialize(): Maximum depth of 256 exceeded. The depth limit can be changed using the max_depth unserialize() option or the unserialize_max_depth ini setting in %s on line %d
++
++Notice: unserialize(): Error at offset 1157 of 1294 bytes in %s on line %d
++bool(false)
++bool(true)
++bool(true)
++Nested unserialize overridden depth limit:
++
++Warning: unserialize(): Maximum depth of 256 exceeded. The depth limit can be changed using the max_depth unserialize() option or the unserialize_max_depth ini setting in %s on line %d
++
++Notice: unserialize(): Error at offset 2309 of 2574 bytes in %s on line %d
++bool(false)
++bool(true)
++bool(true)
+diff --git a/ext/standard/var.c b/ext/standard/var.c
+index 410c0fdeb94f9..5ba2b3c8eb4db 100644
+--- a/ext/standard/var.c
++++ b/ext/standard/var.c
+@@ -1174,7 +1174,7 @@ PHP_FUNCTION(serialize)
+ }
+ /* }}} */
+ 
+-/* {{{ proto mixed unserialize(string variable_representation[, array allowed_classes])
++/* {{{ proto mixed unserialize(string variable_representation[, array options])
+    Takes a string representation of variable and recreates it */
+ PHP_FUNCTION(unserialize)
+ {
+@@ -1182,9 +1182,10 @@ PHP_FUNCTION(unserialize)
+ 	size_t buf_len;
+ 	const unsigned char *p;
+ 	php_unserialize_data_t var_hash;
+-	zval *options = NULL, *classes = NULL;
++	zval *options = NULL;
+ 	zval *retval;
+ 	HashTable *class_hash = NULL, *prev_class_hash;
++	zend_long prev_max_depth, prev_cur_depth;
+ 
+ 	ZEND_PARSE_PARAMETERS_START(1, 2)
+ 		Z_PARAM_STRING(buf, buf_len)
+@@ -1200,12 +1201,16 @@ PHP_FUNCTION(unserialize)
+ 	PHP_VAR_UNSERIALIZE_INIT(var_hash);
+ 
+ 	prev_class_hash = php_var_unserialize_get_allowed_classes(var_hash);
++	prev_max_depth = php_var_unserialize_get_max_depth(var_hash);
++	prev_cur_depth = php_var_unserialize_get_cur_depth(var_hash);
+ 	if (options != NULL) {
+-		classes = zend_hash_str_find(Z_ARRVAL_P(options), "allowed_classes", sizeof("allowed_classes")-1);
++		zval *classes, *max_depth;
++
++		classes = zend_hash_str_find_deref(Z_ARRVAL_P(options), "allowed_classes", sizeof("allowed_classes")-1);
+ 		if (classes && Z_TYPE_P(classes) != IS_ARRAY && Z_TYPE_P(classes) != IS_TRUE && Z_TYPE_P(classes) != IS_FALSE) {
+ 			php_error_docref(NULL, E_WARNING, "allowed_classes option should be array or boolean");
+-			PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+-			RETURN_FALSE;
++			RETVAL_FALSE;
++			goto cleanup;
+ 		}
+ 
+ 		if(classes && (Z_TYPE_P(classes) == IS_ARRAY || !zend_is_true(classes))) {
+@@ -1225,12 +1230,29 @@ PHP_FUNCTION(unserialize)
+ 
+ 			/* Exception during string conversion. */
+ 			if (EG(exception)) {
+-				zend_hash_destroy(class_hash);
+-				FREE_HASHTABLE(class_hash);
+-				PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
++				goto cleanup;
+ 			}
+ 		}
+ 		php_var_unserialize_set_allowed_classes(var_hash, class_hash);
++
++		max_depth = zend_hash_str_find_deref(Z_ARRVAL_P(options), "max_depth", sizeof("max_depth") - 1);
++		if (max_depth) {
++			if (Z_TYPE_P(max_depth) != IS_LONG) {
++				php_error_docref(NULL, E_WARNING, "max_depth should be int");
++				RETVAL_FALSE;
++				goto cleanup;
++			}
++			if (Z_LVAL_P(max_depth) < 0) {
++				php_error_docref(NULL, E_WARNING, "max_depth cannot be negative");
++				RETVAL_FALSE;
++				goto cleanup;
++			}
++
++			php_var_unserialize_set_max_depth(var_hash, Z_LVAL_P(max_depth));
++			/* If the max_depth for a nested unserialize() call has been overridden,
++			 * start counting from zero again (for the nested call only). */
++			php_var_unserialize_set_cur_depth(var_hash, 0);
++		}
+ 	}
+ 
+ 	if (BG(unserialize).level > 1) {
+@@ -1254,13 +1276,16 @@ PHP_FUNCTION(unserialize)
+ 		gc_check_possible_root(ref);
+ 	}
+ 
++cleanup:
+ 	if (class_hash) {
+ 		zend_hash_destroy(class_hash);
+ 		FREE_HASHTABLE(class_hash);
+ 	}
+ 
+-	/* Reset to previous allowed_classes in case this is a nested call */
++	/* Reset to previous options in case this is a nested call */
+ 	php_var_unserialize_set_allowed_classes(var_hash, prev_class_hash);
++	php_var_unserialize_set_max_depth(var_hash, prev_max_depth);
++	php_var_unserialize_set_cur_depth(var_hash, prev_cur_depth);
+ 	PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+ 
+ 	/* Per calling convention we must not return a reference here, so unwrap. We're doing this at
+@@ -1299,3 +1324,13 @@ PHP_FUNCTION(memory_get_peak_usage) {
+ 	RETURN_LONG(zend_memory_peak_usage(real_usage));
+ }
+ /* }}} */
++
++PHP_INI_BEGIN()
++	STD_PHP_INI_ENTRY("unserialize_max_depth", "4096", PHP_INI_ALL, OnUpdateLong, unserialize_max_depth, php_basic_globals, basic_globals)
++PHP_INI_END()
++
++PHP_MINIT_FUNCTION(var)
++{
++	REGISTER_INI_ENTRIES();
++	return SUCCESS;
++}
+diff --git a/ext/standard/var_unserializer.re b/ext/standard/var_unserializer.re
+index 87dd6b180f3d7..a444cdef5b7e7 100644
+--- a/ext/standard/var_unserializer.re
++++ b/ext/standard/var_unserializer.re
+@@ -49,6 +49,8 @@ struct php_unserialize_data {
+ 	var_dtor_entries *last_dtor;
+ 	HashTable        *allowed_classes;
+ 	HashTable        *ref_props;
++	zend_long         cur_depth;
++	zend_long         max_depth;
+ 	var_entries       entries;
+ };
+ 
+@@ -61,6 +63,8 @@ PHPAPI php_unserialize_data_t php_var_unserialize_init() {
+ 		d->first_dtor = d->last_dtor = NULL;
+ 		d->allowed_classes = NULL;
+ 		d->ref_props = NULL;
++		d->cur_depth = 0;
++		d->max_depth = BG(unserialize_max_depth);
+ 		d->entries.used_slots = 0;
+ 		d->entries.next = NULL;
+ 		if (!BG(serialize_lock)) {
+@@ -92,6 +96,20 @@ PHPAPI void php_var_unserialize_set_allowed_classes(php_unserialize_data_t d, Ha
+ 	d->allowed_classes = classes;
+ }
+ 
++PHPAPI void php_var_unserialize_set_max_depth(php_unserialize_data_t d, zend_long max_depth) {
++	d->max_depth = max_depth;
++}
++PHPAPI zend_long php_var_unserialize_get_max_depth(php_unserialize_data_t d) {
++	return d->max_depth;
++}
++
++PHPAPI void php_var_unserialize_set_cur_depth(php_unserialize_data_t d, zend_long cur_depth) {
++	d->cur_depth = cur_depth;
++}
++PHPAPI zend_long php_var_unserialize_get_cur_depth(php_unserialize_data_t d) {
++	return d->cur_depth;
++}
++
+ static inline void var_push(php_unserialize_data_t *var_hashx, zval *rval)
+ {
+ 	var_entries *var_hash = (*var_hashx)->last;
+@@ -438,6 +456,18 @@ static int php_var_unserialize_internal(UNSERIALIZE_PARAMETER, int as_key);
+ 
+ static zend_always_inline int process_nested_data(UNSERIALIZE_PARAMETER, HashTable *ht, zend_long elements, zend_object *obj)
+ {
++	if (var_hash) {
++		if ((*var_hash)->max_depth > 0 && (*var_hash)->cur_depth >= (*var_hash)->max_depth) {
++			php_error_docref(NULL, E_WARNING,
++				"Maximum depth of " ZEND_LONG_FMT " exceeded. "
++				"The depth limit can be changed using the max_depth unserialize() option "
++				"or the unserialize_max_depth ini setting",
++				(*var_hash)->max_depth);
++			return 0;
++		}
++		(*var_hash)->cur_depth++;
++	}
++
+ 	while (elements-- > 0) {
+ 		zval key, *data, d, *old_data;
+ 		zend_ulong idx;
+@@ -447,7 +477,7 @@ static zend_always_inline int process_nested_data(UNSERIALIZE_PARAMETER, HashTab
+ 
+ 		if (!php_var_unserialize_internal(&key, p, max, NULL, 1)) {
+ 			zval_ptr_dtor(&key);
+-			return 0;
++			goto failure;
+ 		}
+ 
+ 		data = NULL;
+@@ -477,7 +507,7 @@ numeric_key:
+ 				}
+ 			} else {
+ 				zval_ptr_dtor(&key);
+-				return 0;
++				goto failure;
+ 			}
+ 		} else {
+ 			if (EXPECTED(Z_TYPE(key) == IS_STRING)) {
+@@ -492,7 +522,7 @@ string_key:
+ 
+ 					if (UNEXPECTED(zend_unmangle_property_name_ex(Z_STR(key), &unmangled_class, &unmangled_prop, &unmangled_prop_len) == FAILURE)) {
+ 						zval_ptr_dtor(&key);
+-						return 0;
++						goto failure;
+ 					}
+ 
+ 					unmangled = zend_string_init(unmangled_prop, unmangled_prop_len, 0);
+@@ -559,13 +589,13 @@ string_key:
+ 				goto string_key;
+ 			} else {
+ 				zval_ptr_dtor(&key);
+-				return 0;
++				goto failure;
+ 			}
+ 		}
+ 
+ 		if (!php_var_unserialize_internal(data, p, max, var_hash, 0)) {
+ 			zval_ptr_dtor(&key);
+-			return 0;
++			goto failure;
+ 		}
+ 
+ 		if (UNEXPECTED(info)) {
+@@ -573,7 +603,7 @@ string_key:
+ 				zval_ptr_dtor(data);
+ 				ZVAL_UNDEF(data);
+ 				zval_dtor(&key);
+-				return 0;
++				goto failure;
+ 			}
+ 			if (Z_ISREF_P(data)) {
+ 				ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(data), info);
+@@ -587,11 +617,20 @@ string_key:
+ 
+ 		if (elements && *(*p-1) != ';' && *(*p-1) != '}') {
+ 			(*p)--;
+-			return 0;
++			goto failure;
+ 		}
+ 	}
+ 
++	if (var_hash) {
++		(*var_hash)->cur_depth--;
++	}
+ 	return 1;
++
++failure:
++	if (var_hash) {
++		(*var_hash)->cur_depth--;
++	}
++	return 0;
+ }
+ 
+ static inline int finish_nested_data(UNSERIALIZE_PARAMETER)
+diff --git a/php.ini-development b/php.ini-development
+index 920dd5d23a9aa..4ac6c44b1e9d9 100644
+--- a/php.ini-development
++++ b/php.ini-development
+@@ -284,6 +284,13 @@ implicit_flush = Off
+ ; callback-function.
+ unserialize_callback_func =
+ 
++; The unserialize_max_depth specifies the default depth limit for unserialized
++; structures. Setting the depth limit too high may result in stack overflows
++; during unserialization. The unserialize_max_depth ini setting can be
++; overridden by the max_depth option on individual unserialize() calls.
++; A value of 0 disables the depth limit.
++;unserialize_max_depth = 4096
++
+ ; When floats & doubles are serialized, store serialize_precision significant
+ ; digits after the floating point. The default value ensures that when floats
+ ; are decoded with unserialize, the data will remain the same.
+diff --git a/php.ini-production b/php.ini-production
+index 9a998a4c71b3d..d47cf161e3f55 100644
+--- a/php.ini-production
++++ b/php.ini-production
+@@ -284,6 +284,13 @@ implicit_flush = Off
+ ; callback-function.
+ unserialize_callback_func =
+ 
++; The unserialize_max_depth specifies the default depth limit for unserialized
++; structures. Setting the depth limit too high may result in stack overflows
++; during unserialization. The unserialize_max_depth ini setting can be
++; overridden by the max_depth option on individual unserialize() calls.
++; A value of 0 disables the depth limit.
++;unserialize_max_depth = 4096
++
+ ; When floats & doubles are serialized, store serialize_precision significant
+ ; digits after the floating point. The default value ensures that when floats
+ ; are decoded with unserialize, the data will remain the same.

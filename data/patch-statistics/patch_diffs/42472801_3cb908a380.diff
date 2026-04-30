@@ -1,0 +1,51 @@
+From cc8e9a436fa408a1c63f4b9afb7643cea76a079c Mon Sep 17 00:00:00 2001
+From: Behdad Esfahbod <behdad@behdad.org>
+Date: Thu, 17 Jan 2019 14:54:32 -0500
+Subject: [PATCH] [AAT] Fully sanitize ankr table at sanitize time
+
+Third try to fix access. Followup 6879efc2c1596d11a6a6ad296f80063b558d5e0f
+
+Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=12532
+Fixes https://bugs.chromium.org/p/chromium/issues/detail?id=922303
+---
+ src/hb-aat-layout-ankr-table.hh | 13 ++++---------
+ 1 file changed, 4 insertions(+), 9 deletions(-)
+
+diff --git a/src/hb-aat-layout-ankr-table.hh b/src/hb-aat-layout-ankr-table.hh
+index 69e27066e0b..77873dd5dfb 100644
+--- a/src/hb-aat-layout-ankr-table.hh
++++ b/src/hb-aat-layout-ankr-table.hh
+@@ -65,14 +65,10 @@ struct ankr
+ 			    unsigned int num_glyphs,
+ 			    const char *end) const
+   {
+-    const Offset<HBUINT16, false> *offset = (this+lookupTable).get_value (glyph_id, num_glyphs);
++    const OffsetTo<GlyphAnchors, HBUINT16, false> *offset = (this+lookupTable).get_value (glyph_id, num_glyphs);
+     if (!offset)
+       return Null(Anchor);
+-    const GlyphAnchors &anchors = StructAtOffset<GlyphAnchors> (&(this+anchorData), *offset);
+-    if (unlikely (end < (const char *) &anchors ||
+-		  end - (const char *) &anchors < anchors.len.static_size ||
+-		  end - (const char *) &anchors < anchors.get_size ()))
+-      return Null(Anchor);
++    const GlyphAnchors &anchors = &(this+anchorData) + *offset;
+     return anchors[i];
+   }
+ 
+@@ -81,14 +77,13 @@ struct ankr
+     TRACE_SANITIZE (this);
+     return_trace (likely (c->check_struct (this) &&
+ 			  version == 0 &&
+-			  lookupTable.sanitize (c, this) &&
+-			  anchorData.sanitize (c, this) /* Just one byte. */));
++			  lookupTable.sanitize (c, this, &(this+anchorData))));
+   }
+ 
+   protected:
+   HBUINT16	version; 	/* Version number (set to zero) */
+   HBUINT16	flags;		/* Flags (currently unused; set to zero) */
+-  LOffsetTo<Lookup<Offset<HBUINT16, false> >, false>
++  LOffsetTo<Lookup<OffsetTo<GlyphAnchors, HBUINT16, false> >, false>
+ 		lookupTable;	/* Offset to the table's lookup table */
+   LOffsetTo<HBUINT8, false>
+ 		anchorData;	/* Offset to the glyph data table */

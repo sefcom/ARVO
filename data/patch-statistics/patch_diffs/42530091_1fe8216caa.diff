@@ -1,0 +1,83 @@
+From 9fbc712003baf498635675388a79a76755446b91 Mon Sep 17 00:00:00 2001
+From: Alex <aleksandrosansan@gmail.com>
+Date: Wed, 15 Nov 2023 08:18:13 +0100
+Subject: [PATCH] Fix oss-fuzz issue 64111 (#1237)
+
+Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=64111
+---
+ Packet++/header/BgpLayer.h |  8 ++++++++
+ Packet++/src/BgpLayer.cpp  | 23 ++++++++++++++++++++---
+ 2 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/Packet++/header/BgpLayer.h b/Packet++/header/BgpLayer.h
+index 01a5f325d5..31cb756376 100644
+--- a/Packet++/header/BgpLayer.h
++++ b/Packet++/header/BgpLayer.h
+@@ -339,6 +339,14 @@ class BgpUpdateMessageLayer : public BgpLayer
+ 	 */
+ 	BgpUpdateMessageLayer(uint8_t* data, size_t dataLen, Layer* prevLayer, Packet* packet) : BgpLayer(data, dataLen, prevLayer, packet) {}
+ 
++	/**
++	* A static method that takes a byte array and detects whether it is a BgpUpdateMessage
++	* @param[in] data A byte array
++	* @param[in] dataSize The byte array size (in bytes)
++	* @return True if the data looks like a valid BgpUpdateMessage layer
++	*/
++	static bool isDataValid(const uint8_t *data, size_t dataSize);
++
+ 	/**
+ 	 * A c'tor that creates a new BGP UPDATE message
+ 	 * @param[in] withdrawnRoutes A vector of withdrawn routes data. If left empty (which is the default value) no withdrawn route information will be written to the message
+diff --git a/Packet++/src/BgpLayer.cpp b/Packet++/src/BgpLayer.cpp
+index 2b54dbbd18..ddf4c91b2d 100644
+--- a/Packet++/src/BgpLayer.cpp
++++ b/Packet++/src/BgpLayer.cpp
+@@ -30,13 +30,14 @@ size_t BgpLayer::getHeaderLen() const
+ 
+ BgpLayer* BgpLayer::parseBgpLayer(uint8_t* data, size_t dataLen, Layer* prevLayer, Packet* packet)
+ {
+-	if (dataLen < sizeof(bgp_common_header))
++	if (data == nullptr || dataLen < sizeof(bgp_common_header))
+ 		return nullptr;
+ 
+ 	bgp_common_header* bgpHeader = (bgp_common_header*)data;
+ 
+ 	// illegal header data - length is too small
+-	if (be16toh(bgpHeader->length) < static_cast<uint16_t>(sizeof(bgp_common_header)))
++	uint16_t messageLen = be16toh(bgpHeader->length);
++	if (dataLen < messageLen || messageLen < static_cast<uint16_t>(sizeof(bgp_common_header)))
+ 		return nullptr;
+ 
+ 	switch (bgpHeader->messageType)
+@@ -44,7 +45,7 @@ BgpLayer* BgpLayer::parseBgpLayer(uint8_t* data, size_t dataLen, Layer* prevLaye
+ 	case 1: // OPEN
+ 		return new BgpOpenMessageLayer(data, dataLen, prevLayer, packet);
+ 	case 2: // UPDATE
+-		return new BgpUpdateMessageLayer(data, dataLen, prevLayer, packet);
++		return BgpUpdateMessageLayer::isDataValid(data, dataLen) ? new BgpUpdateMessageLayer(data, dataLen, prevLayer, packet) : nullptr;
+ 	case 3: // NOTIFICATION
+ 		return new BgpNotificationMessageLayer(data, dataLen, prevLayer, packet);
+ 	case 4: // KEEPALIVE
+@@ -703,6 +704,22 @@ void BgpUpdateMessageLayer::getNetworkLayerReachabilityInfo(std::vector<prefix_a
+ 	parsePrefixAndIPData(dataPtr, nlriSize, nlri);
+ }
+ 
++bool BgpUpdateMessageLayer::isDataValid(const uint8_t *data, size_t dataSize)
++{
++	if (dataSize < sizeof(bgp_common_header) + 2*sizeof(uint16_t))
++		return false;
++
++	uint16_t withdrLen = be16toh(*(uint16_t*)(data + sizeof(bgp_common_header)));
++	if (dataSize < sizeof(bgp_common_header) + 2*sizeof(uint16_t) + withdrLen)
++		return false;
++
++	uint16_t attrLen = be16toh(*(uint16_t*)(data + sizeof(bgp_common_header) + sizeof(uint16_t) + withdrLen));
++	if (dataSize < sizeof(bgp_common_header) + 2*sizeof(uint16_t) + withdrLen + attrLen)
++		return false;
++
++	return true;
++}
++
+ bool BgpUpdateMessageLayer::setNetworkLayerReachabilityInfo(const std::vector<prefix_and_ip>& nlri)
+ {
+ 	uint8_t newNlriData[1500];

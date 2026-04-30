@@ -1,0 +1,66 @@
+From 8733127b36e8e697e84ef1f7f853b4374b2e3162 Mon Sep 17 00:00:00 2001
+From: Reini Urban <reini.urban@gmail.com>
+Date: Wed, 30 Apr 2025 14:53:39 +0200
+Subject: [PATCH] encode: wrong __counted_by optimizations
+
+with eed and some additional fields before the final char[].
+fails with gcc-15 and esp. with mingw.
+wrong memcpy **buffer overflow** warnings.
+---
+ include/dwg.h | 5 +++--
+ src/in_dxf.c  | 5 +++--
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/include/dwg.h b/include/dwg.h
+index 34cb2c6ed9..3d00270461 100644
+--- a/include/dwg.h
++++ b/include/dwg.h
+@@ -8163,7 +8163,8 @@ typedef struct _dwg_entity_eed_data
+       unsigned short codepage:15; /* RS_LE */
+       unsigned short is_tu:1;
+ #ifndef SWIG
+-      char string[] __counted_by(length);      /* inlined */
++      // TODO broken gcc-15 optimization
++      char string[] /*__counted_by(length)*/;      /* inlined */
+ #else
+       char string[0]; // swig limitation https://github.com/swig/swig/issues/1699
+ #endif
+@@ -8173,7 +8174,7 @@ typedef struct _dwg_entity_eed_data
+       unsigned short _padding:15;
+       unsigned short is_tu:1;
+ #ifndef SWIG
+-      DWGCHAR string[] __counted_by(length); /* inlined */
++      DWGCHAR string[] /*__counted_by(length)*/; /* inlined */
+ #else
+       DWGCHAR string[0];
+ #endif
+diff --git a/src/in_dxf.c b/src/in_dxf.c
+index a9388779ff..f38e2a4b16 100644
+--- a/src/in_dxf.c
++++ b/src/in_dxf.c
+@@ -1800,13 +1800,14 @@ add_eed (Dwg_Object *restrict obj, const char *restrict name,
+                 return;
+               }
+             eed[i].data->code = code; // 1000
+-            eed[i].data->u.eed_0.is_tu = 0;
+             eed[i].data->u.eed_0.length = len & 0xFFFF;
++            eed[i].data->u.eed_0.is_tu = 0;
+             eed[i].data->u.eed_0.codepage = dwg->header.codepage;
+             if (len && len < 256)
+               {
+                 LOG_TRACE ("string: \"%s\" [TV %d]\n", pair->value.s,
+                            size - 1);
++                // FIXME buffer overflow with dwgwrite example_2010.dxf
+                 memcpy (eed[i].data->u.eed_0.string, pair->value.s, len + 1);
+               }
+           }
+@@ -1826,8 +1827,8 @@ add_eed (Dwg_Object *restrict obj, const char *restrict name,
+                     return;
+                   }
+                 eed[i].data->code = code;
+-                eed[i].data->u.eed_0.is_tu = 1;
+                 eed[i].data->u.eed_0_r2007.length = len & 0xFFFF;
++                eed[i].data->u.eed_0.is_tu = 1;
+                 LOG_TRACE ("wstring: \"%s\" [TU %d]\n", pair->value.s, len);
+                 if (len)
+                   memcpy (eed[i].data->u.eed_0_r2007.string, tu,

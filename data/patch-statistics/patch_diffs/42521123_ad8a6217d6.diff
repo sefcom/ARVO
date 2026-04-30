@@ -1,0 +1,925 @@
+From 11c89c386c8862f834097cdc5d9ed79634cf00f3 Mon Sep 17 00:00:00 2001
+From: Edward Thomson <ethomson@edwardthomson.com>
+Date: Fri, 12 May 2023 20:48:30 +0100
+Subject: [PATCH] net: move `gitno` buffer to `staticstr`
+
+The `gitno` buffer interface is another layer on top of socket reads.
+Abstract it a bit into a "static string" that has `git_str` like
+semantics but without heap allocation which moves the actual reading
+logic into the socket / stream code, and allows for easier future usage
+of a static / stack-allocated `git_str`-like interface.
+---
+ src/libgit2/fetch.c                     |  1 -
+ src/libgit2/fetch.h                     |  2 -
+ src/libgit2/netops.c                    | 85 -------------------------
+ src/libgit2/netops.h                    | 55 ----------------
+ src/libgit2/pack-objects.c              |  1 -
+ src/libgit2/pack-objects.h              |  1 -
+ src/libgit2/streams/mbedtls.c           |  1 -
+ src/libgit2/streams/openssl.c           |  5 +-
+ src/libgit2/streams/socket.c            |  1 -
+ src/libgit2/streams/socket.h            |  2 +-
+ src/libgit2/transports/auth.h           |  3 +-
+ src/libgit2/transports/git.c            | 15 ++---
+ src/libgit2/transports/http.c           |  1 -
+ src/libgit2/transports/smart.c          | 57 +++++++++--------
+ src/libgit2/transports/smart.h          |  9 ++-
+ src/libgit2/transports/smart_pkt.c      |  1 -
+ src/libgit2/transports/smart_protocol.c | 78 +++++++++++------------
+ src/libgit2/transports/ssh.c            |  1 -
+ src/libgit2/transports/winhttp.c        |  1 -
+ src/util/staticstr.h                    | 66 +++++++++++++++++++
+ tests/util/url/joinpath.c               |  1 -
+ tests/util/url/redirect.c               |  1 -
+ 22 files changed, 151 insertions(+), 237 deletions(-)
+ delete mode 100644 src/libgit2/netops.c
+ delete mode 100644 src/libgit2/netops.h
+ create mode 100644 src/util/staticstr.h
+
+diff --git a/src/libgit2/fetch.c b/src/libgit2/fetch.c
+index 5bbef87f4e0..d74abb4a847 100644
+--- a/src/libgit2/fetch.c
++++ b/src/libgit2/fetch.c
+@@ -17,7 +17,6 @@
+ #include "remote.h"
+ #include "refspec.h"
+ #include "pack.h"
+-#include "netops.h"
+ #include "repository.h"
+ #include "refs.h"
+ #include "transports/smart.h"
+diff --git a/src/libgit2/fetch.h b/src/libgit2/fetch.h
+index 10b6731f0a2..493366dedf1 100644
+--- a/src/libgit2/fetch.h
++++ b/src/libgit2/fetch.h
+@@ -11,8 +11,6 @@
+ 
+ #include "git2/remote.h"
+ 
+-#include "netops.h"
+-
+ int git_fetch_negotiate(git_remote *remote, const git_fetch_options *opts);
+ 
+ int git_fetch_download_pack(git_remote *remote);
+diff --git a/src/libgit2/netops.c b/src/libgit2/netops.c
+deleted file mode 100644
+index 5cae374ad9a..00000000000
+--- a/src/libgit2/netops.c
++++ /dev/null
+@@ -1,85 +0,0 @@
+-/*
+- * Copyright (C) the libgit2 contributors. All rights reserved.
+- *
+- * This file is part of libgit2, distributed under the GNU GPL v2 with
+- * a Linking Exception. For full terms see the included COPYING file.
+- */
+-
+-#include "netops.h"
+-
+-#include <ctype.h>
+-#include "git2/errors.h"
+-
+-#include "posix.h"
+-#include "str.h"
+-#include "runtime.h"
+-
+-int gitno_recv(gitno_buffer *buf)
+-{
+-	return buf->recv(buf);
+-}
+-
+-void gitno_buffer_setup_callback(
+-	gitno_buffer *buf,
+-	char *data,
+-	size_t len,
+-	int (*recv)(gitno_buffer *buf), void *cb_data)
+-{
+-	memset(data, 0x0, len);
+-	buf->data = data;
+-	buf->len = len;
+-	buf->offset = 0;
+-	buf->recv = recv;
+-	buf->cb_data = cb_data;
+-}
+-
+-static int recv_stream(gitno_buffer *buf)
+-{
+-	git_stream *io = (git_stream *) buf->cb_data;
+-	size_t readlen = buf->len - buf->offset;
+-	ssize_t ret;
+-
+-	readlen = min(readlen, INT_MAX);
+-
+-	ret = git_stream_read(io, buf->data + buf->offset, (int)readlen);
+-	if (ret < 0)
+-		return -1;
+-
+-	buf->offset += ret;
+-	return (int)ret;
+-}
+-
+-void gitno_buffer_setup_fromstream(git_stream *st, gitno_buffer *buf, char *data, size_t len)
+-{
+-	memset(data, 0x0, len);
+-	buf->data = data;
+-	buf->len = len;
+-	buf->offset = 0;
+-	buf->recv = recv_stream;
+-	buf->cb_data = st;
+-}
+-
+-/* Consume up to ptr and move the rest of the buffer to the beginning */
+-int gitno_consume(gitno_buffer *buf, const char *ptr)
+-{
+-	size_t consumed;
+-
+-	GIT_ASSERT(ptr - buf->data >= 0);
+-	GIT_ASSERT(ptr - buf->data <= (int) buf->len);
+-
+-	consumed = ptr - buf->data;
+-
+-	memmove(buf->data, ptr, buf->offset - consumed);
+-	memset(buf->data + buf->offset, 0x0, buf->len - buf->offset);
+-	buf->offset -= consumed;
+-
+-	return 0;
+-}
+-
+-/* Consume const bytes and move the rest of the buffer to the beginning */
+-void gitno_consume_n(gitno_buffer *buf, size_t cons)
+-{
+-	memmove(buf->data, buf->data + cons, buf->len - buf->offset);
+-	memset(buf->data + cons, 0x0, buf->len - buf->offset);
+-	buf->offset -= cons;
+-}
+diff --git a/src/libgit2/netops.h b/src/libgit2/netops.h
+deleted file mode 100644
+index a3f4a0f9523..00000000000
+--- a/src/libgit2/netops.h
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/*
+- * Copyright (C) the libgit2 contributors. All rights reserved.
+- *
+- * This file is part of libgit2, distributed under the GNU GPL v2 with
+- * a Linking Exception. For full terms see the included COPYING file.
+- */
+-#ifndef INCLUDE_netops_h__
+-#define INCLUDE_netops_h__
+-
+-#include "common.h"
+-
+-#include "posix.h"
+-#include "stream.h"
+-#include "net.h"
+-
+-#ifdef GIT_OPENSSL
+-# include "streams/openssl.h"
+-#endif
+-
+-typedef struct gitno_ssl {
+-#ifdef GIT_OPENSSL
+-	SSL *ssl;
+-#else
+-	size_t dummy;
+-#endif
+-} gitno_ssl;
+-
+-/* Represents a socket that may or may not be using SSL */
+-typedef struct gitno_socket {
+-	GIT_SOCKET socket;
+-	gitno_ssl ssl;
+-} gitno_socket;
+-
+-typedef struct gitno_buffer {
+-	char *data;
+-	size_t len;
+-	size_t offset;
+-	int (*recv)(struct gitno_buffer *buffer);
+-	void *cb_data;
+-} gitno_buffer;
+-
+-/* Flags to gitno_connect */
+-enum {
+-	/* Attempt to create an SSL connection. */
+-	GITNO_CONNECT_SSL = 1
+-};
+-
+-void gitno_buffer_setup_fromstream(git_stream *st, gitno_buffer *buf, char *data, size_t len);
+-void gitno_buffer_setup_callback(gitno_buffer *buf, char *data, size_t len, int (*recv)(gitno_buffer *buf), void *cb_data);
+-int gitno_recv(gitno_buffer *buf);
+-
+-int gitno_consume(gitno_buffer *buf, const char *ptr);
+-void gitno_consume_n(gitno_buffer *buf, size_t cons);
+-
+-#endif
+diff --git a/src/libgit2/pack-objects.c b/src/libgit2/pack-objects.c
+index fc8efc65f5e..b2d80cba954 100644
+--- a/src/libgit2/pack-objects.c
++++ b/src/libgit2/pack-objects.c
+@@ -11,7 +11,6 @@
+ #include "zstream.h"
+ #include "delta.h"
+ #include "iterator.h"
+-#include "netops.h"
+ #include "pack.h"
+ #include "thread.h"
+ #include "tree.h"
+diff --git a/src/libgit2/pack-objects.h b/src/libgit2/pack-objects.h
+index 0ceebc23cab..bbc8b9430ee 100644
+--- a/src/libgit2/pack-objects.h
++++ b/src/libgit2/pack-objects.h
+@@ -13,7 +13,6 @@
+ #include "str.h"
+ #include "hash.h"
+ #include "oidmap.h"
+-#include "netops.h"
+ #include "zstream.h"
+ #include "pool.h"
+ #include "indexer.h"
+diff --git a/src/libgit2/streams/mbedtls.c b/src/libgit2/streams/mbedtls.c
+index 0cf5c8af1fb..49aa76c3ed8 100644
+--- a/src/libgit2/streams/mbedtls.c
++++ b/src/libgit2/streams/mbedtls.c
+@@ -14,7 +14,6 @@
+ #include "runtime.h"
+ #include "stream.h"
+ #include "streams/socket.h"
+-#include "netops.h"
+ #include "git2/transport.h"
+ #include "util.h"
+ 
+diff --git a/src/libgit2/streams/openssl.c b/src/libgit2/streams/openssl.c
+index 58b2d1b2363..9db911e39b3 100644
+--- a/src/libgit2/streams/openssl.c
++++ b/src/libgit2/streams/openssl.c
+@@ -20,7 +20,6 @@
+ #include "stream.h"
+ #include "net.h"
+ #include "streams/socket.h"
+-#include "netops.h"
+ #include "git2/transport.h"
+ #include "git2/sys/openssl.h"
+ 
+@@ -71,14 +70,14 @@ static void *git_openssl_malloc(size_t bytes, const char *file, int line)
+ 	GIT_UNUSED(line);
+ 	return git__calloc(1, bytes);
+ }
+- 
++
+ static void *git_openssl_realloc(void *mem, size_t size, const char *file, int line)
+ {
+ 	GIT_UNUSED(file);
+ 	GIT_UNUSED(line);
+ 	return git__realloc(mem, size);
+ }
+- 
++
+ static void git_openssl_free(void *mem, const char *file, int line)
+ {
+ 	GIT_UNUSED(file);
+diff --git a/src/libgit2/streams/socket.c b/src/libgit2/streams/socket.c
+index 8f23e746e51..6994d58f268 100644
+--- a/src/libgit2/streams/socket.c
++++ b/src/libgit2/streams/socket.c
+@@ -8,7 +8,6 @@
+ #include "streams/socket.h"
+ 
+ #include "posix.h"
+-#include "netops.h"
+ #include "registry.h"
+ #include "runtime.h"
+ #include "stream.h"
+diff --git a/src/libgit2/streams/socket.h b/src/libgit2/streams/socket.h
+index 300e708937f..73e8de099a6 100644
+--- a/src/libgit2/streams/socket.h
++++ b/src/libgit2/streams/socket.h
+@@ -9,7 +9,7 @@
+ 
+ #include "common.h"
+ 
+-#include "netops.h"
++#include "stream.h"
+ 
+ typedef struct {
+ 	git_stream parent;
+diff --git a/src/libgit2/transports/auth.h b/src/libgit2/transports/auth.h
+index 64680cc5358..9f6f8fd3b2d 100644
+--- a/src/libgit2/transports/auth.h
++++ b/src/libgit2/transports/auth.h
+@@ -9,8 +9,7 @@
+ #define INCLUDE_transports_auth_h__
+ 
+ #include "common.h"
+-
+-#include "netops.h"
++#include "net.h"
+ 
+ typedef enum {
+ 	GIT_HTTP_AUTH_BASIC = 1,
+diff --git a/src/libgit2/transports/git.c b/src/libgit2/transports/git.c
+index 591e2ab0352..53611f2a7a6 100644
+--- a/src/libgit2/transports/git.c
++++ b/src/libgit2/transports/git.c
+@@ -7,7 +7,7 @@
+ 
+ #include "common.h"
+ 
+-#include "netops.h"
++#include "net.h"
+ #include "stream.h"
+ #include "streams/socket.h"
+ #include "git2/sys/transport.h"
+@@ -95,22 +95,21 @@ static int git_proto_stream_read(
+ 	size_t buf_size,
+ 	size_t *bytes_read)
+ {
+-	int error;
+ 	git_proto_stream *s = (git_proto_stream *)stream;
+-	gitno_buffer buf;
++	ssize_t ret;
++	int error;
+ 
+ 	*bytes_read = 0;
+ 
+ 	if (!s->sent_command && (error = send_command(s)) < 0)
+ 		return error;
+ 
+-	gitno_buffer_setup_fromstream(s->io, &buf, buffer, buf_size);
++	ret = git_stream_read(s->io, buffer, min(buf_size, INT_MAX));
+ 
+-	if ((error = gitno_recv(&buf)) < 0)
+-		return error;
+-
+-	*bytes_read = buf.offset;
++	if (ret < 0)
++		return -1;
+ 
++	*bytes_read = (size_t)ret;
+ 	return 0;
+ }
+ 
+diff --git a/src/libgit2/transports/http.c b/src/libgit2/transports/http.c
+index cda76ae6199..0534503bf25 100644
+--- a/src/libgit2/transports/http.c
++++ b/src/libgit2/transports/http.c
+@@ -11,7 +11,6 @@
+ 
+ #include "http_parser.h"
+ #include "net.h"
+-#include "netops.h"
+ #include "remote.h"
+ #include "smart.h"
+ #include "auth.h"
+diff --git a/src/libgit2/transports/smart.c b/src/libgit2/transports/smart.c
+index a56524bff0a..53727282850 100644
+--- a/src/libgit2/transports/smart.c
++++ b/src/libgit2/transports/smart.c
+@@ -13,30 +13,42 @@
+ #include "refspec.h"
+ #include "proxy.h"
+ 
+-static int git_smart__recv_cb(gitno_buffer *buf)
++int git_smart__recv(transport_smart *t)
+ {
+-	transport_smart *t = (transport_smart *) buf->cb_data;
+-	size_t old_len, bytes_read;
+-	int error;
++	size_t bytes_read;
++	int ret;
+ 
++	GIT_ASSERT_ARG(t);
+ 	GIT_ASSERT(t->current_stream);
+ 
+-	old_len = buf->offset;
++	if (git_staticstr_remain(&t->buffer) == 0) {
++		git_error_set(GIT_ERROR_NET, "out of buffer space");
++		return -1;
++	}
+ 
+-	if ((error = t->current_stream->read(t->current_stream, buf->data + buf->offset, buf->len - buf->offset, &bytes_read)) < 0)
+-		return error;
++	ret = t->current_stream->read(t->current_stream,
++		git_staticstr_offset(&t->buffer),
++		git_staticstr_remain(&t->buffer),
++		&bytes_read);
+ 
+-	buf->offset += bytes_read;
++	if (ret < 0)
++		return ret;
++
++	GIT_ASSERT(bytes_read <= INT_MAX);
++	GIT_ASSERT(bytes_read <= git_staticstr_remain(&t->buffer));
++
++	git_staticstr_increase(&t->buffer, bytes_read);
+ 
+ 	if (t->packetsize_cb && !t->cancelled.val) {
+-		error = t->packetsize_cb(bytes_read, t->packetsize_payload);
+-		if (error) {
++		ret = t->packetsize_cb(bytes_read, t->packetsize_payload);
++
++		if (ret) {
+ 			git_atomic32_set(&t->cancelled, 1);
+ 			return GIT_EUSER;
+ 		}
+ 	}
+ 
+-	return (int)(buf->offset - old_len);
++	return (int)bytes_read;
+ }
+ 
+ GIT_INLINE(int) git_smart__reset_stream(transport_smart *t, bool close_subtransport)
+@@ -155,8 +167,6 @@ static int git_smart__connect(
+ 	/* Save off the current stream (i.e. socket) that we are working with */
+ 	t->current_stream = stream;
+ 
+-	gitno_buffer_setup_callback(&t->buffer, t->buffer_data, sizeof(t->buffer_data), git_smart__recv_cb, t);
+-
+ 	/* 2 flushes for RPC; 1 for stateful */
+ 	if ((error = git_smart__store_refs(t, t->rpc ? 2 : 1)) < 0)
+ 		return error;
+@@ -313,8 +323,6 @@ int git_smart__negotiation_step(git_transport *transport, void *data, size_t len
+ 	if ((error = stream->write(stream, (const char *)data, len)) < 0)
+ 		return error;
+ 
+-	gitno_buffer_setup_callback(&t->buffer, t->buffer_data, sizeof(t->buffer_data), git_smart__recv_cb, t);
+-
+ 	return 0;
+ }
+ 
+@@ -339,8 +347,6 @@ int git_smart__get_push_stream(transport_smart *t, git_smart_subtransport_stream
+ 	/* Save off the current stream (i.e. socket) that we are working with */
+ 	t->current_stream = *stream;
+ 
+-	gitno_buffer_setup_callback(&t->buffer, t->buffer_data, sizeof(t->buffer_data), git_smart__recv_cb, t);
+-
+ 	return 0;
+ }
+ 
+@@ -502,20 +508,17 @@ int git_transport_smart(git_transport **out, git_remote *owner, void *param)
+ 	t->owner = owner;
+ 	t->rpc = definition->rpc;
+ 
+-	if (git_vector_init(&t->refs, 16, ref_name_cmp) < 0) {
++	if (git_vector_init(&t->refs, 16, ref_name_cmp) < 0 ||
++	    git_vector_init(&t->heads, 16, ref_name_cmp) < 0 ||
++	    definition->callback(&t->wrapped, &t->parent, definition->param) < 0) {
++		git_vector_free(&t->refs);
++		git_vector_free(&t->heads);
++		t->wrapped->free(t->wrapped);
+ 		git__free(t);
+ 		return -1;
+ 	}
+ 
+-	if (git_vector_init(&t->heads, 16, ref_name_cmp) < 0) {
+-		git__free(t);
+-		return -1;
+-	}
+-
+-	if (definition->callback(&t->wrapped, &t->parent, definition->param) < 0) {
+-		git__free(t);
+-		return -1;
+-	}
++	git_staticstr_init(&t->buffer, GIT_SMART_BUFFER_SIZE);
+ 
+ 	*out = (git_transport *) t;
+ 	return 0;
+diff --git a/src/libgit2/transports/smart.h b/src/libgit2/transports/smart.h
+index 34e27ea8e05..52c7553a1d7 100644
+--- a/src/libgit2/transports/smart.h
++++ b/src/libgit2/transports/smart.h
+@@ -11,12 +11,14 @@
+ 
+ #include "git2.h"
+ #include "vector.h"
+-#include "netops.h"
+ #include "push.h"
+ #include "str.h"
+ #include "oidarray.h"
++#include "staticstr.h"
+ #include "git2/sys/transport.h"
+ 
++#define GIT_SMART_BUFFER_SIZE  65536
++
+ #define GIT_SIDE_BAND_DATA     1
+ #define GIT_SIDE_BAND_PROGRESS 2
+ #define GIT_SIDE_BAND_ERROR    3
+@@ -170,8 +172,7 @@ typedef struct {
+ 	unsigned rpc : 1,
+ 	         have_refs : 1,
+ 	         connected : 1;
+-	gitno_buffer buffer;
+-	char buffer_data[65536];
++	git_staticstr_with_size(GIT_SMART_BUFFER_SIZE) buffer;
+ } transport_smart;
+ 
+ /* smart_protocol.c */
+@@ -192,6 +193,8 @@ int git_smart__download_pack(
+ 	git_indexer_progress *stats);
+ 
+ /* smart.c */
++int git_smart__recv(transport_smart *t);
++
+ int git_smart__negotiation_step(git_transport *transport, void *data, size_t len);
+ int git_smart__get_push_stream(transport_smart *t, git_smart_subtransport_stream **out);
+ 
+diff --git a/src/libgit2/transports/smart_pkt.c b/src/libgit2/transports/smart_pkt.c
+index 9127ad5fe43..7805f332377 100644
+--- a/src/libgit2/transports/smart_pkt.c
++++ b/src/libgit2/transports/smart_pkt.c
+@@ -9,7 +9,6 @@
+ 
+ #include "smart.h"
+ #include "util.h"
+-#include "netops.h"
+ #include "posix.h"
+ #include "str.h"
+ #include "oid.h"
+diff --git a/src/libgit2/transports/smart_protocol.c b/src/libgit2/transports/smart_protocol.c
+index f7a56782930..c9c422d4c85 100644
+--- a/src/libgit2/transports/smart_protocol.c
++++ b/src/libgit2/transports/smart_protocol.c
+@@ -27,7 +27,6 @@ bool git_smart__ofs_delta_enabled = true;
+ 
+ int git_smart__store_refs(transport_smart *t, int flushes)
+ {
+-	gitno_buffer *buf = &t->buffer;
+ 	git_vector *refs = &t->refs;
+ 	int error, flush = 0, recvd;
+ 	const char *line_end = NULL;
+@@ -45,8 +44,10 @@ int git_smart__store_refs(transport_smart *t, int flushes)
+ 	pkt = NULL;
+ 
+ 	do {
+-		if (buf->offset > 0)
+-			error = git_pkt_parse_line(&pkt, &line_end, buf->data, buf->offset, &pkt_parse_data);
++		if (t->buffer.len > 0)
++			error = git_pkt_parse_line(&pkt, &line_end,
++				t->buffer.data, t->buffer.len,
++				&pkt_parse_data);
+ 		else
+ 			error = GIT_EBUFS;
+ 
+@@ -54,7 +55,7 @@ int git_smart__store_refs(transport_smart *t, int flushes)
+ 			return error;
+ 
+ 		if (error == GIT_EBUFS) {
+-			if ((recvd = gitno_recv(buf)) < 0)
++			if ((recvd = git_smart__recv(t)) < 0)
+ 				return recvd;
+ 
+ 			if (recvd == 0) {
+@@ -65,8 +66,7 @@ int git_smart__store_refs(transport_smart *t, int flushes)
+ 			continue;
+ 		}
+ 
+-		if (gitno_consume(buf, line_end) < 0)
+-			return -1;
++		git_staticstr_consume(&t->buffer, line_end);
+ 
+ 		if (pkt->type == GIT_PKT_ERR) {
+ 			git_error_set(GIT_ERROR_NET, "remote error: %s", ((git_pkt_err *)pkt)->error);
+@@ -259,10 +259,9 @@ int git_smart__detect_caps(
+ static int recv_pkt(
+ 	git_pkt **out_pkt,
+ 	git_pkt_type *out_type,
+-	transport_smart *t,
+-	gitno_buffer *buf)
++	transport_smart *t)
+ {
+-	const char *ptr = buf->data, *line_end = ptr;
++	const char *ptr = t->buffer.data, *line_end = ptr;
+ 	git_pkt *pkt = NULL;
+ 	git_pkt_parse_data pkt_parse_data = { 0 };
+ 	int error = 0, ret;
+@@ -271,8 +270,9 @@ static int recv_pkt(
+ 	pkt_parse_data.seen_capabilities = 1;
+ 
+ 	do {
+-		if (buf->offset > 0)
+-			error = git_pkt_parse_line(&pkt, &line_end, ptr, buf->offset, &pkt_parse_data);
++		if (t->buffer.len > 0)
++			error = git_pkt_parse_line(&pkt, &line_end, ptr,
++				t->buffer.len, &pkt_parse_data);
+ 		else
+ 			error = GIT_EBUFS;
+ 
+@@ -282,7 +282,7 @@ static int recv_pkt(
+ 		if (error < 0 && error != GIT_EBUFS)
+ 			return error;
+ 
+-		if ((ret = gitno_recv(buf)) < 0) {
++		if ((ret = git_smart__recv(t)) < 0) {
+ 			return ret;
+ 		} else if (ret == 0) {
+ 			git_error_set(GIT_ERROR_NET, "early EOF");
+@@ -290,8 +290,7 @@ static int recv_pkt(
+ 		}
+ 	} while (error);
+ 
+-	if (gitno_consume(buf, line_end) < 0)
+-		return -1;
++	git_staticstr_consume(&t->buffer, line_end);
+ 
+ 	if (out_type != NULL)
+ 		*out_type = pkt->type;
+@@ -306,11 +305,10 @@ static int recv_pkt(
+ static int store_common(transport_smart *t)
+ {
+ 	git_pkt *pkt = NULL;
+-	gitno_buffer *buf = &t->buffer;
+ 	int error;
+ 
+ 	do {
+-		if ((error = recv_pkt(&pkt, NULL, t, buf)) < 0)
++		if ((error = recv_pkt(&pkt, NULL, t)) < 0)
+ 			return error;
+ 
+ 		if (pkt->type != GIT_PKT_ACK) {
+@@ -327,7 +325,7 @@ static int store_common(transport_smart *t)
+ 	return 0;
+ }
+ 
+-static int wait_while_ack(transport_smart *t, gitno_buffer *buf)
++static int wait_while_ack(transport_smart *t)
+ {
+ 	int error;
+ 	git_pkt *pkt = NULL;
+@@ -336,7 +334,7 @@ static int wait_while_ack(transport_smart *t, gitno_buffer *buf)
+ 	while (1) {
+ 		git_pkt_free(pkt);
+ 
+-		if ((error = recv_pkt(&pkt, NULL, t, buf)) < 0)
++		if ((error = recv_pkt(&pkt, NULL, t)) < 0)
+ 			return error;
+ 
+ 		if (pkt->type == GIT_PKT_NAK)
+@@ -402,7 +400,6 @@ int git_smart__negotiate_fetch(
+ {
+ 	transport_smart *t = (transport_smart *)transport;
+ 	git_revwalk__push_options opts = GIT_REVWALK__PUSH_OPTIONS_INIT;
+-	gitno_buffer *buf = &t->buffer;
+ 	git_str data = GIT_STR_INIT;
+ 	git_revwalk *walk = NULL;
+ 	int error = -1;
+@@ -430,7 +427,7 @@ int git_smart__negotiate_fetch(
+ 		if ((error = git_smart__negotiation_step(&t->parent, data.ptr, data.size)) < 0)
+ 			goto on_error;
+ 
+-		while ((error = recv_pkt((git_pkt **)&pkt, NULL, t, buf)) == 0) {
++		while ((error = recv_pkt((git_pkt **)&pkt, NULL, t)) == 0) {
+ 			bool complete = false;
+ 
+ 			if (pkt->type == GIT_PKT_SHALLOW) {
+@@ -495,7 +492,7 @@ int git_smart__negotiate_fetch(
+ 				if ((error = store_common(t)) < 0)
+ 					goto on_error;
+ 			} else {
+-				if ((error = recv_pkt(NULL, &pkt_type, t, buf)) < 0)
++				if ((error = recv_pkt(NULL, &pkt_type, t)) < 0)
+ 					goto on_error;
+ 
+ 				if (pkt_type == GIT_PKT_ACK) {
+@@ -568,7 +565,7 @@ int git_smart__negotiate_fetch(
+ 
+ 	/* Now let's eat up whatever the server gives us */
+ 	if (!t->caps.multi_ack && !t->caps.multi_ack_detailed) {
+-		if ((error = recv_pkt(NULL, &pkt_type, t, buf)) < 0)
++		if ((error = recv_pkt(NULL, &pkt_type, t)) < 0)
+ 			return error;
+ 
+ 		if (pkt_type != GIT_PKT_ACK && pkt_type != GIT_PKT_NAK) {
+@@ -576,7 +573,7 @@ int git_smart__negotiate_fetch(
+ 			return -1;
+ 		}
+ 	} else {
+-		error = wait_while_ack(t, buf);
++		error = wait_while_ack(t);
+ 	}
+ 
+ 	return error;
+@@ -606,7 +603,10 @@ int git_smart__shallow_roots(git_oidarray *out, git_transport *transport)
+ 	return 0;
+ }
+ 
+-static int no_sideband(transport_smart *t, struct git_odb_writepack *writepack, gitno_buffer *buf, git_indexer_progress *stats)
++static int no_sideband(
++	transport_smart *t,
++	struct git_odb_writepack *writepack,
++	git_indexer_progress *stats)
+ {
+ 	int recvd;
+ 
+@@ -616,12 +616,12 @@ static int no_sideband(transport_smart *t, struct git_odb_writepack *writepack,
+ 			return GIT_EUSER;
+ 		}
+ 
+-		if (writepack->append(writepack, buf->data, buf->offset, stats) < 0)
++		if (writepack->append(writepack, t->buffer.data, t->buffer.len, stats) < 0)
+ 			return -1;
+ 
+-		gitno_consume_n(buf, buf->offset);
++		git_staticstr_clear(&t->buffer);
+ 
+-		if ((recvd = gitno_recv(buf)) < 0)
++		if ((recvd = git_smart__recv(t)) < 0)
+ 			return recvd;
+ 	} while(recvd > 0);
+ 
+@@ -663,7 +663,6 @@ int git_smart__download_pack(
+ 	git_indexer_progress *stats)
+ {
+ 	transport_smart *t = (transport_smart *)transport;
+-	gitno_buffer *buf = &t->buffer;
+ 	git_odb *odb;
+ 	struct git_odb_writepack *writepack = NULL;
+ 	int error = 0;
+@@ -682,9 +681,10 @@ int git_smart__download_pack(
+ 		t->packetsize_payload = &npp;
+ 
+ 		/* We might have something in the buffer already from negotiate_fetch */
+-		if (t->buffer.offset > 0 && !t->cancelled.val)
+-			if (t->packetsize_cb(t->buffer.offset, t->packetsize_payload))
++		if (t->buffer.len > 0 && !t->cancelled.val) {
++			if (t->packetsize_cb(t->buffer.len, t->packetsize_payload))
+ 				git_atomic32_set(&t->cancelled, 1);
++		}
+ 	}
+ 
+ 	if ((error = git_repository_odb__weakptr(&odb, repo)) < 0 ||
+@@ -697,7 +697,7 @@ int git_smart__download_pack(
+ 	 * check which one belongs there.
+ 	 */
+ 	if (!t->caps.side_band && !t->caps.side_band_64k) {
+-		error = no_sideband(t, writepack, buf, stats);
++		error = no_sideband(t, writepack, stats);
+ 		goto done;
+ 	}
+ 
+@@ -711,7 +711,7 @@ int git_smart__download_pack(
+ 			goto done;
+ 		}
+ 
+-		if ((error = recv_pkt(&pkt, NULL, t, buf)) >= 0) {
++		if ((error = recv_pkt(&pkt, NULL, t)) >= 0) {
+ 			/* Check cancellation after network call */
+ 			if (t->cancelled.val) {
+ 				git_error_clear();
+@@ -916,15 +916,15 @@ static int parse_report(transport_smart *transport, git_push *push)
+ 	git_pkt *pkt = NULL;
+ 	git_pkt_parse_data pkt_parse_data = { 0 };
+ 	const char *line_end = NULL;
+-	gitno_buffer *buf = &transport->buffer;
+ 	int error, recvd;
+ 	git_str data_pkt_buf = GIT_STR_INIT;
+ 
+ 	for (;;) {
+-		if (buf->offset > 0)
++		if (transport->buffer.len > 0)
+ 			error = git_pkt_parse_line(&pkt, &line_end,
+-						   buf->data, buf->offset,
+-						   &pkt_parse_data);
++				   transport->buffer.data,
++				   transport->buffer.len,
++				   &pkt_parse_data);
+ 		else
+ 			error = GIT_EBUFS;
+ 
+@@ -934,7 +934,7 @@ static int parse_report(transport_smart *transport, git_push *push)
+ 		}
+ 
+ 		if (error == GIT_EBUFS) {
+-			if ((recvd = gitno_recv(buf)) < 0) {
++			if ((recvd = git_smart__recv(transport)) < 0) {
+ 				error = recvd;
+ 				goto done;
+ 			}
+@@ -947,9 +947,7 @@ static int parse_report(transport_smart *transport, git_push *push)
+ 			continue;
+ 		}
+ 
+-		if (gitno_consume(buf, line_end) < 0)
+-			return -1;
+-
++		git_staticstr_consume(&transport->buffer, line_end);
+ 		error = 0;
+ 
+ 		switch (pkt->type) {
+diff --git a/src/libgit2/transports/ssh.c b/src/libgit2/transports/ssh.c
+index 5500ea100bd..af618e1a6ed 100644
+--- a/src/libgit2/transports/ssh.c
++++ b/src/libgit2/transports/ssh.c
+@@ -13,7 +13,6 @@
+ 
+ #include "runtime.h"
+ #include "net.h"
+-#include "netops.h"
+ #include "smart.h"
+ #include "streams/socket.h"
+ #include "sysdir.h"
+diff --git a/src/libgit2/transports/winhttp.c b/src/libgit2/transports/winhttp.c
+index de24a2a41c1..27e0fb6f7e9 100644
+--- a/src/libgit2/transports/winhttp.c
++++ b/src/libgit2/transports/winhttp.c
+@@ -13,7 +13,6 @@
+ #include "git2/transport.h"
+ #include "posix.h"
+ #include "str.h"
+-#include "netops.h"
+ #include "smart.h"
+ #include "remote.h"
+ #include "repository.h"
+diff --git a/src/util/staticstr.h b/src/util/staticstr.h
+new file mode 100644
+index 00000000000..b7d0790c4fd
+--- /dev/null
++++ b/src/util/staticstr.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (C) the libgit2 contributors. All rights reserved.
++ *
++ * This file is part of libgit2, distributed under the GNU GPL v2 with
++ * a Linking Exception. For full terms see the included COPYING file.
++ */
++#ifndef INCLUDE_stackstr_h__
++#define INCLUDE_stackstr_h__
++
++#include "git2_util.h"
++
++typedef struct {
++	/* Length of / number of bytes used by `data`. */
++	size_t len;
++
++	/* Size of the allocated `data` buffer. */
++	size_t size;
++
++	/* The actual string buffer data. */
++	char data[GIT_FLEX_ARRAY];
++} git_staticstr;
++
++#define git_staticstr_with_size(__size) \
++	struct { \
++		size_t len; \
++		size_t size; \
++		char data[__size]; \
++	}
++
++#define git_staticstr_init(__str, __size) \
++	do { \
++		(__str)->len = 0; \
++		(__str)->size = __size; \
++		(__str)->data[0] = '\0'; \
++	} while(0)
++
++#define git_staticstr_offset(__str) \
++	((__str)->data + (__str)->len)
++
++#define git_staticstr_remain(__str) \
++	((__str)->len > (__str)->size ? 0 : ((__str)->size - (__str)->len))
++
++#define git_staticstr_increase(__str, __len) \
++	do { ((__str)->len += __len); } while(0)
++
++#define git_staticstr_consume_bytes(__str, __len) \
++	do { git_staticstr_consume(__str, (__str)->data + __len); } while(0)
++
++#define git_staticstr_consume(__str, __end) \
++	do { \
++		if (__end > (__str)->data && \
++		    __end <= (__str)->data + (__str)->len) { \
++			size_t __consumed = __end - (__str)->data; \
++			memmove((__str)->data, __end, (__str)->len - __consumed); \
++			(__str)->len -= __consumed; \
++			(__str)->data[(__str)->len] = '\0'; \
++		} \
++	} while(0)
++
++#define git_staticstr_clear(__str) \
++	do { \
++		(__str)->len = 0; \
++		(__str)->data[0] = 0; \
++	} while(0)
++
++#endif
+diff --git a/tests/util/url/joinpath.c b/tests/util/url/joinpath.c
+index 9fc02cde4a9..6027093e492 100644
+--- a/tests/util/url/joinpath.c
++++ b/tests/util/url/joinpath.c
+@@ -1,6 +1,5 @@
+ #include "clar_libgit2.h"
+ #include "net.h"
+-#include "netops.h"
+ 
+ static git_net_url source, target;
+ 
+diff --git a/tests/util/url/redirect.c b/tests/util/url/redirect.c
+index 5401778618f..a6f99dcdf09 100644
+--- a/tests/util/url/redirect.c
++++ b/tests/util/url/redirect.c
+@@ -1,6 +1,5 @@
+ #include "clar_libgit2.h"
+ #include "net.h"
+-#include "netops.h"
+ 
+ static git_net_url conndata;
+ 

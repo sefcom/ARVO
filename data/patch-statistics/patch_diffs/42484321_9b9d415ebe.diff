@@ -1,0 +1,64 @@
+From 187250bda910463f5a3f718b2c7a537102e68005 Mon Sep 17 00:00:00 2001
+From: Dan Bloomberg <dan.bloomberg@gmail.com>
+Date: Fri, 5 Jun 2020 11:58:40 -0700
+Subject: [PATCH] Issue 23091 and 23092 in oss-fuzz: divide by zero and
+ uninitialized value * Also changed enhance_fuzzer to use Spix input.
+
+---
+ prog/fuzzing/enhance_fuzzer.cc | 4 ++--
+ src/readbarcode.c              | 6 ++++--
+ src/readfile.c                 | 2 +-
+ 3 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/prog/fuzzing/enhance_fuzzer.cc b/prog/fuzzing/enhance_fuzzer.cc
+index e9a22b25e..33dbf9fe4 100644
+--- a/prog/fuzzing/enhance_fuzzer.cc
++++ b/prog/fuzzing/enhance_fuzzer.cc
+@@ -14,8 +14,8 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+ 
+         leptSetStdNullHandler();
+ 
+-        pix = pixReadMem(data, size);
+-        if(pix==NULL) return 0;
++        pix = pixReadMemSpix(data, size);
++        if (pix == NULL) return 0;
+         
+         pix0 = pixModifyHue(NULL, pix, 0.01 + 0.05 * 1);
+         pix1 = pixModifySaturation(NULL, pix, -0.9 + 0.1 * 1);
+diff --git a/src/readbarcode.c b/src/readbarcode.c
+index 77c677471..71257bee4 100644
+--- a/src/readbarcode.c
++++ b/src/readbarcode.c
+@@ -858,7 +858,7 @@ numaQuantizeCrossingsByWidth(NUMA       *nas,
+                              NUMA      **pnaohist,
+                              l_int32     debugflag)
+ {
+-l_int32    i, n, ned, nod, iw, width;
++l_int32    i, n, ret, ned, nod, iw, width;
+ l_float32  val, minsize, maxsize, factor;
+ GPLOT     *gplot;
+ NUMA      *naedist, *naodist, *naehist, *naohist, *naecent, *naocent;
+@@ -875,7 +875,9 @@ NUMA      *naerange, *naorange, *naelut, *naolut, *nad;
+         return (NUMA *)ERROR_PTR("binfract <= 0.0", procName, NULL);
+ 
+         /* Get even and odd crossing distances */
+-    numaGetCrossingDistances(nas, &naedist, &naodist, &minsize, &maxsize);
++    ret = numaGetCrossingDistances(nas, &naedist, &naodist, &minsize, &maxsize);
++    if (ret)
++        return (NUMA *)ERROR_PTR("crossing data not found", procName, NULL);
+ 
+         /* Bin the spans in units of binfract * minsize.  These
+          * units are convenient because they scale to make at least
+diff --git a/src/readfile.c b/src/readfile.c
+index f37bf1211..51e58bf05 100644
+--- a/src/readfile.c
++++ b/src/readfile.c
+@@ -633,7 +633,7 @@ l_int32  format;
+ 
+     if (fread(&firstbytes, 1, 12, fp) != 12)
+         return ERROR_INT("failed to read first 12 bytes of file", procName, 1);
+-    firstbytes[12] = '\0';
++    firstbytes[12] = 0;
+     rewind(fp);
+ 
+     findFileFormatBuffer(firstbytes, &format);

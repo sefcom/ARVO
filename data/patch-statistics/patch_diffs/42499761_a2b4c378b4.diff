@@ -1,0 +1,46 @@
+From 0016f63547f70f969eeb6030d8d7433b05cae934 Mon Sep 17 00:00:00 2001
+From: Daniel Bertalan <dani@danielbertalan.dev>
+Date: Tue, 28 Mar 2023 14:07:25 +0200
+Subject: [PATCH] AK: Fix Clang 16 UBSan issue with zero-length `Array`
+
+The current implementation of `Array<T, 0>` has a zero-length C array as
+its storage type. While this is accepted as a GNU extension, when
+compiling with Clang 16, an UBSan error is raised every time an object
+is accessed whose only field is a zero-length array.
+
+This is likely a bug in Clang 16's implementation of UBSan, which has
+been reported here: https://github.com/llvm/llvm-project/issues/61775
+---
+ AK/Array.h | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/AK/Array.h b/AK/Array.h
+index 26c0a225b50606..3bb11998a37f76 100644
+--- a/AK/Array.h
++++ b/AK/Array.h
+@@ -13,6 +13,16 @@
+ 
+ namespace AK {
+ 
++namespace Detail {
++// This type serves as the storage of 0-sized `AK::Array`s. While zero-length `T[0]`
++// is accepted as a GNU extension, it causes problems with UBSan in Clang 16.
++template<typename T>
++struct EmptyArrayStorage {
++    T& operator[](size_t) const { VERIFY_NOT_REACHED(); }
++    constexpr operator T*() const { return nullptr; }
++};
++}
++
+ template<typename T, size_t Size>
+ struct Array {
+     using ValueType = T;
+@@ -109,7 +119,7 @@ struct Array {
+         return value;
+     }
+ 
+-    T __data[Size];
++    Conditional<Size == 0, Detail::EmptyArrayStorage<T>, T[Size]> __data;
+ };
+ 
+ template<typename T, typename... Types>

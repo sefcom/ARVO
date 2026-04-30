@@ -1,0 +1,96 @@
+From 386a1ac6eecf01231b7839deba7e24dd50f5d718 Mon Sep 17 00:00:00 2001
+From: Albert Astals Cid <aacid@kde.org>
+Date: Sat, 25 May 2019 23:55:47 +0200
+Subject: [PATCH] KCompressionDevice: Remove bIgnoreData
+
+Summary:
+bIgnoreData was used in ::seek to say, we don't really care much
+about the next readData call because we know it's coming from this read
+call we're wrapping in bIgnoreData and we will just going to throw
+away the data (see dummy variable).
+
+The problem is that it is not guaranteed that the readData call that the
+read() originates will be over dummy, in some cases it can be over the internal
+qiodevice ring buffer
+  https://code.qt.io/cgit/qt/qtbase.git/tree/src/corelib/io/qiodevice.cpp?h=5.12#n1129
+so if we don't properly store the data we end up with wrong data in the ring buffer and bad things will happen
+
+Reviewers: apol
+
+Reviewed By: apol
+
+Subscribers: apol, kde-frameworks-devel
+
+Tags: #frameworks
+
+Differential Revision: https://phabricator.kde.org/D21388
+---
+ src/kcompressiondevice.cpp | 23 ++++-------------------
+ 1 file changed, 4 insertions(+), 19 deletions(-)
+
+diff --git a/src/kcompressiondevice.cpp b/src/kcompressiondevice.cpp
+index 35c1e46..784c150 100644
+--- a/src/kcompressiondevice.cpp
++++ b/src/kcompressiondevice.cpp
+@@ -47,7 +47,6 @@ public:
+         : bNeedHeader(true)
+         , bSkipHeaders(false)
+         , bOpenedUnderlyingDevice(false)
+-        , bIgnoreData(false)
+         , type(KCompressionDevice::None)
+         , errorCode(QFileDevice::NoError)
+         , deviceReadPos(0)
+@@ -60,7 +59,6 @@ public:
+     bool bNeedHeader;
+     bool bSkipHeaders;
+     bool bOpenedUnderlyingDevice;
+-    bool bIgnoreData;
+     QByteArray buffer; // Used as 'input buffer' when reading, as 'output buffer' when writing
+     QByteArray origFileName;
+     KFilterBase::Result result;
+@@ -250,9 +248,7 @@ bool KCompressionDevice::seek(qint64 pos)
+ 
+     //qCDebug(KArchiveLog) << "reading " << bytesToRead << " dummy bytes";
+     QByteArray dummy(qMin(bytesToRead, qint64(3 * BUFFER_SIZE)), 0);
+-    d->bIgnoreData = true;
+     const bool result = (read(dummy.data(), bytesToRead) == bytesToRead);
+-    d->bIgnoreData = false;
+     return result;
+ }
+ 
+@@ -281,15 +277,8 @@ qint64 KCompressionDevice::readData(char *data, qint64 maxlen)
+         return -1;
+     }
+ 
+-    qint64 outBufferSize;
+-    if (d->bIgnoreData) {
+-        outBufferSize = qMin(maxlen, static_cast<qint64>(3 * BUFFER_SIZE));
+-    } else {
+-        outBufferSize = maxlen;
+-    }
+-    outBufferSize -= dataReceived;
+-    qint64 availOut = outBufferSize;
+-    filter->setOutBuffer(data, outBufferSize);
++    qint64 availOut = maxlen;
++    filter->setOutBuffer(data, maxlen);
+ 
+     while (dataReceived < maxlen) {
+         if (filter->inBufferEmpty()) {
+@@ -327,12 +316,8 @@ qint64 KCompressionDevice::readData(char *data, qint64 maxlen)
+         }
+ 
+         dataReceived += outReceived;
+-        if (!d->bIgnoreData) {  // Move on in the output buffer
+-            data += outReceived;
+-            availOut = maxlen - dataReceived;
+-        } else if (maxlen - dataReceived < outBufferSize) {
+-            availOut = maxlen - dataReceived;
+-        }
++        data += outReceived;
++        availOut = maxlen - dataReceived;
+         if (d->result == KFilterBase::End) {
+             // We're actually at the end, no more data to check
+             if (filter->device()->atEnd()) {
+-- 
+GitLab
+

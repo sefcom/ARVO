@@ -1,0 +1,34 @@
+From c58fe8a01a0ad00760746936b6f4220923411466 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Fri, 23 Jun 2017 18:48:08 +0000
+Subject: [PATCH] /vsicurl/: avoid use after free. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=2360. Credit to OSS
+ Fuzz. trunk only
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@39249 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/port/cpl_http.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/gdal/port/cpl_http.cpp b/gdal/port/cpl_http.cpp
+index 723679edc548..0c4e7fac6b1a 100644
+--- a/gdal/port/cpl_http.cpp
++++ b/gdal/port/cpl_http.cpp
+@@ -877,7 +877,16 @@ void* CPLHTTPSetOptions(void *pcurl, const char * const* papszOptions)
+         pszHeaderFile = CPLGetConfigOption( "GDAL_HTTP_HEADER_FILE", NULL );
+     if( pszHeaderFile != NULL )
+     {
+-        VSILFILE *fp = VSIFOpenL( pszHeaderFile, "rb" );
++        VSILFILE *fp = NULL;
++        // Do not allow /vsicurl/ access from /vsicurl because of GetCurlHandleFor()
++        // e.g. "/vsicurl/,HEADER_FILE=/vsicurl/,url= " would cause use of
++        // memory after free
++        if( strstr(pszHeaderFile, "/vsicurl/") == NULL &&
++            strstr(pszHeaderFile, "/vsis3/") == NULL &&
++            strstr(pszHeaderFile, "/vsigs/") == NULL )
++        {
++            fp = VSIFOpenL( pszHeaderFile, "rb" );
++        }
+         if( fp == NULL )
+         {
+             CPLError(CE_Failure, CPLE_FileIO,

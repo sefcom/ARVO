@@ -1,0 +1,206 @@
+From 5feda0aed227695c2fbf37a498410715f54c7b05 Mon Sep 17 00:00:00 2001
+From: Mark McKinnon <mark.mckinnon@davenport.edu>
+Date: Mon, 28 Jun 2021 14:12:48 -0400
+Subject: [PATCH] Add code to allow Datasource to be passed in
+
+Add code to allow Data Source Id to be passed in newAnalysisResult and newDataArtifact
+---
+ .../sleuthkit/datamodel/AbstractContent.java  | 28 ++++++++++++++
+ .../datamodel/BlackboardArtifact.java         | 19 ++++++++++
+ .../src/org/sleuthkit/datamodel/Content.java  | 37 +++++++++++++++++++
+ .../org/sleuthkit/datamodel/OsAccount.java    |  3 +-
+ .../src/org/sleuthkit/datamodel/Report.java   | 24 ++++++++++++
+ 5 files changed, 110 insertions(+), 1 deletion(-)
+
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/AbstractContent.java b/bindings/java/src/org/sleuthkit/datamodel/AbstractContent.java
+index 74f3c54376..f16830f626 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/AbstractContent.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/AbstractContent.java
+@@ -357,6 +357,22 @@ public AnalysisResultAdded newAnalysisResult(BlackboardArtifact.Type artifactTyp
+ 		}
+ 	}
+ 
++	@Override
++	public AnalysisResultAdded newAnalysisResult(BlackboardArtifact.Type artifactType, Score score, String conclusion, String configuration, String justification, Collection<BlackboardAttribute> attributesList, long dataSourceId) throws TskCoreException {
++
++		long dataSourceObjectId = dataSourceId;
++		CaseDbTransaction trans = db.beginTransaction();
++		try {
++			AnalysisResultAdded resultAdded = db.getBlackboard().newAnalysisResult(artifactType, objId, dataSourceObjectId, score, conclusion, configuration, justification, attributesList, trans);
++
++			trans.commit();
++			return resultAdded;
++		} catch (BlackboardException ex) {
++			trans.rollback();
++			throw new TskCoreException(String.format("Error adding analysis result to content with objId = %d.", objId), ex);
++		}
++	}
++
+ 	@Override
+ 	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList, Long osAccountId) throws TskCoreException {
+ 		DataArtifact artifact = db.getBlackboard().newDataArtifact(artifactType, objId, this.getDataSource().getId(), attributesList, osAccountId);
+@@ -369,6 +385,18 @@ public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collec
+ 		return artifact;
+ 	}
+ 
++	@Override
++	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList, Long osAccountId, long dataSourceId) throws TskCoreException {
++		DataArtifact artifact = db.getBlackboard().newDataArtifact(artifactType, objId, dataSourceId, attributesList, osAccountId);
++
++		if (osAccountId != null) {
++			try (CaseDbConnection connection = db.getConnection()) {
++				db.getOsAccountManager().newOsAccountInstance(osAccountId, dataSourceId, OsAccountInstance.OsAccountInstanceType.LAUNCHED, connection);
++			}
++		}
++		return artifact;
++	}
++
+ 	@Override
+ 	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList) throws TskCoreException {
+ 		return newDataArtifact(artifactType, attributesList, null);
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/BlackboardArtifact.java b/bindings/java/src/org/sleuthkit/datamodel/BlackboardArtifact.java
+index 0aff7720ff..7b872c9fd3 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/BlackboardArtifact.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/BlackboardArtifact.java
+@@ -721,11 +721,30 @@ public AnalysisResultAdded newAnalysisResult(BlackboardArtifact.Type artifactTyp
+ 		}
+ 	}
+ 
++	@Override
++	public AnalysisResultAdded newAnalysisResult(BlackboardArtifact.Type artifactType, Score score, String conclusion, String configuration, String justification, Collection<BlackboardAttribute> attributesList, long dataSourceId) throws TskCoreException {
++		CaseDbTransaction trans = sleuthkitCase.beginTransaction();
++		try {
++			AnalysisResultAdded resultAdded = sleuthkitCase.getBlackboard().newAnalysisResult(artifactType, this.getObjectID(), dataSourceId, score, conclusion, configuration, justification, attributesList, trans);
++
++			trans.commit();
++			return resultAdded;
++		} catch (BlackboardException ex) {
++			trans.rollback();
++			throw new TskCoreException("Error adding analysis result.", ex);
++		}
++	}
++
+ 	@Override
+ 	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList, Long osAccountId) throws TskCoreException {
+ 		throw new TskCoreException("Cannot create data artifact of an artifact. Not supported.");
+ 	}
+ 	
++	@Override
++	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList, Long osAccountId, long dataSourceId) throws TskCoreException {
++		throw new TskCoreException("Cannot create data artifact of an artifact. Not supported.");
++	}
++	
+ 	@Override
+ 	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList) throws TskCoreException {
+ 		return newDataArtifact(artifactType, attributesList, null);
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/Content.java b/bindings/java/src/org/sleuthkit/datamodel/Content.java
+index bef8a5f30d..39df2ae626 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/Content.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/Content.java
+@@ -199,6 +199,27 @@ public interface Content extends SleuthkitVisitableItem {
+ 	 */
+ 	public AnalysisResultAdded newAnalysisResult(BlackboardArtifact.Type artifactType, Score score, String conclusion, String configuration, String justification, Collection<BlackboardAttribute> attributesList) throws TskCoreException;
+ 
++	/**
++	 * Create and add an analysis result associated with this content.
++	 *
++	 *
++	 * @param artifactType	  Type of analysis result artifact to create.
++	 * @param score          Score associated with this analysis.
++	 * @param conclusion     Conclusion from the analysis, may be empty.
++	 * @param configuration  Configuration element associated with this
++	 *                       analysis, may be empty.
++	 * @param justification	 Justification
++	 * @param attributesList Additional attributes to attach to this analysis
++	 *                       result artifact.
++	 * @param dataDourcrId   The data source for the analysis result
++	 *
++	 * @return AnalysisResultAdded The analysis return added and the current
++	 *         aggregate score of content.
++	 *
++	 * @throws TskCoreException if critical error occurred within tsk core.
++	 */
++	public AnalysisResultAdded newAnalysisResult(BlackboardArtifact.Type artifactType, Score score, String conclusion, String configuration, String justification, Collection<BlackboardAttribute> attributesList, long dataSourceId) throws TskCoreException;
++
+ 	/**
+ 	 * Create and add a data artifact associated with this abstract file. This
+ 	 * method creates the data artifact with the os account id associated with
+@@ -230,6 +251,22 @@ public interface Content extends SleuthkitVisitableItem {
+ 	 */
+ 	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList, Long osAccountId) throws TskCoreException;
+ 
++	/**
++	 * Create and add a data artifact associated with this content.
++	 *
++	 * @param artifactType   Type of analysis result artifact to create.
++	 * @param attributesList Additional attributes to attach to this data
++	 *                       artifact.
++	 * @param osAccountId    The OS account id associated with the artifact. May
++	 *                       be null.
++	 * @param dataSourceId   The data source id of the artifact
++	 *
++	 * @return DataArtifact New data artifact.
++	 *
++	 * @throws TskCoreException If a critical error occurred within tsk core.
++	 */
++	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList, Long osAccountId, long dataSourceId) throws TskCoreException;
++
+ 	/**
+ 	 * Returns the final score for the content object.
+ 	 *
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/OsAccount.java b/bindings/java/src/org/sleuthkit/datamodel/OsAccount.java
+index 70dfa7df4b..d78434f4c3 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/OsAccount.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/OsAccount.java
+@@ -250,7 +250,8 @@ synchronized void setAttributesInternal(List<OsAccountAttribute> osAccountAttrib
+ 	/**
+ 	 * Get the account Object Id that is unique within the scope of the case.
+ 	 *
+-	 * @return Account id.
++	 * @return Account
++	 * id.
+ 	 */
+ 	public long getId() {
+ 		return osAccountObjId;
+diff --git a/bindings/java/src/org/sleuthkit/datamodel/Report.java b/bindings/java/src/org/sleuthkit/datamodel/Report.java
+index 5f89a129be..51d6c930e7 100644
+--- a/bindings/java/src/org/sleuthkit/datamodel/Report.java
++++ b/bindings/java/src/org/sleuthkit/datamodel/Report.java
+@@ -266,6 +266,20 @@ public AnalysisResultAdded newAnalysisResult(BlackboardArtifact.Type artifactTyp
+ 		}
+ 	}
+ 
++	@Override
++	public AnalysisResultAdded newAnalysisResult(BlackboardArtifact.Type artifactType, Score score, String conclusion, String configuration, String justification, Collection<BlackboardAttribute> attributesList, long dataSourceId) throws TskCoreException {
++		CaseDbTransaction trans = db.beginTransaction();
++		try {
++			AnalysisResultAdded resultAdded = db.getBlackboard().newAnalysisResult(artifactType, objectId, dataSourceId, score, conclusion, configuration, justification, attributesList, trans);
++
++			trans.commit();
++			return resultAdded;
++		} catch (BlackboardException ex) {
++			trans.rollback();
++			throw new TskCoreException("Error adding analysis result.", ex);
++		}
++	}
++
+ 	@Override
+ 	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList, Long osAccountId) throws TskCoreException {
+ 
+@@ -276,6 +290,16 @@ public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collec
+ 		return db.getBlackboard().newDataArtifact(artifactType, objectId, this.getDataSource().getId(), attributesList, osAccountId);
+ 	}
+ 
++	@Override
++	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList, Long osAccountId, long dataSourceId) throws TskCoreException {
++
++		if (artifactType.getTypeID() != BlackboardArtifact.ARTIFACT_TYPE.TSK_KEYWORD_HIT.getTypeID()) {
++			throw new TskCoreException("Reports can only have keyword hit artifacts.");
++		}
++		
++		return db.getBlackboard().newDataArtifact(artifactType, objectId, dataSourceId, attributesList, osAccountId);
++	}
++
+ 	@Override
+ 	public DataArtifact newDataArtifact(BlackboardArtifact.Type artifactType, Collection<BlackboardAttribute> attributesList) throws TskCoreException {
+ 		return newDataArtifact(artifactType, attributesList, null);

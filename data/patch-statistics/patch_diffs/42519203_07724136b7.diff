@@ -1,0 +1,1798 @@
+From a23725a6e51b766235f77cb1002d0559743dd0b8 Mon Sep 17 00:00:00 2001
+From: Mark Raasveldt <mark.raasveldt@gmail.com>
+Date: Tue, 23 May 2023 16:06:37 +0200
+Subject: [PATCH] Use reinterpret_cast in Cast headers, and more cast removal
+ in Python client
+
+---
+ extension/parquet/column_writer.cpp           |  4 +--
+ extension/parquet/include/column_reader.hpp   |  4 +--
+ extension/parquet/include/column_writer.hpp   |  8 ++---
+ src/common/gzip_file_system.cpp               |  4 +--
+ src/common/types.cpp                          |  4 +--
+ src/include/duckdb/catalog/catalog.hpp        |  4 +--
+ src/include/duckdb/catalog/catalog_entry.hpp  |  4 +--
+ src/include/duckdb/common/allocator.hpp       |  4 +--
+ src/include/duckdb/common/file_system.hpp     |  4 +--
+ .../types/column/partitioned_column_data.hpp  |  4 +--
+ .../types/row/partitioned_tuple_data.hpp      |  4 +--
+ .../duckdb/common/types/vector_buffer.hpp     |  8 ++---
+ .../execution/expression_executor_state.hpp   |  4 +--
+ .../duckdb/execution/physical_operator.hpp    |  4 +--
+ .../execution/physical_operator_states.hpp    | 24 +++++++--------
+ .../duckdb/function/cast/default_casts.hpp    |  8 ++---
+ .../duckdb/function/compression_function.hpp  | 16 +++++-----
+ src/include/duckdb/function/copy_function.hpp | 12 ++++----
+ src/include/duckdb/function/function.hpp      |  6 ++--
+ .../duckdb/function/macro_function.hpp        |  4 +--
+ .../duckdb/function/scalar_function.hpp       |  4 +--
+ .../duckdb/function/table_function.hpp        | 12 ++++----
+ src/include/duckdb/main/query_result.hpp      |  4 +--
+ src/include/duckdb/main/relation.hpp          | 12 ++++++++
+ src/include/duckdb/parser/base_expression.hpp |  4 +--
+ src/include/duckdb/parser/constraint.hpp      |  4 +--
+ .../duckdb/parser/parsed_data/parse_info.hpp  |  4 +--
+ src/include/duckdb/parser/query_node.hpp      |  4 +--
+ src/include/duckdb/parser/result_modifier.hpp |  4 +--
+ src/include/duckdb/parser/sql_statement.hpp   | 11 ++++---
+ src/include/duckdb/parser/tableref.hpp        |  4 +--
+ .../duckdb/planner/bound_constraint.hpp       |  4 +--
+ .../duckdb/planner/bound_query_node.hpp       |  4 +--
+ .../duckdb/planner/bound_result_modifier.hpp  |  4 +--
+ src/include/duckdb/planner/bound_tableref.hpp |  4 +--
+ .../duckdb/planner/logical_operator.hpp       |  4 +--
+ src/include/duckdb/planner/table_binding.hpp  |  4 +--
+ src/include/duckdb/planner/table_filter.hpp   |  4 +--
+ src/include/duckdb/storage/index.hpp          |  4 +--
+ .../duckdb/storage/partial_block_manager.hpp  |  2 +-
+ .../duckdb/storage/storage_manager.hpp        |  4 +--
+ .../duckdb/storage/table/chunk_info.hpp       |  4 +--
+ .../storage/table/column_checkpoint_state.hpp |  4 +--
+ .../duckdb/storage/table/scan_state.hpp       |  8 ++---
+ .../duckdb/transaction/transaction.hpp        |  4 +--
+ src/main/relation.cpp                         |  2 +-
+ src/main/relation/create_table_relation.cpp   |  2 +-
+ src/main/relation/create_view_relation.cpp    |  2 +-
+ src/main/relation/delete_relation.cpp         |  2 +-
+ src/main/relation/explain_relation.cpp        |  2 +-
+ src/main/relation/insert_relation.cpp         |  2 +-
+ src/main/relation/update_relation.cpp         |  2 +-
+ src/main/relation/write_csv_relation.cpp      |  2 +-
+ src/main/relation/write_parquet_relation.cpp  |  2 +-
+ src/transaction/duck_transaction.cpp          |  2 +-
+ .../duckdb_python/numpy/array_wrapper.hpp     |  2 +-
+ tools/pythonpkg/src/map.cpp                   | 10 +++----
+ tools/pythonpkg/src/native/python_objects.cpp |  5 ++--
+ tools/pythonpkg/src/numpy/array_wrapper.cpp   | 14 ++++-----
+ tools/pythonpkg/src/numpy/numpy_scan.cpp      | 30 +++++++++----------
+ tools/pythonpkg/src/pyconnection.cpp          | 24 +++++++--------
+ tools/pythonpkg/src/pyrelation.cpp            |  6 ++--
+ tools/pythonpkg/src/pyresult.cpp              | 16 +++++-----
+ 63 files changed, 200 insertions(+), 186 deletions(-)
+
+diff --git a/extension/parquet/column_writer.cpp b/extension/parquet/column_writer.cpp
+index 37d32a200b3f..405969c56f37 100644
+--- a/extension/parquet/column_writer.cpp
++++ b/extension/parquet/column_writer.cpp
+@@ -285,12 +285,12 @@ class ColumnWriterPageState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/extension/parquet/include/column_reader.hpp b/extension/parquet/include/column_reader.hpp
+index d26ee88adeee..33b7cb047c49 100644
+--- a/extension/parquet/include/column_reader.hpp
++++ b/extension/parquet/include/column_reader.hpp
+@@ -175,7 +175,7 @@ class ColumnReader {
+ 		if (TARGET::TYPE != PhysicalType::INVALID && type.InternalType() != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast column reader to type - type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -183,7 +183,7 @@ class ColumnReader {
+ 		if (TARGET::TYPE != PhysicalType::INVALID && type.InternalType() != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast column reader to type - type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/extension/parquet/include/column_writer.hpp b/extension/parquet/include/column_writer.hpp
+index 90b939378bc8..4885ad84900a 100644
+--- a/extension/parquet/include/column_writer.hpp
++++ b/extension/parquet/include/column_writer.hpp
+@@ -29,12 +29,12 @@ class ColumnWriterState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -51,12 +51,12 @@ class ColumnWriterStatistics {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/common/gzip_file_system.cpp b/src/common/gzip_file_system.cpp
+index 82c23546912e..a1c351166dcf 100644
+--- a/src/common/gzip_file_system.cpp
++++ b/src/common/gzip_file_system.cpp
+@@ -221,14 +221,14 @@ bool MiniZStreamWrapper::Read(StreamData &sd) {
+ void MiniZStreamWrapper::Write(CompressedFile &file, StreamData &sd, data_ptr_t uncompressed_data,
+                                int64_t uncompressed_size) {
+ 	// update the src and the total size
+-	crc = duckdb_miniz::mz_crc32(crc, (const unsigned char *)uncompressed_data, uncompressed_size);
++	crc = duckdb_miniz::mz_crc32(crc, reinterpret_cast<const unsigned char *>(uncompressed_data), uncompressed_size);
+ 	total_size += uncompressed_size;
+ 
+ 	auto remaining = uncompressed_size;
+ 	while (remaining > 0) {
+ 		idx_t output_remaining = (sd.out_buff.get() + sd.out_buf_size) - sd.out_buff_start;
+ 
+-		mz_stream_ptr->next_in = (const unsigned char *)uncompressed_data;
++		mz_stream_ptr->next_in = reinterpret_cast<const unsigned char *>(uncompressed_data);
+ 		mz_stream_ptr->avail_in = remaining;
+ 		mz_stream_ptr->next_out = sd.out_buff_start;
+ 		mz_stream_ptr->avail_out = output_remaining;
+diff --git a/src/common/types.cpp b/src/common/types.cpp
+index c4cf057e4845..ca2b351a1cfa 100644
+--- a/src/common/types.cpp
++++ b/src/common/types.cpp
+@@ -814,12 +814,12 @@ struct ExtraTypeInfo {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ 
+ protected:
+diff --git a/src/include/duckdb/catalog/catalog.hpp b/src/include/duckdb/catalog/catalog.hpp
+index ad20296e71df..5881f9cffa48 100644
+--- a/src/include/duckdb/catalog/catalog.hpp
++++ b/src/include/duckdb/catalog/catalog.hpp
+@@ -333,13 +333,13 @@ class Catalog {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/catalog/catalog_entry.hpp b/src/include/duckdb/catalog/catalog_entry.hpp
+index fe74e1735d48..a8a0a74561db 100644
+--- a/src/include/duckdb/catalog/catalog_entry.hpp
++++ b/src/include/duckdb/catalog/catalog_entry.hpp
+@@ -72,12 +72,12 @@ class CatalogEntry {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/common/allocator.hpp b/src/include/duckdb/common/allocator.hpp
+index fb6f6e9fa613..cac14c293675 100644
+--- a/src/include/duckdb/common/allocator.hpp
++++ b/src/include/duckdb/common/allocator.hpp
+@@ -30,12 +30,12 @@ struct PrivateAllocatorData {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/common/file_system.hpp b/src/include/duckdb/common/file_system.hpp
+index d410fe064760..6c9d4962ea3e 100644
+--- a/src/include/duckdb/common/file_system.hpp
++++ b/src/include/duckdb/common/file_system.hpp
+@@ -80,12 +80,12 @@ struct FileHandle {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ 
+ public:
+diff --git a/src/include/duckdb/common/types/column/partitioned_column_data.hpp b/src/include/duckdb/common/types/column/partitioned_column_data.hpp
+index 000df62f49e6..3defecb01fe8 100644
+--- a/src/include/duckdb/common/types/column/partitioned_column_data.hpp
++++ b/src/include/duckdb/common/types/column/partitioned_column_data.hpp
+@@ -113,12 +113,12 @@ class PartitionedColumnData {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/common/types/row/partitioned_tuple_data.hpp b/src/include/duckdb/common/types/row/partitioned_tuple_data.hpp
+index 87487e92e2a1..8c9b976b49c1 100644
+--- a/src/include/duckdb/common/types/row/partitioned_tuple_data.hpp
++++ b/src/include/duckdb/common/types/row/partitioned_tuple_data.hpp
+@@ -140,12 +140,12 @@ class PartitionedTupleData {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/common/types/vector_buffer.hpp b/src/include/duckdb/common/types/vector_buffer.hpp
+index 0d8c1813cb79..94341102bdaa 100644
+--- a/src/include/duckdb/common/types/vector_buffer.hpp
++++ b/src/include/duckdb/common/types/vector_buffer.hpp
+@@ -52,7 +52,7 @@ struct VectorAuxiliaryData {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast vector auxiliary data to type - type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -60,7 +60,7 @@ struct VectorAuxiliaryData {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast vector auxiliary data to type - type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -126,12 +126,12 @@ class VectorBuffer {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/execution/expression_executor_state.hpp b/src/include/duckdb/execution/expression_executor_state.hpp
+index db4d229bded1..c40908ed82bf 100644
+--- a/src/include/duckdb/execution/expression_executor_state.hpp
++++ b/src/include/duckdb/execution/expression_executor_state.hpp
+@@ -44,12 +44,12 @@ struct ExpressionState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/execution/physical_operator.hpp b/src/include/duckdb/execution/physical_operator.hpp
+index e6d311afb385..e26d44fe13b8 100644
+--- a/src/include/duckdb/execution/physical_operator.hpp
++++ b/src/include/duckdb/execution/physical_operator.hpp
+@@ -187,7 +187,7 @@ class PhysicalOperator {
+ 		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -195,7 +195,7 @@ class PhysicalOperator {
+ 		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/execution/physical_operator_states.hpp b/src/include/duckdb/execution/physical_operator_states.hpp
+index bad471c0d44e..cb4cb8677108 100644
+--- a/src/include/duckdb/execution/physical_operator_states.hpp
++++ b/src/include/duckdb/execution/physical_operator_states.hpp
+@@ -48,12 +48,12 @@ class OperatorState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -65,12 +65,12 @@ class GlobalOperatorState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -86,12 +86,12 @@ class GlobalSinkState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -106,12 +106,12 @@ class LocalSinkState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -127,12 +127,12 @@ class GlobalSourceState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -144,12 +144,12 @@ class LocalSourceState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/function/cast/default_casts.hpp b/src/include/duckdb/function/cast/default_casts.hpp
+index 12f6b6ab0b56..97e9ff902eff 100644
+--- a/src/include/duckdb/function/cast/default_casts.hpp
++++ b/src/include/duckdb/function/cast/default_casts.hpp
+@@ -26,12 +26,12 @@ struct BindCastInfo {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -44,12 +44,12 @@ struct BoundCastData {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/function/compression_function.hpp b/src/include/duckdb/function/compression_function.hpp
+index 012929630b20..a691a8aa82cd 100644
+--- a/src/include/duckdb/function/compression_function.hpp
++++ b/src/include/duckdb/function/compression_function.hpp
+@@ -33,12 +33,12 @@ struct AnalyzeState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -49,12 +49,12 @@ struct CompressionState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -65,12 +65,12 @@ struct CompressedSegmentState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -85,12 +85,12 @@ struct CompressionAppendState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/function/copy_function.hpp b/src/include/duckdb/function/copy_function.hpp
+index ab4e98b72449..3588724ae45c 100644
+--- a/src/include/duckdb/function/copy_function.hpp
++++ b/src/include/duckdb/function/copy_function.hpp
+@@ -27,12 +27,12 @@ struct LocalFunctionData {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -43,12 +43,12 @@ struct GlobalFunctionData {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -59,12 +59,12 @@ struct PreparedBatchData {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/function/function.hpp b/src/include/duckdb/function/function.hpp
+index 706fa495277a..9a9bb9e441fb 100644
+--- a/src/include/duckdb/function/function.hpp
++++ b/src/include/duckdb/function/function.hpp
+@@ -49,17 +49,17 @@ struct FunctionData {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ 	// FIXME: this function should be removed in the future
+ 	template <class TARGET>
+ 	TARGET &CastNoConst() const {
+-		return (TARGET &)*this;
++		return const_cast<TARGET &>(reinterpret_cast<const TARGET &>(*this));
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/function/macro_function.hpp b/src/include/duckdb/function/macro_function.hpp
+index 29fea6c11ce8..2444cf0b5984 100644
+--- a/src/include/duckdb/function/macro_function.hpp
++++ b/src/include/duckdb/function/macro_function.hpp
+@@ -57,7 +57,7 @@ class MacroFunction {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast macro to type - macro type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -65,7 +65,7 @@ class MacroFunction {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast macro to type - macro type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/function/scalar_function.hpp b/src/include/duckdb/function/scalar_function.hpp
+index 7742383ca4ce..74ef87d8a34b 100644
+--- a/src/include/duckdb/function/scalar_function.hpp
++++ b/src/include/duckdb/function/scalar_function.hpp
+@@ -25,12 +25,12 @@ struct FunctionLocalState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/function/table_function.hpp b/src/include/duckdb/function/table_function.hpp
+index 83cd99b4aca3..003d240f70cc 100644
+--- a/src/include/duckdb/function/table_function.hpp
++++ b/src/include/duckdb/function/table_function.hpp
+@@ -31,12 +31,12 @@ struct TableFunctionInfo {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -55,12 +55,12 @@ struct GlobalTableFunctionState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -70,12 +70,12 @@ struct LocalTableFunctionState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/main/query_result.hpp b/src/include/duckdb/main/query_result.hpp
+index 1e4bede37cd5..2f800c4a7fda 100644
+--- a/src/include/duckdb/main/query_result.hpp
++++ b/src/include/duckdb/main/query_result.hpp
+@@ -95,7 +95,7 @@ class QueryResult : public BaseQueryResult {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast query result to type - query result type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -103,7 +103,7 @@ class QueryResult : public BaseQueryResult {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast query result to type - query result type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ 
+ public:
+diff --git a/src/include/duckdb/main/relation.hpp b/src/include/duckdb/main/relation.hpp
+index 7eaea4bd5f6f..486995fe4aa8 100644
+--- a/src/include/duckdb/main/relation.hpp
++++ b/src/include/duckdb/main/relation.hpp
+@@ -163,6 +163,18 @@ class Relation : public std::enable_shared_from_this<Relation> {
+ 
+ protected:
+ 	DUCKDB_API string RenderWhitespace(idx_t depth);
++
++public:
++	template <class TARGET>
++	TARGET &Cast() {
++		D_ASSERT(dynamic_cast<TARGET *>(this));
++		return reinterpret_cast<TARGET &>(*this);
++	}
++	template <class TARGET>
++	const TARGET &Cast() const {
++		D_ASSERT(dynamic_cast<const TARGET *>(this));
++		return reinterpret_cast<const TARGET &>(*this);
++	}
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/duckdb/parser/base_expression.hpp b/src/include/duckdb/parser/base_expression.hpp
+index b60bb12ed656..08c3e1dbdc81 100644
+--- a/src/include/duckdb/parser/base_expression.hpp
++++ b/src/include/duckdb/parser/base_expression.hpp
+@@ -88,7 +88,7 @@ class BaseExpression {
+ 		if (expression_class != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast expression to type - expression type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -96,7 +96,7 @@ class BaseExpression {
+ 		if (expression_class != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast expression to type - expression type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/parser/constraint.hpp b/src/include/duckdb/parser/constraint.hpp
+index 77819d4a337d..78ae2a719c0d 100644
+--- a/src/include/duckdb/parser/constraint.hpp
++++ b/src/include/duckdb/parser/constraint.hpp
+@@ -74,7 +74,7 @@ class Constraint {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast constraint to type - constraint type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -82,7 +82,7 @@ class Constraint {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast constraint to type - constraint type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ } // namespace duckdb
+diff --git a/src/include/duckdb/parser/parsed_data/parse_info.hpp b/src/include/duckdb/parser/parsed_data/parse_info.hpp
+index 1f69bcfca49a..d1b26a59f33a 100644
+--- a/src/include/duckdb/parser/parsed_data/parse_info.hpp
++++ b/src/include/duckdb/parser/parsed_data/parse_info.hpp
+@@ -20,13 +20,13 @@ struct ParseInfo {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/parser/query_node.hpp b/src/include/duckdb/parser/query_node.hpp
+index 045eb991944c..2c5d42eaa49a 100644
+--- a/src/include/duckdb/parser/query_node.hpp
++++ b/src/include/duckdb/parser/query_node.hpp
+@@ -95,7 +95,7 @@ class QueryNode {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast query node to type - query node type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -103,7 +103,7 @@ class QueryNode {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast query node to type - query node type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/parser/result_modifier.hpp b/src/include/duckdb/parser/result_modifier.hpp
+index 8ecd7bfa2d28..9716455c2a69 100644
+--- a/src/include/duckdb/parser/result_modifier.hpp
++++ b/src/include/duckdb/parser/result_modifier.hpp
+@@ -61,7 +61,7 @@ class ResultModifier {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast result modifier to type - result modifier type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -69,7 +69,7 @@ class ResultModifier {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast result modifier to type - result modifier type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/parser/sql_statement.hpp b/src/include/duckdb/parser/sql_statement.hpp
+index 825fb1b1f326..d8ebc1a21cdf 100644
+--- a/src/include/duckdb/parser/sql_statement.hpp
++++ b/src/include/duckdb/parser/sql_statement.hpp
+@@ -18,6 +18,9 @@ namespace duckdb {
+ 
+ //! SQLStatement is the base class of any type of SQL statement.
+ class SQLStatement {
++public:
++	static constexpr const StatementType TYPE = StatementType::INVALID_STATEMENT;
++
+ public:
+ 	explicit SQLStatement(StatementType type) : type(type) {
+ 	}
+@@ -52,18 +55,18 @@ class SQLStatement {
+ public:
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+-		if (type != TARGET::TYPE) {
++		if (type != TARGET::TYPE && TARGET::TYPE != StatementType::INVALID_STATEMENT) {
+ 			throw InternalException("Failed to cast statement to type - statement type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+-		if (type != TARGET::TYPE) {
++		if (type != TARGET::TYPE && TARGET::TYPE != StatementType::INVALID_STATEMENT) {
+ 			throw InternalException("Failed to cast statement to type - statement type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ } // namespace duckdb
+diff --git a/src/include/duckdb/parser/tableref.hpp b/src/include/duckdb/parser/tableref.hpp
+index 147a1823e70b..91bbd548798c 100644
+--- a/src/include/duckdb/parser/tableref.hpp
++++ b/src/include/duckdb/parser/tableref.hpp
+@@ -64,7 +64,7 @@ class TableRef {
+ 		if (type != TARGET::TYPE && TARGET::TYPE != TableReferenceType::INVALID) {
+ 			throw InternalException("Failed to cast constraint to type - constraint type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -72,7 +72,7 @@ class TableRef {
+ 		if (type != TARGET::TYPE && TARGET::TYPE != TableReferenceType::INVALID) {
+ 			throw InternalException("Failed to cast constraint to type - constraint type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ } // namespace duckdb
+diff --git a/src/include/duckdb/planner/bound_constraint.hpp b/src/include/duckdb/planner/bound_constraint.hpp
+index 9ffa7061e7f1..dd0200f9b52a 100644
+--- a/src/include/duckdb/planner/bound_constraint.hpp
++++ b/src/include/duckdb/planner/bound_constraint.hpp
+@@ -37,7 +37,7 @@ class BoundConstraint {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast constraint to type - bound constraint type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -45,7 +45,7 @@ class BoundConstraint {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast constraint to type - bound constraint type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ } // namespace duckdb
+diff --git a/src/include/duckdb/planner/bound_query_node.hpp b/src/include/duckdb/planner/bound_query_node.hpp
+index 02a43217d832..cd5a78b6aa94 100644
+--- a/src/include/duckdb/planner/bound_query_node.hpp
++++ b/src/include/duckdb/planner/bound_query_node.hpp
+@@ -41,7 +41,7 @@ class BoundQueryNode {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast bound query node to type - query node type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -49,7 +49,7 @@ class BoundQueryNode {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast bound query node to type - query node type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/planner/bound_result_modifier.hpp b/src/include/duckdb/planner/bound_result_modifier.hpp
+index e92e4b20beaf..297f4139e721 100644
+--- a/src/include/duckdb/planner/bound_result_modifier.hpp
++++ b/src/include/duckdb/planner/bound_result_modifier.hpp
+@@ -30,7 +30,7 @@ class BoundResultModifier {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast result modifier to type - result modifier type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -38,7 +38,7 @@ class BoundResultModifier {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast result modifier to type - result modifier type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/planner/bound_tableref.hpp b/src/include/duckdb/planner/bound_tableref.hpp
+index d9993ea477dd..0a831c54aeed 100644
+--- a/src/include/duckdb/planner/bound_tableref.hpp
++++ b/src/include/duckdb/planner/bound_tableref.hpp
+@@ -32,7 +32,7 @@ class BoundTableRef {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast bound table ref to type - table ref type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -40,7 +40,7 @@ class BoundTableRef {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast bound table ref to type - table ref type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ } // namespace duckdb
+diff --git a/src/include/duckdb/planner/logical_operator.hpp b/src/include/duckdb/planner/logical_operator.hpp
+index 8c5223f5011b..91d005d9e10c 100644
+--- a/src/include/duckdb/planner/logical_operator.hpp
++++ b/src/include/duckdb/planner/logical_operator.hpp
+@@ -96,7 +96,7 @@ class LogicalOperator {
+ 		if (TARGET::TYPE != LogicalOperatorType::LOGICAL_INVALID && type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast logical operator to type - logical operator type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -104,7 +104,7 @@ class LogicalOperator {
+ 		if (TARGET::TYPE != LogicalOperatorType::LOGICAL_INVALID && type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast logical operator to type - logical operator type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ } // namespace duckdb
+diff --git a/src/include/duckdb/planner/table_binding.hpp b/src/include/duckdb/planner/table_binding.hpp
+index c04d731dea92..4d6679c1f7ac 100644
+--- a/src/include/duckdb/planner/table_binding.hpp
++++ b/src/include/duckdb/planner/table_binding.hpp
+@@ -62,7 +62,7 @@ struct Binding {
+ 		if (binding_type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast binding to type - binding type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -70,7 +70,7 @@ struct Binding {
+ 		if (binding_type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast binding to type - binding type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/planner/table_filter.hpp b/src/include/duckdb/planner/table_filter.hpp
+index 25ed82ea661b..dd3f7d7010a4 100644
+--- a/src/include/duckdb/planner/table_filter.hpp
++++ b/src/include/duckdb/planner/table_filter.hpp
+@@ -54,7 +54,7 @@ class TableFilter {
+ 		if (filter_type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast table to type - table filter type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -62,7 +62,7 @@ class TableFilter {
+ 		if (filter_type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast table to type - table filter type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/storage/index.hpp b/src/include/duckdb/storage/index.hpp
+index 376198a34ea7..cfca04e3c312 100644
+--- a/src/include/duckdb/storage/index.hpp
++++ b/src/include/duckdb/storage/index.hpp
+@@ -153,13 +153,13 @@ class Index {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/storage/partial_block_manager.hpp b/src/include/duckdb/storage/partial_block_manager.hpp
+index b0fa98ecb86e..2860566391d8 100644
+--- a/src/include/duckdb/storage/partial_block_manager.hpp
++++ b/src/include/duckdb/storage/partial_block_manager.hpp
+@@ -54,7 +54,7 @@ struct PartialBlock {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/storage/storage_manager.hpp b/src/include/duckdb/storage/storage_manager.hpp
+index 9bab3936ef5a..d09930d285d1 100644
+--- a/src/include/duckdb/storage/storage_manager.hpp
++++ b/src/include/duckdb/storage/storage_manager.hpp
+@@ -87,12 +87,12 @@ class StorageManager {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/storage/table/chunk_info.hpp b/src/include/duckdb/storage/table/chunk_info.hpp
+index fa4ee9737d91..9a593c22686b 100644
+--- a/src/include/duckdb/storage/table/chunk_info.hpp
++++ b/src/include/duckdb/storage/table/chunk_info.hpp
+@@ -51,7 +51,7 @@ class ChunkInfo {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast chunk info to type - query result type mismatch");
+ 		}
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 
+ 	template <class TARGET>
+@@ -59,7 +59,7 @@ class ChunkInfo {
+ 		if (type != TARGET::TYPE) {
+ 			throw InternalException("Failed to cast chunk info to type - query result type mismatch");
+ 		}
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/storage/table/column_checkpoint_state.hpp b/src/include/duckdb/storage/table/column_checkpoint_state.hpp
+index 5500e4b68e77..e547309a77ab 100644
+--- a/src/include/duckdb/storage/table/column_checkpoint_state.hpp
++++ b/src/include/duckdb/storage/table/column_checkpoint_state.hpp
+@@ -47,12 +47,12 @@ struct ColumnCheckpointState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/storage/table/scan_state.hpp b/src/include/duckdb/storage/table/scan_state.hpp
+index f69ff68df6ea..cefa13a27fe8 100644
+--- a/src/include/duckdb/storage/table/scan_state.hpp
++++ b/src/include/duckdb/storage/table/scan_state.hpp
+@@ -39,12 +39,12 @@ struct SegmentScanState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+@@ -55,12 +55,12 @@ struct IndexScanState {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/transaction/transaction.hpp b/src/include/duckdb/transaction/transaction.hpp
+index 4bef6d73a8e1..0caa342afb11 100644
+--- a/src/include/duckdb/transaction/transaction.hpp
++++ b/src/include/duckdb/transaction/transaction.hpp
+@@ -62,12 +62,12 @@ class Transaction {
+ 	template <class TARGET>
+ 	TARGET &Cast() {
+ 		D_ASSERT(dynamic_cast<TARGET *>(this));
+-		return (TARGET &)*this;
++		return reinterpret_cast<TARGET &>(*this);
+ 	}
+ 	template <class TARGET>
+ 	const TARGET &Cast() const {
+ 		D_ASSERT(dynamic_cast<const TARGET *>(this));
+-		return (const TARGET &)*this;
++		return reinterpret_cast<const TARGET &>(*this);
+ 	}
+ };
+ 
+diff --git a/src/main/relation.cpp b/src/main/relation.cpp
+index a2a367af33fd..6fda202fa8ec 100644
+--- a/src/main/relation.cpp
++++ b/src/main/relation.cpp
+@@ -209,7 +209,7 @@ unique_ptr<QueryResult> Relation::ExecuteOrThrow() {
+ BoundStatement Relation::Bind(Binder &binder) {
+ 	SelectStatement stmt;
+ 	stmt.node = GetQueryNode();
+-	return binder.Bind((SQLStatement &)stmt);
++	return binder.Bind(stmt.Cast<SQLStatement>());
+ }
+ 
+ shared_ptr<Relation> Relation::InsertRel(const string &schema_name, const string &table_name) {
+diff --git a/src/main/relation/create_table_relation.cpp b/src/main/relation/create_table_relation.cpp
+index f5411db9e78d..e8ac45ede6f8 100644
+--- a/src/main/relation/create_table_relation.cpp
++++ b/src/main/relation/create_table_relation.cpp
+@@ -23,7 +23,7 @@ BoundStatement CreateTableRelation::Bind(Binder &binder) {
+ 	info->query = std::move(select);
+ 	info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
+ 	stmt.info = std::move(info);
+-	return binder.Bind((SQLStatement &)stmt);
++	return binder.Bind(stmt.Cast<SQLStatement>());
+ }
+ 
+ const vector<ColumnDefinition> &CreateTableRelation::Columns() {
+diff --git a/src/main/relation/create_view_relation.cpp b/src/main/relation/create_view_relation.cpp
+index cd8cf828dde9..b9c80c074511 100644
+--- a/src/main/relation/create_view_relation.cpp
++++ b/src/main/relation/create_view_relation.cpp
+@@ -32,7 +32,7 @@ BoundStatement CreateViewRelation::Bind(Binder &binder) {
+ 	info->schema = schema_name;
+ 	info->on_conflict = replace ? OnCreateConflict::REPLACE_ON_CONFLICT : OnCreateConflict::ERROR_ON_CONFLICT;
+ 	stmt.info = std::move(info);
+-	return binder.Bind((SQLStatement &)stmt);
++	return binder.Bind(stmt.Cast<SQLStatement>());
+ }
+ 
+ const vector<ColumnDefinition> &CreateViewRelation::Columns() {
+diff --git a/src/main/relation/delete_relation.cpp b/src/main/relation/delete_relation.cpp
+index b2ae9f1895ad..8afc8226e8a2 100644
+--- a/src/main/relation/delete_relation.cpp
++++ b/src/main/relation/delete_relation.cpp
+@@ -21,7 +21,7 @@ BoundStatement DeleteRelation::Bind(Binder &binder) {
+ 	DeleteStatement stmt;
+ 	stmt.condition = condition ? condition->Copy() : nullptr;
+ 	stmt.table = std::move(basetable);
+-	return binder.Bind((SQLStatement &)stmt);
++	return binder.Bind(stmt.Cast<SQLStatement>());
+ }
+ 
+ const vector<ColumnDefinition> &DeleteRelation::Columns() {
+diff --git a/src/main/relation/explain_relation.cpp b/src/main/relation/explain_relation.cpp
+index b87a61571505..0a3f81257e38 100644
+--- a/src/main/relation/explain_relation.cpp
++++ b/src/main/relation/explain_relation.cpp
+@@ -16,7 +16,7 @@ BoundStatement ExplainRelation::Bind(Binder &binder) {
+ 	auto select = make_uniq<SelectStatement>();
+ 	select->node = child->GetQueryNode();
+ 	ExplainStatement explain(std::move(select), type);
+-	return binder.Bind((SQLStatement &)explain);
++	return binder.Bind(explain.Cast<SQLStatement>());
+ }
+ 
+ const vector<ColumnDefinition> &ExplainRelation::Columns() {
+diff --git a/src/main/relation/insert_relation.cpp b/src/main/relation/insert_relation.cpp
+index 202a499b5f29..c6738d486019 100644
+--- a/src/main/relation/insert_relation.cpp
++++ b/src/main/relation/insert_relation.cpp
+@@ -21,7 +21,7 @@ BoundStatement InsertRelation::Bind(Binder &binder) {
+ 	stmt.schema = schema_name;
+ 	stmt.table = table_name;
+ 	stmt.select_statement = std::move(select);
+-	return binder.Bind((SQLStatement &)stmt);
++	return binder.Bind(stmt.Cast<SQLStatement>());
+ }
+ 
+ const vector<ColumnDefinition> &InsertRelation::Columns() {
+diff --git a/src/main/relation/update_relation.cpp b/src/main/relation/update_relation.cpp
+index 9554a9cb9281..152d04af3933 100644
+--- a/src/main/relation/update_relation.cpp
++++ b/src/main/relation/update_relation.cpp
+@@ -30,7 +30,7 @@ BoundStatement UpdateRelation::Bind(Binder &binder) {
+ 	for (auto &expr : expressions) {
+ 		stmt.set_info->expressions.push_back(expr->Copy());
+ 	}
+-	return binder.Bind((SQLStatement &)stmt);
++	return binder.Bind(stmt.Cast<SQLStatement>());
+ }
+ 
+ const vector<ColumnDefinition> &UpdateRelation::Columns() {
+diff --git a/src/main/relation/write_csv_relation.cpp b/src/main/relation/write_csv_relation.cpp
+index fb1695d89bb8..016ea0186bd9 100644
+--- a/src/main/relation/write_csv_relation.cpp
++++ b/src/main/relation/write_csv_relation.cpp
+@@ -22,7 +22,7 @@ BoundStatement WriteCSVRelation::Bind(Binder &binder) {
+ 	info->format = "csv";
+ 	info->options = options;
+ 	copy.info = std::move(info);
+-	return binder.Bind((SQLStatement &)copy);
++	return binder.Bind(copy.Cast<SQLStatement>());
+ }
+ 
+ const vector<ColumnDefinition> &WriteCSVRelation::Columns() {
+diff --git a/src/main/relation/write_parquet_relation.cpp b/src/main/relation/write_parquet_relation.cpp
+index 9032e6f3c6ba..6cedc29cb384 100644
+--- a/src/main/relation/write_parquet_relation.cpp
++++ b/src/main/relation/write_parquet_relation.cpp
+@@ -22,7 +22,7 @@ BoundStatement WriteParquetRelation::Bind(Binder &binder) {
+ 	info->format = "parquet";
+ 	info->options = options;
+ 	copy.info = std::move(info);
+-	return binder.Bind((SQLStatement &)copy);
++	return binder.Bind(copy.Cast<SQLStatement>());
+ }
+ 
+ const vector<ColumnDefinition> &WriteParquetRelation::Columns() {
+diff --git a/src/transaction/duck_transaction.cpp b/src/transaction/duck_transaction.cpp
+index a26fd5f1225f..f1451b3d780b 100644
+--- a/src/transaction/duck_transaction.cpp
++++ b/src/transaction/duck_transaction.cpp
+@@ -44,7 +44,7 @@ DuckTransaction &DuckTransaction::Get(ClientContext &context, Catalog &catalog)
+ 	if (!transaction.IsDuckTransaction()) {
+ 		throw InternalException("DuckTransaction::Get called on non-DuckDB transaction");
+ 	}
+-	return (DuckTransaction &)transaction;
++	return transaction.Cast<DuckTransaction>();
+ }
+ 
+ LocalStorage &DuckTransaction::GetLocalStorage() {
+diff --git a/tools/pythonpkg/src/include/duckdb_python/numpy/array_wrapper.hpp b/tools/pythonpkg/src/include/duckdb_python/numpy/array_wrapper.hpp
+index 966800bd4390..8de4f2babc19 100644
+--- a/tools/pythonpkg/src/include/duckdb_python/numpy/array_wrapper.hpp
++++ b/tools/pythonpkg/src/include/duckdb_python/numpy/array_wrapper.hpp
+@@ -52,7 +52,7 @@ struct ArrayWrapper {
+ 
+ class NumpyResultConversion {
+ public:
+-	NumpyResultConversion(vector<LogicalType> &types, idx_t initial_capacity);
++	NumpyResultConversion(const vector<LogicalType> &types, idx_t initial_capacity);
+ 
+ 	void Append(DataChunk &chunk);
+ 
+diff --git a/tools/pythonpkg/src/map.cpp b/tools/pythonpkg/src/map.cpp
+index 0aebac4cc138..d9ec300135e4 100644
+--- a/tools/pythonpkg/src/map.cpp
++++ b/tools/pythonpkg/src/map.cpp
+@@ -25,7 +25,7 @@ struct MapFunctionData : public TableFunctionData {
+ 	vector<string> in_names, out_names;
+ };
+ 
+-static py::handle FunctionCall(NumpyResultConversion &conversion, vector<string> &names, PyObject *function) {
++static py::handle FunctionCall(NumpyResultConversion &conversion, const vector<string> &names, PyObject *function) {
+ 	py::dict in_numpy_dict;
+ 	for (idx_t col_idx = 0; col_idx < names.size(); col_idx++) {
+ 		in_numpy_dict[names[col_idx].c_str()] = conversion.ToArray(col_idx);
+@@ -131,8 +131,8 @@ unique_ptr<FunctionData> MapFunction::MapFunctionBind(ClientContext &context, Ta
+ 
+ 	auto data_uptr = make_uniq<MapFunctionData>();
+ 	auto &data = *data_uptr;
+-	data.function = (PyObject *)input.inputs[0].GetPointer();
+-	auto explicit_schema = (PyObject *)input.inputs[1].GetPointer();
++	data.function = reinterpret_cast<PyObject *>(input.inputs[0].GetPointer());
++	auto explicit_schema = reinterpret_cast<PyObject *>(input.inputs[1].GetPointer());
+ 
+ 	data.in_names = input.input_table_names;
+ 	data.in_types = input.input_table_types;
+@@ -154,7 +154,7 @@ unique_ptr<FunctionData> MapFunction::MapFunctionBind(ClientContext &context, Ta
+ 	return std::move(data_uptr);
+ }
+ 
+-static string TypeVectorToString(vector<LogicalType> &types) {
++static string TypeVectorToString(const vector<LogicalType> &types) {
+ 	return StringUtil::Join(types, types.size(), ", ", [](const LogicalType &argument) { return argument.ToString(); });
+ }
+ 
+@@ -166,7 +166,7 @@ OperatorResultType MapFunction::MapFunctionExec(ExecutionContext &context, Table
+ 		return OperatorResultType::NEED_MORE_INPUT;
+ 	}
+ 
+-	auto &data = (MapFunctionData &)*data_p.bind_data;
++	auto &data = data_p.bind_data->Cast<MapFunctionData>();
+ 
+ 	D_ASSERT(input.GetTypes() == data.in_types);
+ 	NumpyResultConversion conversion(data.in_types, input.size());
+diff --git a/tools/pythonpkg/src/native/python_objects.cpp b/tools/pythonpkg/src/native/python_objects.cpp
+index 9441cc861a1c..fb088b39d87a 100644
+--- a/tools/pythonpkg/src/native/python_objects.cpp
++++ b/tools/pythonpkg/src/native/python_objects.cpp
+@@ -275,7 +275,7 @@ Value PyDate::ToDuckValue() {
+ }
+ 
+ void PythonObject::Initialize() {
+-	PyDateTime_IMPORT; // Python datetime initialize #2
++	PyDateTime_IMPORT; // NOLINT: Python datetime initialize #2
+ }
+ 
+ py::object PythonObject::FromValue(const Value &val, const LogicalType &type) {
+@@ -303,8 +303,7 @@ py::object PythonObject::FromValue(const Value &val, const LogicalType &type) {
+ 	case LogicalTypeId::UBIGINT:
+ 		return py::cast(val.GetValue<uint64_t>());
+ 	case LogicalTypeId::HUGEINT:
+-		return py::reinterpret_steal<py::object>(
+-		    PyLong_FromString((char *)val.GetValue<string>().c_str(), nullptr, 10));
++		return py::reinterpret_steal<py::object>(PyLong_FromString(val.GetValue<string>().c_str(), nullptr, 10));
+ 	case LogicalTypeId::FLOAT:
+ 		return py::cast(val.GetValue<float>());
+ 	case LogicalTypeId::DOUBLE:
+diff --git a/tools/pythonpkg/src/numpy/array_wrapper.cpp b/tools/pythonpkg/src/numpy/array_wrapper.cpp
+index 8f7d363aedee..c9611cc57d41 100644
+--- a/tools/pythonpkg/src/numpy/array_wrapper.cpp
++++ b/tools/pythonpkg/src/numpy/array_wrapper.cpp
+@@ -192,7 +192,7 @@ struct StringConvert {
+ 		for (idx_t i = 0; i < len; i++) {
+ 			if (data[i] > 127) {
+ 				// there are! fallback to slower case
+-				return ConvertUnicodeValue((const char *)data, len, i);
++				return ConvertUnicodeValue(const_char_ptr_cast(data), len, i);
+ 			}
+ 		}
+ 		// no unicode: fast path
+@@ -323,7 +323,7 @@ template <class DUCKDB_T, class NUMPY_T, class CONVERT>
+ static bool ConvertColumn(idx_t target_offset, data_ptr_t target_data, bool *target_mask, UnifiedVectorFormat &idata,
+                           idx_t count) {
+ 	auto src_ptr = UnifiedVectorFormat::GetData<DUCKDB_T>(idata);
+-	auto out_ptr = (NUMPY_T *)target_data;
++	auto out_ptr = reinterpret_cast<NUMPY_T *>(target_data);
+ 	if (!idata.validity.AllValid()) {
+ 		for (idx_t i = 0; i < count; i++) {
+ 			idx_t src_idx = idata.sel->get_index(i);
+@@ -352,7 +352,7 @@ template <class DUCKDB_T, class NUMPY_T>
+ static bool ConvertColumnCategoricalTemplate(idx_t target_offset, data_ptr_t target_data, UnifiedVectorFormat &idata,
+                                              idx_t count) {
+ 	auto src_ptr = UnifiedVectorFormat::GetData<DUCKDB_T>(idata);
+-	auto out_ptr = (NUMPY_T *)target_data;
++	auto out_ptr = reinterpret_cast<NUMPY_T *>(target_data);
+ 	if (!idata.validity.AllValid()) {
+ 		for (idx_t i = 0; i < count; i++) {
+ 			idx_t src_idx = idata.sel->get_index(i);
+@@ -379,7 +379,7 @@ static bool ConvertColumnCategoricalTemplate(idx_t target_offset, data_ptr_t tar
+ template <class NUMPY_T, class CONVERT>
+ static bool ConvertNested(idx_t target_offset, data_ptr_t target_data, bool *target_mask, Vector &input,
+                           UnifiedVectorFormat &idata, idx_t count) {
+-	auto out_ptr = (NUMPY_T *)target_data;
++	auto out_ptr = reinterpret_cast<NUMPY_T *>(target_data);
+ 	if (!idata.validity.AllValid()) {
+ 		for (idx_t i = 0; i < count; i++) {
+ 			idx_t src_idx = idata.sel->get_index(i);
+@@ -428,7 +428,7 @@ template <class DUCKDB_T>
+ static bool ConvertDecimalInternal(idx_t target_offset, data_ptr_t target_data, bool *target_mask,
+                                    UnifiedVectorFormat &idata, idx_t count, double division) {
+ 	auto src_ptr = UnifiedVectorFormat::GetData<DUCKDB_T>(idata);
+-	auto out_ptr = (double *)target_data;
++	auto out_ptr = reinterpret_cast<double *>(target_data);
+ 	if (!idata.validity.AllValid()) {
+ 		for (idx_t i = 0; i < count; i++) {
+ 			idx_t src_idx = idata.sel->get_index(i);
+@@ -627,7 +627,7 @@ void ArrayWrapper::Resize(idx_t new_capacity) {
+ 
+ void ArrayWrapper::Append(idx_t current_offset, Vector &input, idx_t count) {
+ 	auto dataptr = data->data;
+-	auto maskptr = (bool *)mask->data;
++	auto maskptr = reinterpret_cast<bool *>(mask->data);
+ 	D_ASSERT(dataptr);
+ 	D_ASSERT(maskptr);
+ 	D_ASSERT(input.GetType() == data->type);
+@@ -774,7 +774,7 @@ py::object ArrayWrapper::ToArray(idx_t count) const {
+ 	return masked_array;
+ }
+ 
+-NumpyResultConversion::NumpyResultConversion(vector<LogicalType> &types, idx_t initial_capacity)
++NumpyResultConversion::NumpyResultConversion(const vector<LogicalType> &types, idx_t initial_capacity)
+     : count(0), capacity(0) {
+ 	owned_data.reserve(types.size());
+ 	for (auto &type : types) {
+diff --git a/tools/pythonpkg/src/numpy/numpy_scan.cpp b/tools/pythonpkg/src/numpy/numpy_scan.cpp
+index 8c0e9362f548..cdff2ce4be39 100644
+--- a/tools/pythonpkg/src/numpy/numpy_scan.cpp
++++ b/tools/pythonpkg/src/numpy/numpy_scan.cpp
+@@ -62,11 +62,11 @@ void ScanNumpyCategory(py::array &column, idx_t count, idx_t offset, Vector &out
+ template <class T>
+ void ScanNumpyMasked(PandasColumnBindData &bind_data, idx_t count, idx_t offset, Vector &out) {
+ 	D_ASSERT(bind_data.pandas_col->Backend() == PandasColumnBackend::NUMPY);
+-	auto &numpy_col = (PandasNumpyColumn &)*bind_data.pandas_col;
++	auto &numpy_col = reinterpret_cast<PandasNumpyColumn &>(*bind_data.pandas_col);
+ 	ScanNumpyColumn<T>(numpy_col.array, numpy_col.stride, offset, out, count);
+ 	auto &result_mask = FlatVector::Validity(out);
+ 	if (bind_data.mask) {
+-		auto mask = (bool *)bind_data.mask->numpy_array.data();
++		auto mask = reinterpret_cast<const bool *>(bind_data.mask->numpy_array.data());
+ 		for (idx_t i = 0; i < count; i++) {
+ 			auto is_null = mask[offset + i];
+ 			if (is_null) {
+@@ -77,10 +77,10 @@ void ScanNumpyMasked(PandasColumnBindData &bind_data, idx_t count, idx_t offset,
+ }
+ 
+ template <class T>
+-void ScanNumpyFpColumn(T *src_ptr, idx_t stride, idx_t count, idx_t offset, Vector &out) {
++void ScanNumpyFpColumn(const T *src_ptr, idx_t stride, idx_t count, idx_t offset, Vector &out) {
+ 	auto &mask = FlatVector::Validity(out);
+ 	if (stride == sizeof(T)) {
+-		FlatVector::SetData(out, data_ptr_cast(src_ptr + offset));
++		FlatVector::SetData(out, (data_ptr_t)(src_ptr + offset)); // NOLINT
+ 		// Turn NaN values into NULL
+ 		auto tgt_ptr = FlatVector::GetData<T>(out);
+ 		for (idx_t i = 0; i < count; i++) {
+@@ -190,7 +190,7 @@ void NumpyScan::ScanObjectColumn(PyObject **col, idx_t count, idx_t offset, Vect
+ //! 'count' is the amount of values we will convert in this batch
+ void NumpyScan::Scan(PandasColumnBindData &bind_data, idx_t count, idx_t offset, Vector &out) {
+ 	D_ASSERT(bind_data.pandas_col->Backend() == PandasColumnBackend::NUMPY);
+-	auto &numpy_col = (PandasNumpyColumn &)*bind_data.pandas_col;
++	auto &numpy_col = reinterpret_cast<PandasNumpyColumn &>(*bind_data.pandas_col);
+ 	auto &array = numpy_col.array;
+ 
+ 	switch (bind_data.numpy_type) {
+@@ -222,10 +222,10 @@ void NumpyScan::Scan(PandasColumnBindData &bind_data, idx_t count, idx_t offset,
+ 		ScanNumpyMasked<int64_t>(bind_data, count, offset, out);
+ 		break;
+ 	case NumpyNullableType::FLOAT_32:
+-		ScanNumpyFpColumn<float>((float *)array.data(), numpy_col.stride, count, offset, out);
++		ScanNumpyFpColumn<float>(reinterpret_cast<const float *>(array.data()), numpy_col.stride, count, offset, out);
+ 		break;
+ 	case NumpyNullableType::FLOAT_64:
+-		ScanNumpyFpColumn<double>((double *)array.data(), numpy_col.stride, count, offset, out);
++		ScanNumpyFpColumn<double>(reinterpret_cast<const double *>(array.data()), numpy_col.stride, count, offset, out);
+ 		break;
+ 	case NumpyNullableType::DATETIME:
+ 	case NumpyNullableType::DATETIME_TZ: {
+@@ -245,7 +245,7 @@ void NumpyScan::Scan(PandasColumnBindData &bind_data, idx_t count, idx_t offset,
+ 		break;
+ 	}
+ 	case NumpyNullableType::TIMEDELTA: {
+-		auto src_ptr = (int64_t *)array.data();
++		auto src_ptr = reinterpret_cast<const int64_t *>(array.data());
+ 		auto tgt_ptr = FlatVector::GetData<interval_t>(out);
+ 		auto &mask = FlatVector::Validity(out);
+ 
+@@ -272,7 +272,7 @@ void NumpyScan::Scan(PandasColumnBindData &bind_data, idx_t count, idx_t offset,
+ 	case NumpyNullableType::OBJECT: {
+ 		//! We have determined the underlying logical type of this object column
+ 		// Get the source pointer of the numpy array
+-		auto src_ptr = (PyObject **)array.data();
++		auto src_ptr = (PyObject **)array.data(); // NOLINT
+ 		if (out.GetType().id() != LogicalTypeId::VARCHAR) {
+ 			return NumpyScan::ScanObjectColumn(src_ptr, count, offset, out);
+ 		}
+@@ -298,7 +298,7 @@ void NumpyScan::Scan(PandasColumnBindData &bind_data, idx_t count, idx_t offset,
+ 				if (import_cache.pandas().libs.NAType.IsLoaded()) {
+ 					// If pandas is imported, check if the type is NAType
+ 					auto val_type = Py_TYPE(val);
+-					auto na_type = (PyTypeObject *)import_cache.pandas().libs.NAType().ptr();
++					auto na_type = reinterpret_cast<PyTypeObject *>(import_cache.pandas().libs.NAType().ptr());
+ 					if (val_type == na_type) {
+ 						out_mask.SetInvalid(row);
+ 						continue;
+@@ -329,16 +329,16 @@ void NumpyScan::Scan(PandasColumnBindData &bind_data, idx_t count, idx_t offset,
+ 			}
+ 			if (PyUnicode_IS_COMPACT_ASCII(val)) {
+ 				// ascii string: we can zero copy
+-				tgt_ptr[row] = string_t((const char *)PyUnicode_DATA(val), PyUnicode_GET_LENGTH(val));
++				tgt_ptr[row] = string_t(const_char_ptr_cast(PyUnicode_DATA(val)), PyUnicode_GET_LENGTH(val));
+ 			} else {
+ 				// unicode gunk
+-				auto ascii_obj = (PyASCIIObject *)val;
+-				auto unicode_obj = (PyCompactUnicodeObject *)val;
++				auto ascii_obj = reinterpret_cast<PyASCIIObject *>(val);
++				auto unicode_obj = reinterpret_cast<PyCompactUnicodeObject *>(val);
+ 				// compact unicode string: is there utf8 data available?
+ 				if (unicode_obj->utf8) {
+ 					// there is! zero copy
+-					tgt_ptr[row] = string_t((const char *)unicode_obj->utf8, unicode_obj->utf8_length);
+-				} else if (PyUnicode_IS_COMPACT(unicode_obj) && !PyUnicode_IS_ASCII(unicode_obj)) {
++					tgt_ptr[row] = string_t(const_char_ptr_cast(unicode_obj->utf8), unicode_obj->utf8_length);
++				} else if (PyUnicode_IS_COMPACT(unicode_obj) && !PyUnicode_IS_ASCII(unicode_obj)) { // NOLINT
+ 					auto kind = PyUnicode_KIND(val);
+ 					switch (kind) {
+ 					case PyUnicode_1BYTE_KIND:
+diff --git a/tools/pythonpkg/src/pyconnection.cpp b/tools/pythonpkg/src/pyconnection.cpp
+index ee67e72179ca..827d6a72feb5 100644
+--- a/tools/pythonpkg/src/pyconnection.cpp
++++ b/tools/pythonpkg/src/pyconnection.cpp
+@@ -357,7 +357,7 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
+ 	    .def("__exit__", &DuckDBPyConnection::Exit, py::arg("exc_type"), py::arg("exc"), py::arg("traceback"));
+ 
+ 	InitializeConnectionMethods(connection_module);
+-	PyDateTime_IMPORT;
++	PyDateTime_IMPORT; // NOLINT
+ 	DuckDBPyConnection::ImportCache();
+ }
+ 
+@@ -543,9 +543,9 @@ void DuckDBPyConnection::RegisterArrowObject(const py::object &arrow_object, con
+ 		py::gil_scoped_release release;
+ 		temporary_views[name] =
+ 		    connection
+-		        ->TableFunction("arrow_scan", {Value::POINTER((uintptr_t)stream_factory.get()),
+-		                                       Value::POINTER((uintptr_t)stream_factory_produce),
+-		                                       Value::POINTER((uintptr_t)stream_factory_get_schema)})
++		        ->TableFunction("arrow_scan", {Value::POINTER(CastPointerToValue(stream_factory.get())),
++		                                       Value::POINTER(CastPointerToValue(stream_factory_produce)),
++		                                       Value::POINTER(CastPointerToValue(stream_factory_get_schema))})
+ 		        ->CreateView(name, true, true);
+ 	}
+ 	vector<shared_ptr<ExternalDependency>> dependencies;
+@@ -569,7 +569,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterPythonObject(const st
+ 			{
+ 				py::gil_scoped_release release;
+ 				temporary_views[name] =
+-				    connection->TableFunction("pandas_scan", {Value::POINTER((uintptr_t)new_df.ptr())})
++				    connection->TableFunction("pandas_scan", {Value::POINTER(CastPointerToValue(new_df.ptr()))})
+ 				        ->CreateView(name, true, true);
+ 			}
+ 
+@@ -736,7 +736,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(
+ 	}
+ 
+ 	auto read_csv_p = connection->ReadCSV(name, options);
+-	auto &read_csv = (ReadCSVRelation &)*read_csv_p;
++	auto &read_csv = read_csv_p->Cast<ReadCSVRelation>();
+ 	if (file_like_object_wrapper) {
+ 		D_ASSERT(!read_csv.extra_dependencies);
+ 		read_csv.extra_dependencies = std::move(file_like_object_wrapper);
+@@ -1098,9 +1098,9 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromArrow(py::object &arrow_obj
+ 	auto stream_factory_get_schema = PythonTableArrowArrayStreamFactory::GetSchema;
+ 
+ 	auto rel = connection
+-	               ->TableFunction("arrow_scan", {Value::POINTER((uintptr_t)stream_factory.get()),
+-	                                              Value::POINTER((uintptr_t)stream_factory_produce),
+-	                                              Value::POINTER((uintptr_t)stream_factory_get_schema)})
++	               ->TableFunction("arrow_scan", {Value::POINTER(CastPointerToValue(stream_factory.get())),
++	                                              Value::POINTER(CastPointerToValue(stream_factory_produce)),
++	                                              Value::POINTER(CastPointerToValue(stream_factory_get_schema))})
+ 	               ->Alias(name);
+ 	rel->extra_dependencies =
+ 	    make_uniq<PythonDependencies>(make_uniq<RegisteredArrow>(std::move(stream_factory), arrow_object));
+@@ -1330,7 +1330,7 @@ static unique_ptr<TableRef> TryReplacement(py::dict &dict, py::str &table_name,
+ 		} else {
+ 			string name = "df_" + StringUtil::GenerateRandomName();
+ 			auto new_df = PandasScanFunction::PandasReplaceCopiedNames(entry);
+-			children.push_back(make_uniq<ConstantExpression>(Value::POINTER((uintptr_t)new_df.ptr())));
++			children.push_back(make_uniq<ConstantExpression>(Value::POINTER(CastPointerToValue(new_df.ptr()))));
+ 			table_function->function = make_uniq<FunctionExpression>("pandas_scan", std::move(children));
+ 			table_function->external_dependency =
+ 			    make_uniq<PythonDependencies>(make_uniq<RegisteredObject>(entry), make_uniq<RegisteredObject>(new_df));
+@@ -1382,7 +1382,7 @@ static unique_ptr<TableRef> TryReplacement(py::dict &dict, py::str &table_name,
+ 			throw NotImplementedException("Unsupported Numpy object");
+ 			break;
+ 		}
+-		children.push_back(make_uniq<ConstantExpression>(Value::POINTER((uintptr_t)data.ptr())));
++		children.push_back(make_uniq<ConstantExpression>(Value::POINTER(CastPointerToValue(data.ptr()))));
+ 		table_function->function = make_uniq<FunctionExpression>("pandas_scan", std::move(children));
+ 		table_function->external_dependency =
+ 		    make_uniq<PythonDependencies>(make_uniq<RegisteredObject>(entry), make_uniq<RegisteredObject>(data));
+@@ -1571,7 +1571,7 @@ ModifiedMemoryFileSystem &DuckDBPyConnection::GetObjectFileSystem() {
+ 			    "This operation could not be completed because required module 'fsspec' is not installed");
+ 		}
+ 		internal_object_filesystem = make_shared<ModifiedMemoryFileSystem>(modified_memory_fs());
+-		auto &abstract_fs = (AbstractFileSystem &)*internal_object_filesystem;
++		auto &abstract_fs = reinterpret_cast<AbstractFileSystem &>(*internal_object_filesystem);
+ 		RegisterFilesystem(abstract_fs);
+ 	}
+ 	return *internal_object_filesystem;
+diff --git a/tools/pythonpkg/src/pyrelation.cpp b/tools/pythonpkg/src/pyrelation.cpp
+index ecdb772f9312..45fd21ccac6d 100644
+--- a/tools/pythonpkg/src/pyrelation.cpp
++++ b/tools/pythonpkg/src/pyrelation.cpp
+@@ -847,8 +847,8 @@ void DuckDBPyRelation::Create(const string &table) {
+ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Map(py::function fun, Optional<py::object> schema) {
+ 	AssertRelation();
+ 	vector<Value> params;
+-	params.emplace_back(Value::POINTER((uintptr_t)fun.ptr()));
+-	params.emplace_back(Value::POINTER((uintptr_t)schema.ptr()));
++	params.emplace_back(Value::POINTER(CastPointerToValue(fun.ptr())));
++	params.emplace_back(Value::POINTER(CastPointerToValue(schema.ptr())));
+ 	auto relation = make_uniq<DuckDBPyRelation>(rel->TableFunction("python_map_function", params));
+ 	auto rel_dependency = make_uniq<PythonDependencies>();
+ 	rel_dependency->map_function = std::move(fun);
+@@ -882,7 +882,7 @@ string DuckDBPyRelation::Explain(ExplainType type) {
+ 	py::gil_scoped_release release;
+ 	auto res = rel->Explain(type);
+ 	D_ASSERT(res->type == duckdb::QueryResultType::MATERIALIZED_RESULT);
+-	auto &materialized = (duckdb::MaterializedQueryResult &)*res;
++	auto &materialized = res->Cast<MaterializedQueryResult>();
+ 	auto &coll = materialized.Collection();
+ 	string result;
+ 	for (auto &row : coll.Rows()) {
+diff --git a/tools/pythonpkg/src/pyresult.cpp b/tools/pythonpkg/src/pyresult.cpp
+index 1053ca4605d6..b472a8a36199 100644
+--- a/tools/pythonpkg/src/pyresult.cpp
++++ b/tools/pythonpkg/src/pyresult.cpp
+@@ -47,7 +47,7 @@ unique_ptr<DataChunk> DuckDBPyResult::FetchChunk() {
+ }
+ 
+ unique_ptr<DataChunk> DuckDBPyResult::FetchNext(QueryResult &result) {
+-	if (!result_closed && result.type == QueryResultType::STREAM_RESULT && !((StreamQueryResult &)result).IsOpen()) {
++	if (!result_closed && result.type == QueryResultType::STREAM_RESULT && !result.Cast<StreamQueryResult>().IsOpen()) {
+ 		result_closed = true;
+ 		return nullptr;
+ 	}
+@@ -59,7 +59,7 @@ unique_ptr<DataChunk> DuckDBPyResult::FetchNext(QueryResult &result) {
+ }
+ 
+ unique_ptr<DataChunk> DuckDBPyResult::FetchNextRaw(QueryResult &result) {
+-	if (!result_closed && result.type == QueryResultType::STREAM_RESULT && !((StreamQueryResult &)result).IsOpen()) {
++	if (!result_closed && result.type == QueryResultType::STREAM_RESULT && !result.Cast<StreamQueryResult>().IsOpen()) {
+ 		result_closed = true;
+ 		return nullptr;
+ 	}
+@@ -169,13 +169,13 @@ py::dict DuckDBPyResult::FetchNumpyInternal(bool stream, idx_t vectors_per_chunk
+ 	idx_t initial_capacity = STANDARD_VECTOR_SIZE * 2ULL;
+ 	if (result->type == QueryResultType::MATERIALIZED_RESULT) {
+ 		// materialized query result: we know exactly how much space we need
+-		auto &materialized = (MaterializedQueryResult &)*result;
++		auto &materialized = result->Cast<MaterializedQueryResult>();
+ 		initial_capacity = materialized.RowCount();
+ 	}
+ 
+ 	NumpyResultConversion conversion(result->types, initial_capacity);
+ 	if (result->type == QueryResultType::MATERIALIZED_RESULT) {
+-		auto &materialized = (MaterializedQueryResult &)*result;
++		auto &materialized = result->Cast<MaterializedQueryResult>();
+ 		for (auto &chunk : materialized.Collection().Chunks()) {
+ 			conversion.Append(chunk);
+ 		}
+@@ -186,22 +186,22 @@ py::dict DuckDBPyResult::FetchNumpyInternal(bool stream, idx_t vectors_per_chunk
+ 		if (!stream) {
+ 			vectors_per_chunk = NumericLimits<idx_t>::Maximum();
+ 		}
+-		auto stream_result = (StreamQueryResult *)result.get();
++		auto &stream_result = result->Cast<StreamQueryResult>();
+ 		for (idx_t count_vec = 0; count_vec < vectors_per_chunk; count_vec++) {
+-			if (!stream_result->IsOpen()) {
++			if (!stream_result.IsOpen()) {
+ 				break;
+ 			}
+ 			unique_ptr<DataChunk> chunk;
+ 			{
+ 				py::gil_scoped_release release;
+-				chunk = FetchNextRaw(*stream_result);
++				chunk = FetchNextRaw(stream_result);
+ 			}
+ 			if (!chunk || chunk->size() == 0) {
+ 				//! finished
+ 				break;
+ 			}
+ 			conversion.Append(*chunk);
+-			InsertCategory(*stream_result, categories);
++			InsertCategory(stream_result, categories);
+ 		}
+ 	}
+ 

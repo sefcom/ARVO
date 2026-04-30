@@ -1,0 +1,98 @@
+From 21771329dd2f13568f458a925671f9db80bc8ade Mon Sep 17 00:00:00 2001
+From: Julius Pfrommer <julius.pfrommer@web.de>
+Date: Sat, 6 Oct 2018 15:36:45 +0200
+Subject: [PATCH] Subscription: Close subscriptions before closing the
+ SecureChannel
+
+---
+ src/server/ua_session.c         | 13 -------------
+ src/server/ua_session_manager.c | 31 ++++++++++++++++++++++---------
+ 2 files changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/src/server/ua_session.c b/src/server/ua_session.c
+index 075c9ccfaaa..34f16f6aa0f 100644
+--- a/src/server/ua_session.c
++++ b/src/server/ua_session.c
+@@ -36,19 +36,6 @@ void UA_Session_deleteMembersCleanup(UA_Session *session, UA_Server* server) {
+         UA_BrowseDescription_deleteMembers(&cp->browseDescription);
+         UA_free(cp);
+     }
+-
+-#ifdef UA_ENABLE_SUBSCRIPTIONS
+-    UA_Subscription *sub, *tempsub;
+-    LIST_FOREACH_SAFE(sub, &session->serverSubscriptions, listEntry, tempsub) {
+-        UA_Session_deleteSubscription(server, session, sub->subscriptionId);
+-    }
+-
+-    UA_PublishResponseEntry *entry;
+-    while((entry = UA_Session_dequeuePublishReq(session))) {
+-        UA_PublishResponse_deleteMembers(&entry->response);
+-        UA_free(entry);
+-    }
+-#endif
+ }
+ 
+ void UA_Session_attachToSecureChannel(UA_Session *session, UA_SecureChannel *channel) {
+diff --git a/src/server/ua_session_manager.c b/src/server/ua_session_manager.c
+index 910c225eb7d..be7de86d8f8 100644
+--- a/src/server/ua_session_manager.c
++++ b/src/server/ua_session_manager.c
+@@ -11,6 +11,7 @@
+ 
+ #include "ua_session_manager.h"
+ #include "ua_server_internal.h"
++#include "ua_subscription.h"
+ 
+ UA_StatusCode
+ UA_SessionManager_init(UA_SessionManager *sm, UA_Server *server) {
+@@ -20,15 +21,6 @@ UA_SessionManager_init(UA_SessionManager *sm, UA_Server *server) {
+     return UA_STATUSCODE_GOOD;
+ }
+ 
+-void UA_SessionManager_deleteMembers(UA_SessionManager *sm) {
+-    session_list_entry *current, *temp;
+-    LIST_FOREACH_SAFE(current, &sm->sessions, pointers, temp) {
+-        LIST_REMOVE(current, pointers);
+-        UA_Session_deleteMembersCleanup(&current->session, sm->server);
+-        UA_free(current);
+-    }
+-}
+-
+ /* Delayed callback to free the session memory */
+ static void
+ removeSessionCallback(UA_Server *server, session_list_entry *entry) {
+@@ -37,6 +29,20 @@ removeSessionCallback(UA_Server *server, session_list_entry *entry) {
+ 
+ static void
+ removeSession(UA_SessionManager *sm, session_list_entry *sentry) {
++    /* Remove the Subscriptions */
++#ifdef UA_ENABLE_SUBSCRIPTIONS
++    UA_Subscription *sub, *tempsub;
++    LIST_FOREACH_SAFE(sub, &sentry->session.serverSubscriptions, listEntry, tempsub) {
++        UA_Session_deleteSubscription(sm->server, &sentry->session, sub->subscriptionId);
++    }
++
++    UA_PublishResponseEntry *entry;
++    while((entry = UA_Session_dequeuePublishReq(&sentry->session))) {
++        UA_PublishResponse_deleteMembers(&entry->response);
++        UA_free(entry);
++    }
++#endif
++
+     /* Detach the Session from the SecureChannel */
+     UA_Session_detachFromSecureChannel(&sentry->session);
+ 
+@@ -56,6 +62,13 @@ removeSession(UA_SessionManager *sm, session_list_entry *sentry) {
+     UA_WorkQueue_enqueueDelayed(&sm->server->workQueue, &sentry->cleanupCallback);
+ }
+ 
++void UA_SessionManager_deleteMembers(UA_SessionManager *sm) {
++    session_list_entry *current, *temp;
++    LIST_FOREACH_SAFE(current, &sm->sessions, pointers, temp) {
++        removeSession(sm, current);
++    }
++}
++
+ void
+ UA_SessionManager_cleanupTimedOut(UA_SessionManager *sm,
+                                   UA_DateTime nowMonotonic) {

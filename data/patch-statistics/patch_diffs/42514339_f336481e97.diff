@@ -1,0 +1,126 @@
+From d98008b0c85e1e853e2f67a4e260f75794cb96ee Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshnikov <polimax at mail.ru>
+Date: Sat, 6 Jan 2018 14:46:57 +0000
+Subject: [PATCH] Fix Heap-buffer-overflow READ 1 in OGR CAD driver
+ (https://oss-fuzz.com/v2/testcase-detail/5723062755393536). Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@41207 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ .../ogrsf_frmts/cad/libopencad/cadlayer.cpp   |  3 +--
+ .../ogrsf_frmts/cad/libopencad/dwg/r2000.cpp  | 25 +++++++++++--------
+ 2 files changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/gdal/ogr/ogrsf_frmts/cad/libopencad/cadlayer.cpp b/gdal/ogr/ogrsf_frmts/cad/libopencad/cadlayer.cpp
+index 12daa1bc7006..fb2ac9930291 100644
+--- a/gdal/ogr/ogrsf_frmts/cad/libopencad/cadlayer.cpp
++++ b/gdal/ogr/ogrsf_frmts/cad/libopencad/cadlayer.cpp
+@@ -156,8 +156,7 @@ void CADLayer::addHandle( long handle, CADObject::ObjectType type, long cadinser
+ #endif //_DEBUG
+     if( type == CADObject::ATTRIB || type == CADObject::ATTDEF )
+     {
+-        CADGeometry* pCADGeometry = pCADFile->GetGeometry( this->getId() - 1,
+-                                                           handle );
++        CADGeometry* pCADGeometry = pCADFile->GetGeometry( getId() - 1, handle );
+         std::unique_ptr<CADAttdef> attdef( dynamic_cast<CADAttdef*>(pCADGeometry) );
+         if(attdef)
+         {
+diff --git a/gdal/ogr/ogrsf_frmts/cad/libopencad/dwg/r2000.cpp b/gdal/ogr/ogrsf_frmts/cad/libopencad/dwg/r2000.cpp
+index d79e3d8c5256..ce0ebb38f51b 100644
+--- a/gdal/ogr/ogrsf_frmts/cad/libopencad/dwg/r2000.cpp
++++ b/gdal/ogr/ogrsf_frmts/cad/libopencad/dwg/r2000.cpp
+@@ -1429,7 +1429,7 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+ 
+         case CADObject::MTEXT:
+         {
+-            CADMText       * mtext    = new CADMText();
++            CADMText * mtext = new CADMText();
+             CADMTextObject * cadmText = static_cast<CADMTextObject *>(
+                     readedObject.get());
+ 
+@@ -1458,7 +1458,7 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+             // to do so, == and ++ operators should be implemented.
+             unique_ptr<CADVertexPFaceObject> vertex;
+             auto dCurrentEntHandle = cadpolyPface->hVertexes[0].getAsLong();
+-            auto dLastEntHandle    = cadpolyPface->hVertexes[1].getAsLong();
++            auto dLastEntHandle = cadpolyPface->hVertexes[1].getAsLong();
+             while( true )
+             {
+                 CADObject *pCADVertexPFaceObject = GetObject( dCurrentEntHandle );
+@@ -1511,7 +1511,7 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+ 
+         case CADObject::XLINE:
+         {
+-            CADXLine       * xline    = new CADXLine();
++            CADXLine * xline = new CADXLine();
+             CADXLineObject * cadxLine = static_cast<CADXLineObject *>(
+                     readedObject.get());
+ 
+@@ -1577,7 +1577,8 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+ 
+                 if(nStrSize > 0)
+                 {
+-                    for( size_t i = 0; i < nStrSize; ++i )
++                    for( size_t i = 0; i < nStrSize &&
++                         i < citer->acData.size() - 4; ++i )
+                     {
+                         sEED += citer->acData[i + 4];
+                     }
+@@ -1598,7 +1599,7 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+             {
+                 // FIXME: get CADHandle and return getAsLong() result.
+                 sEED += "Layer table ref (handle):";
+-                for( size_t i = 0; i < 8; ++i )
++                for( size_t i = 0; i < 8 && i < citer->acData.size() - 1; ++i )
+                 {
+                     sEED += citer->acData[i + 1];
+                 }
+@@ -1610,7 +1611,8 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+                 sEED += "Binary chunk (chars):";
+                 if(nChunkSize > 0)
+                 {
+-                    for( size_t i = 0; i < nChunkSize; ++i )
++                    for( size_t i = 0; i < nChunkSize &&
++                         citer->acData.size() - 2; ++i )
+                     {
+                         sEED += citer->acData[i + 2];
+                     }
+@@ -1625,7 +1627,7 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+             {
+                 // FIXME: Get CADHandle and return getAsLong() result.
+                 sEED += "Entity handle ref (handle):";
+-                for( size_t i = 0; i < 8; ++i )
++                for( size_t i = 0; i < 8 && citer->acData.size() - 1; ++i )
+                 {
+                     sEED += citer->acData[i + 1];
+                 }
+@@ -1655,7 +1657,8 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+             {
+                 sEED += "Double:";
+                 double dfVal = 0;
+-                memcpy( & dfVal, citer->acData.data() + 1, 8 );
++                if(citer->acData.size() > 7)
++                    memcpy( & dfVal, citer->acData.data() + 1, 8 );
+                 sEED += to_string( dfVal );
+                 break;
+             }
+@@ -1663,7 +1666,8 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+             {
+                 sEED += "Short:";
+                 short dVal = 0;
+-                memcpy( & dVal, citer->acData.data() + 1, 2 );
++                if(citer->acData.size() > 1)
++                    memcpy( & dVal, citer->acData.data() + 1, 2 );
+                 sEED += to_string( dVal );
+                 break;
+             }
+@@ -1671,7 +1675,8 @@ CADGeometry * DWGFileR2000::GetGeometry( size_t iLayerIndex, long dHandle, long
+             {
+                 sEED += "Long Int:";
+                 long dVal = 0;
+-                memcpy( & dVal, citer->acData.data() + 1, 4 );
++                if(citer->acData.size() > 3)
++                    memcpy( & dVal, citer->acData.data() + 1, 4 );
+                 sEED += to_string( dVal );
+                 break;
+             }

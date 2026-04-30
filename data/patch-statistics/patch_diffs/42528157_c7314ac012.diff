@@ -1,0 +1,70 @@
+From b64ed060d8813e114d2996adbd1eb68f3d26ad9e Mon Sep 17 00:00:00 2001
+From: Tim Ledbetter <timledbetter@gmail.com>
+Date: Tue, 3 Oct 2023 23:40:09 +0100
+Subject: [PATCH] LibGfx/PNGLoader: Add validation for IHDR width, height and
+ bit depth
+
+---
+ .../LibGfx/ImageFormats/PNGLoader.cpp         | 35 +++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/Userland/Libraries/LibGfx/ImageFormats/PNGLoader.cpp b/Userland/Libraries/LibGfx/ImageFormats/PNGLoader.cpp
+index 95e17873731350..aa8f8294c4158f 100644
+--- a/Userland/Libraries/LibGfx/ImageFormats/PNGLoader.cpp
++++ b/Userland/Libraries/LibGfx/ImageFormats/PNGLoader.cpp
+@@ -166,8 +166,8 @@ struct PNGLoadingContext {
+     u8 const* data { nullptr };
+     u8 const* data_current_ptr { nullptr };
+     size_t data_size { 0 };
+-    int width { -1 };
+-    int height { -1 };
++    i32 width { -1 };
++    i32 height { -1 };
+     u8 bit_depth { 0 };
+     PNG::ColorType color_type { 0 };
+     u8 compression_method { 0 };
+@@ -926,6 +926,22 @@ static bool is_valid_filter_method(u8 filter_method)
+     return filter_method == 0;
+ }
+ 
++static bool is_valid_bit_depth(u8 bit_depth, PNG::ColorType color_type)
++{
++    switch (bit_depth) {
++    case 1:
++    case 2:
++    case 4:
++        return color_type == PNG::ColorType::Greyscale || color_type == PNG::ColorType::IndexedColor;
++    case 8:
++        return true;
++    case 16:
++        return color_type != PNG::ColorType::IndexedColor;
++    default:
++        return false;
++    }
++}
++
+ static ErrorOr<void> process_IHDR(ReadonlyBytes data, PNGLoadingContext& context)
+ {
+     if (data.size() < (int)sizeof(PNG_IHDR))
+@@ -933,6 +949,21 @@ static ErrorOr<void> process_IHDR(ReadonlyBytes data, PNGLoadingContext& context
+ 
+     auto const& ihdr = *(const PNG_IHDR*)data.data();
+ 
++    if (ihdr.width == 0 || ihdr.width > NumericLimits<i32>::max()) {
++        dbgln("PNG has invalid width {}", ihdr.width);
++        return Error::from_string_literal("Invalid width");
++    }
++
++    if (ihdr.height == 0 || ihdr.height > NumericLimits<i32>::max()) {
++        dbgln("PNG has invalid height {}", ihdr.height);
++        return Error::from_string_literal("Invalid height");
++    }
++
++    if (!is_valid_bit_depth(ihdr.bit_depth, ihdr.color_type)) {
++        dbgln("PNG has invalid bit depth {} for color type {}", ihdr.bit_depth, to_underlying(ihdr.color_type));
++        return Error::from_string_literal("Invalid bit depth");
++    }
++
+     if (!is_valid_compression_method(ihdr.compression_method)) {
+         dbgln("PNG has invalid compression method {}", ihdr.compression_method);
+         return Error::from_string_literal("Unsupported compression method");

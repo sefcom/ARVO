@@ -1,0 +1,448 @@
+From 82396cfa523b4b7ef16e720d6c353fc85d91841d Mon Sep 17 00:00:00 2001
+From: jeanlf <jeanlf@gpac.io>
+Date: Thu, 20 May 2021 13:13:51 +0200
+Subject: [PATCH] updated vvcC syntax to FDIS version
+
+---
+ applications/mp4box/filedump.c |  24 ++++----
+ include/gpac/mpeg4_odf.h       |   6 +-
+ src/filters/reframe_nalu.c     |   7 ++-
+ src/isomedia/avc_ext.c         |  16 ++++-
+ src/isomedia/box_dump.c        |  31 +++++-----
+ src/isomedia/iff.c             |   2 +-
+ src/media_tools/isom_tools.c   |   6 +-
+ src/odf/descriptors.c          | 104 ++++++++++++++++++---------------
+ 8 files changed, 111 insertions(+), 85 deletions(-)
+
+diff --git a/applications/mp4box/filedump.c b/applications/mp4box/filedump.c
+index 88310571a1..defb0c3911 100644
+--- a/applications/mp4box/filedump.c
++++ b/applications/mp4box/filedump.c
+@@ -2254,6 +2254,8 @@ static void DumpMetaItem(GF_ISOFile *file, Bool root_meta, u32 tk_num, char *nam
+ 	}
+ 
+ 	count = gf_isom_get_meta_item_count(file, root_meta, tk_num);
++	if (!count && !meta_type) return;
++
+ 	primary_id = gf_isom_get_meta_primary_item_id(file, root_meta, tk_num);
+ 	fprintf(stderr, "%s type: \"%s\" - %d resource item(s)\n", name, meta_type ? gf_4cc_to_str(meta_type) : "undefined", (count+(primary_id>0)));
+ 	switch (gf_isom_has_meta_xml(file, root_meta, tk_num)) {
+@@ -2340,8 +2342,8 @@ static void DumpMetaItem(GF_ISOFile *file, Bool root_meta, u32 tk_num, char *nam
+ 		fprintf(stderr, "\n");
+ 		if (url) fprintf(stderr, "%sURL: %s\n", szInd, url);
+ 		if (urn) fprintf(stderr, "%sURN: %s\n", szInd, urn);
+-
+ 	}
++	fprintf(stderr, "\n");
+ }
+ 
+ 
+@@ -2455,18 +2457,19 @@ void dump_vvc_track_info(GF_ISOFile *file, u32 trackNum, GF_VVCConfig *vvccfg
+ 	u32 idx;
+ #endif
+ 	u32 k;
+-	fprintf(stderr, "\tVVC Info:");
+-
+-	fprintf(stderr, " Profile %d @ Level %d - Chroma Format %s\n", vvccfg->general_profile_idc, vvccfg->general_level_idc, vvccfg->chromaformat_plus_one ? gf_avc_hevc_get_chroma_format_name(vvccfg->chromaformat_plus_one-1) : "n/a");
+-	fprintf(stderr, "\n");
+ 	fprintf(stderr, "\tNAL Unit length bits: %d", 8*vvccfg->nal_unit_size);
+-	if (vvccfg->general_constraint_info && vvccfg->num_constraint_info && vvccfg->general_constraint_info[0]) {
+-		fprintf(stderr, " - general constraint info 0x");
+-		for (idx=0; idx<vvccfg->num_constraint_info; idx++) {
+-			fprintf(stderr, "%02X", vvccfg->general_constraint_info[idx]);
++	if (vvccfg->ptl_present) {
++		fprintf(stderr, " Profile %d @ Level %d - Chroma Format %s", vvccfg->general_profile_idc, vvccfg->general_level_idc, gf_avc_hevc_get_chroma_format_name(vvccfg->chroma_format));
++		if (vvccfg->general_constraint_info && vvccfg->num_constraint_info && vvccfg->general_constraint_info[0]) {
++			fprintf(stderr, " - general constraint info 0x");
++			for (idx=0; idx<vvccfg->num_constraint_info; idx++) {
++				fprintf(stderr, "%02X", vvccfg->general_constraint_info[idx]);
++			}
+ 		}
++		fprintf(stderr, "\n");
++		fprintf(stderr, "\tBit Depth %d - %d temporal layers\n", vvccfg->bit_depth, vvccfg->numTemporalLayers);
+ 	}
+-	fprintf(stderr, "\n");
++
+ 	fprintf(stderr, "\tParameter Sets: ");
+ 	for (k=0; k<gf_list_count(vvccfg->param_array); k++) {
+ 		GF_NALUFFParamArray *ar=gf_list_get(vvccfg->param_array, k);
+@@ -2519,7 +2522,6 @@ void dump_vvc_track_info(GF_ISOFile *file, u32 trackNum, GF_VVCConfig *vvccfg
+ 		}
+ 	}
+ #endif
+-	fprintf(stderr, "\tBit Depth %d - %d temporal layers\n", vvccfg->bit_depth_plus_one-1, vvccfg->numTemporalLayers);
+ 
+ 	for (k=0; k<gf_list_count(vvccfg->param_array); k++) {
+ 		GF_NALUFFParamArray *ar=gf_list_get(vvccfg->param_array, k);
+diff --git a/include/gpac/mpeg4_odf.h b/include/gpac/mpeg4_odf.h
+index a7b5a14ae1..536b78e34b 100644
+--- a/include/gpac/mpeg4_odf.h
++++ b/include/gpac/mpeg4_odf.h
+@@ -1022,7 +1022,6 @@ typedef struct
+ /*! VVC config record - not a real MPEG-4 descriptor*/
+ typedef struct
+ {
+-	u8 configurationVersion;
+ 	u8 general_profile_idc;
+ 	u8 general_tier_flag;
+ 	u8 general_sub_profile_idc;
+@@ -1033,11 +1032,12 @@ typedef struct
+ 	u8 ptl_sublayer_present_mask;
+ 	u8 sublayer_level_idc[8];
+ 
+-	u8 chromaformat_plus_one;
+-	u8 bit_depth_plus_one;
++	u8 chroma_format;
++	u8 bit_depth;
+ 	u16 avgFrameRate;
+ 	u8 constantFrameRate;
+ 	u8 numTemporalLayers;
++	u16 maxPictureWidth, maxPictureHeight;
+ 
+ 	Bool ptl_present, ptl_frame_only_constraint, ptl_multilayer_enabled;
+ 	u8 num_sub_profiles;
+diff --git a/src/filters/reframe_nalu.c b/src/filters/reframe_nalu.c
+index dbe3c6e1ea..cf94f97c44 100644
+--- a/src/filters/reframe_nalu.c
++++ b/src/filters/reframe_nalu.c
+@@ -1166,7 +1166,6 @@ static void naludmx_create_vvc_decoder_config(GF_NALUDmxCtx *ctx, u8 **dsi, u32
+ 
+ 		if (first || (is_lvvc && first_lvvc) ) {
+ 			VVC_VPS *vps = &ctx->vvc_state->vps[sps->vps_id];
+-			cfg->configurationVersion = 1;
+ 			cfg->avgFrameRate = 0;
+ 			cfg->constantFrameRate = 1;
+ 			cfg->numTemporalLayers = sps->max_sublayers;
+@@ -1190,8 +1189,10 @@ static void naludmx_create_vvc_decoder_config(GF_NALUDmxCtx *ctx, u8 **dsi, u32
+ 				cfg->num_sub_profiles = 0;
+ 				cfg->ols_idx = 0;
+ 			}
+-			cfg->chromaformat_plus_one = 1 + sps->chroma_format_idc;
+-			cfg->bit_depth_plus_one = 1 + sps->bitdepth;
++			cfg->chroma_format = sps->chroma_format_idc;
++			cfg->bit_depth = sps->bitdepth;
++			cfg->maxPictureWidth = sps->width;
++			cfg->maxPictureHeight = sps->height;
+ 
+ 			if (sps->aspect_ratio_info_present_flag && sps->sar_width && sps->sar_height) {
+ 				sar->num = sps->sar_width;
+diff --git a/src/isomedia/avc_ext.c b/src/isomedia/avc_ext.c
+index 4fb5a6140a..a234825fa6 100644
+--- a/src/isomedia/avc_ext.c
++++ b/src/isomedia/avc_ext.c
+@@ -3021,26 +3021,36 @@ GF_Err vvcc_box_size(GF_Box *s)
+ 		return GF_OK;
+ 	}
+ 
+-	ptr->size += 6;
++	ptr->size += 1;
+ 	if (ptr->config->ptl_present) {
++		ptr->size += 3;
++		//size PTL
+ 		if (!ptr->config->general_constraint_info)
+ 			ptr->config->num_constraint_info = 0;
+ 		if (!ptr->config->sub_profiles_idc)
+ 			ptr->config->num_sub_profiles = 0;
+ 
+-		ptr->size += 2 + 2 + ptr->config->num_constraint_info + 2 + ptr->config->num_sub_profiles*4;
++		ptr->size += 3 + ptr->config->num_constraint_info;
+ 		if (ptr->config->numTemporalLayers>1)
+ 			ptr->size += 1;
+ 		for (i=0; i<ptr->config->numTemporalLayers; i++) {
+ 			if (ptr->config->ptl_sublayer_present_mask & (1<<i))
+ 				ptr->size+=1;
+ 		}
++		ptr->size += 1 + ptr->config->num_sub_profiles*4;
++		//end size PTL
++		ptr->size += 6;
+ 	}
+ 
++	ptr->size += 1;
+ 	count = gf_list_count(ptr->config->param_array);
+ 	for (i=0; i<count; i++) {
+ 		GF_NALUFFParamArray *ar = (GF_NALUFFParamArray*)gf_list_get(ptr->config->param_array, i);
+-		ptr->size += 3;
++		if ((ar->type != GF_VVC_NALU_DEC_PARAM) && (ar->type != GF_VVC_NALU_OPI))
++			ptr->size += 3;
++		else
++			ptr->size += 1;
++
+ 		subcount = gf_list_count(ar->nalus);
+ 		for (j=0; j<subcount; j++) {
+ 			ptr->size += 2 + ((GF_NALUFFParam *)gf_list_get(ar->nalus, j))->size;
+diff --git a/src/isomedia/box_dump.c b/src/isomedia/box_dump.c
+index 445c3cfa8f..0669b07e60 100644
+--- a/src/isomedia/box_dump.c
++++ b/src/isomedia/box_dump.c
+@@ -1717,7 +1717,7 @@ GF_Err vvcc_box_dump(GF_Box *a, FILE * trace)
+ 		} else {
+ 			gf_fprintf(trace, "<VVCDecoderConfigurationRecord nal_unit_size=\"\" configurationVersion=\"\" ");
+ 			gf_fprintf(trace, "general_profile_idc=\"\" general_tier_flag=\"\" general_sub_profile_idc=\"\" general_constraint_info=\"\" general_level_idc=\"\" ");
+-			gf_fprintf(trace, "chroma_format=\"\" luma_bit_depth=\"\" chroma_bit_depth=\"\" avgFrameRate=\"\" constantFrameRate=\"\" numTemporalLayers=\"\"");
++			gf_fprintf(trace, "chroma_format=\"\" luma_bit_depth=\"\" chroma_bit_depth=\"\" avgFrameRate=\"\" constantFrameRate=\"\" numTemporalLayers=\"\" maxWidth=\"\" maxHeight=\"\"");
+ 
+ 			gf_fprintf(trace, ">\n");
+ 			gf_fprintf(trace, "<ParameterSetArray nalu_type=\"\" complete_set=\"\">\n");
+@@ -1730,21 +1730,22 @@ GF_Err vvcc_box_dump(GF_Box *a, FILE * trace)
+ 	}
+ 
+ 	gf_fprintf(trace, "<VVCDecoderConfigurationRecord nal_unit_size=\"%d\" ", p->config->nal_unit_size);
+-	gf_fprintf(trace, "configurationVersion=\"%u\" ", p->config->configurationVersion);
+-	gf_fprintf(trace, "general_profile_idc=\"%u\" ", p->config->general_profile_idc);
+-	gf_fprintf(trace, "general_tier_flag=\"%u\" ", p->config->general_tier_flag);
+-	gf_fprintf(trace, "general_sub_profile_idc=\"%u\" ", p->config->general_sub_profile_idc);
+-	if (p->config->general_constraint_info) {
+-		gf_fprintf(trace, "general_constraint_info=\"");
+-		dump_data_hex(trace, p->config->general_constraint_info, p->config->num_constraint_info);
+-		gf_fprintf(trace, "\" ");
++	if (p->config->ptl_present) {
++
++		gf_fprintf(trace, "chroma_format=\"%s\" chroma_bit_depth=\"%u\" avgFrameRate=\"%u\" constantFrameRate=\"%u\" numTemporalLayers=\"%u\" maxWidth=\"%u\" maxHeight=\"%u\" ",
++			gf_avc_hevc_get_chroma_format_name(p->config->chroma_format),
++			p->config->bit_depth, p->config->avgFrameRate, p->config->constantFrameRate, p->config->numTemporalLayers, p->config->maxPictureWidth, p->config->maxPictureHeight);
++
++		gf_fprintf(trace, "general_profile_idc=\"%u\" ", p->config->general_profile_idc);
++		gf_fprintf(trace, "general_tier_flag=\"%u\" ", p->config->general_tier_flag);
++		gf_fprintf(trace, "general_sub_profile_idc=\"%u\" ", p->config->general_sub_profile_idc);
++		if (p->config->general_constraint_info) {
++			gf_fprintf(trace, "general_constraint_info=\"");
++			dump_data_hex(trace, p->config->general_constraint_info, p->config->num_constraint_info);
++			gf_fprintf(trace, "\" ");
++		}
++		gf_fprintf(trace, "general_level_idc=\"%u\" ", p->config->general_level_idc);
+ 	}
+-	gf_fprintf(trace, "general_level_idc=\"%u\" ", p->config->general_level_idc);
+-
+-	gf_fprintf(trace, "chroma_format=\"%s\" chroma_bit_depth=\"%u\" avgFrameRate=\"%u\" constantFrameRate=\"%u\" numTemporalLayers=\"%u\" ",
+-			p->config->chromaformat_plus_one ? gf_avc_hevc_get_chroma_format_name(p->config->chromaformat_plus_one) : "n/a",
+-			p->config->bit_depth_plus_one - 1, p->config->avgFrameRate, p->config->constantFrameRate, p->config->numTemporalLayers);
+-
+ 	gf_fprintf(trace, ">\n");
+ 
+ 	count = gf_list_count(p->config->param_array);
+diff --git a/src/isomedia/iff.c b/src/isomedia/iff.c
+index 14c1bf8da5..2357fc2fe2 100644
+--- a/src/isomedia/iff.c
++++ b/src/isomedia/iff.c
+@@ -1453,7 +1453,7 @@ static GF_Err gf_isom_iff_create_image_item_from_track_internal(GF_ISOFile *movi
+ 
+ 		config_needed = 1;
+ 		num_channels = 3;
+-		bits_per_channel[0] = ((GF_VVCConfigurationBox *)config_box)->config->bit_depth_plus_one - 1;
++		bits_per_channel[0] = ((GF_VVCConfigurationBox *)config_box)->config->bit_depth;
+ 		bits_per_channel[1] = bits_per_channel[2] = bits_per_channel[0];
+ 		//media_brand = GF_ISOM_BRAND_HEIC;
+ 		break;
+diff --git a/src/media_tools/isom_tools.c b/src/media_tools/isom_tools.c
+index 0459080a89..2016daa12b 100644
+--- a/src/media_tools/isom_tools.c
++++ b/src/media_tools/isom_tools.c
+@@ -3937,7 +3937,11 @@ GF_Err rfc_6381_get_codec_vvc(char *szCodec, u32 subtype, GF_VVCConfig *vvcc)
+ {
+ 	assert(vvcc);
+ 
+-	snprintf(szCodec, RFC6381_CODEC_NAME_SIZE_MAX, "%s.%d.%s%d", gf_4cc_to_str(subtype), vvcc->general_profile_idc, vvcc->general_tier_flag ? "H" : "L", vvcc->general_level_idc);
++	if ( (subtype==GF_4CC('v','v','c','N')) || (subtype==GF_4CC('v','v','s','1')) ) {
++		snprintf(szCodec, RFC6381_CODEC_NAME_SIZE_MAX, "%s", gf_4cc_to_str(subtype));
++	} else {
++		snprintf(szCodec, RFC6381_CODEC_NAME_SIZE_MAX, "%s.%d.%s%d", gf_4cc_to_str(subtype), vvcc->general_profile_idc, vvcc->general_tier_flag ? "H" : "L", vvcc->general_level_idc);
++	}
+ 	return GF_OK;
+ }
+ GF_Err rfc_6381_get_codec_mpegha(char *szCodec, u32 subtype, u8 *dsi, u32 dsi_size, s32 pl)
+diff --git a/src/odf/descriptors.c b/src/odf/descriptors.c
+index 69fdf9de47..afc623729e 100644
+--- a/src/odf/descriptors.c
++++ b/src/odf/descriptors.c
+@@ -1086,8 +1086,9 @@ GF_VVCConfig *gf_odf_vvc_cfg_new()
+ 	GF_SAFEALLOC(cfg, GF_VVCConfig);
+ 	if (!cfg) return NULL;
+ 	cfg->param_array = gf_list_new();
+-	cfg->configurationVersion = 1;
+ 	cfg->nal_unit_size = 4;
++	cfg->chroma_format = 1;
++	cfg->bit_depth = 8;
+ 	return cfg;
+ }
+ 
+@@ -1124,19 +1125,27 @@ GF_Err gf_odf_vvc_cfg_write_bs(GF_VVCConfig *cfg, GF_BitStream *bs)
+ 	count = gf_list_count(cfg->param_array);
+ 
+ 	if (!cfg->write_annex_b) {
+-		gf_bs_write_u8(bs, cfg->configurationVersion);
+-		gf_bs_write_u16(bs, cfg->avgFrameRate);
+-		gf_bs_write_int(bs, cfg->constantFrameRate, 2);
+-		gf_bs_write_int(bs, cfg->numTemporalLayers, 3);
++
++		gf_bs_write_int(bs, 0xFF, 5);
+ 		gf_bs_write_int(bs, cfg->nal_unit_size - 1, 2);
+ 		gf_bs_write_int(bs, cfg->ptl_present, 1);
+ 
+ 		if (cfg->ptl_present) {
+ 			s32 idx;
++
++			gf_bs_write_int(bs, cfg->ols_idx, 9);
++			gf_bs_write_int(bs, cfg->numTemporalLayers, 3);
++			gf_bs_write_int(bs, cfg->constantFrameRate, 2);
++			gf_bs_write_int(bs, cfg->chroma_format, 2);
++			gf_bs_write_int(bs, cfg->bit_depth - 8, 3);
++			gf_bs_write_int(bs, 0xFF, 5);
++
+ 			if (!cfg->general_constraint_info)
+ 				cfg->num_constraint_info = 0;
+ 
+-			gf_bs_write_u8(bs, cfg->num_constraint_info);
++			//write PTL
++			gf_bs_write_int(bs, 0, 2);
++			gf_bs_write_int(bs, cfg->num_constraint_info, 6);
+ 			gf_bs_write_int(bs, cfg->general_profile_idc, 7);
+ 			gf_bs_write_int(bs, cfg->general_tier_flag, 1);
+ 			gf_bs_write_u8(bs, cfg->general_level_idc);
+@@ -1149,9 +1158,10 @@ GF_Err gf_odf_vvc_cfg_write_bs(GF_VVCConfig *cfg, GF_BitStream *bs)
+ 			} else {
+ 				gf_bs_write_int(bs, 0, 6);
+ 			}
++
+ 			for (idx=cfg->numTemporalLayers-2; idx>=0; idx--) {
+ 				u8 val = cfg->ptl_sublayer_present_mask & (1<<idx);
+-				gf_bs_write_int(bs, val, 1);
++				gf_bs_write_int(bs, val ? 1 : 0, 1);
+ 			}
+ 			for (idx=cfg->numTemporalLayers; idx<=8 && cfg->numTemporalLayers>1; idx++) {
+ 				gf_bs_write_int(bs, 0, 1);
+@@ -1165,21 +1175,12 @@ GF_Err gf_odf_vvc_cfg_write_bs(GF_VVCConfig *cfg, GF_BitStream *bs)
+ 			for (idx=0; idx<cfg->num_sub_profiles; idx++) {
+ 				gf_bs_write_u32(bs, cfg->sub_profiles_idc[idx]);
+ 			}
+-			gf_bs_write_int(bs, cfg->ols_idx, 16);
+-		}
+-		gf_bs_write_int(bs, cfg->chromaformat_plus_one ? 1 : 0, 1);
+-		if (cfg->chromaformat_plus_one)
+-			gf_bs_write_int(bs, cfg->chromaformat_plus_one - 1, 2);
+-		else
+-			gf_bs_write_int(bs, 0xFF, 2);
++			//end PTL
+ 
+-		gf_bs_write_int(bs, cfg->bit_depth_plus_one ? 1 : 0, 1);
+-		if (cfg->bit_depth_plus_one)
+-			gf_bs_write_int(bs, cfg->bit_depth_plus_one - 8 - 1, 3);
+-		else
+-			gf_bs_write_int(bs, 0xFF, 3);
+-
+-		gf_bs_write_int(bs, 1, 1);
++			gf_bs_write_u16(bs, cfg->maxPictureWidth);
++			gf_bs_write_u16(bs, cfg->maxPictureHeight);
++			gf_bs_write_u16(bs, cfg->avgFrameRate);
++		}
+ 		gf_bs_write_int(bs, count, 8);
+ 	}
+ 
+@@ -1190,9 +1191,13 @@ GF_Err gf_odf_vvc_cfg_write_bs(GF_VVCConfig *cfg, GF_BitStream *bs)
+ 		nalucount = gf_list_count(ar->nalus);
+ 		if (!cfg->write_annex_b) {
+ 			gf_bs_write_int(bs, ar->array_completeness, 1);
+-			gf_bs_write_int(bs, 0, 1);
+-			gf_bs_write_int(bs, ar->type, 6);
+-			gf_bs_write_int(bs, nalucount, 16);
++			gf_bs_write_int(bs, 0, 2);
++			gf_bs_write_int(bs, ar->type, 5);
++
++			if ((ar->type != GF_VVC_NALU_DEC_PARAM) && (ar->type != GF_VVC_NALU_OPI))
++				gf_bs_write_int(bs, nalucount, 16);
++			else
++				nalucount = 1;
+ 		}
+ 
+ 		for (j=0; j<nalucount; j++) {
+@@ -1229,16 +1234,23 @@ GF_VVCConfig *gf_odf_vvc_cfg_read_bs(GF_BitStream *bs)
+ 	u32 i, count;
+ 	GF_VVCConfig *cfg = gf_odf_vvc_cfg_new();
+ 
+-	cfg->configurationVersion = gf_bs_read_u8(bs);
+-	cfg->avgFrameRate = gf_bs_read_u16(bs);
+-	cfg->constantFrameRate = gf_bs_read_int(bs, 2);
+-	cfg->numTemporalLayers = gf_bs_read_int(bs, 3);
++	gf_bs_read_int(bs, 5);
+ 	cfg->nal_unit_size = 1 + gf_bs_read_int(bs, 2);
+ 	cfg->ptl_present = gf_bs_read_int(bs, 1);
+ 
+ 	if (cfg->ptl_present) {
+ 		s32 j;
+-		cfg->num_constraint_info = gf_bs_read_u8(bs);
++
++		cfg->ols_idx = gf_bs_read_int(bs, 9);
++		cfg->numTemporalLayers = gf_bs_read_int(bs, 3);
++		cfg->constantFrameRate = gf_bs_read_int(bs, 2);
++		cfg->chroma_format = gf_bs_read_int(bs, 2);
++		cfg->bit_depth = 8 + gf_bs_read_int(bs, 3);
++		gf_bs_read_int(bs, 5);
++
++		//parse PTL
++		gf_bs_read_int(bs, 2);
++		cfg->num_constraint_info = gf_bs_read_int(bs, 6);
+ 		cfg->general_profile_idc = gf_bs_read_int(bs, 7);
+ 		cfg->general_tier_flag = gf_bs_read_int(bs, 1);
+ 		cfg->general_level_idc = gf_bs_read_u8(bs);
+@@ -1255,13 +1267,14 @@ GF_VVCConfig *gf_odf_vvc_cfg_read_bs(GF_BitStream *bs)
+ 			gf_bs_read_data(bs, cfg->general_constraint_info, cfg->num_constraint_info - 1);
+ 			cfg->general_constraint_info[cfg->num_constraint_info-1] =  gf_bs_read_int(bs, 6);
+ 		} else {
++			//forbidden in spec!
+ 			gf_bs_read_int(bs, 6);
+ 		}
+ 
+ 		cfg->ptl_sublayer_present_mask = 0;
+ 		for (j=cfg->numTemporalLayers-2; j>=0; j--) {
+-			u8 val = gf_bs_read_int(bs, 1);
+-			cfg->ptl_sublayer_present_mask = val << j;
++			u32 val = gf_bs_read_int(bs, 1);
++			cfg->ptl_sublayer_present_mask |= val << j;
+ 		}
+ 		for (j=cfg->numTemporalLayers; j<=8 && cfg->numTemporalLayers>1; j++) {
+ 			gf_bs_read_int(bs, 1);
+@@ -1284,23 +1297,13 @@ GF_VVCConfig *gf_odf_vvc_cfg_read_bs(GF_BitStream *bs)
+ 		for (i=0; i<cfg->num_sub_profiles; i++) {
+ 			cfg->sub_profiles_idc[i] = gf_bs_read_u32(bs);
+ 		}
+-		cfg->ols_idx = gf_bs_read_u16(bs);
+-	}
+ 
+-	if (gf_bs_read_int(bs, 1)) {
+-		cfg->chromaformat_plus_one = 1 + gf_bs_read_int(bs, 2);
+-	} else {
+-		cfg->chromaformat_plus_one = 0;
+-		gf_bs_read_int(bs, 2);
+-	}
++		//end PTL
+ 
+-	if (gf_bs_read_int(bs, 1)) {
+-		cfg->bit_depth_plus_one = 1 + 8 + gf_bs_read_int(bs, 3);
+-	} else {
+-		cfg->bit_depth_plus_one = 0;
+-		gf_bs_read_int(bs, 3);
++		cfg->maxPictureWidth = gf_bs_read_u16(bs);
++		cfg->maxPictureHeight = gf_bs_read_u16(bs);
++		cfg->avgFrameRate = gf_bs_read_u16(bs);
+ 	}
+-	gf_bs_read_int(bs, 1);
+ 
+ 	count = gf_bs_read_int(bs, 8);
+ 	for (i=0; i<count; i++) {
+@@ -1316,9 +1319,14 @@ GF_VVCConfig *gf_odf_vvc_cfg_read_bs(GF_BitStream *bs)
+ 		gf_list_add(cfg->param_array, ar);
+ 
+ 		ar->array_completeness = gf_bs_read_int(bs, 1);
+-		gf_bs_read_int(bs, 1);
+-		ar->type = gf_bs_read_int(bs, 6);
+-		nalucount = gf_bs_read_int(bs, 16);
++		gf_bs_read_int(bs, 2);
++		ar->type = gf_bs_read_int(bs, 5);
++
++		if ((ar->type != GF_VVC_NALU_DEC_PARAM) && (ar->type != GF_VVC_NALU_OPI))
++			nalucount = gf_bs_read_int(bs, 16);
++		else
++			nalucount = 1;
++			
+ 		for (j=0; j<nalucount; j++) {
+ 			GF_NALUFFParam *sl;
+ 			u32 size = gf_bs_read_int(bs, 16);

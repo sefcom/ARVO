@@ -1,0 +1,72 @@
+From 869bd2589ff211ca906b4240f6dbd0ef6308b8fc Mon Sep 17 00:00:00 2001
+From: Aurelien David <aurelien.david@telecom-paristech.fr>
+Date: Wed, 25 Sep 2024 13:24:37 +0200
+Subject: [PATCH] added some size checks to m2ts
+
+ossfuzz issues 368725673, 368490563
+---
+ src/media_tools/mpegts.c | 9 +++++++--
+ src/odf/slc.c            | 5 ++---
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/src/media_tools/mpegts.c b/src/media_tools/mpegts.c
+index b22fdbecd7..cac6564eec 100644
+--- a/src/media_tools/mpegts.c
++++ b/src/media_tools/mpegts.c
+@@ -499,6 +499,11 @@ static void gf_m2ts_section_complete(GF_M2TS_Demuxer *ts, GF_M2TS_SectionFilter
+ 		if (section_valid) {
+ 			GF_M2TS_Section *section;
+ 
++			if (sec->length <= section_start) {
++				GF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, ("[MPEG-2 TS] section length invalid\n"));
++				return;
++			}
++
+ 			GF_SAFEALLOC(section, GF_M2TS_Section);
+ 			if (!section) {
+ 				GF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, ("[MPEG-2 TS] Fail to create section\n"));
+@@ -1151,7 +1156,7 @@ static void gf_m2ts_process_pmt(GF_M2TS_Demuxer *ts, GF_M2TS_SECTION_ES *pmt, GF
+ 		len = (u32) data[5];
+ 		while (info_length > first_loop_len) {
+ 			if (tag == GF_M2TS_MPEG4_IOD_DESCRIPTOR) {
+-				if ((len>2) && (len - 2 <= info_length)) {
++				if ((len>2) && (len - 2 <= info_length) && (data_size>8) && (data_size-8 > (u32)len-2)) {
+ 					u32 size;
+ 					GF_BitStream *iod_bs;
+ 					iod_bs = gf_bs_new((char *)data+8, len-2, GF_BITSTREAM_READ);
+@@ -1199,7 +1204,7 @@ static void gf_m2ts_process_pmt(GF_M2TS_Demuxer *ts, GF_M2TS_SECTION_ES *pmt, GF
+ 					/* don't know what to do with it for now, delete */
+ 					gf_m2ts_metadata_pointer_descriptor_del(metapd);
+ 				}
+-			} else if(tag == GF_M2TS_REGISTRATION_DESCRIPTOR && len >= 4) {
++			} else if(tag == GF_M2TS_REGISTRATION_DESCRIPTOR && len >= 4 && data_size>9) {
+ 				u32 reg_desc_format = GF_4CC(data[6], data[7], data[8], data[9]);
+ 				GF_LOG(GF_LOG_INFO, GF_LOG_CONTAINER, ("[MPEG-2 TS] Registration descriptor with format_identifier \"%s\"\n", gf_4cc_to_str(reg_desc_format)));
+ 			} else {
+diff --git a/src/odf/slc.c b/src/odf/slc.c
+index 4563bb2b85..d5c13b9633 100644
+--- a/src/odf/slc.c
++++ b/src/odf/slc.c
+@@ -166,6 +166,8 @@ GF_Err gf_odf_read_slc(GF_BitStream *bs, GF_SLConfig *sl, u32 DescSize)
+ 		e = gf_odf_slc_set_pref(sl);
+ 		if (e) return e;
+ 	} else {
++		if (gf_bs_available(bs) < 15) return GF_ODF_INVALID_DESCRIPTOR;
++
+ 		sl->useAccessUnitStartFlag = gf_bs_read_int(bs, 1);
+ 		sl->useAccessUnitEndFlag = gf_bs_read_int(bs, 1);
+ 		sl->useRandomAccessPointFlag = gf_bs_read_int(bs, 1);
+@@ -179,13 +181,10 @@ GF_Err gf_odf_read_slc(GF_BitStream *bs, GF_SLConfig *sl, u32 DescSize)
+ 
+ 		sl->timestampLength = gf_bs_read_int(bs, 8);
+ 		if (sl->timestampLength > 64) return GF_ODF_INVALID_DESCRIPTOR;
+-
+ 		sl->OCRLength = gf_bs_read_int(bs, 8);
+ 		if (sl->OCRLength > 64) return GF_ODF_INVALID_DESCRIPTOR;
+-
+ 		sl->AULength = gf_bs_read_int(bs, 8);
+ 		if (sl->AULength > 32) return GF_ODF_INVALID_DESCRIPTOR;
+-
+ 		sl->instantBitrateLength = gf_bs_read_int(bs, 8);
+ 		sl->degradationPriorityLength = gf_bs_read_int(bs, 4);
+ 		sl->AUSeqNumLength = gf_bs_read_int(bs, 5);

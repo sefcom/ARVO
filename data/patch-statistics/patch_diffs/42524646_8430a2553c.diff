@@ -1,0 +1,183 @@
+From e9376e47307daf4dd81658b8d0c356e0936b692c Mon Sep 17 00:00:00 2001
+From: Jakub Zawadzki <darkjames-ws@darkjames.pl>
+Date: Sun, 4 Feb 2018 10:12:31 +0100
+Subject: [PATCH] h225: Fix use after free.
+
+next_tvb_add_handle() allocates memory in packet scope.
+When dissecting another packet from dissect_h225_h225_RasMessage() handler [it don't call next_tvb_init()]
+next_tvb_add_handle() will write to freed pointer.
+
+Fix by calling next_tvb_init() after leaving scope in order to clear list->last pointer.
+
+ASAN report:
+ERROR: AddressSanitizer: heap-use-after-free on address 0x6070000854f0 at pc 0x00000208574a bp 0x7ffca839cf00 sp 0x7ffca839cef8
+WRITE of size 8 at 0x6070000854f0 thread T0
+    #0 0x2085749 in next_tvb_add_handle /src/wireshark/epan/next_tvb.c
+    #1 0xef8728 in dissect_h225_ParallelH245Control_item /src/wireshark/epan/dissectors/./asn1/h225/h225.cnf:368:3
+(...)
+    #21 0x168f460 in dissect_per_sequence /src/wireshark/epan/dissectors/packet-per.c:1920:12
+    #22 0xef31d3 in dissect_h225_InfoRequestResponse /src/wireshark/epan/dissectors/./asn1/h225/h225.cnf:910:12
+    #23 0x168e7db in dissect_per_choice /src/wireshark/epan/dissectors/packet-per.c
+    #24 0xeed6e3 in dissect_h225_RasMessage /src/wireshark/epan/dissectors/./asn1/h225/h225.cnf:298:12
+    #25 0xef97af in dissect_RasMessage_PDU /src/wireshark/epan/dissectors/./asn1/h225/h225.cnf:339:12
+    #26 0xeef872 in dissect_h225_h225_RasMessage /src/wireshark/epan/dissectors/./asn1/h225/packet-h225-template.c:385:12
+
+0x6070000854f0 is located 0 bytes inside of 72-byte region [0x6070000854f0,0x607000085538)
+freed by thread T0 here:
+    #0 0x4e2528 in __interceptor_cfree.localalias.0 /src/llvm/projects/compiler-rt/lib/asan/asan_malloc_linux.cc:76
+    #1 0x21263a1 in wmem_simple_free_all /src/wireshark/epan/wmem/wmem_allocator_simple.c:107:9
+    #2 0x205aa4d in wmem_leave_packet_scope /src/wireshark/epan/wmem/wmem_scopes.c:81:5
+(...)
+
+previously allocated by thread T0 here:
+    #0 0x4e26e8 in __interceptor_malloc /src/llvm/projects/compiler-rt/lib/asan/asan_malloc_linux.cc:88
+    #1 0x225c588 in g_malloc (/out/fuzzshark_test+0x225c588)
+    #2 0x20855e0 in next_tvb_add_handle /src/wireshark/epan/next_tvb.c:40:10
+    #3 0xef8728 in dissect_h225_ParallelH245Control_item /src/wireshark/epan/dissectors/./asn1/h225/h225.cnf:368:3
+
+Found by oss-fuzz/5921
+
+Change-Id: Iea006914a9e0c433d2073f6f4c7a2973d5a33a11
+Link: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=5921
+Reviewed-on: https://code.wireshark.org/review/25593
+Petri-Dish: Jakub Zawadzki <darkjames-ws@darkjames.pl>
+Tested-by: Petri Dish Buildbot
+Reviewed-by: Anders Broman <a.broman58@gmail.com>
+---
+ .../asn1/h225/packet-h225-template.c          | 12 ++++++++++
+ epan/dissectors/packet-h225.c                 | 22 ++++++++++++++-----
+ 2 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/epan/dissectors/asn1/h225/packet-h225-template.c b/epan/dissectors/asn1/h225/packet-h225-template.c
+index e39971dfc4e..c92f5362384 100644
+--- a/epan/dissectors/asn1/h225/packet-h225-template.c
++++ b/epan/dissectors/asn1/h225/packet-h225-template.c
+@@ -44,6 +44,7 @@
+ #include <epan/tap.h>
+ #include <epan/stat_tap_ui.h>
+ #include <epan/rtd_table.h>
++#include "packet-frame.h"
+ #include "packet-tpkt.h"
+ #include "packet-per.h"
+ #include "packet-h225.h"
+@@ -329,6 +330,14 @@ h225ras_call_t * append_h225ras_call(h225ras_call_t *prev_call, packet_info *pin
+   return h225ras_call;
+ }
+ 
++static void
++h225_frame_end(void)
++{
++  /* next_tvb pointers are allocated in packet scope, clear it. */
++  next_tvb_init(&h245_list);
++  next_tvb_init(&tp_list);
++}
++
+ static int
+ dissect_h225_H323UserInformation(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
+ {
+@@ -342,6 +351,7 @@ dissect_h225_H323UserInformation(tvbuff_t *tvb, packet_info *pinfo, proto_tree *
+   h225_pi->msg_type = H225_CS;
+   p_add_proto_data(pinfo->pool, pinfo, proto_h225, 0, h225_pi);
+ 
++  register_frame_end_routine(pinfo, h225_frame_end);
+   next_tvb_init(&h245_list);
+   next_tvb_init(&tp_list);
+ 
+@@ -377,6 +387,8 @@ dissect_h225_h225_RasMessage(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree
+   h225_pi->msg_type = H225_RAS;
+   p_add_proto_data(pinfo->pool, pinfo, proto_h225, 0, h225_pi);
+ 
++  register_frame_end_routine(pinfo, h225_frame_end);
++
+   col_set_str(pinfo->cinfo, COL_PROTOCOL, PSNAME);
+ 
+   it=proto_tree_add_protocol_format(tree, proto_h225, tvb, offset, -1, PSNAME" RAS");
+diff --git a/epan/dissectors/packet-h225.c b/epan/dissectors/packet-h225.c
+index 65fe553597e..ad85e2e13f0 100644
+--- a/epan/dissectors/packet-h225.c
++++ b/epan/dissectors/packet-h225.c
+@@ -52,6 +52,7 @@
+ #include <epan/tap.h>
+ #include <epan/stat_tap_ui.h>
+ #include <epan/rtd_table.h>
++#include "packet-frame.h"
+ #include "packet-tpkt.h"
+ #include "packet-per.h"
+ #include "packet-h225.h"
+@@ -908,7 +909,7 @@ static int hf_h225_stopped = -1;                  /* NULL */
+ static int hf_h225_notAvailable = -1;             /* NULL */
+ 
+ /*--- End of included file: packet-h225-hf.c ---*/
+-#line 128 "./asn1/h225/packet-h225-template.c"
++#line 129 "./asn1/h225/packet-h225-template.c"
+ 
+ /* Initialize the subtree pointers */
+ static gint ett_h225 = -1;
+@@ -1156,7 +1157,7 @@ static gint ett_h225_ServiceControlResponse = -1;
+ static gint ett_h225_T_result = -1;
+ 
+ /*--- End of included file: packet-h225-ett.c ---*/
+-#line 132 "./asn1/h225/packet-h225-template.c"
++#line 133 "./asn1/h225/packet-h225-template.c"
+ 
+ /* Preferences */
+ static guint h225_tls_port = TLS_PORT_CS;
+@@ -7823,7 +7824,7 @@ static int dissect_RasMessage_PDU(tvbuff_t *tvb _U_, packet_info *pinfo _U_, pro
+ 
+ 
+ /*--- End of included file: packet-h225-fn.c ---*/
+-#line 248 "./asn1/h225/packet-h225-template.c"
++#line 249 "./asn1/h225/packet-h225-template.c"
+ 
+ /* Forward declaration we need below */
+ void proto_reg_handoff_h225(void);
+@@ -7908,6 +7909,14 @@ h225ras_call_t * append_h225ras_call(h225ras_call_t *prev_call, packet_info *pin
+   return h225ras_call;
+ }
+ 
++static void
++h225_frame_end(void)
++{
++  /* next_tvb pointers are allocated in packet scope, clear it. */
++  next_tvb_init(&h245_list);
++  next_tvb_init(&tp_list);
++}
++
+ static int
+ dissect_h225_H323UserInformation(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
+ {
+@@ -7921,6 +7930,7 @@ dissect_h225_H323UserInformation(tvbuff_t *tvb, packet_info *pinfo, proto_tree *
+   h225_pi->msg_type = H225_CS;
+   p_add_proto_data(pinfo->pool, pinfo, proto_h225, 0, h225_pi);
+ 
++  register_frame_end_routine(pinfo, h225_frame_end);
+   next_tvb_init(&h245_list);
+   next_tvb_init(&tp_list);
+ 
+@@ -7956,6 +7966,8 @@ dissect_h225_h225_RasMessage(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree
+   h225_pi->msg_type = H225_RAS;
+   p_add_proto_data(pinfo->pool, pinfo, proto_h225, 0, h225_pi);
+ 
++  register_frame_end_routine(pinfo, h225_frame_end);
++
+   col_set_str(pinfo->cinfo, COL_PROTOCOL, PSNAME);
+ 
+   it=proto_tree_add_protocol_format(tree, proto_h225, tvb, offset, -1, PSNAME" RAS");
+@@ -11476,7 +11488,7 @@ void proto_register_h225(void) {
+         NULL, HFILL }},
+ 
+ /*--- End of included file: packet-h225-hfarr.c ---*/
+-#line 812 "./asn1/h225/packet-h225-template.c"
++#line 824 "./asn1/h225/packet-h225-template.c"
+   };
+ 
+   /* List of subtrees */
+@@ -11726,7 +11738,7 @@ void proto_register_h225(void) {
+     &ett_h225_T_result,
+ 
+ /*--- End of included file: packet-h225-ettarr.c ---*/
+-#line 818 "./asn1/h225/packet-h225-template.c"
++#line 830 "./asn1/h225/packet-h225-template.c"
+   };
+ 
+   static tap_param h225_stat_params[] = {

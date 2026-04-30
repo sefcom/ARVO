@@ -1,0 +1,284 @@
+From 56c425eec1d9ff9692f9fb2433b7650bde373992 Mon Sep 17 00:00:00 2001
+From: davidot <davidot@serenityos.org>
+Date: Wed, 29 Dec 2021 11:55:06 +0100
+Subject: [PATCH] LibJS: Detect invalid unicode and stop lexing at that point
+
+Previously we might swallow invalid unicode point which would skip valid
+ascii characters. This could be dangerous as we might skip a '"' thus
+not closing a string where we should.
+This might have been exploitable as it would not have been clear what
+code gets executed when looking at a script.
+
+Another approach to this would be simply replacing all invalid
+characters with the replacement character (this is what v8 does). But
+our lexer and parser are currently not set up for such a change.
+---
+ Tests/LibJS/test-invalid-unicode-js.cpp | 146 +++++++++++++++++-------
+ Userland/Libraries/LibJS/Lexer.cpp      |  47 ++++++--
+ Userland/Libraries/LibJS/Lexer.h        |   2 +
+ 3 files changed, 145 insertions(+), 50 deletions(-)
+
+diff --git a/Tests/LibJS/test-invalid-unicode-js.cpp b/Tests/LibJS/test-invalid-unicode-js.cpp
+index 9e209f29d5ac1a..75b6682a081701 100644
+--- a/Tests/LibJS/test-invalid-unicode-js.cpp
++++ b/Tests/LibJS/test-invalid-unicode-js.cpp
+@@ -7,54 +7,129 @@
+ #include <LibJS/Parser.h>
+ #include <LibTest/TestCase.h>
+ 
+-TEST_CASE(invalid_unicode_only)
++static bool produces_eof_tokens(JS::Lexer& lexer)
+ {
+-    char const* code = "\xEA\xFD";
+-    auto lexer = JS::Lexer(code);
+-    auto token = lexer.next();
+-    EXPECT_EQ(token.type(), JS::TokenType::Invalid);
+-
+-    // After this we can get as many eof tokens as we like.
+     for (auto i = 0; i < 10; i++) {
+         auto eof_token = lexer.next();
+-        EXPECT_EQ(eof_token.type(), JS::TokenType::Eof);
++        if (eof_token.type() != JS::TokenType::Eof)
++            return false;
+     }
++    return true;
+ }
+ 
+-TEST_CASE(long_invalid_unicode)
++static bool triggers_immediate_unicode_fault(StringView code)
+ {
+-    char const* code = "\xF7";
+     auto lexer = JS::Lexer(code);
+-    auto token = lexer.next();
+-    EXPECT_EQ(token.type(), JS::TokenType::Invalid);
++    auto first_token = lexer.next();
+ 
+-    // After this we can get as many eof tokens as we like.
+-    for (auto i = 0; i < 10; i++) {
+-        auto eof_token = lexer.next();
+-        EXPECT_EQ(eof_token.type(), JS::TokenType::Eof);
+-    }
++    if (first_token.type() != JS::TokenType::Invalid)
++        return false;
++
++    return produces_eof_tokens(lexer);
+ }
++// In the not leading character it must start with 0b10xxxxxx
++// Thus all these options are invalid:
++// \x0y = 0000 y (or \x1y, \x2y and \x3y)
++// \x4y = 0100 y (or \x5y, \x6y and \x7y)
++// \xCy = 1100 y (or \xDy, \xEy and \xFy)
++// And the only valid option is:
++// \x8y = 1000 y (or \x9y, \xAy
+ 
+-TEST_CASE(invalid_unicode_and_valid_code)
++TEST_CASE(no_input_only_gives_eof)
+ {
+-    char const* code = "\xEA\xFDthrow 1;";
++    char const* code = "";
+     auto lexer = JS::Lexer(code);
+-    auto invalid_token = lexer.next();
+-    EXPECT_EQ(invalid_token.type(), JS::TokenType::Invalid);
+-    // 0xEA is the start of a three character unicode code point thus it consumes the 't'.
+-    auto token_after = lexer.next();
+-    EXPECT_EQ(token_after.value(), "hrow");
++    EXPECT(produces_eof_tokens(lexer));
++}
++
++TEST_CASE(invalid_start_code_point)
++{
++    EXPECT(triggers_immediate_unicode_fault("\x80"sv));
++    EXPECT(triggers_immediate_unicode_fault("\x90"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xA0"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xB0"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF8"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xFF"sv));
++}
++
++TEST_CASE(code_points_of_length_2)
++{
++    // Initial 110xxxxx -> \xCy or \xDy
++    EXPECT(triggers_immediate_unicode_fault("\xC5"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xC5\x02"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xC5\x52"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xC5\xD2"sv));
++
++    EXPECT(triggers_immediate_unicode_fault("\xD5"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xD5\x23"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xD5\x74"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xD5\xF5"sv));
++}
++
++TEST_CASE(code_points_of_length_3)
++{
++    // Initial 1110xxxx -> \xEy
++    EXPECT(triggers_immediate_unicode_fault("\xE5"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xE5\x02"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xE5\x52"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xE5\xD2"sv));
++
++    EXPECT(triggers_immediate_unicode_fault("\xEA\x80"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xEA\x81\x07"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xEA\x82\x57"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xEA\x83\xD7"sv));
++}
++
++TEST_CASE(code_points_of_length_4)
++{
++    // Initial 11110xxx -> \xF{0..7}
++    EXPECT(triggers_immediate_unicode_fault("\xF0"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF1\x02"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF2\x52"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF3\xD2"sv));
++
++    EXPECT(triggers_immediate_unicode_fault("\xF4\x80"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF5\x81\x07"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF6\x82\x57"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF7\x83\xD7"sv));
++
++    EXPECT(triggers_immediate_unicode_fault("\xF4\x80\x80"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF5\x91\x80\x07"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF6\xA2\x80\x57"sv));
++    EXPECT(triggers_immediate_unicode_fault("\xF7\xB3\x80\xD7"sv));
++}
++
++TEST_CASE(gives_valid_part_until_fault)
++{
++    auto code = "abc\xF5\x81\x80\x07; abc\xF5\x81\x80\x07 += 4"sv;
++    JS::Lexer lexer(code);
++    auto first_token = lexer.next();
++    EXPECT_EQ(first_token.type(), JS::TokenType::Identifier);
++    EXPECT_EQ(first_token.value(), "abc"sv);
++    auto second_token = lexer.next();
++    EXPECT_EQ(second_token.type(), JS::TokenType::Invalid);
++    EXPECT(produces_eof_tokens(lexer));
++}
++
++TEST_CASE(gives_fully_parsed_tokens_even_if_invalid_unicode_follows)
++{
++    auto code = "let \xE5\xD2"sv;
++    JS::Lexer lexer(code);
++    auto first_token = lexer.next();
++    EXPECT_EQ(first_token.type(), JS::TokenType::Let);
++    auto second_token = lexer.next();
++    EXPECT_EQ(second_token.type(), JS::TokenType::Invalid);
++    EXPECT(produces_eof_tokens(lexer));
++}
++
++TEST_CASE(invalid_unicode_and_valid_code)
++{
++    EXPECT(triggers_immediate_unicode_fault("\xEA\xFDthrow 1;"sv));
+ }
+ 
+ TEST_CASE(long_invalid_unicode_and_valid_code)
+ {
+-    char const* code = "\xF7throw 1;";
+-    auto lexer = JS::Lexer(code);
+-    auto invalid_token = lexer.next();
+-    EXPECT_EQ(invalid_token.type(), JS::TokenType::Invalid);
+-    // 0xF7 is the start of a four character unicode code point thus it consumes 'thr'.
+-    auto token_after = lexer.next();
+-    EXPECT_EQ(token_after.value(), "ow");
++    EXPECT(triggers_immediate_unicode_fault("\xF7throw 1;"sv));
+ }
+ 
+ TEST_CASE(invalid_unicode_after_valid_code_and_before_eof)
+@@ -65,12 +140,5 @@ TEST_CASE(invalid_unicode_after_valid_code_and_before_eof)
+     EXPECT_EQ(let_token.type(), JS::TokenType::Let);
+     auto invalid_token = lexer.next();
+     EXPECT_EQ(invalid_token.type(), JS::TokenType::Invalid);
+-    // It should still get the valid trivia in front.
+-    EXPECT_EQ(invalid_token.trivia(), " ");
+-
+-    // After this we can get as many eof tokens as we like.
+-    for (auto i = 0; i < 10; i++) {
+-        auto eof_token = lexer.next();
+-        EXPECT_EQ(eof_token.type(), JS::TokenType::Eof);
+-    }
++    EXPECT(produces_eof_tokens(lexer));
+ }
+diff --git a/Userland/Libraries/LibJS/Lexer.cpp b/Userland/Libraries/LibJS/Lexer.cpp
+index a439d0c6840f39..a71469f3621cc8 100644
+--- a/Userland/Libraries/LibJS/Lexer.cpp
++++ b/Userland/Libraries/LibJS/Lexer.cpp
+@@ -194,7 +194,7 @@ void Lexer::consume()
+     } else if (is_unicode_character()) {
+         size_t char_size = 1;
+         if ((m_current_char & 64) == 0) {
+-            // invalid char
++            m_hit_invalid_unicode = m_position;
+         } else if ((m_current_char & 32) == 0) {
+             char_size = 2;
+         } else if ((m_current_char & 16) == 0) {
+@@ -206,7 +206,18 @@ void Lexer::consume()
+         VERIFY(char_size >= 1);
+         --char_size;
+ 
+-        m_position += char_size;
++        for (size_t i = m_position; i < m_position + char_size; i++) {
++            if (i >= m_source.length() || (m_source[i] & 0b11000000) != 0b10000000) {
++                m_hit_invalid_unicode = m_position;
++                break;
++            }
++        }
++
++        if (m_hit_invalid_unicode.has_value())
++            m_position = m_source.length();
++        else
++            m_position += char_size;
++
+         if (did_reach_eof())
+             return;
+ 
+@@ -813,15 +824,29 @@ Token Lexer::next()
+         }
+     }
+ 
+-    m_current_token = Token(
+-        token_type,
+-        token_message,
+-        m_source.substring_view(trivia_start - 1, value_start - trivia_start),
+-        m_source.substring_view(value_start - 1, m_position - value_start),
+-        m_filename,
+-        value_start_line_number,
+-        value_start_column_number,
+-        m_position);
++    if (m_hit_invalid_unicode.has_value()) {
++        value_start = m_hit_invalid_unicode.value() - 1;
++        m_current_token = Token(TokenType::Invalid, "Invalid unicode codepoint in source",
++            "", // Since the invalid unicode can occur anywhere in the current token the trivia is not correct
++            m_source.substring_view(value_start + 1, min(4u, m_source.length() - value_start - 2)),
++            m_filename,
++            m_line_number,
++            m_line_column - 1,
++            m_position);
++        m_hit_invalid_unicode.clear();
++        // Do not produce any further tokens.
++        VERIFY(is_eof());
++    } else {
++        m_current_token = Token(
++            token_type,
++            token_message,
++            m_source.substring_view(trivia_start - 1, value_start - trivia_start),
++            m_source.substring_view(value_start - 1, m_position - value_start),
++            m_filename,
++            value_start_line_number,
++            value_start_column_number,
++            m_position);
++    }
+ 
+     if (identifier.has_value())
+         m_current_token.set_identifier_value(identifier.release_value());
+diff --git a/Userland/Libraries/LibJS/Lexer.h b/Userland/Libraries/LibJS/Lexer.h
+index 6f5e3cbdb5fb3f..326f5aa45b86b0 100644
+--- a/Userland/Libraries/LibJS/Lexer.h
++++ b/Userland/Libraries/LibJS/Lexer.h
+@@ -77,6 +77,8 @@ class Lexer {
+ 
+     bool m_allow_html_comments { true };
+ 
++    Optional<size_t> m_hit_invalid_unicode;
++
+     static HashMap<FlyString, TokenType> s_keywords;
+     static HashMap<String, TokenType> s_three_char_tokens;
+     static HashMap<String, TokenType> s_two_char_tokens;

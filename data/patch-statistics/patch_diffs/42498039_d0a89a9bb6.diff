@@ -1,0 +1,219 @@
+From 910b803d8d3489ec15d797a237b1f3e2f5e75bb0 Mon Sep 17 00:00:00 2001
+From: davidot <david.tuin@gmail.com>
+Date: Sun, 13 Jun 2021 16:21:59 +0200
+Subject: [PATCH] LibJS: Implement Array.prototype.flatMap
+
+Also made recursive_array_flat more compliant with the spec
+So renamed it to flatten_into_array
+---
+ .../LibJS/Runtime/ArrayPrototype.cpp          | 61 +++++++++++++---
+ .../Libraries/LibJS/Runtime/ArrayPrototype.h  |  1 +
+ .../LibJS/Runtime/CommonPropertyNames.h       |  1 +
+ .../builtins/Array/Array.prototype.flatMap.js | 71 +++++++++++++++++++
+ 4 files changed, 125 insertions(+), 9 deletions(-)
+ create mode 100644 Userland/Libraries/LibJS/Tests/builtins/Array/Array.prototype.flatMap.js
+
+diff --git a/Userland/Libraries/LibJS/Runtime/ArrayPrototype.cpp b/Userland/Libraries/LibJS/Runtime/ArrayPrototype.cpp
+index 02c2c0c1c3c982..311c1f92484829 100644
+--- a/Userland/Libraries/LibJS/Runtime/ArrayPrototype.cpp
++++ b/Userland/Libraries/LibJS/Runtime/ArrayPrototype.cpp
+@@ -61,6 +61,7 @@ void ArrayPrototype::initialize(GlobalObject& global_object)
+     define_native_function(vm.names.fill, fill, 1, attr);
+     define_native_function(vm.names.values, values, 0, attr);
+     define_native_function(vm.names.flat, flat, 0, attr);
++    define_native_function(vm.names.flatMap, flat_map, 1, attr);
+     define_native_function(vm.names.at, at, 1, attr);
+     define_native_function(vm.names.keys, keys, 0, attr);
+ 
+@@ -1273,29 +1274,48 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::keys)
+     return ArrayIterator::create(global_object, this_object, Object::PropertyKind::Key);
+ }
+ 
+-static void recursive_array_flat(VM& vm, GlobalObject& global_object, Array& new_array, Object& array, double depth)
++// 23.1.3.10.1 FlattenIntoArray ( target, source, sourceLen, start, depth [ , mapperFunction [ , thisArg ] ] ), https://tc39.es/ecma262/#sec-flattenintoarray
++static size_t flatten_into_array(VM& vm, GlobalObject& global_object, Array& new_array, Object& array, size_t target_index, double depth, Function* mapper_func = {}, Value this_arg = {})
+ {
++    VERIFY(!mapper_func || (!this_arg.is_empty() && depth == 1));
+     auto array_length = length_of_array_like(global_object, array);
+     if (vm.exception())
+-        return;
++        return {};
+ 
+     for (size_t j = 0; j < array_length; ++j) {
+-        auto value = array.get(j);
++        auto value_exists = array.has_property(j);
+         if (vm.exception())
+-            return;
++            return {};
++
++        if (!value_exists)
++            continue;
++        auto value = array.get(j).value_or(js_undefined());
++        if (vm.exception())
++            return {};
++
++        if (mapper_func) {
++            value = vm.call(*mapper_func, this_arg, value, Value(j), &array);
++            if (vm.exception())
++                return {};
++        }
+ 
+         if (depth > 0 && value.is_array(global_object)) {
+-            recursive_array_flat(vm, global_object, new_array, value.as_array(), depth - 1);
++            target_index = flatten_into_array(vm, global_object, new_array, value.as_array(), target_index, depth - 1);
++            if (vm.exception())
++                return {};
+             continue;
+         }
+         if (vm.exception())
+-            return;
++            return {};
+         if (!value.is_empty()) {
+-            new_array.indexed_properties().append(value);
++            new_array.put(target_index, value);
+             if (vm.exception())
+-                return;
++                return {};
++
++            ++target_index;
+         }
+     }
++    return target_index;
+ }
+ 
+ // 23.1.3.10 Array.prototype.flat ( [ depth ] ), https://tc39.es/ecma262/#sec-array.prototype.flat
+@@ -1318,9 +1338,32 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::flat)
+         }
+     }
+ 
+-    recursive_array_flat(vm, global_object, *new_array, *this_object, depth);
++    flatten_into_array(vm, global_object, *new_array, *this_object, 0, depth);
++    if (vm.exception())
++        return {};
++    return new_array;
++}
++
++// 23.1.3.11 Array.prototype.flatMap ( mapperFunction [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.flatmap
++JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::flat_map)
++{
++    auto* this_object = vm.this_value(global_object).to_object(global_object);
++    if (!this_object)
++        return {};
++
++    auto* mapper_function = callback_from_args(global_object, "flatMap");
++    if (!mapper_function)
++        return {};
++
++    auto this_argument = vm.argument(1);
++
++    // FIXME: Use ArraySpeciesCreate.
++    auto new_array = Array::create(global_object);
++
++    flatten_into_array(vm, global_object, *new_array, *this_object, 0, 1, mapper_function, this_argument);
+     if (vm.exception())
+         return {};
++
+     return new_array;
+ }
+ 
+diff --git a/Userland/Libraries/LibJS/Runtime/ArrayPrototype.h b/Userland/Libraries/LibJS/Runtime/ArrayPrototype.h
+index 8bcceac0fca6b0..4a01777496dc99 100644
+--- a/Userland/Libraries/LibJS/Runtime/ArrayPrototype.h
++++ b/Userland/Libraries/LibJS/Runtime/ArrayPrototype.h
+@@ -47,6 +47,7 @@ class ArrayPrototype final : public Array {
+     JS_DECLARE_NATIVE_FUNCTION(fill);
+     JS_DECLARE_NATIVE_FUNCTION(values);
+     JS_DECLARE_NATIVE_FUNCTION(flat);
++    JS_DECLARE_NATIVE_FUNCTION(flat_map);
+     JS_DECLARE_NATIVE_FUNCTION(at);
+     JS_DECLARE_NATIVE_FUNCTION(keys);
+ };
+diff --git a/Userland/Libraries/LibJS/Runtime/CommonPropertyNames.h b/Userland/Libraries/LibJS/Runtime/CommonPropertyNames.h
+index 795d0816b91eb0..394b43ca269e13 100644
+--- a/Userland/Libraries/LibJS/Runtime/CommonPropertyNames.h
++++ b/Userland/Libraries/LibJS/Runtime/CommonPropertyNames.h
+@@ -118,6 +118,7 @@ namespace JS {
+     P(fixed)                                 \
+     P(flags)                                 \
+     P(flat)                                  \
++    P(flatMap)                               \
+     P(floor)                                 \
+     P(fontcolor)                             \
+     P(fontsize)                              \
+diff --git a/Userland/Libraries/LibJS/Tests/builtins/Array/Array.prototype.flatMap.js b/Userland/Libraries/LibJS/Tests/builtins/Array/Array.prototype.flatMap.js
+new file mode 100644
+index 00000000000000..bb33d506f07089
+--- /dev/null
++++ b/Userland/Libraries/LibJS/Tests/builtins/Array/Array.prototype.flatMap.js
+@@ -0,0 +1,71 @@
++test("length is 1", () => {
++    expect(Array.prototype.flatMap).toHaveLength(1);
++});
++
++describe("normal behavior", () => {
++    test("basic functionality", () => {
++        function identity(i) {
++            return i;
++        }
++
++        var array1 = [1, 2, [3, 4]];
++        var array2 = [1, 2, [3, 4, [5, 6]]];
++        expect(array1.flatMap(identity)).toEqual([1, 2, 3, 4]);
++        // only goes to depth 1
++        expect(array2.flatMap(identity)).toEqual([1, 2, 3, 4, [5, 6]]);
++    });
++
++    test("flattens return values", () => {
++        function double(i) {
++            return [i, 2 * i];
++        }
++
++        var array1 = [1, 2];
++        var array2 = [1, [3]];
++        expect(array1.flatMap(double)).toEqual([1, 2, 2, 4]);
++
++        // looks weird but it is correct
++        expect(array2.flatMap(double)).toEqual([1, 2, [3], 6]);
++    });
++
++    test("binds this value", () => {
++        let this_ = undefined;
++        function callable() {
++            this_ = this;
++        }
++        const this_arg = { "yak?": "always" };
++        [0].flatMap(callable, this_arg);
++        expect(this_).toEqual(this_arg);
++    });
++
++    test("gives secondary arguments", () => {
++        const found_values = [];
++        const found_indices = [];
++        const found_array_values = [];
++        const found_this_values = [];
++        function callable(val, index, obj) {
++            found_values.push(val);
++            found_indices.push(index);
++            found_array_values.push(obj);
++            found_this_values.push(this);
++        }
++        const this_arg = { "yak?": "always" };
++        const array = ["a", "b", "c"];
++        array.flatMap(callable, this_arg);
++
++        expect(found_values).toEqual(["a", "b", "c"]);
++        expect(found_indices).toEqual([0, 1, 2]);
++        expect(found_array_values).toEqual([array, array, array]);
++        expect(found_this_values).toEqual([this_arg, this_arg, this_arg]);
++    });
++
++    test("empty array means no calls", () => {
++        let called = false;
++        function callable() {
++            called = true;
++            throw "Should not be called";
++        }
++        [].flatMap(callable);
++        expect(called).toBeFalse();
++    });
++});

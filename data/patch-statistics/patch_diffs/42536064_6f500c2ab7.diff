@@ -1,0 +1,267 @@
+From 9301aa1d62582206617c432d925a642a284e873d Mon Sep 17 00:00:00 2001
+From: Djordje Baljozovic <121813753+djb-rwth@users.noreply.github.com>
+Date: Thu, 13 Jun 2024 04:00:18 +0200
+Subject: [PATCH] Version 1.07-RC3
+
+---
+ INCHI-1-SRC/INCHI_BASE/src/bcf_s.h    |  3 ++-
+ INCHI-1-SRC/INCHI_BASE/src/ichican2.c |  2 +-
+ INCHI-1-SRC/INCHI_BASE/src/ichimap2.c | 25 ++++++++++++++++---------
+ INCHI-1-SRC/INCHI_BASE/src/ichiread.c |  8 +++++---
+ INCHI-1-SRC/INCHI_BASE/src/ichitaut.c | 11 ++++++++---
+ INCHI-1-SRC/INCHI_BASE/src/runichi3.c |  6 +++---
+ INCHI-1-SRC/INCHI_BASE/src/strutil.c  | 26 --------------------------
+ 7 files changed, 35 insertions(+), 46 deletions(-)
+
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/bcf_s.h b/INCHI-1-SRC/INCHI_BASE/src/bcf_s.h
+index d824c44a..21a4c683 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/bcf_s.h
++++ b/INCHI-1-SRC/INCHI_BASE/src/bcf_s.h
+@@ -66,7 +66,7 @@
+ #endif
+ 
+ /* djb-rwth: control macros */
+-#define GCC_DEBUG 1 /* djb-rwth: required for GCC 12+ vs GCC 11- debugging */
++/* #define GCC_DEBUG 0  djb-rwth: required for GCC 12+ vs GCC 11- debugging */
+ #define RINCHI_TEST 0 /* djb-rwrh: RInChI testing */
+ 
+ /* djb-rwth: custom functions */
+@@ -76,5 +76,6 @@ int memcpy_custom(char** dst, char* src, unsigned long long len);
+ /* djb-rwth: external variables required for oss-fuzz fixes */
+ extern int at_size_check1; /* djb-rwth: required for fixing oss-fuzz issue #68329 */
+ extern int sminor_size; /* djb-rwth: required for fixing oss-fuzz issue #66746 */
++extern int na_global; /* djb-rwth: required for fixing oss-fuzz issue #69315 */
+ 
+ #endif
+\ No newline at end of file
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichican2.c b/INCHI-1-SRC/INCHI_BASE/src/ichican2.c
+index 8d955105..c0e85683 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichican2.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichican2.c
+@@ -54,7 +54,7 @@
+ #include "ichitime.h"
+ 
+ #include "bcf_s.h"
+-static int na_global; /* djb-rwth: required for fixing oss-fuzz issue #69315 */
++int na_global; /* djb-rwth: required for fixing oss-fuzz issue #69315 */
+ 
+ #define MAX_CELLS    32766
+ #define MAX_NODES    32766
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichimap2.c b/INCHI-1-SRC/INCHI_BASE/src/ichimap2.c
+index 89faf892..67ae4b58 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichimap2.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichimap2.c
+@@ -379,7 +379,7 @@ int SetNewRanksFromNeighLists( CANON_GLOBALS *pCG,
+                                int bUseAltSort,
+                                int( *comp )( const void *, const void *, void * ) )
+ {
+-    int     i, nNumDiffRanks;
++    int     i, nNumDiffRanks, j;
+     AT_RANK nCurrentRank;
+     /*  -- nAtomNumber[] is already properly set --
+     for ( i = 0; i < num_atoms; i++ ) {
+@@ -397,17 +397,24 @@ int SetNewRanksFromNeighLists( CANON_GLOBALS *pCG,
+     else
+         inchi_qsort( pCG, nAtomNumber, num_atoms, sizeof( nAtomNumber[0] ), comp /*CompNeighListRanksOrd*/ );
+ 
+-    for (i = num_atoms - 1, nCurrentRank = nNewRank[(int) nAtomNumber[i]] = (AT_RANK) num_atoms, nNumDiffRanks = 1;
+-          0 < i;
+-          i--)
++    /* djb-rwth: fixing oss-fuzz issue #69315 */
++    nNumDiffRanks = 1;
++    if ((num_atoms > 0) && (num_atoms <= na_global))
+     {
+-        /*  Note: CompNeighListRanks() in following line implicitly reads nRank pointed by pn_RankForSort */
+-        if (CompNeighListRanks( &nAtomNumber[i - 1], &nAtomNumber[i], pCG ))
++        nCurrentRank = (AT_RANK)num_atoms;
++        j = num_atoms - 1;
++        nNewRank[(int)nAtomNumber[j]] = nCurrentRank;
++        
++        for (i = num_atoms - 1; i > 0; i--)
+         {
+-            nNumDiffRanks++;
+-            nCurrentRank = (AT_RANK) i;
++            /*  Note: CompNeighListRanks() in following line implicitly reads nRank pointed by pn_RankForSort */
++            if (CompNeighListRanks(&nAtomNumber[i - 1], &nAtomNumber[i], pCG))
++            {
++                nNumDiffRanks++;
++                nCurrentRank = (AT_RANK)i;
++            }
++            nNewRank[(int)nAtomNumber[i - 1]] = nCurrentRank;
+         }
+-        nNewRank[(int) nAtomNumber[i - 1]] = nCurrentRank;
+     }
+ 
+     return nNumDiffRanks;
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichiread.c b/INCHI-1-SRC/INCHI_BASE/src/ichiread.c
+index 2ee98c9e..0e3f4aca 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichiread.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichiread.c
+@@ -80,7 +80,7 @@
+ /* */
+ 
+ #include "bcf_s.h"
+-
++static int pi_nnc; /* djb-rwth: required for fixing oss-fuzz issue #69489 */
+ 
+ #define SEGM_LINE_ADD 128
+ 
+@@ -5754,7 +5754,7 @@ int ParseSegmentPerm( const char *str,
+                     goto exit_function;
+                 }
+                 iComponent1 = (int)inchi_strtol(p, &q, 10);
+-                if (!iComponent1 || (iComponent1 > nNumComponents) || (iComponent1 > sminor_size)) /* djb-rwth: fixing oss-fuzz issue #66746 */
++                if ((iComponent1 < 1) || (iComponent1 > nNumComponents) || (iComponent1 >= sminor_size)) /* djb-rwth: fixing oss-fuzz issue #66746 */
+                 {
+                     ret = RI_ERR_SYNTAX;  /* syntax error */
+                     goto exit_function;
+@@ -8367,7 +8367,8 @@ int ParseSegmentMobileH( const char *str,
+             pTaut = pEnd;
+             t = NULL; /* found no tautomeric group for this component */
+         }
+-        for (i = 0; i < mpy_component; i++)
++        /* djb-rwth: fixing oss-fuzz issue #69489 */
++        for (i = 0; (i < mpy_component) && (iComponent + i < pi_nnc); i++)
+         {
+             if (bMobileH == TAUT_NON)
+             {
+@@ -9869,6 +9870,7 @@ int ParseSegmentFormula( const char *str,
+                 {
+                     /* allocate InChI */
+                     pInChI = (INChI*)inchi_calloc(nNumComponents, sizeof(INChI));
++                    pi_nnc = nNumComponents;
+                     if (!(pInChI))
+                     {
+                         return RI_ERR_ALLOC; /* alloc failure */
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/ichitaut.c b/INCHI-1-SRC/INCHI_BASE/src/ichitaut.c
+index b6dc6789..667946a9 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/ichitaut.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/ichitaut.c
+@@ -50,6 +50,7 @@
+ #include "util.h"
+ 
+ #include "bcf_s.h"
++static int tgi_mntg_global;
+ 
+ /* Local prototypes */
+ 
+@@ -4394,7 +4395,6 @@ int MarkTautomerGroups( CANON_GLOBALS *pCG,
+     int  nNumEndPoints, nNumBondPos, nNumPossibleMobile;
+     int  bNonTautBond, bAltBond; /* djb-rwth: removing redundant variables */
+     int  nNumDonor, nNumAcceptor, bPossiblyEndpoint;
+-    T_GROUP *t_group;
+     int bIgnoreIsotopic; /* djb-rwth: removing redundant variables */
+     ENDPOINT_INFO eif1, eif2;
+     int nErr = 0;
+@@ -4425,7 +4425,8 @@ int MarkTautomerGroups( CANON_GLOBALS *pCG,
+         t_group_info->tGroupNumber = tGroupNumber;
+         t_group_info->max_num_t_groups = num_atoms / 2 + 1; /*  upper limit */
+         /* djb-rwth: fixing oss-fuzz issue #52978 */
+-        T_GROUP* tgi_tgr = (T_GROUP*)inchi_calloc(t_group_info->max_num_t_groups + 1, sizeof(t_group[0]));
++        T_GROUP* tgi_tgr = (T_GROUP*)inchi_calloc((long long)t_group_info->max_num_t_groups + 1, sizeof(t_group_info->t_group[0]));
++        tgi_mntg_global = t_group_info->max_num_t_groups;
+         if (!tgi_tgr)
+         {
+             t_group_info->max_num_t_groups = -1;
+@@ -6415,13 +6416,17 @@ int make_a_copy_of_t_group_info( T_GROUP_INFO *t_group_info,
+         if (( len = t_group_info_orig->max_num_t_groups ) > 0)
+         {
+             /* djb-rwth: fixing oss-fuzz issue #52978 */
++            if (len != tgi_mntg_global)
++            {
++                len = tgi_mntg_global;
++            }
+             T_GROUP* tgi_tg = (T_GROUP*)inchi_malloc(((long long)len+1) * sizeof(t_group_info->t_group[0])); /* djb-rwth: cast operator added */
+             if (tgi_tg && t_group_info_orig->t_group)
+             {
+                 t_group_info->t_group = tgi_tg;
+                 memcpy(tgi_tg,
+                     t_group_info_orig->t_group,
+-                    ((long long)len+1) * sizeof(t_group_info->t_group[0])); /* djb-rwth: cast operator added */
++                    len * sizeof(t_group_info->t_group[0])); /* djb-rwth: cast operator added */
+             }
+             else
+             {
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/runichi3.c b/INCHI-1-SRC/INCHI_BASE/src/runichi3.c
+index b1daa5d4..8e6ea2ad 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/runichi3.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/runichi3.c
+@@ -2506,7 +2506,7 @@ int  OrigAtData_RemoveHalfBond( int      this_atom,
+ {
+     int k, kk;
+     /* djb-rwth: fixing oss-fuzz issues #68286, #30342 */
+-    if (at && (at + this_atom))
++    if (at)
+     {
+         inp_ATOM* a = &(at[this_atom]);
+         if (a)
+@@ -4181,8 +4181,8 @@ int OAD_Polymer_CompareRanksOfTwoAtoms( int atom1, int atom2, OAD_AtProps *aprop
+     int a1typ = CARBOAT;
+     int a2typ = CARBOAT;
+ 
+-    /* djb-rwth: fixing oss-fuzz issue #68277 */
+-    if ((a1 > nat_global) || (a2 > nat_global) || (a1 < 0) || (a2 < 0))
++    /* djb-rwth: fixing oss-fuzz issue #69501, #68277 */
++    if ((a1 >= nat_global) || (a2 >= nat_global) || (a1 < 0) || (a2 < 0))
+     {
+         return 0;
+     }
+diff --git a/INCHI-1-SRC/INCHI_BASE/src/strutil.c b/INCHI-1-SRC/INCHI_BASE/src/strutil.c
+index bc310c00..1caf3244 100644
+--- a/INCHI-1-SRC/INCHI_BASE/src/strutil.c
++++ b/INCHI-1-SRC/INCHI_BASE/src/strutil.c
+@@ -4410,16 +4410,6 @@ int MarkDisconnectedComponents( ORIG_ATOM_DATA *orig_at_data,
+     /* Mark and count; avoid deep DFS recursion: it may make verifying software unhappy */
+     /* nNewCompNumber[i] will contain new component number for atoms at[i], i=0..num_at-1 */
+     
+-    /* djb-rwth: GCC 12+ compiled executables crash here for 7 PubChem structures */
+-#if (GCC_DEBUG)
+-    FILE* gcc_fptr;
+-    gcc_fptr = fopen("gcc_crash_report.txt", "w");
+-    if (!gcc_fptr)
+-    {
+-        printf("\n>>>>>Error opening gcc_crash_report.txt file!<<<<<\n");
+-    }
+-#endif
+-
+     for (j = 0; j < num_at; j++)
+     {
+         if (!nNewCompNumber[j])
+@@ -4437,17 +4427,11 @@ int MarkDisconnectedComponents( ORIG_ATOM_DATA *orig_at_data,
+             /* find next neighbor */
+             do
+             {
+-#if (GCC_DEBUG)
+-                fprintf(gcc_fptr, "\ncur_at = %d, nxt_at = %d, iNeigh[cur_at] = %d, at[cur_at].val = %d ", cur_at, nxt_at, iNeigh[cur_at], at[cur_at].valence);
+-#endif
+                 if (iNeigh[cur_at] < at[cur_at].valence)
+                 {
+                     int ineigh_incr = (int)iNeigh[cur_at];
+                     nxt_at = at[cur_at].neighbor[ineigh_incr];
+                     iNeigh[cur_at]++;
+-#if (GCC_DEBUG)
+-                    fprintf(gcc_fptr, "/ ineigh_incr = %d, new_nxt_at = %d, iNeigh[cur_at]_inc = %d, nNewCompNumber[nxt_at] = %d ", ineigh_incr, nxt_at, iNeigh[cur_at], nNewCompNumber[nxt_at]);
+-#endif
+ 
+                     if (!nNewCompNumber[nxt_at])
+                     {
+@@ -4467,19 +4451,9 @@ int MarkDisconnectedComponents( ORIG_ATOM_DATA *orig_at_data,
+                     cur_at = nPrevAtom[cur_at]; /* retract */
+                 }
+             } while (cur_neq_fst);
+-#if (GCC_DEBUG)
+-            fprintf(gcc_fptr, "\n");
+-#endif
+         }
+     }
+ 
+-#if (GCC_DEBUG)
+-    if (gcc_fptr)
+-    {
+-        fclose(gcc_fptr);
+-    }
+-#endif
+-
+     inchi_free( nPrevAtom );
+     nPrevAtom = NULL;
+     inchi_free( iNeigh );

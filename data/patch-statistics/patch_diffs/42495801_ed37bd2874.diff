@@ -1,0 +1,122 @@
+From a6b4a11f80a05a17995a036b643c37adb3c3dc62 Mon Sep 17 00:00:00 2001
+From: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date: Wed, 14 Apr 2021 15:21:01 +0300
+Subject: [PATCH] Fix OSS-Fuzz issues
+
+---
+ source/m3_bind.c    |  2 +-
+ source/m3_compile.c |  8 +++++---
+ source/m3_core.h    |  1 +
+ source/m3_env.c     | 17 ++++++++---------
+ source/m3_parse.c   |  3 +--
+ 5 files changed, 16 insertions(+), 15 deletions(-)
+
+diff --git a/source/m3_bind.c b/source/m3_bind.c
+index c8191a57..951a7de1 100644
+--- a/source/m3_bind.c
++++ b/source/m3_bind.c
+@@ -82,7 +82,7 @@ _   (AllocFuncType (& funcType, (u32) maxNumTypes));
+         }
+         else
+         {
+-            _throwif ("malformed signature; arg count overflow", funcType->numRets + funcType->numArgs >= maxNumTypes);
++            _throwif ("malformed signature; arg count overflow", (u32)(funcType->numRets) + funcType->numArgs >= maxNumTypes);
+             funcType->numArgs++;
+             *typelist++ = type;
+         }
+diff --git a/source/m3_compile.c b/source/m3_compile.c
+index 25a32cd9..e84330e0 100644
+--- a/source/m3_compile.c
++++ b/source/m3_compile.c
+@@ -2206,8 +2206,7 @@ const M3OpInfo*  GetOpInfo  (m3opcode_t opcode)
+ M3Result  Compile_BlockStatements  (IM3Compilation o)
+ {
+     M3Result result = m3Err_none;
+-
+-    _throwif ("block code underrun", o->wasm >= o->wasmEnd);
++    bool ended = false;
+ 
+     while (o->wasm < o->wasmEnd)
+     {                                                                   emit_stack_dump (o);
+@@ -2241,9 +2240,12 @@ _           (Compile_Operator (o, opcode));
+         if (o->stackIndex > d_m3MaxFunctionStackHeight)         // TODO: is this only place to check?
+             _throw (m3Err_functionStackOverflow);
+ 
+-        if (opcode == c_waOp_end or opcode == c_waOp_else)
++        if (opcode == c_waOp_end or opcode == c_waOp_else) {
++            ended = true;
+             break;
++        }
+     }
++    _throwif(m3Err_wasmMalformed, !(ended));
+ 
+ _catch:
+     return result;
+diff --git a/source/m3_core.h b/source/m3_core.h
+index c78768e8..fdf0754b 100644
+--- a/source/m3_core.h
++++ b/source/m3_core.h
+@@ -165,6 +165,7 @@ M3CodePageHeader;
+ #define d_m3MaxSaneGlobalsCount             100000
+ #define d_m3MaxSaneElementSegments          100000
+ #define d_m3MaxSaneDataSegments             100000
++#define d_m3MaxSaneTableSize                100000
+ #define d_m3MaxSaneUtf8Length               10000
+ #define d_m3MaxSaneFunctionArgRetCount      1000    // still insane, but whatever
+ 
+diff --git a/source/m3_env.c b/source/m3_env.c
+index 6d914d66..0dc4f992 100644
+--- a/source/m3_env.c
++++ b/source/m3_env.c
+@@ -466,16 +466,15 @@ _       (EvaluateExpression (io_module, & segmentOffset, c_m3Type_i32, & start,
+ 
+         m3log (runtime, "loading data segment: %d; size: %d; offset: %d", i, segment->size, segmentOffset);
+ 
+-        if (io_memory->mallocated)
++        _throwif ("unallocated linear memory", !(io_memory->mallocated));
++
++        if (segmentOffset > 0 && (size_t) segmentOffset + segment->size <= io_memory->mallocated->length)
+         {
+             u8 * dest = m3MemData (io_memory->mallocated) + segmentOffset;
+-
+-            if ((size_t) segmentOffset + segment->size <= io_memory->mallocated->length)
+-                memcpy (dest, segment->data, segment->size);
+-            else
+-                _throw ("data segment overflowing linear memory");
++            memcpy (dest, segment->data, segment->size);
++        } else {
++            _throw ("data segment out of bounds");
+         }
+-        else _throw ("unallocated linear memory");
+     }
+ 
+     _catch: return result;
+@@ -503,12 +502,12 @@ _           (EvaluateExpression (io_module, & offset, c_m3Type_i32, & bytes, end
+             u32 numElements;
+ _           (ReadLEB_u32 (& numElements, & bytes, end));
+ 
+-            size_t endElement = numElements + offset;
++            size_t endElement = (size_t)(numElements) + offset;
++            _throwif ("table overflow", endElement > d_m3MaxSaneTableSize);
+ 
+             io_module->table0 = m3_ReallocArray (IM3Function, io_module->table0, endElement, io_module->table0Size);
+             _throwifnull(io_module->table0);
+ 
+-            _throwif ("table overflow", endElement > UINT_MAX)
+             io_module->table0Size = (u32) endElement;
+ 
+             for (u32 e = 0; e < numElements; ++e)
+diff --git a/source/m3_parse.c b/source/m3_parse.c
+index 37479f6b..6b29022a 100644
+--- a/source/m3_parse.c
++++ b/source/m3_parse.c
+@@ -82,8 +82,7 @@ _               (NormalizeType (& argType, wasmType));
+ 
+             u32 numRets;
+ _           (ReadLEB_u32 (& numRets, & i_bytes, i_end));
+-
+-            _throwif (m3Err_tooManyArgsRets, numRets + numArgs > d_m3MaxSaneFunctionArgRetCount);
++            _throwif (m3Err_tooManyArgsRets, (u64)(numRets) + numArgs > d_m3MaxSaneFunctionArgRetCount);
+ 
+ _           (AllocFuncType (& ftype, numRets + numArgs));
+             ftype->numArgs = numArgs;

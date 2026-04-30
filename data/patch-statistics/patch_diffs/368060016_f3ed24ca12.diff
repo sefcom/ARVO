@@ -1,0 +1,2393 @@
+From 7f22bab6a957363b2002d0d6c964bfd49afe5f45 Mon Sep 17 00:00:00 2001
+From: Lily Chen <chlily@google.com>
+Date: Thu, 5 Dec 2024 18:41:00 -0500
+Subject: [PATCH] v7.10.2: Extracted from
+ https://www.rarlab.com/rar/unrarsrc-7.1.2.tar.gz (sic: version numbers) (#42)
+
+---
+ UnRAR.vcxproj    |   2 +
+ UnRARDll.vcxproj |   2 +
+ arccmt.cpp       |   7 +-
+ archive.cpp      |   4 +-
+ archive.hpp      |   5 +-
+ arcread.cpp      |  27 ++++++-
+ blake2s.hpp      |   9 +--
+ cmddata.cpp      |  78 +++++++++++++-----
+ cmddata.hpp      |  11 +++
+ cmdmix.cpp       |  14 ++--
+ consio.cpp       |  40 ++++++----
+ consio.hpp       |   4 +-
+ crypt.hpp        |   3 +-
+ dll.cpp          |  25 ++++--
+ dll.hpp          |   3 +-
+ dll.rc           |   8 +-
+ errhnd.hpp       |   1 +
+ extinfo.hpp      |   4 -
+ extract.cpp      |  87 ++++++++++++++------
+ extract.hpp      |   2 +-
+ filefn.cpp       |  68 ++++++----------
+ filefn.hpp       |   7 +-
+ hash.cpp         |   4 +-
+ hash.hpp         |   2 +
+ largepage.cpp    | 201 +++++++++++++++++++++++++++++++++++++++++++++++
+ largepage.hpp    |  54 +++++++++++++
+ list.cpp         |   2 +-
+ loclang.hpp      |  16 ++--
+ makefile         |   7 +-
+ motw.cpp         | 131 ++++++++++++++++++++++++++++++
+ motw.hpp         |  26 ++++++
+ options.hpp      |  13 ++-
+ os.hpp           |   6 +-
+ rar.hpp          |   5 ++
+ rardefs.hpp      |   6 +-
+ smallfn.cpp      |   2 -
+ smallfn.hpp      |   1 -
+ system.cpp       |  32 ++++++--
+ system.hpp       |   3 +
+ timefn.hpp       |  12 +--
+ ui.hpp           |  32 ++++----
+ uiconsole.cpp    |  18 ++++-
+ unicode.cpp      |   8 +-
+ unpack.cpp       |  16 +++-
+ unpack.hpp       |   5 +-
+ version.hpp      |   8 +-
+ volume.cpp       |   2 +-
+ win32acl.cpp     |  23 ------
+ win32stm.cpp     | 132 +++++++++++++++++++++----------
+ 49 files changed, 910 insertions(+), 268 deletions(-)
+ create mode 100644 largepage.cpp
+ create mode 100644 largepage.hpp
+ create mode 100644 motw.cpp
+ create mode 100644 motw.hpp
+
+diff --git a/UnRAR.vcxproj b/UnRAR.vcxproj
+index 512bcf1..ac0878f 100644
+--- a/UnRAR.vcxproj
++++ b/UnRAR.vcxproj
+@@ -238,8 +238,10 @@
+     <ClCompile Include="hash.cpp" />
+     <ClCompile Include="headers.cpp" />
+     <ClCompile Include="isnt.cpp" />
++    <ClCompile Include="largepage.cpp" />
+     <ClCompile Include="list.cpp" />
+     <ClCompile Include="match.cpp" />
++    <ClCompile Include="motw.cpp" />
+     <ClCompile Include="options.cpp" />
+     <ClCompile Include="pathfn.cpp" />
+     <ClCompile Include="qopen.cpp" />
+diff --git a/UnRARDll.vcxproj b/UnRARDll.vcxproj
+index 72cecd8..17ea1b4 100644
+--- a/UnRARDll.vcxproj
++++ b/UnRARDll.vcxproj
+@@ -374,7 +374,9 @@
+     <ClCompile Include="hash.cpp" />
+     <ClCompile Include="headers.cpp" />
+     <ClCompile Include="isnt.cpp" />
++    <ClCompile Include="largepage.cpp" />
+     <ClCompile Include="match.cpp" />
++    <ClCompile Include="motw.cpp" />
+     <ClCompile Include="options.cpp" />
+     <ClCompile Include="pathfn.cpp" />
+     <ClCompile Include="qopen.cpp" />
+diff --git a/arccmt.cpp b/arccmt.cpp
+index f23a7dd..a0fcd7b 100644
+--- a/arccmt.cpp
++++ b/arccmt.cpp
+@@ -36,7 +36,12 @@ bool Archive::DoGetComment(std::wstring &CmtData)
+     {
+       // Current (RAR 3.0+) version of archive comment.
+       Seek(GetStartPos(),SEEK_SET);
+-      return SearchSubBlock(SUBHEAD_TYPE_CMT)!=0 && ReadCommentData(CmtData);
++      if (SearchSubBlock(SUBHEAD_TYPE_CMT)!=0)
++        if (ReadCommentData(CmtData))
++          return true;
++        else
++          uiMsg(UIERROR_CMTBROKEN,FileName);
++      return false;
+     }
+ #ifndef SFX_MODULE
+     // Old style (RAR 2.9) comment header embedded into the main 
+diff --git a/archive.cpp b/archive.cpp
+index c2293de..f90b619 100644
+--- a/archive.cpp
++++ b/archive.cpp
+@@ -67,7 +67,7 @@ void Archive::CheckArc(bool EnableBroken)
+     // password is incorrect.
+     if (!FailedHeaderDecryption)
+       uiMsg(UIERROR_BADARCHIVE,FileName);
+-    ErrHandler.Exit(RARX_FATAL);
++    ErrHandler.Exit(RARX_BADARC);
+   }
+ }
+ 
+@@ -109,9 +109,11 @@ RARFORMAT Archive::IsSignature(const byte *D,size_t Size)
+         // We check the last signature byte, so we can return a sensible
+         // warning in case we'll want to change the archive format
+         // sometimes in the future.
++#ifndef SFX_MODULE
+         if (D[6]==0)
+           Type=RARFMT15;
+         else
++#endif
+           if (D[6]==1)
+             Type=RARFMT50;
+           else
+diff --git a/archive.hpp b/archive.hpp
+index 58bdafa..895f853 100644
+--- a/archive.hpp
++++ b/archive.hpp
+@@ -58,7 +58,7 @@ class Archive:public File
+     bool ProhibitQOpen;
+ #endif
+   public:
+-    Archive(CommandData *InitCmd=NULL);
++    Archive(CommandData *InitCmd=nullptr);
+     ~Archive();
+     static RARFORMAT IsSignature(const byte *D,size_t Size);
+     bool IsArchive(bool EnableBroken);
+@@ -147,6 +147,9 @@ class Archive:public File
+     bool NewArchive;
+ 
+     std::wstring FirstVolumeName;
++#ifdef PROPAGATE_MOTW
++    MarkOfTheWeb Motw;
++#endif
+ };
+ 
+ 
+diff --git a/arcread.cpp b/arcread.cpp
+index 825da72..ab80463 100644
+--- a/arcread.cpp
++++ b/arcread.cpp
+@@ -20,10 +20,10 @@ size_t Archive::ReadHeader()
+     case RARFMT14:
+       ReadSize=ReadHeader14();
+       break;
+-#endif
+     case RARFMT15:
+       ReadSize=ReadHeader15();
+       break;
++#endif
+     case RARFMT50:
+       ReadSize=ReadHeader50();
+       break;
+@@ -106,6 +106,9 @@ void Archive::UnexpEndArcMsg()
+   if (CurBlockPos!=ArcSize || NextBlockPos!=ArcSize)
+   {
+     uiMsg(UIERROR_UNEXPEOF,FileName);
++    if (CurHeaderType!=HEAD_FILE)
++      uiMsg(UIERROR_TRUNCSERVICE,FileName,SubHead.FileName);
++
+     ErrHandler.SetErrorCode(RARX_WARNING);
+   }
+ }
+@@ -137,6 +140,7 @@ inline int64 SafeAdd(int64 v1,int64 v2,int64 f)
+ }
+ 
+ 
++#ifndef SFX_MODULE
+ size_t Archive::ReadHeader15()
+ {
+   RawRead Raw(this);
+@@ -145,7 +149,7 @@ size_t Archive::ReadHeader15()
+ 
+   if (Decrypt)
+   {
+-#ifdef RAR_NOCRYPT // For rarext.dll and unrar_nocrypt.dll.
++#ifdef RAR_NOCRYPT // For rarext.dll, Setup.SFX and unrar_nocrypt.dll.
+     return 0;
+ #else
+     RequestArcPassword(NULL);
+@@ -545,6 +549,7 @@ size_t Archive::ReadHeader15()
+ 
+   return Raw.Size();
+ }
++#endif // #ifndef SFX_MODULE
+ 
+ 
+ size_t Archive::ReadHeader50()
+@@ -740,10 +745,15 @@ size_t Archive::ReadHeader50()
+           byte csum[SIZE_PSWCHECK_CSUM];
+           Raw.GetB(csum,SIZE_PSWCHECK_CSUM);
+ 
++// Exclude this code for rarext.dll, Setup.SFX and unrar_nocrypt.dll linked
++// without sha256. But still set Encrypted=true for rarext.dll here,
++// so it can recognize encrypted header archives in archive properties.
++#ifndef RAR_NOCRYPT
+           byte Digest[SHA256_DIGEST_SIZE];
+           sha256_get(CryptHead.PswCheck, SIZE_PSWCHECK, Digest);
+ 
+           CryptHead.UsePswCheck=memcmp(csum,Digest,SIZE_PSWCHECK_CSUM)==0;
++#endif
+         }
+         Encrypted=true;
+       }
+@@ -1036,22 +1046,30 @@ void Archive::ProcessExtra50(RawRead *Raw,size_t ExtraSize,const BaseBlock *bb)
+       FileHeader *hd=(FileHeader *)bb;
+       switch(FieldType)
+       {
++#ifndef RAR_NOCRYPT // Except rarext.dll, Setup.SFX and unrar_nocrypt.dll.
+         case FHEXTRA_CRYPT:
+           {
+             FileHeader *hd=(FileHeader *)bb;
+             uint EncVersion=(uint)Raw->GetV();
+             if (EncVersion>CRYPT_VERSION)
++            {
+               UnkEncVerMsg(hd->FileName,L"x" + std::to_wstring(EncVersion));
++              hd->CryptMethod=CRYPT_UNKNOWN;
++            }
+             else
+             {
+               uint Flags=(uint)Raw->GetV();
+-              hd->UsePswCheck=(Flags & FHEXTRA_CRYPT_PSWCHECK)!=0;
+-              hd->UseHashKey=(Flags & FHEXTRA_CRYPT_HASHMAC)!=0;
+               hd->Lg2Count=Raw->Get1();
+               if (hd->Lg2Count>CRYPT5_KDF_LG2_COUNT_MAX)
++              {
+                 UnkEncVerMsg(hd->FileName,L"xc" + std::to_wstring(hd->Lg2Count));
++                hd->CryptMethod=CRYPT_UNKNOWN;
++              }
+               else
+               {
++                hd->UsePswCheck=(Flags & FHEXTRA_CRYPT_PSWCHECK)!=0;
++                hd->UseHashKey=(Flags & FHEXTRA_CRYPT_HASHMAC)!=0;
++
+                 Raw->GetB(hd->Salt,SIZE_SALT50);
+                 Raw->GetB(hd->InitV,SIZE_INITV);
+                 if (hd->UsePswCheck)
+@@ -1085,6 +1103,7 @@ void Archive::ProcessExtra50(RawRead *Raw,size_t ExtraSize,const BaseBlock *bb)
+             }
+           }
+           break;
++#endif
+         case FHEXTRA_HASH:
+           {
+             FileHeader *hd=(FileHeader *)bb;
+diff --git a/blake2s.hpp b/blake2s.hpp
+index 06e396a..90b7885 100644
+--- a/blake2s.hpp
++++ b/blake2s.hpp
+@@ -5,12 +5,9 @@
+ #define BLAKE2_DIGEST_SIZE 32
+ #define BLAKE2_THREADS_NUMBER 8
+ 
+-enum blake2s_constant
+-{
+-  BLAKE2S_BLOCKBYTES = 64,
+-  BLAKE2S_OUTBYTES   = 32
+-};
+-
++// Use constexpr instead of enums for -std=c++20 compatibility.
++constexpr size_t BLAKE2S_BLOCKBYTES = 64;
++constexpr size_t BLAKE2S_OUTBYTES = 32;
+ 
+ // Alignment to 64 improves performance of both SSE and non-SSE versions.
+ // Alignment to n*16 is required for SSE version, so we selected 64.
+diff --git a/cmddata.cpp b/cmddata.cpp
+index 37bcf5b..0a1852d 100644
+--- a/cmddata.cpp
++++ b/cmddata.cpp
+@@ -38,6 +38,9 @@ void CommandData::Init()
+   InclArgs.Reset();
+   ArcNames.Reset();
+   StoreArgs.Reset();
++#ifdef PROPAGATE_MOTW
++  MotwList.Reset();
++#endif
+   Password.Clean();
+   NextVolSizes.clear();
+ #ifdef RARDLL
+@@ -189,7 +192,7 @@ void CommandData::ParseDone()
+ #if !defined(SFX_MODULE)
+ void CommandData::ParseEnvVar()
+ {
+-  char *EnvVar=getenv("RAR");
++  char *EnvVar=getenv("RARINISWITCHES");
+   if (EnvVar!=NULL)
+   {
+     std::wstring EnvStr;
+@@ -293,6 +296,9 @@ void CommandData::ProcessSwitchesString(const std::wstring &Str)
+ void CommandData::ProcessSwitch(const wchar *Switch)
+ {
+ 
++  if (LargePageAlloc::ProcessSwitch(this,Switch))
++    return;
++
+   switch(toupperw(Switch[0]))
+   {
+     case '@':
+@@ -619,8 +625,6 @@ void CommandData::ProcessSwitch(const wchar *Switch)
+               }
+             }
+           break;
+-        case 'M':
+-          break;
+         case 'D':
+           {
+             bool SetDictLimit=toupperw(Switch[2])=='X';
+@@ -665,33 +669,30 @@ void CommandData::ProcessSwitch(const wchar *Switch)
+           if (toupperw(Switch[2])=='S' && Switch[3]==0)
+             SkipEncrypted=true;
+           break;
+-        case 'S':
++        case 'L':
++          if (toupperw(Switch[2])=='P')
+           {
+-            std::wstring StoreNames=(Switch[2]==0 ? DefaultStoreList:Switch+2);
+-            size_t Pos=0;
+-            while (Pos<StoreNames.size())
++            UseLargePages=true;
++            if (!LargePageAlloc::IsPrivilegeAssigned() && LargePageAlloc::AssignConfirmation())
+             {
+-              if (StoreNames[Pos]=='.')
+-                Pos++;
+-              size_t EndPos=StoreNames.find(';',Pos);
+-              std::wstring Mask=StoreNames.substr(Pos,EndPos==std::wstring::npos ? EndPos:EndPos-Pos);
+-              if (Mask.find_first_of(L"*?.")==std::wstring::npos)
+-                Mask.insert(0,L"*.");
+-              StoreArgs.AddString(Mask);
+-              if (EndPos==std::wstring::npos)
+-                break;
+-              Pos=EndPos+1;
++              LargePageAlloc::AssignPrivilege();
++
++              // Quit immediately. We do not want to interrupt the current copy
++              // archive processing with reboot after assigning privilege.
++              SetupComplete=true;
+             }
+           }
+           break;
++        case 'M':
++          break;
++        case 'S':
++          GetBriefMaskList(Switch[2]==0 ? DefaultStoreList:Switch+2,StoreArgs);
++          break;
+ #ifdef RAR_SMP
+         case 'T':
+           Threads=atoiw(Switch+2);
+           if (Threads>MaxPoolThreads || Threads<1)
+             BadSwitch(Switch);
+-          else
+-          {
+-          }
+           break;
+ #endif
+         default:
+@@ -752,6 +753,18 @@ void CommandData::ProcessSwitch(const wchar *Switch)
+             }
+           break;
+ #endif
++#ifdef PROPAGATE_MOTW
++        case 'M':
++          {
++            MotwAllFields=Switch[2]=='1';
++            const wchar *Sep=wcschr(Switch+2,'=');
++            if (Switch[2]=='-')
++              MotwList.Reset();
++            else
++              GetBriefMaskList(Sep==nullptr ? L"*":Sep+1,MotwList);
++          }
++          break;
++#endif
+ #ifdef _WIN_ALL
+         case 'N':
+           if (toupperw(Switch[2])=='I')
+@@ -1033,6 +1046,11 @@ void CommandData::ProcessCommand()
+ #ifndef SFX_MODULE
+ 
+   const wchar *SingleCharCommands=L"FUADPXETK";
++
++  // RAR -mlp command is the legitimate way to assign the required privilege.
++  if (Command.empty() && UseLargePages || SetupComplete)
++    return;
++
+   if (Command[0]!=0 && Command[1]!=0 && wcschr(SingleCharCommands,Command[0])!=NULL || ArcName.empty())
+     OutHelp(Command.empty() ? RARX_SUCCESS:RARX_USERERROR); // Return 'success' for 'rar' without parameters.
+ 
+@@ -1231,5 +1249,25 @@ int64 CommandData::GetVolSize(const wchar *S,uint DefMultiplier)
+ }
+ 
+ 
++// Treat the list like rar;zip as *.rar;*.zip for -ms and similar switches.
++void CommandData::GetBriefMaskList(const std::wstring &Masks,StringList &Args)
++{
++  size_t Pos=0;
++  while (Pos<Masks.size())
++  {
++    if (Masks[Pos]=='.')
++      Pos++;
++    size_t EndPos=Masks.find(';',Pos);
++    std::wstring Mask=Masks.substr(Pos,EndPos==std::wstring::npos ? EndPos:EndPos-Pos);
++    if (Mask.find_first_of(L"*?.")==std::wstring::npos)
++      Mask.insert(0,L"*.");
++    Args.AddString(Mask);
++    if (EndPos==std::wstring::npos)
++      break;
++    Pos=EndPos+1;
++  }
++}
++
++
+ 
+ 
+diff --git a/cmddata.hpp b/cmddata.hpp
+index 1c7a28c..7308244 100644
+--- a/cmddata.hpp
++++ b/cmddata.hpp
+@@ -1,6 +1,12 @@
+ #ifndef _RAR_CMDDATA_
+ #define _RAR_CMDDATA_
+ 
++#if defined(_WIN_ALL) && !defined(SFX_MODULE)
++// In Windows we implement our own command line parser to avoid replacing
++// \" by " in standard parser. Such replacing corrupts destination paths
++// like "dest path\" in extraction commands.
++#define CUSTOM_CMDLINE_PARSER
++#endif
+ 
+ #define DefaultStoreList L"7z;ace;arj;bz2;cab;gz;jpeg;jpg;lha;lz;lzh;mp3;rar;taz;tbz;tbz2;tgz;txz;xz;z;zip;zipx;zst;tzst"
+ 
+@@ -56,6 +62,8 @@ class CommandData:public RAROptions
+     void ReportWrongSwitches(RARFORMAT Format);
+ #endif
+ 
++    void GetBriefMaskList(const std::wstring &Masks,StringList &Args);
++
+ 
+     std::wstring Command;
+     std::wstring ArcName;
+@@ -78,6 +86,9 @@ class CommandData:public RAROptions
+     StringList InclArgs;
+     StringList ArcNames;
+     StringList StoreArgs;
++#ifdef PROPAGATE_MOTW
++    StringList MotwList;  // Extensions to assign the mark of the web.
++#endif
+ 
+     SecPassword Password;
+ 
+diff --git a/cmdmix.cpp b/cmdmix.cpp
+index e70b7d0..7a7b5bc 100644
+--- a/cmdmix.cpp
++++ b/cmdmix.cpp
+@@ -63,12 +63,12 @@ void CommandData::OutHelp(RAR_EXIT ExitCode)
+     MCHelpSwAT,MCHelpSwAC,MCHelpSwAD,MCHelpSwAG,MCHelpSwAI,MCHelpSwAP,
+     MCHelpSwCm,MCHelpSwCFGm,MCHelpSwCL,MCHelpSwCU,MCHelpSwDH,MCHelpSwEP,
+     MCHelpSwEP3,MCHelpSwEP4,MCHelpSwF,MCHelpSwIDP,MCHelpSwIERR,
+-    MCHelpSwINUL,MCHelpSwIOFF,MCHelpSwKB,MCHelpSwME,MCHelpSwN,MCHelpSwNa,
+-    MCHelpSwNal,MCHelpSwO,MCHelpSwOC,MCHelpSwOL,MCHelpSwOP,MCHelpSwOR,
+-    MCHelpSwOW,MCHelpSwP,MCHelpSwR,MCHelpSwRI,MCHelpSwSC,MCHelpSwSI,
+-    MCHelpSwSL,MCHelpSwSM,MCHelpSwTA,MCHelpSwTB,MCHelpSwTN,MCHelpSwTO,
+-    MCHelpSwTS,MCHelpSwU,MCHelpSwVUnr,MCHelpSwVER,MCHelpSwVP,MCHelpSwX,
+-    MCHelpSwXa,MCHelpSwXal,MCHelpSwY
++    MCHelpSwINUL,MCHelpSwIOFF,MCHelpSwKB,MCHelpSwME,MCHelpSwMLP,
++    MCHelpSwN,MCHelpSwNa,MCHelpSwNal,MCHelpSwO,MCHelpSwOC,MCHelpSwOL,
++    MCHelpSwOM,MCHelpSwOP,MCHelpSwOR,MCHelpSwOW,MCHelpSwP,MCHelpSwR,
++    MCHelpSwRI,MCHelpSwSC,MCHelpSwSI,MCHelpSwSL,MCHelpSwSM,MCHelpSwTA,
++    MCHelpSwTB,MCHelpSwTN,MCHelpSwTO,MCHelpSwTS,MCHelpSwU,MCHelpSwVUnr,
++    MCHelpSwVER,MCHelpSwVP,MCHelpSwX,MCHelpSwXa,MCHelpSwXal,MCHelpSwY
+ #endif
+   };
+ 
+@@ -80,7 +80,7 @@ void CommandData::OutHelp(RAR_EXIT ExitCode)
+ #ifndef _WIN_ALL
+     static MSGID Win32Only[]={
+       MCHelpSwIEML,MCHelpSwVD,MCHelpSwAO,MCHelpSwOS,MCHelpSwIOFF,
+-      MCHelpSwEP2,MCHelpSwOC,MCHelpSwONI,MCHelpSwDR,MCHelpSwRI
++      MCHelpSwEP2,MCHelpSwMLP,MCHelpSwOC,MCHelpSwONI,MCHelpSwDR,MCHelpSwRI
+     };
+     bool Found=false;
+     for (uint J=0;J<ASIZE(Win32Only);J++)
+diff --git a/consio.cpp b/consio.cpp
+index 023c3f3..6c0787c 100644
+--- a/consio.cpp
++++ b/consio.cpp
+@@ -255,7 +255,7 @@ bool GetConsolePassword(UIPASSWORD_TYPE Type,const std::wstring &FileName,SecPas
+ 
+ 
+ #ifndef SILENT
+-bool getwstr(std::wstring &str)
++void getwstr(std::wstring &str)
+ {
+   // Print buffered prompt title function before waiting for input.
+   fflush(stderr);
+@@ -281,8 +281,8 @@ bool getwstr(std::wstring &str)
+     if (ReadSize<=0)
+     {
+       // Looks like stdin is a null device. We can enter to infinite loop
+-      // calling Ask(), so let's better exit.
+-      ErrHandler.Exit(RARX_USERBREAK);
++      // calling Ask() or set an empty password, so let's better exit.
++     ErrHandler.ReadError(L"stdin");
+     }
+     StrA[ReadSize]=0;
+ 
+@@ -297,20 +297,26 @@ bool getwstr(std::wstring &str)
+   else
+   {
+     std::vector<wchar> Buf(MaxRead);  // Up to 4 UTF-8 characters per wchar_t.
++    DWORD SizeToRead=(DWORD)Buf.size()-1;
++
++    // ReadConsole fails in Windows 7 for requested input exceeding 30 KB.
++    // Not certain about Windows 8, so check for Windows 10 here.
++    if (WinNT()<=WNT_W10)
++      SizeToRead=Min(SizeToRead,0x4000);
++
+     DWORD ReadSize=0;
+-    if (ReadConsole(GetStdHandle(STD_INPUT_HANDLE),&Buf[0],(DWORD)Buf.size()-1,&ReadSize,NULL)==0)
+-      return false;
++    if (ReadConsole(GetStdHandle(STD_INPUT_HANDLE),&Buf[0],SizeToRead,&ReadSize,NULL)==0)
++      ErrHandler.ReadError(L"stdin"); // Unknown user input, safer to abort.
+     Buf[ReadSize]=0;
+     str=Buf.data();
+   }
+ #else
+   std::vector<wchar> Buf(MaxRead);  // Up to 4 UTF-8 characters per wchar_t.
+   if (fgetws(&Buf[0],Buf.size(),stdin)==NULL)
+-    ErrHandler.Exit(RARX_USERBREAK); // Avoid infinite Ask() loop.
++    ErrHandler.ReadError(L"stdin"); // Avoid infinite Ask() loop.
+   str=Buf.data();
+ #endif
+   RemoveLF(str);
+-  return true;
+ }
+ #endif
+ 
+@@ -324,22 +330,22 @@ int Ask(const wchar *AskStr)
+ {
+   uiAlarm(UIALARM_QUESTION);
+ 
+-  const int MaxItems=10;
++  const uint MaxItems=10;
+   wchar Item[MaxItems][40];
+-  int ItemKeyPos[MaxItems],NumItems=0;
++  uint ItemKeyPos[MaxItems],NumItems=0;
+ 
+-  for (const wchar *NextItem=AskStr;NextItem!=NULL;NextItem=wcschr(NextItem+1,'_'))
++  for (const wchar *NextItem=AskStr;NextItem!=nullptr;NextItem=wcschr(NextItem+1,'_'))
+   {
+     wchar *CurItem=Item[NumItems];
+     wcsncpyz(CurItem,NextItem+1,ASIZE(Item[0]));
+     wchar *EndItem=wcschr(CurItem,'_');
+-    if (EndItem!=NULL)
++    if (EndItem!=nullptr)
+       *EndItem=0;
+-    int KeyPos=0,CurKey;
++    uint KeyPos=0,CurKey;
+     while ((CurKey=CurItem[KeyPos])!=0)
+     {
+       bool Found=false;
+-      for (int I=0;I<NumItems && !Found;I++)
++      for (uint I=0;I<NumItems && !Found;I++)
+         if (toupperw(Item[I][ItemKeyPos[I]])==toupperw(CurKey))
+           Found=true;
+       if (!Found && CurKey!=' ')
+@@ -350,11 +356,11 @@ int Ask(const wchar *AskStr)
+     NumItems++;
+   }
+ 
+-  for (int I=0;I<NumItems;I++)
++  for (uint I=0;I<NumItems;I++)
+   {
+     eprintf(I==0 ? (NumItems>3 ? L"\n":L" "):L", ");
+-    int KeyPos=ItemKeyPos[I];
+-    for (int J=0;J<KeyPos;J++)
++    uint KeyPos=ItemKeyPos[I];
++    for (uint J=0;J<KeyPos;J++)
+       eprintf(L"%c",Item[I][J]);
+     eprintf(L"[%c]%ls",Item[I][KeyPos],&Item[I][KeyPos+1]);
+   }
+@@ -362,7 +368,7 @@ int Ask(const wchar *AskStr)
+   std::wstring Str;
+   getwstr(Str);
+   wchar Ch=toupperw(Str[0]);
+-  for (int I=0;I<NumItems;I++)
++  for (uint I=0;I<NumItems;I++)
+     if (Ch==Item[I][ItemKeyPos[I]])
+       return I+1;
+   return 0;
+diff --git a/consio.hpp b/consio.hpp
+index 6336af7..cf131d9 100644
+--- a/consio.hpp
++++ b/consio.hpp
+@@ -16,13 +16,13 @@ bool GetConsolePassword(UIPASSWORD_TYPE Type,const std::wstring &FileName,SecPas
+   inline void eprintf(const wchar *fmt,...) {}
+   inline void Alarm() {}
+   inline int Ask(const wchar *AskStr) {return 0;}
+-  inline bool getwstr(std::wstring &str) {return false;}
++  inline void getwstr(std::wstring &str) {}
+ #else
+   void mprintf(const wchar *fmt,...);
+   void eprintf(const wchar *fmt,...);
+   void Alarm();
+   int Ask(const wchar *AskStr);
+-  bool getwstr(std::wstring &str);
++  void getwstr(std::wstring &str);
+ #endif
+ 
+ #endif
+diff --git a/crypt.hpp b/crypt.hpp
+index 983d4bf..286c848 100644
+--- a/crypt.hpp
++++ b/crypt.hpp
+@@ -3,7 +3,8 @@
+ 
+ 
+ enum CRYPT_METHOD {
+-  CRYPT_NONE,CRYPT_RAR13,CRYPT_RAR15,CRYPT_RAR20,CRYPT_RAR30,CRYPT_RAR50
++  CRYPT_NONE,CRYPT_RAR13,CRYPT_RAR15,CRYPT_RAR20,CRYPT_RAR30,CRYPT_RAR50,
++  CRYPT_UNKNOWN
+ };
+ 
+ #define SIZE_SALT50              16
+diff --git a/dll.cpp b/dll.cpp
+index de8796d..4086409 100644
+--- a/dll.cpp
++++ b/dll.cpp
+@@ -16,8 +16,7 @@ struct DataSet
+ 
+ HANDLE PASCAL RAROpenArchive(struct RAROpenArchiveData *r)
+ {
+-  RAROpenArchiveDataEx rx;
+-  memset(&rx,0,sizeof(rx));
++  RAROpenArchiveDataEx rx{};
+   rx.ArcName=r->ArcName;
+   rx.OpenMode=r->OpenMode;
+   rx.CmtBuf=r->CmtBuf;
+@@ -32,7 +31,7 @@ HANDLE PASCAL RAROpenArchive(struct RAROpenArchiveData *r)
+ 
+ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
+ {
+-  DataSet *Data=NULL;
++  DataSet *Data=nullptr;
+   try
+   {
+     ErrHandler.Clean();
+@@ -74,7 +73,7 @@ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
+     {
+       r->OpenResult=ERAR_EOPEN;
+       delete Data;
+-      return NULL;
++      return nullptr;
+     }
+     if (!Data->Arc.IsArchive(true))
+     {
+@@ -89,7 +88,7 @@ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
+           r->OpenResult=ERAR_BAD_ARCHIVE;
+       }
+       delete Data;
+-      return NULL;
++      return nullptr;
+     }
+     r->Flags=0;
+     
+@@ -115,7 +114,7 @@ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
+     std::wstring CmtDataW;
+     if (r->CmtBufSize!=0 && Data->Arc.GetComment(CmtDataW))
+     {
+-      if (r->CmtBufW!=NULL)
++      if (r->CmtBufW!=nullptr)
+       {
+ //        CmtDataW.push_back(0);
+         size_t Size=wcslen(CmtDataW.data())+1;
+@@ -141,6 +140,18 @@ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
+     else
+       r->CmtState=r->CmtSize=0;
+ 
++#ifdef PROPAGATE_MOTW
++    if (r->MarkOfTheWeb!=nullptr)
++    {
++      Data->Cmd.MotwAllFields=r->MarkOfTheWeb[0]=='1';
++      const wchar *Sep=wcschr(r->MarkOfTheWeb,'=');
++      if (r->MarkOfTheWeb[0]=='-')
++        Data->Cmd.MotwList.Reset();
++      else
++        Data->Cmd.GetBriefMaskList(Sep==nullptr ? L"*":Sep+1,Data->Cmd.MotwList);
++    }
++#endif
++
+     Data->Extract.ExtractArchiveInit(Data->Arc);
+     return (HANDLE)Data;
+   }
+@@ -494,6 +505,8 @@ static int RarErrorToDll(RAR_EXIT ErrCode)
+       return ERAR_BAD_PASSWORD;
+     case RARX_SUCCESS:
+       return ERAR_SUCCESS; // 0.
++    case RARX_BADARC:
++      return ERAR_BAD_ARCHIVE;
+     default:
+       return ERAR_UNKNOWN;
+   }
+diff --git a/dll.hpp b/dll.hpp
+index ac8d53f..3a8ded9 100644
+--- a/dll.hpp
++++ b/dll.hpp
+@@ -157,7 +157,8 @@ struct RAROpenArchiveDataEx
+   LPARAM        UserData;
+   unsigned int  OpFlags;
+   wchar_t      *CmtBufW;
+-  unsigned int  Reserved[25];
++  wchar_t      *MarkOfTheWeb;
++  unsigned int  Reserved[23];
+ };
+ 
+ enum UNRARCALLBACK_MESSAGES {
+diff --git a/dll.rc b/dll.rc
+index c959c86..47182ee 100644
+--- a/dll.rc
++++ b/dll.rc
+@@ -2,8 +2,8 @@
+ #include <commctrl.h>
+ 
+ VS_VERSION_INFO VERSIONINFO
+-FILEVERSION 7, 1, 100, 1230
+-PRODUCTVERSION 7, 1, 100, 1230
++FILEVERSION 7, 10, 2, 1436
++PRODUCTVERSION 7, 10, 2, 1436
+ FILEOS VOS__WINDOWS32
+ FILETYPE VFT_APP
+ {
+@@ -14,8 +14,8 @@ FILETYPE VFT_APP
+       VALUE "CompanyName", "Alexander Roshal\0"
+       VALUE "ProductName", "RAR decompression library\0"
+       VALUE "FileDescription", "RAR decompression library\0"
+-      VALUE "FileVersion", "7.1.0\0"
+-      VALUE "ProductVersion", "7.1.0\0"
++      VALUE "FileVersion", "7.10.2\0"
++      VALUE "ProductVersion", "7.10.2\0"
+       VALUE "LegalCopyright", "Copyright © Alexander Roshal 1993-2024\0"
+       VALUE "OriginalFilename", "Unrar.dll\0"
+     }
+diff --git a/errhnd.hpp b/errhnd.hpp
+index 3b558b1..065350f 100644
+--- a/errhnd.hpp
++++ b/errhnd.hpp
+@@ -16,6 +16,7 @@ enum RAR_EXIT // RAR exit code.
+   RARX_NOFILES   =  10,
+   RARX_BADPWD    =  11,
+   RARX_READ      =  12,
++  RARX_BADARC    =  13,
+   RARX_USERBREAK = 255
+ };
+ 
+diff --git a/extinfo.hpp b/extinfo.hpp
+index 11b89fe..4d0967a 100644
+--- a/extinfo.hpp
++++ b/extinfo.hpp
+@@ -11,10 +11,6 @@ bool ExtractHardlink(CommandData *Cmd,const std::wstring &NameNew,const std::wst
+ 
+ std::wstring GetStreamNameNTFS(Archive &Arc);
+ 
+-#ifdef _WIN_ALL
+-bool SetPrivilege(LPCTSTR PrivName);
+-#endif
+-
+ void SetExtraInfo20(CommandData *Cmd,Archive &Arc,const std::wstring &Name);
+ void SetExtraInfo(CommandData *Cmd,Archive &Arc,const std::wstring &Name);
+ void SetFileHeaderExtra(CommandData *Cmd,Archive &Arc,const std::wstring &Name);
+diff --git a/extract.cpp b/extract.cpp
+index f799e6a..d9f37c4 100644
+--- a/extract.cpp
++++ b/extract.cpp
+@@ -25,6 +25,7 @@ CmdExtract::CmdExtract(CommandData *Cmd)
+ #ifdef RAR_SMP
+   Unp->SetThreads(Cmd->Threads);
+ #endif
++  Unp->AllowLargePages(Cmd->UseLargePages);
+ }
+ 
+ 
+@@ -112,6 +113,15 @@ void CmdExtract::DoExtract()
+ 
+ void CmdExtract::ExtractArchiveInit(Archive &Arc)
+ {
++  if (Cmd->Command[0]=='T' || Cmd->Command[0]=='I')
++    Cmd->Test=true;
++
++#ifdef PROPAGATE_MOTW
++  // Invoke here, so it is also supported by unrar.dll.
++  if (!Cmd->Test && Cmd->MotwList.ItemsCount()>0)
++    Arc.Motw.ReadZoneIdStream(Arc.FileName,Cmd->MotwAllFields);
++#endif
++
+   DataIO.AdjustTotalArcSize(&Arc);
+ 
+   FileCount=0;
+@@ -178,12 +188,18 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
+     }
+ #endif
+ 
+-    mprintf(St(MNotRAR),ArcName.c_str());
+-
++    bool RarExt=false;
+ #ifndef SFX_MODULE
+-    if (CmpExt(ArcName,L"rar"))
++    RarExt=CmpExt(ArcName,L"rar");
+ #endif
+-      ErrHandler.SetErrorCode(RARX_WARNING);
++
++    if (RarExt)
++      uiMsg(UIERROR_BADARCHIVE,ArcName); // Non-archive .rar file.
++    else
++      mprintf(St(MNotRAR),ArcName.c_str()); // Non-archive not .rar file, likely in "rar x *.*".
++
++    if (RarExt)
++      ErrHandler.SetErrorCode(RARX_BADARC);
+     return EXTRACT_ARC_NEXT;
+   }
+ 
+@@ -254,9 +270,6 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
+ 
+   ExtractArchiveInit(Arc);
+ 
+-  if (Cmd->Command[0]=='T' || Cmd->Command[0]=='I')
+-    Cmd->Test=true;
+-
+ 
+   if (Cmd->Command[0]=='I')
+   {
+@@ -494,7 +507,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+           DestFileName=!Cmd->TempPath.empty() ? Cmd->TempPath:Cmd->ExtrPath;
+           AddEndSlash(DestFileName);
+           DestFileName+=L"__tmp_reference_source_";
+-          MkTemp(DestFileName);
++          MkTemp(DestFileName,nullptr);
+           MatchedRef.TmpName=DestFileName;
+         }
+         RefTarget=true; // Need it even for 't' to test the reference source.
+@@ -553,6 +566,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+       return !Arc.Solid; // Can try extracting next file only in non-solid archive.
+     }
+ 
++#ifndef RAR_NOCRYPT  // For rarext.dll, Setup.SFX and unrar_nocrypt.dll.
+     if (Arc.FileHead.Encrypted)
+     {
+       RarCheckPassword CheckPwd;
+@@ -579,9 +593,9 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+         // Set a password before creating the file, so we can skip creating
+         // in case of wrong password.
+         SecPassword FilePassword=Cmd->Password;
+-  #if defined(_WIN_ALL) && !defined(SFX_MODULE)
++#if defined(_WIN_ALL) && !defined(SFX_MODULE)
+         ConvertDosPassword(Arc,FilePassword);
+-  #endif
++#endif
+ 
+         byte PswCheck[SIZE_PSWCHECK];
+         bool EncSet=DataIO.SetEncryption(false,Arc.FileHead.CryptMethod,
+@@ -609,16 +623,16 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+ 
+             // Avoid new requests for unrar.dll to prevent the infinite loop
+             // if app always returns the same password.
+-  #ifndef RARDLL
++#ifndef RARDLL
+             continue; // Request a password again.
+-  #endif
++#endif
+           }
+-  #ifdef RARDLL
++#ifdef RARDLL
+           // If we already have ERAR_EOPEN as result of missing volume,
+           // we should not replace it with less precise ERAR_BAD_PASSWORD.
+           if (Cmd->DllError!=ERAR_EOPEN)
+             Cmd->DllError=ERAR_BAD_PASSWORD;
+-  #endif
++#endif
+           ErrHandler.SetErrorCode(RARX_BADPWD);
+           ExtrFile=false;
+         }
+@@ -627,6 +641,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+     }
+     else
+       DataIO.SetEncryption(false,CRYPT_NONE,NULL,NULL,NULL,0,NULL,NULL);
++#endif // RAR_NOCRYPT
+ 
+     // Per file symlink conversion flag. Can be turned off in unrar.dll.
+     bool CurConvertSymlinkPaths=ConvertSymlinkPaths;
+@@ -688,7 +703,29 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+           // any overwrite prompts.
+           if (!CheckWinLimit(Arc,ArcFileName))
+             return false;
+-          ExtrFile=ExtrCreateFile(Arc,CurFile);
++
++          // Read+write mode is required to set "Compressed" attribute.
++          // Other than that prefer the write only mode to avoid
++          // OpenIndiana NAS problem with SetFileTime and read+write files.
++#if defined(_WIN_ALL) && !defined(SFX_MODULE)
++          bool Compressed=Cmd->SetCompressedAttr &&
++               (Arc.FileHead.FileAttr & FILE_ATTRIBUTE_COMPRESSED)!=0;
++          bool WriteOnly=!Compressed;
++#else
++          bool WriteOnly=true;
++#endif
++
++          ExtrFile=ExtrCreateFile(Arc,CurFile,WriteOnly);
++
++#if defined(_WIN_ALL) && !defined(SFX_MODULE)
++          // 2024.03.12: Set early to compress written data immediately.
++          // For 10 GB text file it was ~1.5x faster than when set after close.
++
++          if (ExtrFile && Compressed)
++            SetFileCompression(CurFile.GetHandle(),true);
++
++#endif
++
+         }
+ 
+     if (!ExtrFile && Arc.Solid)
+@@ -968,6 +1005,9 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+           if (Preallocated>0 && (BrokenFile || DataIO.CurUnpWrite!=Preallocated))
+             CurFile.Truncate();
+ 
++#ifdef PROPAGATE_MOTW
++          Arc.Motw.CreateZoneIdStream(DestFileName,Cmd->MotwList);
++#endif
+ 
+           CurFile.SetOpenFileTime(
+             Cmd->xmtime==EXTTIME_NONE ? NULL:&Arc.FileHead.mtime,
+@@ -987,9 +1027,6 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
+         if (SetAttr)
+         {
+ #if defined(_WIN_ALL) && !defined(SFX_MODULE)
+-          if (Cmd->SetCompressedAttr &&
+-              (Arc.FileHead.FileAttr & FILE_ATTRIBUTE_COMPRESSED)!=0)
+-            SetFileCompression(DestFileName,true);
+           if (Cmd->ClearArc)
+             Arc.FileHead.FileAttr&=~FILE_ATTRIBUTE_ARCHIVE;
+ #endif
+@@ -1406,7 +1443,7 @@ void CmdExtract::ExtrCreateDir(Archive &Arc,const std::wstring &ArcFileName)
+ }
+ 
+ 
+-bool CmdExtract::ExtrCreateFile(Archive &Arc,File &CurFile)
++bool CmdExtract::ExtrCreateFile(Archive &Arc,File &CurFile,bool WriteOnly)
+ {
+   bool Success=true;
+   wchar Command=Cmd->Command[0];
+@@ -1417,9 +1454,7 @@ bool CmdExtract::ExtrCreateFile(Archive &Arc,File &CurFile)
+   if ((Command=='E' || Command=='X') && !Cmd->Test)
+   {
+     bool UserReject;
+-    // Specify "write only" mode to avoid OpenIndiana NAS problems
+-    // with SetFileTime and read+write files.
+-    if (!FileCreate(Cmd,&CurFile,DestFileName,&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime,true))
++    if (!FileCreate(Cmd,&CurFile,DestFileName,&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime,WriteOnly))
+     {
+       Success=false;
+       if (!UserReject)
+@@ -1479,10 +1514,16 @@ bool CmdExtract::CheckUnpVer(Archive &Arc,const std::wstring &ArcFileName)
+   if (Arc.FileHead.Method==0)
+     WrongVer=false;
+ 
++  // Can't unpack the unknown encryption even for stored files.
++  if (Arc.FileHead.CryptMethod==CRYPT_UNKNOWN)
++    WrongVer=true;
++
+   if (WrongVer)
+   {
+     ErrHandler.UnknownMethodMsg(Arc.FileName,ArcFileName);
+-    uiMsg(UIERROR_NEWERRAR,Arc.FileName);
++    // No need to suggest a new version if it is just a broken archive.
++    if (!Arc.BrokenHeader)
++      uiMsg(UIERROR_NEWERRAR,Arc.FileName);
+   }
+   return !WrongVer;
+ }
+diff --git a/extract.hpp b/extract.hpp
+index 4400057..18d8f8c 100644
+--- a/extract.hpp
++++ b/extract.hpp
+@@ -37,7 +37,7 @@ class CmdExtract
+     void ConvertDosPassword(Archive &Arc,SecPassword &DestPwd);
+ #endif
+     void ExtrCreateDir(Archive &Arc,const std::wstring &ArcFileName);
+-    bool ExtrCreateFile(Archive &Arc,File &CurFile);
++    bool ExtrCreateFile(Archive &Arc,File &CurFile,bool WriteOnly);
+     bool CheckUnpVer(Archive &Arc,const std::wstring &ArcFileName);
+ #ifndef SFX_MODULE
+     void AnalyzeArchive(const std::wstring &ArcName,bool Volume,bool NewNumbering);
+diff --git a/filefn.cpp b/filefn.cpp
+index 3cb2589..d23f4f7 100644
+--- a/filefn.cpp
++++ b/filefn.cpp
+@@ -129,6 +129,8 @@ void SetDirTime(const std::wstring &Name,RarTime *ftm,RarTime *ftc,RarTime *fta)
+ }
+ 
+ 
++
++
+ bool IsRemovable(const std::wstring &Name)
+ {
+ #if defined(_WIN_ALL)
+@@ -320,10 +322,10 @@ bool SetFileAttr(const std::wstring &Name,uint Attr)
+ }
+ 
+ 
+-wchar* MkTemp(wchar *Name,size_t MaxSize)
++// Ext is the extension with the leading dot, like L".bat", or nullptr to use
++// the default extension.
++bool MkTemp(std::wstring &Name,const wchar *Ext)
+ {
+-  size_t Length=wcslen(Name);
+-
+   RarTime CurTime;
+   CurTime.SetCurrentTime();
+ 
+@@ -342,47 +344,20 @@ wchar* MkTemp(wchar *Name,size_t MaxSize)
+ 
+   for (uint Attempt=0;;Attempt++)
+   {
+-    uint Ext=Random%50000+Attempt;
+-    wchar RndText[50];
++    uint RandomExt=Random%50000+Attempt;
++    if (Attempt==1000)
++      return false;
++
+     // User asked to specify the single extension for all temporary files,
+     // so it can be added to server ransomware protection exceptions.
+     // He wrote, this protection blocks temporary files when adding
+-    // a file to RAR archive with drag and drop.
+-    swprintf(RndText,ASIZE(RndText),L"%u.%03u.rartemp",PID,Ext);
+-    if (Length+wcslen(RndText)>=MaxSize || Attempt==1000)
+-      return NULL;
+-    wcsncpyz(Name+Length,RndText,MaxSize-Length);
+-    if (!FileExist(Name))
+-      break;
+-  }
+-  return Name;
+-}
++    // a file to RAR archive with drag and drop. So unless a calling code
++    // requires a specific extension, like .bat file when uninstalling,
++    // we set the uniform extension here.
++    if (Ext==nullptr)
++      Ext=L".rartemp";
+ 
+-
+-bool MkTemp(std::wstring &Name)
+-{
+-  RarTime CurTime;
+-  CurTime.SetCurrentTime();
+-
+-  // We cannot use CurTime.GetWin() as is, because its lowest bits can
+-  // have low informational value, like being a zero or few fixed numbers.
+-  uint Random=(uint)(CurTime.GetWin()/100000);
+-
+-  // Using PID we guarantee that different RAR copies use different temp names
+-  // even if started in exactly the same time.
+-  uint PID=0;
+-#ifdef _WIN_ALL
+-  PID=(uint)GetCurrentProcessId();
+-#elif defined(_UNIX)
+-  PID=(uint)getpid();
+-#endif
+-
+-  for (uint Attempt=0;;Attempt++)
+-  {
+-    uint Ext=Random%50000+Attempt;
+-    if (Attempt==1000)
+-      return false;
+-    std::wstring NewName=Name + std::to_wstring(PID) + L"." + std::to_wstring(Ext) + L".rartemp";
++    std::wstring NewName=Name + std::to_wstring(PID) + L"." + std::to_wstring(RandomExt) + Ext;
+     if (!FileExist(NewName))
+     {
+       Name=NewName;
+@@ -545,14 +520,21 @@ bool SetFileCompression(const std::wstring &Name,bool State)
+       hFile=CreateFile(LongName.c_str(),FILE_READ_DATA|FILE_WRITE_DATA,
+                  FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,
+                  FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_SEQUENTIAL_SCAN,NULL);
++    if (hFile==INVALID_HANDLE_VALUE)
++      return false;
+   }
+-  if (hFile==INVALID_HANDLE_VALUE)
+-    return false;
++  bool Success=SetFileCompression(hFile,State);
++  CloseHandle(hFile);
++  return Success;
++}
++
++
++bool SetFileCompression(HANDLE hFile,bool State)
++{
+   SHORT NewState=State ? COMPRESSION_FORMAT_DEFAULT:COMPRESSION_FORMAT_NONE;
+   DWORD Result;
+   int RetCode=DeviceIoControl(hFile,FSCTL_SET_COMPRESSION,&NewState,
+                               sizeof(NewState),NULL,0,&Result,NULL);
+-  CloseHandle(hFile);
+   return RetCode!=0;
+ }
+ 
+diff --git a/filefn.hpp b/filefn.hpp
+index 4e06197..8ac7c10 100644
+--- a/filefn.hpp
++++ b/filefn.hpp
+@@ -6,7 +6,10 @@ enum MKDIR_CODE {MKDIR_SUCCESS,MKDIR_ERROR,MKDIR_BADPATH};
+ MKDIR_CODE MakeDir(const std::wstring &Name,bool SetAttr,uint Attr);
+ bool CreateDir(const std::wstring &Name);
+ bool CreatePath(const std::wstring &Path,bool SkipLastName,bool Silent);
++
+ void SetDirTime(const std::wstring &Name,RarTime *ftm,RarTime *ftc,RarTime *fta);
++
++
+ bool IsRemovable(const std::wstring &Name);
+ 
+ #ifndef SFX_MODULE
+@@ -28,8 +31,7 @@ bool IsDeleteAllowed(uint FileAttr);
+ void PrepareToDelete(const std::wstring &Name);
+ uint GetFileAttr(const std::wstring &Name);
+ bool SetFileAttr(const std::wstring &Name,uint Attr);
+-wchar* MkTemp(wchar *Name,size_t MaxSize);
+-bool MkTemp(std::wstring &Name);
++bool MkTemp(std::wstring &Name,const wchar *Ext);
+ 
+ enum CALCFSUM_FLAGS {CALCFSUM_SHOWTEXT=1,CALCFSUM_SHOWPERCENT=2,CALCFSUM_SHOWPROGRESS=4,CALCFSUM_CURPOS=8};
+ 
+@@ -41,6 +43,7 @@ bool DelDir(const std::wstring &Name);
+ 
+ #if defined(_WIN_ALL) && !defined(SFX_MODULE)
+ bool SetFileCompression(const std::wstring &Name,bool State);
++bool SetFileCompression(HANDLE hFile,bool State);
+ void ResetFileCache(const std::wstring &Name);
+ #endif
+ 
+diff --git a/hash.cpp b/hash.cpp
+index cde3db9..d07b2d2 100644
+--- a/hash.cpp
++++ b/hash.cpp
+@@ -275,7 +275,9 @@ bool DataHash::Cmp(HashValue *CmpValue,byte *Key)
+ {
+   HashValue Final;
+   Result(&Final);
+-  if (Key!=NULL)
++#ifndef RAR_NOCRYPT
++  if (Key!=nullptr)
+     ConvertHashToMAC(&Final,Key);
++#endif
+   return Final==*CmpValue;
+ }
+diff --git a/hash.hpp b/hash.hpp
+index 0189113..99488e6 100644
+--- a/hash.hpp
++++ b/hash.hpp
+@@ -13,6 +13,8 @@ struct HashValue
+   bool operator == (const HashValue &cmp) const;
+ 
+   // Not actually used now. Const member for same reason as operator == above.
++  // Can be removed after switching to C++20, which automatically provides "!="
++  // if operator == is defined.
+   bool operator != (const HashValue &cmp) const {return !(*this==cmp);}
+ 
+   HASH_TYPE Type;
+diff --git a/largepage.cpp b/largepage.cpp
+new file mode 100644
+index 0000000..7b574c5
+--- /dev/null
++++ b/largepage.cpp
+@@ -0,0 +1,201 @@
++#include "rar.hpp"
++
++/*
++To enable, disable or check Large Memory pages manually:
++- open "Local Security Policy" from "Start Menu";
++- open "Lock Pages in Memory" in "Local Policies\User Rights Assignment";
++- add or remove the user and sign out and sign in or restart Windows.
++*/
++
++#if defined(_WIN_ALL) && !defined(SFX_MODULE) && !defined(RARDLL)
++#define ALLOW_LARGE_PAGES
++#endif
++
++LargePageAlloc::LargePageAlloc()
++{
++  UseLargePages=false;
++#ifdef ALLOW_LARGE_PAGES
++  PageSize=0;
++#endif
++}
++
++
++void LargePageAlloc::AllowLargePages(bool Allow)
++{
++#ifdef ALLOW_LARGE_PAGES
++  if (Allow && PageSize==0)
++  {
++    HMODULE hKernel=GetModuleHandle(L"kernel32.dll");
++    if (hKernel!=nullptr)
++    {
++      typedef SIZE_T (*GETLARGEPAGEMINIMUM)();
++      GETLARGEPAGEMINIMUM pGetLargePageMinimum=(GETLARGEPAGEMINIMUM)GetProcAddress(hKernel, "GetLargePageMinimum");
++      if (pGetLargePageMinimum!=nullptr)
++        PageSize=pGetLargePageMinimum();
++    }
++    if (PageSize==0 || !SetPrivilege(SE_LOCK_MEMORY_NAME))
++    {
++      UseLargePages=false;
++      return;
++    }
++  }
++
++  UseLargePages=Allow;
++#endif
++}
++
++
++bool LargePageAlloc::IsPrivilegeAssigned()
++{
++#ifdef ALLOW_LARGE_PAGES
++  return SetPrivilege(SE_LOCK_MEMORY_NAME);
++#else
++  return true;
++#endif
++}
++
++
++bool LargePageAlloc::AssignPrivilege()
++{
++#ifdef ALLOW_LARGE_PAGES
++  HANDLE hToken = NULL;
++
++  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
++    return false;
++
++  // Get the required buffer size.
++  DWORD BufSize=0;
++  GetTokenInformation(hToken, TokenUser, NULL, 0, &BufSize);
++  if (BufSize==0 || BufSize>1000000) // Sanity check for returned value.
++  {
++    CloseHandle(hToken);
++    return false;
++  }
++
++  TOKEN_USER *TokenInfo = (TOKEN_USER*)malloc(BufSize);
++
++  // Get the current user token information.
++  if (GetTokenInformation(hToken,TokenUser,TokenInfo,BufSize,&BufSize)==0)
++  {
++    CloseHandle(hToken);
++    return false;
++  }
++
++  // Get SID string for the current user.
++  LPWSTR ApiSidStr;
++  ConvertSidToStringSid(TokenInfo->User.Sid, &ApiSidStr);
++
++  // Convert SID to C++ string and release API based buffer.
++  std::wstring SidStr=ApiSidStr;
++  LocalFree(ApiSidStr);
++  CloseHandle(hToken);
++
++  if (IsUserAdmin())
++    AssignPrivilegeBySid(SidStr);
++  else
++  {
++    // Define here, so they survive until ShellExecuteEx call.
++    std::wstring ExeName=GetModuleFileStr();
++    std::wstring Param=std::wstring(L"-") + LOCKMEM_SWITCH + SidStr;
++
++    SHELLEXECUTEINFO shExecInfo{};
++    shExecInfo.cbSize = sizeof(shExecInfo);
++
++    shExecInfo.hwnd = NULL; // Specifying WinRAR main window here does not work well in command line mode.
++    shExecInfo.lpVerb = L"runas";
++    shExecInfo.lpFile = ExeName.c_str();
++    shExecInfo.lpParameters = Param.c_str();
++    shExecInfo.nShow = SW_SHOWNORMAL;
++    BOOL Result=ShellExecuteEx(&shExecInfo);
++  }
++#endif
++
++  return true;
++}
++
++
++bool LargePageAlloc::AssignPrivilegeBySid(const std::wstring &Sid)
++{
++#ifdef ALLOW_LARGE_PAGES
++  LSA_HANDLE PolicyHandle;
++  LSA_OBJECT_ATTRIBUTES ObjectAttributes{}; // Docs require to zero initalize it.
++
++#ifndef STATUS_SUCCESS // Can be defined through WIL package in WinRAR.
++  // We define STATUS_SUCCESS here instead of including ntstatus.h to avoid
++  // macro redefinition warnings. We tried UMDF_USING_NTSTATUS define
++  // and other workarounds, but it didn't help.
++  const uint STATUS_SUCCESS=0;
++#endif
++
++  if (LsaOpenPolicy(NULL,&ObjectAttributes,POLICY_CREATE_ACCOUNT|
++                    POLICY_LOOKUP_NAMES,&PolicyHandle)!=STATUS_SUCCESS)
++    return false;
++
++  PSID UserSid;
++  ConvertStringSidToSid(Sid.c_str(),&UserSid);
++
++  LSA_UNICODE_STRING LsaString;
++  LsaString.Buffer=(PWSTR)SE_LOCK_MEMORY_NAME;
++  // It must be in bytes, so multiple it to sizeof(wchar_t).
++  LsaString.Length=(USHORT)wcslen(LsaString.Buffer)*sizeof(LsaString.Buffer[0]);
++  LsaString.MaximumLength=LsaString.Length;
++
++  bool Success=LsaAddAccountRights(PolicyHandle,UserSid,&LsaString,1)==STATUS_SUCCESS;
++
++  LocalFree(UserSid);
++  LsaClose(PolicyHandle);
++
++  mprintf(St(MPrivilegeAssigned));
++  if (Ask(St(MYesNo)) == 1)
++    Shutdown(POWERMODE_RESTART);
++
++  return Success;
++#else
++  return true;
++#endif
++}
++
++
++bool LargePageAlloc::AssignConfirmation()
++{
++#ifdef ALLOW_LARGE_PAGES
++  mprintf(St(MLockInMemoryNeeded));
++  return Ask(St(MYesNo)) == 1;
++#else
++  return false;
++#endif
++}
++
++
++void* LargePageAlloc::new_large(size_t Size)
++{
++  void *Allocated=nullptr;
++
++#ifdef ALLOW_LARGE_PAGES
++  if (UseLargePages && Size>=PageSize)
++  {
++    // VirtualAlloc fails if allocation size isn't multiple of page size.
++    SIZE_T AllocSize=Size%PageSize==0 ? Size:(Size/PageSize+1)*PageSize;
++    Allocated=VirtualAlloc(nullptr,AllocSize,MEM_COMMIT|MEM_RESERVE|MEM_LARGE_PAGES,PAGE_READWRITE);
++    if (Allocated!=nullptr)
++      LargeAlloc.push_back(Allocated);
++  }
++#endif
++  return Allocated;
++}
++
++
++bool LargePageAlloc::delete_large(void *Addr)
++{
++#ifdef ALLOW_LARGE_PAGES
++  if (Addr!=nullptr)
++    for (size_t I=0;I<LargeAlloc.size();I++)
++      if (LargeAlloc[I]==Addr)
++      {
++        LargeAlloc[I]=nullptr;
++        VirtualFree(Addr,0,MEM_RELEASE);
++        return true;
++      }
++#endif
++  return false;
++}
+diff --git a/largepage.hpp b/largepage.hpp
+new file mode 100644
+index 0000000..62b357b
+--- /dev/null
++++ b/largepage.hpp
+@@ -0,0 +1,54 @@
++#ifndef _RAR_LARGEPAGE_
++#define _RAR_LARGEPAGE_
++
++class LargePageAlloc
++{
++  private:
++    static constexpr const wchar *LOCKMEM_SWITCH=L"isetup_privilege_lockmem";
++
++    void* new_large(size_t Size);
++    bool delete_large(void *Addr);
++#ifdef _WIN_ALL
++    std::vector<void*> LargeAlloc;
++    SIZE_T PageSize;
++#endif
++    bool UseLargePages;
++  public:
++    LargePageAlloc();
++    void AllowLargePages(bool Allow);
++    static bool IsPrivilegeAssigned();
++    static bool AssignPrivilege();
++    static bool AssignPrivilegeBySid(const std::wstring &Sid);
++    static bool AssignConfirmation();
++
++    static bool ProcessSwitch(CommandData *Cmd,const wchar *Switch)
++    {
++      if (Switch[0]==LOCKMEM_SWITCH[0])
++      {
++        size_t Length=wcslen(LOCKMEM_SWITCH);
++        if (wcsncmp(Switch,LOCKMEM_SWITCH,Length)==0)
++        {
++          LargePageAlloc::AssignPrivilegeBySid(Switch+Length);
++          return true;
++        }
++      }
++      return false;
++    }
++
++    template <class T> T* new_l(size_t Size,bool Clear=false)
++    {
++      T *Allocated=(T*)new_large(Size*sizeof(T));
++      if (Allocated==nullptr)
++        Allocated=Clear ? new T[Size]{} : new T[Size];
++      return Allocated;
++    }
++
++    template <class T> void delete_l(T *Addr)
++    {
++      if (!delete_large(Addr))
++        delete[] Addr;
++    }
++};
++
++
++#endif
+diff --git a/list.cpp b/list.cpp
+index 3eae4de..15aa73a 100644
+--- a/list.cpp
++++ b/list.cpp
+@@ -37,7 +37,7 @@ void ListArchive(CommandData *Cmd)
+           mprintf(L"\n%s: %s",St(MListArchive),Arc.FileName.c_str());
+ 
+           mprintf(L"\n%s: ",St(MListDetails));
+-          const wchar *Fmt=Arc.Format==RARFMT14 ? L"RAR 1.4":(Arc.Format==RARFMT15 ? L"RAR 4":L"RAR 5");
++          const wchar *Fmt=Arc.Format==RARFMT14 ? L"RAR 1.4":(Arc.Format==RARFMT15 ? L"RAR 1.5":L"RAR 5");
+           mprintf(L"%s", Fmt);
+           if (Arc.Solid)
+             mprintf(L", %s", St(MListSolid));
+diff --git a/loclang.hpp b/loclang.hpp
+index df94a8e..3ee42f7 100644
+--- a/loclang.hpp
++++ b/loclang.hpp
+@@ -97,6 +97,7 @@
+ #define   MCHelpSwMC         L"\n  mc<par>       Set advanced compression parameters"
+ #define   MCHelpSwMD         L"\n  md[x]<n>[kmg] Dictionary size in KB, MB or GB"
+ #define   MCHelpSwME         L"\n  me[par]       Set encryption parameters"
++#define   MCHelpSwMLP        L"\n  mlp           Use large memory pages"
+ #define   MCHelpSwMS         L"\n  ms[ext;ext]   Specify file types to store"
+ #define   MCHelpSwMT         L"\n  mt<threads>   Set the number of threads"
+ #define   MCHelpSwN          L"\n  n<file>       Additionally filter included files"
+@@ -107,6 +108,7 @@
+ #define   MCHelpSwOH         L"\n  oh            Save hard links as the link instead of the file"
+ #define   MCHelpSwOI         L"\n  oi[0-4][:min] Save identical files as references"
+ #define   MCHelpSwOL         L"\n  ol[a,-]       Process symbolic links as the link [absolute paths, skip]"
++#define   MCHelpSwOM         L"\n  om[-|1][=lst] Propagate Mark of the Web"
+ #define   MCHelpSwONI        L"\n  oni           Allow potentially incompatible names"
+ #define   MCHelpSwOP         L"\n  op<path>      Set the output path for extracted files"
+ #define   MCHelpSwOR         L"\n  or            Rename files automatically"
+@@ -232,8 +234,8 @@
+ #define   MArcComment        L"\nArchive comment"
+ #define   MReadStdinCmt      L"\nReading comment from stdin\n"
+ #define   MReadCommFrom      L"\nReading comment from %s"
+-#define   MDelComment        L"\nDeleting comment from %s"
+-#define   MAddComment        L"\nAdding comment to %s"
++#define   MDelComment        L"\nDeleting a comment from %s"
++#define   MAddComment        L"\nAdding a comment to %s"
+ #define   MLogCommBrk        L"\nThe archive comment is corrupt"
+ #define   MCommAskCont       L"\nPress 'Enter' to continue or 'Q' to quit:"
+ #define   MWriteCommTo       L"\nWrite comment to %s"
+@@ -302,7 +304,7 @@
+ #define   MRecSecDamage      L"\nSector %ld (offsets %lX...%lX) damaged"
+ #define   MRecCorrected      L" - data recovered"
+ #define   MRecFailed         L" - cannot recover data"
+-#define   MAddRecRec         L"\nAdding data recovery record"
++#define   MAddRecRec         L"\nAdding the data recovery record"
+ #define   MEraseForVolume    L"\n\nErasing contents of drive %c:\n"
+ #define   MGetOwnersError    L"\nWARNING: Cannot get %s owner and group\n"
+ #define   MErrGetOwnerID     L"\nWARNING: Cannot get owner %s ID\n"
+@@ -329,7 +331,6 @@
+ #define   MSubHeadCorrupt    L"\nERROR: Corrupt data header found, ignored"
+ #define   MSubHeadUnknown    L"\nWARNING: Unknown data header format, ignored"
+ #define   MSubHeadDataCRC    L"\nERROR: Corrupt %s data block"
+-#define   MSubHeadType       L"\nData header type: %s"
+ #define   MScanError         L"\nCannot read contents of %s"
+ #define   MNotVolume         L"\n%s is not volume"
+ #define   MRecVolDiffSets    L"\nERROR: %s and %s belong to different sets"
+@@ -384,7 +385,7 @@
+ #define   MUseSmalllerDict   L"\nPlease use a smaller compression dictionary."
+ #define   MExtrDictOutMem    L"\nNot enough memory to unpack the archive with %u GB compression dictionary."
+ #define   MSuggest64bit      L"\n64-bit RAR version is necessary."
+-#define   MOpenErrAtime      L"\nYou may need to remove -tsp switch to open this file."
++#define   MOpenErrAtime      L"\nYou may need to remove -tsp switch or run RAR as administrator to open this file."
+ #define   MErrReadInfo       L"\nChoose 'Ignore' to continue with the already read file part only, 'Ignore all' to do it for all read errors, 'Retry' to repeat read and 'Quit' to abort."
+ #define   MErrReadTrunc      L"\n%s is archived incompletely because of read error.\n"
+ #define   MErrReadCount      L"\n%u files are archived incompletely because of read errors."
+@@ -402,3 +403,8 @@
+ #define   MDictComprLimit    L"\n%u GB dictionary exceeds %u GB limit and not allowed when compressing data."
+ #define   MNeedSFX64         L"\n64-bit self-extracting module is necessary for %u GB compression dictionary."
+ #define   MSkipUnsafeLink    L"\nSkipping the potentially unsafe %s -> %s link. For archives from a trustworthy source use -ola to extract it anyway."
++#define   MTruncService      L"\nTruncated at the service block: %s"
++#define   MHeaderQO          L"quick open information"
++#define   MHeaderRR          L"recovery record"
++#define   MLockInMemoryNeeded L"-mlp switch requires ""Lock pages in memory"" privilege. Do you wish to assign it to the current user account?"
++#define   MPrivilegeAssigned L"User privilege has been successfully assigned and will be activated after Windows restart. Restart now?"
+diff --git a/makefile b/makefile
+index ce54a02..f7fe61a 100644
+--- a/makefile
++++ b/makefile
+@@ -2,8 +2,11 @@
+ # Makefile for UNIX - unrar
+ 
+ # Linux using GCC
++# 2024.08.19: -march=native isn't recognized on some platforms such as RISCV64.
++# Thus we removed it. Clang ARM users can add -march=armv8-a+crypto to enable
++# ARM NEON crypto.
+ CXX=c++
+-CXXFLAGS=-march=native -O2 -std=c++11 -Wno-logical-op-parentheses -Wno-switch -Wno-dangling-else
++CXXFLAGS=-O2 -std=c++11 -Wno-logical-op-parentheses -Wno-switch -Wno-dangling-else
+ LIBFLAGS=-fPIC
+ DEFINES=-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -DRAR_SMP
+ STRIP=strip
+@@ -25,7 +28,7 @@ OBJECTS=rar.o strlist.o strfn.o pathfn.o smallfn.o global.o file.o filefn.o filc
+ 	archive.o arcread.o unicode.o system.o crypt.o crc.o rawread.o encname.o \
+ 	resource.o match.o timefn.o rdwrfn.o consio.o options.o errhnd.o rarvm.o secpassword.o \
+ 	rijndael.o getbits.o sha1.o sha256.o blake2s.o hash.o extinfo.o extract.o volume.o \
+-	list.o find.o unpack.o headers.o threadpool.o rs16.o cmddata.o ui.o
++	list.o find.o unpack.o headers.o threadpool.o rs16.o cmddata.o ui.o largepage.o
+ 
+ .cpp.o:
+ 	$(COMPILE) -D$(WHAT) -c $<
+diff --git a/motw.cpp b/motw.cpp
+new file mode 100644
+index 0000000..25698fe
+--- /dev/null
++++ b/motw.cpp
+@@ -0,0 +1,131 @@
++#include "rar.hpp"
++
++/* Zone.Identifier stream can include the text like:
++
++[ZoneTransfer]
++ZoneId=3
++HostUrl=https://site/path/file.ext
++ReferrerUrl=d:\path\archive.ext
++
++Where ZoneId can be:
++
++    0 = My Computer
++    1 = Local intranet
++    2 = Trusted sites
++    3 = Internet
++    4 = Restricted sites
++*/
++
++MarkOfTheWeb::MarkOfTheWeb()
++{
++  ZoneIdValue=-1; // -1 indicates the missing MOTW.
++  AllFields=false;
++}
++
++
++void MarkOfTheWeb::Clear()
++{
++  ZoneIdValue=-1;
++}
++
++
++void MarkOfTheWeb::ReadZoneIdStream(const std::wstring &FileName,bool AllFields)
++{
++  MarkOfTheWeb::AllFields=AllFields;
++  ZoneIdValue=-1;
++  ZoneIdStream.clear();
++
++  std::wstring StreamName=FileName+MOTW_STREAM_NAME;
++
++  File SrcFile;
++  if (SrcFile.Open(StreamName))
++  {
++    ZoneIdStream.resize(MOTW_STREAM_MAX_SIZE);
++    int BufSize=SrcFile.Read(&ZoneIdStream[0],ZoneIdStream.size());
++    ZoneIdStream.resize(BufSize<0 ? 0:BufSize);
++
++    if (BufSize<=0)
++      return;
++
++    ZoneIdValue=ParseZoneIdStream(ZoneIdStream);
++  }
++}
++
++
++// 'Stream' contains the raw "Zone.Identifier" NTFS stream data on input
++// and either raw or cleaned stream data on output.
++int MarkOfTheWeb::ParseZoneIdStream(std::string &Stream)
++{
++  if (Stream.rfind("[ZoneTransfer]",0)==std::string::npos)
++    return -1; // Not a valid Mark of the Web. Prefer the archive MOTW if any.
++
++  std::string::size_type ZoneId=Stream.find("ZoneId=",0);
++  if (ZoneId==std::string::npos || !IsDigit(Stream[ZoneId+7]))
++    return -1; // Not a valid Mark of the Web.
++  int ZoneIdValue=atoi(&Stream[ZoneId+7]);
++  if (ZoneIdValue<0 || ZoneIdValue>4)
++    return -1; // Not a valid Mark of the Web.
++
++  if (!AllFields)
++    Stream="[ZoneTransfer]\r\nZoneId=" + std::to_string(ZoneIdValue) + "\r\n";
++
++  return ZoneIdValue;
++}
++
++
++void MarkOfTheWeb::CreateZoneIdStream(const std::wstring &Name,StringList &MotwList)
++{
++  if (ZoneIdValue==-1)
++    return;
++
++  size_t ExtPos=GetExtPos(Name);
++  const wchar *Ext=ExtPos==std::wstring::npos ? L"":&Name[ExtPos+1];
++
++  bool Matched=false;
++  wchar *CurMask;
++  MotwList.Rewind();
++  while ((CurMask=MotwList.GetString())!=nullptr)
++  {
++    // Perform the fast extension comparison for simple *.ext masks.
++    // When extracting 100000 files with "Exe and office" masks set,
++    // this loop spends 1.14s without this optimization and 0.24s with it.
++    bool FastCmp=CurMask[0]=='*' && CurMask[1]=='.' && !IsWildcard(CurMask+2);
++    if (FastCmp && wcsicomp(Ext,CurMask+2)==0 || !FastCmp && CmpName(CurMask,Name,MATCH_NAMES))
++    {
++      Matched=true;
++      break;
++    }
++  }
++
++  if (!Matched)
++    return;
++
++  std::wstring StreamName=Name+MOTW_STREAM_NAME;
++  
++  File StreamFile;
++  if (StreamFile.Create(StreamName)) // Can fail on FAT.
++  {
++    // We got a report that write to stream failed on Synology 2411+ NAS drive.
++    // So we handle it silently instead of aborting.
++    StreamFile.SetExceptions(false);
++    if (StreamFile.Write(&ZoneIdStream[0],ZoneIdStream.size()))
++      StreamFile.Close();
++  }
++}
++
++
++bool MarkOfTheWeb::IsNameConflicting(const std::wstring &StreamName)
++{
++  // We must use the case insensitive comparison for L":Zone.Identifier"
++  // to catch specially crafted archived streams like L":zone.identifier".
++  return wcsicomp(StreamName,MOTW_STREAM_NAME)==0 && ZoneIdValue!=-1;
++}
++
++
++// Return true and prepare the file stream to write if its ZoneId is stricter
++// than archive ZoneId. If it is missing, less or equally strict, return false.
++bool MarkOfTheWeb::IsFileStreamMoreSecure(std::string &FileStream)
++{
++  int StreamZone=ParseZoneIdStream(FileStream);
++  return StreamZone>ZoneIdValue;
++}
+diff --git a/motw.hpp b/motw.hpp
+new file mode 100644
+index 0000000..e24feea
+--- /dev/null
++++ b/motw.hpp
+@@ -0,0 +1,26 @@
++#ifndef _RAR_MOTW_
++#define _RAR_MOTW_
++
++class MarkOfTheWeb
++{
++  private:
++    const size_t MOTW_STREAM_MAX_SIZE=1024;
++    const wchar* MOTW_STREAM_NAME=L":Zone.Identifier"; // Must start from ':'.
++
++    int ParseZoneIdStream(std::string &Stream);
++
++    std::string ZoneIdStream; // Store archive ":Zone.Identifier" NTFS stream data.
++    int ZoneIdValue; // -1 if missing.
++    bool AllFields; // Copy all MOTW fields or ZoneId only.
++  public:
++    MarkOfTheWeb();
++    void Clear();
++    void ReadZoneIdStream(const std::wstring &FileName,bool AllFields);
++    void CreateZoneIdStream(const std::wstring &Name,StringList &MotwList);
++    bool IsNameConflicting(const std::wstring &StreamName);
++    bool IsFileStreamMoreSecure(std::string &FileStream);
++};
++
++#endif
++
++
+diff --git a/options.hpp b/options.hpp
+index 1061bd0..4fa6841 100644
+--- a/options.hpp
++++ b/options.hpp
+@@ -52,7 +52,7 @@ enum ARC_METADATA
+   ARCMETA_RESTORE  // -amr
+ };
+ 
+-enum QOPEN_MODE { QOPEN_NONE, QOPEN_AUTO, QOPEN_ALWAYS };
++enum QOPEN_MODE { QOPEN_NONE=0, QOPEN_AUTO, QOPEN_ALWAYS };
+ 
+ enum RAR_CHARSET { RCH_DEFAULT=0,RCH_ANSI,RCH_OEM,RCH_UNICODE,RCH_UTF8 };
+ 
+@@ -168,6 +168,14 @@ class RAROptions
+     bool SkipSymLinks;
+     int Priority;
+     int SleepTime;
++
++    bool UseLargePages;
++
++    // Quit after processing some system integration related switch,
++    // like enabling the large memory pages privilege.
++    // menu for non-admin user and quit.
++    bool SetupComplete;
++
+     bool KeepBroken;
+     bool OpenShared;
+     bool DeleteFiles;
+@@ -185,6 +193,9 @@ class RAROptions
+     bool SyncFiles;
+     bool ProcessEA;
+     bool SaveStreams;
++#ifdef PROPAGATE_MOTW
++    bool MotwAllFields;
++#endif
+     bool SetCompressedAttr;
+     bool IgnoreGeneralAttr;
+     RarTime FileMtimeBefore,FileCtimeBefore,FileAtimeBefore;
+diff --git a/os.hpp b/os.hpp
+index b671846..f7e841b 100644
+--- a/os.hpp
++++ b/os.hpp
+@@ -8,12 +8,13 @@
+ #define SILENT
+ #endif
+ 
++
+ #include <new>
+ #include <string>
+ #include <vector>
+ #include <deque>
+ #include <memory> // For automatic pointers.
+-
++#include <algorithm>
+ 
+ #ifdef _WIN_ALL
+ 
+@@ -57,6 +58,9 @@
+ #include <wincrypt.h>
+ #include <wchar.h>
+ #include <wctype.h>
++#include <Sddl.h>
++#include <ntsecapi.h>
++
+ 
+ // For WMI requests.
+ #include <comdef.h>
+diff --git a/rar.hpp b/rar.hpp
+index 38cd744..d31ecd8 100644
+--- a/rar.hpp
++++ b/rar.hpp
+@@ -32,6 +32,9 @@
+ #ifdef _WIN_ALL
+ #include "isnt.hpp"
+ #endif
++#ifdef PROPAGATE_MOTW
++#include "motw.hpp"
++#endif
+ #include "file.hpp"
+ #include "crc.hpp"
+ #include "filefn.hpp"
+@@ -61,6 +64,8 @@
+ 
+ #include "threadpool.hpp"
+ 
++#include "largepage.hpp"
++
+ #include "unpack.hpp"
+ 
+ 
+diff --git a/rardefs.hpp b/rardefs.hpp
+index 433010f..378ccc7 100644
+--- a/rardefs.hpp
++++ b/rardefs.hpp
+@@ -21,7 +21,7 @@
+ // the excessive memory allocation for dynamically allocated strings.
+ #define  MAXPATHSIZE       0x10000
+ 
+-#define  MAXSFXSIZE        0x200000
++#define  MAXSFXSIZE        0x400000
+ 
+ #define  MAXCMTSIZE        0x40000
+ 
+@@ -47,4 +47,8 @@
+ // Produce the value, which is equal or larger than 'v' and aligned to 'a'.
+ #define ALIGN_VALUE(v,a) (size_t(v) + ( (~size_t(v) + 1) & (a - 1) ) )
+ 
++#if defined(_WIN_ALL) && !defined(SFX_MODULE)
++#define PROPAGATE_MOTW // Propagate the archive Mark of the Web.
++#endif
++
+ #endif
+diff --git a/smallfn.cpp b/smallfn.cpp
+index 81259d0..924e195 100644
+--- a/smallfn.cpp
++++ b/smallfn.cpp
+@@ -15,5 +15,3 @@ int ToPercentUnlim(int64 N1,int64 N2)
+     return 0;
+   return (int)(N1*100/N2);
+ }
+-
+-
+diff --git a/smallfn.hpp b/smallfn.hpp
+index f53daa8..1e706a5 100644
+--- a/smallfn.hpp
++++ b/smallfn.hpp
+@@ -3,6 +3,5 @@
+ 
+ int ToPercent(int64 N1,int64 N2);
+ int ToPercentUnlim(int64 N1,int64 N2);
+-void RARInitData();
+ 
+ #endif
+diff --git a/system.cpp b/system.cpp
+index cf9d183..b8f96cb 100644
+--- a/system.cpp
++++ b/system.cpp
+@@ -101,19 +101,35 @@ void Wait()
+ 
+ 
+ 
+-#if defined(_WIN_ALL) && !defined(SFX_MODULE)
+-void Shutdown(POWER_MODE Mode)
++#ifdef _WIN_ALL
++bool SetPrivilege(LPCTSTR PrivName)
+ {
++  bool Success=false;
++
+   HANDLE hToken;
+-  TOKEN_PRIVILEGES tkp;
+-  if (OpenProcessToken(GetCurrentProcess(),TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY,&hToken))
++  if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken))
+   {
+-    LookupPrivilegeValue(NULL,SE_SHUTDOWN_NAME,&tkp.Privileges[0].Luid);
+-    tkp.PrivilegeCount = 1;
+-    tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
++    TOKEN_PRIVILEGES tp;
++    tp.PrivilegeCount = 1;
++    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+ 
+-    AdjustTokenPrivileges(hToken,FALSE,&tkp,0,(PTOKEN_PRIVILEGES)NULL,0);
++    if (LookupPrivilegeValue(NULL,PrivName,&tp.Privileges[0].Luid) &&
++        AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, NULL) &&
++        GetLastError() == ERROR_SUCCESS)
++      Success=true;
++
++    CloseHandle(hToken);
+   }
++
++  return Success;
++}
++#endif
++
++
++#if defined(_WIN_ALL) && !defined(SFX_MODULE)
++void Shutdown(POWER_MODE Mode)
++{
++  SetPrivilege(SE_SHUTDOWN_NAME);
+   if (Mode==POWERMODE_OFF)
+     ExitWindowsEx(EWX_SHUTDOWN|EWX_FORCE,SHTDN_REASON_FLAG_PLANNED);
+   if (Mode==POWERMODE_SLEEP)
+diff --git a/system.hpp b/system.hpp
+index de4c14a..ff6a669 100644
+--- a/system.hpp
++++ b/system.hpp
+@@ -22,6 +22,9 @@ void SetPriority(int Priority);
+ clock_t MonoClock();
+ void Wait();
+ bool EmailFile(const std::wstring &FileName,std::wstring MailToW);
++#ifdef _WIN_ALL
++bool SetPrivilege(LPCTSTR PrivName);
++#endif
+ void Shutdown(POWER_MODE Mode);
+ bool ShutdownCheckAnother(bool Open);
+ 
+diff --git a/timefn.hpp b/timefn.hpp
+index 6c265ec..5b11e86 100644
+--- a/timefn.hpp
++++ b/timefn.hpp
+@@ -40,12 +40,12 @@ class RarTime
+     static const uint REMINDER_PRECISION = TICKS_PER_SECOND;
+   public:
+     RarTime() {Reset();}
+-    bool operator == (RarTime &rt) {return itime==rt.itime;}
+-    bool operator != (RarTime &rt) {return itime!=rt.itime;}
+-    bool operator < (RarTime &rt)  {return itime<rt.itime;}
+-    bool operator <= (RarTime &rt) {return itime<rt.itime || itime==rt.itime;}
+-    bool operator > (RarTime &rt)  {return itime>rt.itime;}
+-    bool operator >= (RarTime &rt) {return itime>rt.itime || itime==rt.itime;}
++    bool operator == (const RarTime &rt) const {return itime==rt.itime;}
++    bool operator != (const RarTime &rt) const {return itime!=rt.itime;}
++    bool operator < (const RarTime &rt)  const {return itime<rt.itime;}
++    bool operator <= (const RarTime &rt) const {return itime<rt.itime || itime==rt.itime;}
++    bool operator > (const RarTime &rt)  const {return itime>rt.itime;}
++    bool operator >= (const RarTime &rt) const {return itime>rt.itime || itime==rt.itime;}
+ 
+     void GetLocal(RarLocalTime *lt);
+     void SetLocal(RarLocalTime *lt);
+diff --git a/ui.hpp b/ui.hpp
+index f37001b..7f8dac7 100644
+--- a/ui.hpp
++++ b/ui.hpp
+@@ -26,21 +26,21 @@ enum UIMESSAGE_CODE {
+   UIERROR_NOTFIRSTVOLUME, UIERROR_RECVOLLIMIT, UIERROR_RECVOLDIFFSETS,
+   UIERROR_RECVOLALLEXIST, UIERROR_RECVOLFOUND, UIERROR_RECONSTRUCTING,
+   UIERROR_RECVOLCANNOTFIX, UIERROR_OPFAILED, UIERROR_UNEXPEOF,
+-  UIERROR_BADARCHIVE, UIERROR_CMTBROKEN, UIERROR_INVALIDNAME,
+-  UIERROR_NEWRARFORMAT, UIERROR_NOTSUPPORTED, UIERROR_ENCRNOTSUPPORTED,
+-  UIERROR_RARZIPONLY, UIERROR_REPAIROLDFORMAT, UIERROR_NOFILESREPAIRED,
+-  UIERROR_NOFILESTOADD, UIERROR_NOFILESTODELETE, UIERROR_NOFILESTOEXTRACT,
+-  UIERROR_MISSINGVOL, UIERROR_NEEDPREVVOL, UIERROR_UNKNOWNEXTRA,
+-  UIERROR_CORRUPTEXTRA, UIERROR_NTFSREQUIRED, UIERROR_ZIPVOLSFX,
+-  UIERROR_FILERO, UIERROR_TOOLARGESFX, UIERROR_NOZIPSFX, UIERROR_NEEEDSFX64,
+-  UIERROR_EMAIL, UIERROR_ACLGET, UIERROR_ACLBROKEN, UIERROR_ACLUNKNOWN,
+-  UIERROR_ACLSET, UIERROR_STREAMBROKEN, UIERROR_STREAMUNKNOWN,
+-  UIERROR_INCOMPATSWITCH, UIERROR_PATHTOOLONG, UIERROR_DIRSCAN,
+-  UIERROR_UOWNERGET, UIERROR_UOWNERBROKEN, UIERROR_UOWNERGETOWNERID,
+-  UIERROR_UOWNERGETGROUPID, UIERROR_UOWNERSET, UIERROR_ULINKREAD,
+-  UIERROR_ULINKEXIST, UIERROR_OPENPRESERVEATIME, UIERROR_READERRTRUNCATED,
+-  UIERROR_READERRCOUNT, UIERROR_DIRNAMEEXISTS,UIERROR_TRUNCPSW,
+-  UIERROR_ADJUSTVALUE, UIERROR_SKIPUNSAFELINK,
++  UIERROR_TRUNCSERVICE, UIERROR_BADARCHIVE, UIERROR_CMTBROKEN, 
++  UIERROR_INVALIDNAME, UIERROR_NEWRARFORMAT, UIERROR_NOTSUPPORTED,
++  UIERROR_ENCRNOTSUPPORTED, UIERROR_RARZIPONLY, UIERROR_REPAIROLDFORMAT,
++  UIERROR_NOFILESREPAIRED, UIERROR_NOFILESTOADD, UIERROR_NOFILESTODELETE,
++  UIERROR_NOFILESTOEXTRACT, UIERROR_MISSINGVOL, UIERROR_NEEDPREVVOL,
++  UIERROR_UNKNOWNEXTRA, UIERROR_CORRUPTEXTRA, UIERROR_NTFSREQUIRED,
++  UIERROR_ZIPVOLSFX, UIERROR_FILERO, UIERROR_TOOLARGESFX, UIERROR_NOZIPSFX,
++  UIERROR_NEEEDSFX64, UIERROR_EMAIL, UIERROR_ACLGET, UIERROR_ACLBROKEN,
++  UIERROR_ACLUNKNOWN, UIERROR_ACLSET, UIERROR_STREAMBROKEN,
++  UIERROR_STREAMUNKNOWN, UIERROR_INCOMPATSWITCH, UIERROR_PATHTOOLONG,
++  UIERROR_DIRSCAN, UIERROR_UOWNERGET, UIERROR_UOWNERBROKEN,
++  UIERROR_UOWNERGETOWNERID, UIERROR_UOWNERGETGROUPID, UIERROR_UOWNERSET,
++  UIERROR_ULINKREAD, UIERROR_ULINKEXIST, UIERROR_OPENPRESERVEATIME,
++  UIERROR_READERRTRUNCATED, UIERROR_READERRCOUNT, UIERROR_DIRNAMEEXISTS,
++  UIERROR_TRUNCPSW, UIERROR_ADJUSTVALUE, UIERROR_SKIPUNSAFELINK,
+ 
+   UIMSG_FIRST,
+   UIMSG_STRING, UIMSG_BUILD, UIMSG_RRSEARCH, UIMSG_ANALYZEFILEDATA,
+@@ -50,7 +50,7 @@ enum UIMESSAGE_CODE {
+   UIMSG_CORRECTINGNAME, UIMSG_BADARCHIVE, UIMSG_CREATING, UIMSG_RENAMING,
+   UIMSG_RECVOLCALCCHECKSUM, UIMSG_RECVOLFOUND, UIMSG_RECVOLMISSING,
+   UIMSG_MISSINGVOL, UIMSG_RECONSTRUCTING, UIMSG_CHECKSUM, UIMSG_FAT32SIZE,
+-  UIMSG_SKIPENCARC, UIMSG_FILERENAME,
++  UIMSG_SKIPENCARC, UIMSG_FILERENAME, 
+ 
+   UIWAIT_FIRST,
+   UIWAIT_DISKFULLNEXT, UIWAIT_FCREATEERROR, UIWAIT_BADPSW,
+diff --git a/uiconsole.cpp b/uiconsole.cpp
+index cc1c72d..71559f6 100644
+--- a/uiconsole.cpp
++++ b/uiconsole.cpp
+@@ -45,10 +45,8 @@ UIASKREP_RESULT uiAskReplace(std::wstring &Name,int64 FileSize,RarTime *FileTime
+   if (AllowRename && Choice==5)
+   {
+     mprintf(St(MAskNewName));
+-    if (getwstr(Name))
+-      return UIASKREP_R_RENAME;
+-    else
+-      return UIASKREP_R_SKIP; // Process fwgets failure as if user answered 'No'.
++    getwstr(Name);
++    return UIASKREP_R_RENAME;
+   }
+   return UIASKREP_R_CANCEL;
+ }
+@@ -245,6 +243,18 @@ void uiMsgStore::Msg()
+     case UIERROR_UNEXPEOF:
+       Log(Str[0],St(MLogUnexpEOF));
+       break;
++    case UIERROR_TRUNCSERVICE:
++      {
++        const wchar *Type=nullptr;
++        if (wcscmp(Str[1],SUBHEAD_TYPE_QOPEN)==0)
++          Type=St(MHeaderQO);
++        else
++          if (wcscmp(Str[1],SUBHEAD_TYPE_RR)==0)
++            Type=St(MHeaderRR);
++        if (Type!=nullptr)
++          Log(Str[0],St(MTruncService),Type);
++      }
++      break;
+     case UIERROR_BADARCHIVE:
+       Log(Str[0],St(MBadArc),Str[0]);
+       break;
+diff --git a/unicode.cpp b/unicode.cpp
+index 812e35b..e6d4977 100644
+--- a/unicode.cpp
++++ b/unicode.cpp
+@@ -272,8 +272,12 @@ void WideToRaw(const std::wstring &Src,std::vector<byte> &Dest)
+     Dest.push_back((byte)C);
+     Dest.push_back((byte)(C>>8));
+   }
+-  Dest.push_back(0); // 2 bytes of trailing UTF-16 zero.
+-  Dest.push_back(0);
++  // In STL version of this function we do not add the trailing zero.
++  // Otherwise we would need to remove it when restoring std::wstring
++  // from raw data.
++
++  // Dest.push_back(0); // 2 bytes of trailing UTF-16 zero.
++  // Dest.push_back(0);
+ }
+ 
+ 
+diff --git a/unpack.cpp b/unpack.cpp
+index 99c6f15..1b13293 100644
+--- a/unpack.cpp
++++ b/unpack.cpp
+@@ -53,7 +53,7 @@ Unpack::~Unpack()
+   InitFilters30(false);
+ #endif
+ 
+-  free(Window);
++  Alloc.delete_l<byte>(Window); // delete Window;
+ #ifdef RAR_SMP
+   delete UnpThreadPool;
+   delete[] ReadBufMT;
+@@ -123,11 +123,19 @@ void Unpack::Init(uint64 WinSize,bool Solid)
+   if (Solid && (Window!=NULL || Fragmented && WinSize>FragWindow.GetWinSize()))
+     throw std::bad_alloc();
+ 
+-  free(Window);
++  Alloc.delete_l<byte>(Window); // delete Window;
++  Window=nullptr;
+   
+-  Window=Fragmented ? NULL : (byte *)malloc((size_t)WinSize);
++  try
++  {
++    if (!Fragmented)
++      Window=Alloc.new_l<byte>((size_t)WinSize,false); // Window=new byte[(size_t)WinSize];
++  }
++  catch (std::bad_alloc) // Use the fragmented window in this case.
++  {
++  }
+ 
+-  if (Window==NULL)
++  if (Window==nullptr)
+     if (WinSize<0x1000000 || sizeof(size_t)>4)
+       throw std::bad_alloc(); // Exclude RAR4, small dictionaries and 64-bit.
+     else
+diff --git a/unpack.hpp b/unpack.hpp
+index 5ed904a..8fa287a 100644
+--- a/unpack.hpp
++++ b/unpack.hpp
+@@ -55,7 +55,7 @@ struct DecodeTable:PackDef
+   // Translates compressed bits (up to QuickBits length)
+   // to position in alphabet in quick mode.
+   // 'ushort' saves some memory and even provides a little speed gain
+-  // comparting to 'uint' here.
++  // comparing to 'uint' here.
+   ushort QuickNum[1<<MAX_QUICK_DECODE_BITS];
+ 
+   // Translate the position in code list to position in alphabet.
+@@ -241,6 +241,8 @@ class Unpack:PackDef
+     byte *ReadBufMT;
+ #endif
+ 
++    LargePageAlloc Alloc;
++
+     std::vector<byte> FilterSrcMemory;
+     std::vector<byte> FilterDstMemory;
+ 
+@@ -382,6 +384,7 @@ class Unpack:PackDef
+     Unpack(ComprDataIO *DataIO);
+     ~Unpack();
+     void Init(uint64 WinSize,bool Solid);
++    void AllowLargePages(bool Allow) {Alloc.AllowLargePages(Allow);}
+     void DoUnpack(uint Method,bool Solid);
+     bool IsFileExtracted() {return FileExtracted;}
+     void SetDestSize(int64 DestSize) {DestUnpSize=DestSize;FileExtracted=false;}
+diff --git a/version.hpp b/version.hpp
+index 6987a9a..1fa5327 100644
+--- a/version.hpp
++++ b/version.hpp
+@@ -1,6 +1,6 @@
+ #define RARVER_MAJOR     7
+-#define RARVER_MINOR     1
+-#define RARVER_BETA      0
+-#define RARVER_DAY      12
+-#define RARVER_MONTH     5
++#define RARVER_MINOR    10
++#define RARVER_BETA      2
++#define RARVER_DAY       4
++#define RARVER_MONTH    12
+ #define RARVER_YEAR   2024
+diff --git a/volume.cpp b/volume.cpp
+index e171515..e0b5243 100644
+--- a/volume.cpp
++++ b/volume.cpp
+@@ -142,7 +142,7 @@ bool MergeArchive(Archive &Arc,ComprDataIO *DataIO,bool ShowFileName,wchar Comma
+     // replacing an encrypted header volume to unencrypted and adding
+     // unexpected files by third party to encrypted extraction.
+     uiMsg(UIERROR_BADARCHIVE,Arc.FileName);
+-    ErrHandler.Exit(RARX_FATAL);
++    ErrHandler.Exit(RARX_BADARC);
+   }
+ 
+   if (SplitHeader)
+diff --git a/win32acl.cpp b/win32acl.cpp
+index 36cb852..091838f 100644
+--- a/win32acl.cpp
++++ b/win32acl.cpp
+@@ -110,26 +110,3 @@ void SetACLPrivileges()
+ 
+   InitDone=true;
+ }
+-
+-
+-bool SetPrivilege(LPCTSTR PrivName)
+-{
+-  bool Success=false;
+-
+-  HANDLE hToken;
+-  if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken))
+-  {
+-    TOKEN_PRIVILEGES tp;
+-    tp.PrivilegeCount = 1;
+-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+-
+-    if (LookupPrivilegeValue(NULL,PrivName,&tp.Privileges[0].Luid) &&
+-        AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, NULL) &&
+-        GetLastError() == ERROR_SUCCESS)
+-      Success=true;
+-
+-    CloseHandle(hToken);
+-  }
+-
+-  return Success;
+-}
+diff --git a/win32stm.cpp b/win32stm.cpp
+index 0c9c72a..0c7e88a 100644
+--- a/win32stm.cpp
++++ b/win32stm.cpp
+@@ -2,8 +2,21 @@
+ 
+ #ifdef _WIN_ALL
+ // StreamName must include the leading ':'.
+-static bool IsNtfsReservedStream(const std::wstring &StreamName)
++static bool IsNtfsProhibitedStream(const std::wstring &StreamName)
+ {
++  // 2024.03.14: We replaced the predefined names check with simpler
++  // "no more than a single colon" check. Second colon could be used to
++  // define the type of alternate stream, but RAR archives work only with
++  // data streams and do not store :$DATA type in archive. It is assumed.
++  // So there is no legitimate use for stream type inside of archive,
++  // but it can be abused to hide the actual file data in file::$DATA
++  // or hide the actual MOTW data in Zone.Identifier:$DATA.
++  uint ColonCount=0;
++  for (wchar Ch:StreamName)
++    if (Ch==':' && ++ColonCount>1)
++      return true;
++  return false;
++/*
+   const wchar *Reserved[]{
+     L"::$ATTRIBUTE_LIST",L"::$BITMAP",L"::$DATA",L"::$EA",L"::$EA_INFORMATION",
+     L"::$FILE_NAME",L"::$INDEX_ALLOCATION",L":$I30:$INDEX_ALLOCATION",
+@@ -14,6 +27,7 @@ static bool IsNtfsReservedStream(const std::wstring &StreamName)
+     if (wcsicomp(StreamName,Name)==0)
+       return true;
+   return false;
++*/
+ }
+ #endif
+ 
+@@ -36,41 +50,45 @@ void ExtractStreams20(Archive &Arc,const std::wstring &FileName)
+   }
+ 
+   std::wstring StreamName;
+-  if (FileName.size()==1)
+-  {
+-    // Convert single character names like f:stream to .\f:stream to
+-    // resolve the ambiguity with drive letters.
+-    StreamName=L".\\"+FileName;
+-  }
+-  else
+-    StreamName=FileName;
+-  if (Arc.StreamHead.StreamName[0]!=':')
++  CharToWide(Arc.StreamHead.StreamName,StreamName);
++
++  if (StreamName[0]!=':')
+   {
+     uiMsg(UIERROR_STREAMBROKEN,Arc.FileName,FileName);
+     ErrHandler.SetErrorCode(RARX_CRC);
+     return;
+   }
+ 
+-  std::wstring StoredName;
+-  // "substr(1)" to exclude ':', so we can use ConvertPath() below.
+-  CharToWide(Arc.StreamHead.StreamName.substr(1),StoredName);
+-  ConvertPath(&StoredName,&StoredName);
+-
++  // Convert single character names like f:stream to .\f:stream to
++  // resolve the ambiguity with drive letters.
++  std::wstring FullName=FileName.size()==1 ? L".\\"+FileName:FileName;
++  FullName+=StreamName;
+ 
+-  StoredName=L":"+StoredName;
+-  if (IsNtfsReservedStream(StoredName))
++#ifdef PROPAGATE_MOTW
++  // 2022.10.31: Can't easily read RAR 2.0 stream data here, so if we already
++  // propagated the archive Zone.Identifier stream, also known as Mark of
++  // the Web, to extracted file, we do not overwrite it here.
++  if (Arc.Motw.IsNameConflicting(StreamName))
+     return;
+ 
+-  StreamName+=StoredName;
++  // 2024.02.03: Prevent using Zone.Identifier:$DATA to overwrite Zone.Identifier
++  // according to ZDI-CAN-23156 Trend Micro report.
++  // 2024.03.14: Not needed after adding check for 2+ ':' in IsNtfsProhibitedStream(().
++  // if (wcsnicomp(StreamName,L":Zone.Identifier:",17)==0)
++  //  return;
++#endif
++
++  if (IsNtfsProhibitedStream(StreamName))
++    return;
+ 
+   FindData FD;
+-  bool Found=FindFile::FastFind(FileName,&FD);
++  bool HostFound=FindFile::FastFind(FileName,&FD);
+ 
+   if ((FD.FileAttr & FILE_ATTRIBUTE_READONLY)!=0)
+     SetFileAttr(FileName,FD.FileAttr & ~FILE_ATTRIBUTE_READONLY);
+ 
+   File CurFile;
+-  if (CurFile.WCreate(StreamName))
++  if (CurFile.WCreate(FullName))
+   {
+     ComprDataIO DataIO;
+     Unpack Unpack(&DataIO);
+@@ -91,10 +109,15 @@ void ExtractStreams20(Archive &Arc,const std::wstring &FileName)
+     else
+       CurFile.Close();
+   }
++
++  // Restoring original file timestamps.
+   File HostFile;
+-  if (Found && HostFile.Open(FileName,FMF_OPENSHARED|FMF_UPDATE))
++  if (HostFound && HostFile.Open(FileName,FMF_OPENSHARED|FMF_UPDATE))
+     SetFileTime(HostFile.GetHandle(),&FD.ftCreationTime,&FD.ftLastAccessTime,
+                 &FD.ftLastWriteTime);
++
++  // Restoring original file attributes.
++  // Important if file was read only or did not have "Archive" attribute.
+   if ((FD.FileAttr & FILE_ATTRIBUTE_READONLY)!=0)
+     SetFileAttr(FileName,FD.FileAttr);
+ }
+@@ -104,16 +127,6 @@ void ExtractStreams20(Archive &Arc,const std::wstring &FileName)
+ #ifdef _WIN_ALL
+ void ExtractStreams(Archive &Arc,const std::wstring &FileName,bool TestMode)
+ {
+-  std::wstring FullName;
+-  if (FileName[0]!=0 && FileName[1]==0)
+-  {
+-    // Convert single character names like f:stream to .\f:stream to
+-    // resolve the ambiguity with drive letters.
+-    FullName=L".\\"+FileName;
+-  }
+-  else
+-    FullName=FileName;
+-
+   std::wstring StreamName=GetStreamNameNTFS(Arc);
+   if (StreamName[0]!=':')
+   {
+@@ -125,14 +138,43 @@ void ExtractStreams(Archive &Arc,const std::wstring &FileName,bool TestMode)
+   if (TestMode)
+   {
+     File CurFile;
+-    Arc.ReadSubData(NULL,&CurFile,true);
++    Arc.ReadSubData(nullptr,&CurFile,true);
+     return;
+   }
+ 
++  // Convert single character names like f:stream to .\f:stream to
++  // resolve the ambiguity with drive letters.
++  std::wstring FullName=FileName.size()==1 ? L".\\"+FileName:FileName;
+   FullName+=StreamName;
+ 
++#ifdef PROPAGATE_MOTW
++  // 2022.10.31: If we already propagated the archive Zone.Identifier stream,
++  // also known as Mark of the Web, to extracted file, we overwrite it here
++  // only if file zone is stricter. Received a user request for such behavior.
+ 
+-  if (IsNtfsReservedStream(StreamName))
++  std::string ParsedMotw;
++  if (Arc.Motw.IsNameConflicting(StreamName))
++  {
++    // Do not worry about excessive memory allocation, ReadSubData prevents it.
++    std::vector<byte> FileMotw;
++    if (!Arc.ReadSubData(&FileMotw,nullptr,false))
++      return;
++    ParsedMotw.assign(FileMotw.begin(),FileMotw.end());
++
++    // We already set the archive stream. If file stream value isn't more
++    // restricted, we do not want to write it over the existing archive stream.
++    if (!Arc.Motw.IsFileStreamMoreSecure(ParsedMotw))
++      return;
++  }
++
++  // 2024.02.03: Prevent using :Zone.Identifier:$DATA to overwrite :Zone.Identifier
++  // according to ZDI-CAN-23156 Trend Micro report.
++  // 2024.03.14: Not needed after adding check for 2+ ':' in IsNtfsProhibitedStream(().
++  // if (wcsnicomp(StreamName,L":Zone.Identifier:",17)==0)
++  //  return;
++#endif
++
++  if (IsNtfsProhibitedStream(StreamName))
+     return;
+ 
+   FindData FD;
+@@ -144,7 +186,17 @@ void ExtractStreams(Archive &Arc,const std::wstring &FileName,bool TestMode)
+ 
+   if (CurFile.WCreate(FullName))
+   {
+-    if (Arc.ReadSubData(NULL,&CurFile,false))
++#ifdef PROPAGATE_MOTW
++    if (!ParsedMotw.empty())
++    {
++      // The archive propagated security zone is either missing
++      // or less strict than file one. Write the file security zone here.
++      CurFile.Write(ParsedMotw.data(),ParsedMotw.size());
++      CurFile.Close();
++    }
++    else
++#endif
++    if (Arc.ReadSubData(nullptr,&CurFile,false))
+       CurFile.Close();
+   }
+ 
+@@ -154,9 +206,10 @@ void ExtractStreams(Archive &Arc,const std::wstring &FileName,bool TestMode)
+     SetFileTime(HostFile.GetHandle(),&FD.ftCreationTime,&FD.ftLastAccessTime,
+                 &FD.ftLastWriteTime);
+ 
+-  // Restoring original file attributes. Important if file was read only
+-  // or did not have "Archive" attribute
+-  SetFileAttr(FileName,FD.FileAttr);
++  // Restoring original file attributes.
++  // Important if file was read only or did not have "Archive" attribute.
++  if ((FD.FileAttr & FILE_ATTRIBUTE_READONLY)!=0)
++    SetFileAttr(FileName,FD.FileAttr);
+ }
+ #endif
+ 
+@@ -168,9 +221,8 @@ std::wstring GetStreamNameNTFS(Archive &Arc)
+     Dest=RawToWide(Arc.SubHead.SubData);
+   else
+   {
+-    std::vector<byte> Src=Arc.SubHead.SubData;
+-    Src.push_back(0); // Needed for our UtfToWide.
+-    UtfToWide((char *)Src.data(),Dest);
++    std::string Src(Arc.SubHead.SubData.begin(),Arc.SubHead.SubData.end());
++    UtfToWide(Src.data(),Dest);
+   }
+   return Dest;
+ }

@@ -1,0 +1,56 @@
+From 4cb5129c2a9eea3e836bbcd2439ad6077f994dd0 Mon Sep 17 00:00:00 2001
+From: Dan Bloomberg <dan.bloomberg@gmail.com>
+Date: Wed, 18 Nov 2020 21:28:07 -0800
+Subject: [PATCH] Fix oss-fuzz issue 27592: pix_rotate_shear_fuzzer: uninit in
+ jpeg library * Also fix comment about jpeg reading hint with bad data.
+
+---
+ prog/fuzzing/pix_rotate_shear_fuzzer.cc |  5 +++--
+ src/jpegio.c                            | 14 ++++++++------
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/prog/fuzzing/pix_rotate_shear_fuzzer.cc b/prog/fuzzing/pix_rotate_shear_fuzzer.cc
+index 4bf1288af..9ae2569cd 100644
+--- a/prog/fuzzing/pix_rotate_shear_fuzzer.cc
++++ b/prog/fuzzing/pix_rotate_shear_fuzzer.cc
+@@ -36,12 +36,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+ 
+   leptSetStdNullHandler();
+ 
+-  // Check for pnm format; this can cause timeouts.
++  // Don't do pnm format (which can cause timeouts) or
++  // jpeg format (which can have uninitialized variables.
+   // The format checker requires at least 12 bytes.
+   if (size < 12) return EXIT_SUCCESS;
+   int format;
+   findFileFormatBuffer(data, &format);
+-  if (format == IFF_PNM) return EXIT_SUCCESS;
++  if (format == IFF_PNM || format == IFF_JFIF_JPEG) return EXIT_SUCCESS;
+ 
+   Pix* pix = pixReadMem(reinterpret_cast<const unsigned char*>(data), size);
+   if (pix == nullptr) {
+diff --git a/src/jpegio.c b/src/jpegio.c
+index 208cea1ab..993683dae 100644
+--- a/src/jpegio.c
++++ b/src/jpegio.c
+@@ -103,12 +103,14 @@
+  *    can extract just the 8 bpp luminance channel, using pixReadJpeg(),
+  *    where you use L_JPEG_READ_LUMINANCE for the %hint arg.
+  *
+- *    How to fail to read if the data is corrupted
+- *    ---------------------------------------------
+- *    By default, if the low-level jpeg library functions do not abort,
+- *    a pix will be returned, even if the data is corrupted and warnings
+- *    are issued.  In order to be most likely to fail to read when there
+- *    is data corruption, use L_JPEG_FAIL_ON_BAD_DATA in the %hint arg.
++ *    How to continue to read if the data is corrupted
++ *    ------------------------------------------------
++ *    By default, if data is corrupted we make every effort to fail
++ *    to return a pix.  (Failure is not always possible with bad
++ *    data, because in some situations, such as during arithmetic
++ *    decoding, the low-level jpeg library will not abort or raise
++ *    a warning.)  To attempt to ignore warnings and get a pix when data
++ *    is corrupted, use L_JPEG_CONTINUE_WITH_BAD_DATA in the %hint arg.
+  *
+  *    Compressing to memory and decompressing from memory
+  *    ---------------------------------------------------

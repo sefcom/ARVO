@@ -1,0 +1,64 @@
+From 4134dfd6fea11a9ed14fe0576a68c5211a33c4d7 Mon Sep 17 00:00:00 2001
+From: pancake <pancake@nopcode.org>
+Date: Fri, 31 May 2024 01:34:34 +0200
+Subject: [PATCH] Fix stack overflow in strings search ##crash
+
+---
+ libr/include/r_search.h |  4 ++--
+ libr/search/strings.c   | 15 +++++++--------
+ 2 files changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/libr/include/r_search.h b/libr/include/r_search.h
+index f66e792a1d542..9ff4976408c36 100644
+--- a/libr/include/r_search.h
++++ b/libr/include/r_search.h
+@@ -76,8 +76,8 @@ typedef struct r_search_t {
+ 	int mode;
+ 	int longest; // iff > 0, longest element in kws
+ 	ut32 pattern_size;
+-	ut32 string_min; // max length of strings for R_SEARCH_STRING
+-	ut32 string_max; // min length of strings for R_SEARCH_STRING
++	ut32 string_min;
++	ut32 string_max;
+ 	void *data; // data used by search algorithm
+ 	RSearchDFree *datafree;
+ 	void *user; // user data passed to callback
+diff --git a/libr/search/strings.c b/libr/search/strings.c
+index 152cc4c7e0302..592849b0cdd34 100644
+--- a/libr/search/strings.c
++++ b/libr/search/strings.c
+@@ -61,18 +61,18 @@ static bool is_encoded(int encoding, unsigned char c) {
+ 
+ static int findstrings(RSearch *s, ut64 from, const ut8 *buf, int len, RSearchKeyword *kw) {
+ 	int i = 0;
+-	int widechar = false;
+-	int matches = 0;
+-	char str[4096];
++	bool widechar = false;
++	size_t matches = 0;
++	size_t max_matches = s->string_max + 1;
+ 	for (i = 0; i < len; i++) {
+-		char ch = buf[i];
++		const char ch = buf[i];
+ 		// non-cp850 encoded
+ 		if (IS_PRINTABLE (ch) || IS_WHITESPACE (ch) || is_encoded (0, ch)) {
+-			str[matches] = ch;
+-			if (matches < sizeof (str)) {
++			if (matches < max_matches) {
+ 				matches++;
+ 			} else {
+ 				R_LOG_WARN ("Truncated match, keyword is too large");
++				matches = 0;
+ 			}
+ 		} else {
+ 			/* wide char check \x??\x00\x??\x00 */
+@@ -82,8 +82,7 @@ static int findstrings(RSearch *s, ut64 from, const ut8 *buf, int len, RSearchKe
+ 			}
+ 			/* check if the length fits on our request */
+ 			if (matches >= s->string_min && (s->string_max == 0 || matches <= s->string_max)) {
+-				str[matches] = '\0';
+-				size_t len = strlen (str);
++				size_t len = matches;
+ 				if (len > 2) {
+ 					kw->keyword_length = len;
+ 					if (widechar) {

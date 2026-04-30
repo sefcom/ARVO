@@ -1,0 +1,60 @@
+From 41863a00f0d811c659c9ba87ae2cc0c3aae5a77f Mon Sep 17 00:00:00 2001
+From: Patrick Steinhardt <ps@pks.im>
+Date: Mon, 29 Oct 2018 17:19:58 +0100
+Subject: [PATCH] strntol: fix out-of-bounds read when skipping leading spaces
+
+The `git__strntol` family of functions accepts leading spaces and will
+simply skip them. The skipping will not honor the provided buffer's
+length, though, which may lead it to read outside of the provided
+buffer's bounds if it is not a simple NUL-terminated string.
+Furthermore, if leading space is trimmed, the function will further
+advance the pointer but not update the number of remaining bytes, which
+may also lead to out-of-bounds reads.
+
+Fix the issue by properly paying attention to the buffer length and
+updating it when stripping leading whitespace characters. Add a test
+that verifies that we won't read past the provided buffer length.
+---
+ src/util.c          |  7 +++++--
+ tests/core/strtol.c | 10 ++++++++++
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/util.c b/src/util.c
+index 52495f75258..b191d1a16cb 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -83,8 +83,11 @@ int git__strntol64(int64_t *result, const char *nptr, size_t nptr_len, const cha
+ 	/*
+ 	 * White space
+ 	 */
+-	while (git__isspace(*p))
+-		p++;
++	while (nptr_len && git__isspace(*p))
++		p++, nptr_len--;
++
++	if (!nptr_len)
++		goto Return;
+ 
+ 	/*
+ 	 * Sign
+diff --git a/tests/core/strtol.c b/tests/core/strtol.c
+index ba79fba5108..ac19a28082c 100644
+--- a/tests/core/strtol.c
++++ b/tests/core/strtol.c
+@@ -76,6 +76,16 @@ void test_core_strtol__buffer_length_truncates(void)
+ 	cl_assert_equal_i(i64, 1);
+ }
+ 
++void test_core_strtol__buffer_length_with_leading_ws_truncates(void)
++{
++	int64_t i64;
++
++	cl_git_fail(git__strntol64(&i64, " 1", 1, NULL, 10));
++
++	cl_git_pass(git__strntol64(&i64, " 11", 2, NULL, 10));
++	cl_assert_equal_i(i64, 1);
++}
++
+ void test_core_strtol__error_message_cuts_off(void)
+ {
+ 	assert_l32_fails("2147483657foobar", 10);

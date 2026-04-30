@@ -1,0 +1,48 @@
+From b78560fd372e01c11ca4f183f929d99b1f89f314 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20G=C3=B6ttsche?= <cgzones@googlemail.com>
+Date: Thu, 23 Dec 2021 19:19:45 +0100
+Subject: [PATCH] libsepol: check for valid sensitivity before lookup
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Check the sensitivity is valid and thus the lookup in the name array
+`p_sens_val_to_name` is valid.
+
+Found by oss-fuzz (#42729, #42730, #42735, #42741)
+
+    ==54784==The signal is caused by a READ memory access.
+        #0 0x5a10f3 in mls_semantic_level_expand ./selinux/libsepol/src/expand.c:934:11
+        #1 0x53839e in policydb_user_cache ./selinux/libsepol/src/policydb.c:972:7
+        #2 0x5c6325 in hashtab_map ./selinux/libsepol/src/hashtab.c:236:10
+        #3 0x5392e9 in policydb_index_others ./selinux/libsepol/src/policydb.c:1274:6
+        #4 0x53f90a in policydb_read ./selinux/libsepol/src/policydb.c:4496:6
+        #5 0x50c679 in LLVMFuzzerTestOneInput ./selinux/libsepol/fuzz/binpolicy-fuzzer.c:35:6
+        #6 0x4409e3 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (./selinux/out/binpolicy-fuzzer+0x4409e3)
+        #7 0x4295bf in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (./selinux/out/binpolicy-fuzzer+0x4295bf)
+        #8 0x42f850 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (./selinux/out/binpolicy-fuzzer+0x42f850)
+        #9 0x45b6d2 in main (./selinux/out/binpolicy-fuzzer+0x45b6d2)
+        #10 0x7f059fcd71c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+        #11 0x7f059fcd7277 in __libc_start_main csu/../csu/libc-start.c:409:3
+        #12 0x423900 in _start (./out/binpolicy-fuzzer+0x423900)
+
+Signed-off-by: Christian Göttsche <cgzones@googlemail.com>
+---
+ libsepol/src/expand.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/libsepol/src/expand.c b/libsepol/src/expand.c
+index 8a7259a0a3..898e6b8753 100644
+--- a/libsepol/src/expand.c
++++ b/libsepol/src/expand.c
+@@ -929,6 +929,10 @@ int mls_semantic_level_expand(mls_semantic_level_t * sl, mls_level_t * l,
+ 	if (!sl->sens)
+ 		return 0;
+ 
++	/* Invalid sensitivity */
++	if (sl->sens > p->p_levels.nprim || !p->p_sens_val_to_name[sl->sens - 1])
++		return -1;
++
+ 	l->sens = sl->sens;
+ 	levdatum = (level_datum_t *) hashtab_search(p->p_levels.table,
+ 						    p->p_sens_val_to_name[l->sens - 1]);

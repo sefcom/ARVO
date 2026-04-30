@@ -1,0 +1,46 @@
+From 0794494c8f2f756e3c9384dba21c54f7d4ba9286 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Fri, 21 Jun 2019 00:47:15 +0200
+Subject: [PATCH] avcodec/alsdec: Check opt_order / sb_length in ra_block
+ handling
+
+Fixes: out of array access
+Fixes: 15277/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_ALS_fuzzer-5184853437317120
+Fixes: 15280/clusterfuzz-testcase-minimized-ffmpeg_AV_CODEC_ID_ALS_fuzzer-5741062137577472
+
+Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+---
+ libavcodec/alsdec.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/alsdec.c b/libavcodec/alsdec.c
+index 420bcf835a..96cfbbf1fe 100644
+--- a/libavcodec/alsdec.c
++++ b/libavcodec/alsdec.c
+@@ -789,14 +789,20 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
+ 
+     // read first value and residuals in case of a random access block
+     if (bd->ra_block) {
++        start = FFMIN(opt_order, 3);
++        av_assert0(sb_length <= sconf->frame_length);
++        if (sb_length <= start) {
++            // opt_order or sb_length may be corrupted, either way this is unsupported and not well defined in the specification
++            av_log(avctx, AV_LOG_ERROR, "Sub block length smaller or equal start\n");
++            return AVERROR_PATCHWELCOME;
++        }
++
+         if (opt_order)
+             bd->raw_samples[0] = decode_rice(gb, avctx->bits_per_raw_sample - 4);
+         if (opt_order > 1)
+             bd->raw_samples[1] = decode_rice(gb, FFMIN(s[0] + 3, ctx->s_max));
+         if (opt_order > 2)
+             bd->raw_samples[2] = decode_rice(gb, FFMIN(s[0] + 1, ctx->s_max));
+-
+-        start = FFMIN(opt_order, 3);
+     }
+ 
+     // read all residuals
+-- 
+2.25.1
+

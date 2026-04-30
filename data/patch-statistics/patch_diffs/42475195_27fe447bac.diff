@@ -1,0 +1,5264 @@
+From a875795bb5d8c216fa17d685b49784c4d5c93f87 Mon Sep 17 00:00:00 2001
+From: radare <pancake@nopcode.org>
+Date: Mon, 27 May 2019 18:18:01 +0200
+Subject: [PATCH] Completely eliminate the bytes apis in RBin ##bin
+
+* Huge bytes->buffer on almost all the plugins, break API and ABI \o/
+* Changed the way RBinFiles are created
+* Changed the structure of the Sdb instance
+* Improve ELF and MZ detection mechanisms to reduce false positives
+* Change all the free/destroy methods to return void
+* Fix "ks" shell
+* Simplify and change the way RBinWrite apis work
+---
+ libr/bin/bfile.c                              | 218 +++++++-----------
+ libr/bin/bin.c                                |  75 +++---
+ libr/bin/bin_write.c                          |  37 +--
+ libr/bin/format/elf/elf.c                     |  85 ++-----
+ libr/bin/format/elf/elf.h                     |  14 +-
+ libr/bin/format/elf/elf_write.c               |  22 +-
+ libr/bin/format/mach0/fatmach0.c              |  60 ++---
+ libr/bin/format/mach0/fatmach0.h              |   3 +-
+ libr/bin/format/mach0/mach0.c                 |  27 ++-
+ libr/bin/format/mach0/mach0.h                 |   2 +-
+ .../bin/format/mach0/mach064_is_kernelcache.c |  48 ++++
+ libr/bin/format/mz/mz.c                       |   2 +-
+ libr/bin/format/pe/pe.h                       |   2 +-
+ libr/bin/format/pe/pe_write.c                 |  18 +-
+ libr/bin/i/private.h                          |   3 +-
+ libr/bin/obj.c                                |  95 +++++---
+ libr/bin/p/bin_any.c                          |  17 +-
+ libr/bin/p/bin_art.c                          |  36 ++-
+ libr/bin/p/bin_avr.c                          |  11 +-
+ libr/bin/p/bin_bf.c                           |  17 +-
+ libr/bin/p/bin_bflt.c                         |  10 +-
+ libr/bin/p/bin_bios.c                         |  24 +-
+ libr/bin/p/bin_bootimg.c                      |  10 +-
+ libr/bin/p/bin_coff.c                         |  12 +-
+ libr/bin/p/bin_dex.c                          |  13 +-
+ libr/bin/p/bin_dol.c                          |  11 +-
+ libr/bin/p/bin_dyldcache.c                    |  25 +-
+ libr/bin/p/bin_elf.c                          |  17 +-
+ libr/bin/p/bin_elf.inc                        |  11 +-
+ libr/bin/p/bin_elf64.c                        |  11 +-
+ libr/bin/p/bin_fs.c                           |  70 +++---
+ libr/bin/p/bin_java.c                         |  19 +-
+ libr/bin/p/bin_mach0.c                        |  40 ++--
+ libr/bin/p/bin_mach064.c                      |  17 +-
+ libr/bin/p/bin_mbn.c                          |  82 +++----
+ libr/bin/p/bin_mdmp.c                         |  59 ++---
+ libr/bin/p/bin_menuet.c                       |  22 +-
+ libr/bin/p/bin_mz.c                           |  95 +++++---
+ libr/bin/p/bin_nes.c                          |  31 +--
+ libr/bin/p/bin_nin3ds.c                       |  40 ++--
+ libr/bin/p/bin_ninds.c                        |  78 +++----
+ libr/bin/p/bin_ningb.c                        |  35 +--
+ libr/bin/p/bin_ningba.c                       |  30 +--
+ libr/bin/p/bin_nro.c                          |  47 ++--
+ libr/bin/p/bin_nso.c                          |  34 ++-
+ libr/bin/p/bin_omf.c                          |  50 ++--
+ libr/bin/p/bin_p9.c                           |  12 +-
+ libr/bin/p/bin_pe.c                           |  26 ++-
+ libr/bin/p/bin_pe.inc                         |  75 ++----
+ libr/bin/p/bin_pe64.c                         |  33 ++-
+ libr/bin/p/bin_pebble.c                       |  36 ++-
+ libr/bin/p/bin_psxexe.c                       |  17 +-
+ libr/bin/p/bin_qnx.c                          |  21 +-
+ libr/bin/p/bin_sfc.c                          |  24 +-
+ libr/bin/p/bin_smd.c                          |  16 +-
+ libr/bin/p/bin_spc700.c                       |  38 ++-
+ libr/bin/p/bin_symbols.c                      |  21 +-
+ libr/bin/p/bin_te.c                           |  69 +++---
+ libr/bin/p/bin_vsf.c                          |  30 +--
+ libr/bin/p/bin_wasm.c                         |  28 +--
+ libr/bin/p/bin_write_elf.c                    |   3 +-
+ libr/bin/p/bin_write_elf.inc                  |  30 +--
+ libr/bin/p/bin_write_pe.c                     |   9 +-
+ libr/bin/p/bin_xbe.c                          |  26 +--
+ libr/bin/p/bin_xnu_kernelcache.c              |  31 ++-
+ libr/bin/p/bin_xtr_dyldcache.c                |  15 +-
+ libr/bin/p/bin_xtr_fatmach0.c                 | 145 ++++--------
+ libr/bin/p/bin_xtr_pemixed.c                  |  54 ++---
+ libr/bin/p/bin_z64.c                          |  35 ++-
+ libr/bin/p/bin_zimg.c                         |  43 ++--
+ libr/core/cbin.c                              |   3 +-
+ libr/core/cmd.c                               |   3 +-
+ libr/core/cmd_info.c                          |   1 -
+ libr/debug/debug.c                            |   2 +-
+ libr/include/r_bin.h                          |  23 +-
+ libr/main/rabin2.c                            |  10 +-
+ 76 files changed, 1144 insertions(+), 1420 deletions(-)
+
+diff --git a/libr/bin/bfile.c b/libr/bin/bfile.c
+index 60d2a59fb7aa8..bb628350c6688 100644
+--- a/libr/bin/bfile.c
++++ b/libr/bin/bfile.c
+@@ -325,87 +325,55 @@ static void get_strings_range(RBinFile *bf, RList *list, int min, int raw, ut64
+ 	string_scan_range (list, bf, min, from, to, -1, raw, section);
+ }
+ 
+-R_IPI RBinFile *r_bin_file_new(RBin *bin, const char *file, const ut8 *bytes, ut64 sz, ut64 file_sz, int rawstr, int fd, const char *xtrname, Sdb *sdb, bool steal_ptr) {
+-	RBinFile *binfile = R_NEW0 (RBinFile);
+-	if (!binfile) {
++R_IPI RBinFile *r_bin_file_new(RBin *bin, const char *file, ut64 file_sz, int rawstr, int fd, const char *xtrname, Sdb *sdb, bool steal_ptr) {
++	ut32 bf_id;
++	if (!r_id_pool_grab_id (bin->ids->pool, &bf_id)) {
+ 		return NULL;
+ 	}
+-	// TODO: use r_id_storage api
+-	if (!r_id_pool_grab_id (bin->ids->pool, &binfile->id)) {
+-		if (steal_ptr) { // we own the ptr, free on error
+-			free ((void*) bytes);
+-		}
+-		free (binfile);		//no id means no binfile
++	RBinFile *bf = R_NEW0 (RBinFile);
++	if (!bf) {
+ 		return NULL;
+ 	}
+-	int res = r_bin_file_set_bytes (binfile, bytes, sz, steal_ptr);
+-	if (!res && steal_ptr) { // we own the ptr, free on error
+-		free ((void *)bytes);
+-	}
+-	binfile->rbin = bin;
+-	binfile->file = file ? strdup (file) : NULL;
+-	binfile->rawstr = rawstr;
+-	binfile->fd = fd;
+-	binfile->curxtr = xtrname ? r_bin_get_xtrplugin_by_name (bin, xtrname) : NULL;
+-	binfile->sdb = sdb;
+-	binfile->size = file_sz;
+-	binfile->xtr_data = r_list_newf ((RListFree)r_bin_xtrdata_free);
+-	binfile->objs = r_list_newf ((RListFree)r_bin_object_free);
+-	binfile->xtr_obj = NULL;
+-
+-	if (!binfile->buf) {
+-		binfile->buf = r_buf_new ();
+-	}
+-
+-	if (sdb) {
+-		binfile->sdb = sdb_ns (sdb, sdb_fmt ("fd.%d", fd), 1);
+-		sdb_set (binfile->sdb, "archs", "0:0:x86:32", 0); // x86??
+-		/* NOTE */
+-		/* Those refs++ are necessary because sdb_ns() doesnt rerefs all
+-		 * sub-namespaces */
+-		/* And if any namespace is referenced backwards it gets
+-		 * double-freed */
+-		binfile->sdb_addrinfo = sdb_ns (binfile->sdb, "addrinfo", 1);
+-		binfile->sdb_addrinfo->refs++;
+-		sdb_ns_set (sdb, "cur", binfile->sdb);
+-		binfile->sdb->refs++;
+-	}
+-	return binfile;
++	bf->id = bf_id;
++	bf->rbin = bin;
++	bf->file = file ? strdup (file) : NULL;
++	bf->rawstr = rawstr;
++	bf->fd = fd;
++	bf->curxtr = xtrname ? r_bin_get_xtrplugin_by_name (bin, xtrname) : NULL;
++	bf->sdb = sdb;
++	bf->size = file_sz;
++	bf->xtr_data = r_list_newf ((RListFree)r_bin_xtrdata_free);
++	bf->objs = r_list_newf ((RListFree)r_bin_object_free);
++	bf->xtr_obj = NULL;
++	bf->sdb = sdb_new0 ();
++	bf->sdb_addrinfo = sdb_new0 (); //ns (bf->sdb, "addrinfo", 1);
++	// bf->sdb_addrinfo->refs++;
++	return bf;
+ }
+ 
+-static RBinPlugin *get_plugin(RBin *bin, const char *pluginname, const ut8 *bytes, ut64 sz) {
++static RBinPlugin *get_plugin_from_buffer(RBin *bin, const char *pluginname, RBuffer *buf) {
+ 	RBinPlugin *plugin = bin->force? r_bin_get_binplugin_by_name (bin, bin->force): NULL;
+ 	if (plugin) {
+ 		return plugin;
+ 	}
+-
+ 	plugin = pluginname? r_bin_get_binplugin_by_name (bin, pluginname): NULL;
+ 	if (plugin) {
+ 		return plugin;
+ 	}
+-
+-	plugin = r_bin_get_binplugin_by_bytes (bin, bytes, sz);
++	plugin = r_bin_get_binplugin_by_buffer (bin, buf);
+ 	if (plugin) {
+ 		return plugin;
+ 	}
+-
+ 	return r_bin_get_binplugin_any (bin);
+ }
+ 
+-static RBinPlugin * get_plugin_with_buffer (RBin *bin, RBuffer *buf) {
+-	ut8 bytes[4096];
+-	// XXX this must be removed to make get_plugin work with RBuffer instead of char*+sz
+-	r_buf_read_at (buf, 0, bytes, sizeof (bytes));
+-	return get_plugin (bin, NULL, (const ut8 *)bytes, sizeof (bytes));
+-}
+-
+ R_API bool r_bin_file_object_new_from_xtr_data(RBin *bin, RBinFile *bf, ut64 baseaddr, ut64 loadaddr, RBinXtrData *data) {
+ 	r_return_val_if_fail (bin && bf && data, false);
+ 
+ 	ut64 offset = data->offset;
+ 	ut64 sz = data->size;
+ 
+-	RBinPlugin *plugin = get_plugin_with_buffer (bin, data->buf);
++	RBinPlugin *plugin = get_plugin_from_buffer (bin, NULL, data->buf);
+ 	bf->buf = r_buf_ref (data->buf);
+ 
+ 	RBinObject *o = r_bin_object_new (bf, plugin, baseaddr, loadaddr, offset, sz);
+@@ -435,14 +403,6 @@ R_API bool r_bin_file_object_new_from_xtr_data(RBin *bin, RBinFile *bf, ut64 bas
+ 	return true;
+ }
+ 
+-static RBinFile *file_create_append(RBin *bin, const char *file, const ut8 *bytes, ut64 sz, ut64 file_sz, int rawstr, int fd, const char *xtrname, bool steal_ptr) {
+-	RBinFile *bf = r_bin_file_new (bin, file, bytes, sz, file_sz, rawstr, fd, xtrname, bin->sdb, steal_ptr);
+-	if (bf) {
+-		r_list_append (bin->binfiles, bf);
+-	}
+-	return bf;
+-}
+-
+ static bool xtr_metadata_match(RBinXtrData *xtr_data, const char *arch, int bits) {
+ 	if (!xtr_data->metadata || !xtr_data->metadata->arch) {
+ 		return false;
+@@ -453,29 +413,23 @@ static bool xtr_metadata_match(RBinXtrData *xtr_data, const char *arch, int bits
+ }
+ 
+ R_IPI RBinFile *r_bin_file_new_from_buffer(RBin *bin, const char *file, RBuffer *buf, ut64 file_sz, int rawstr, ut64 baseaddr, ut64 loadaddr, int fd, const char *pluginname, ut64 offset) {
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (buf, &sz);
+-	return r_bin_file_new_from_bytes (bin, file, bytes, sz, file_sz, rawstr, baseaddr, loadaddr, fd, pluginname, offset);
+-}
+-
+-R_IPI RBinFile *r_bin_file_new_from_bytes(RBin *bin, const char *file, const ut8 *bytes, ut64 sz, ut64 file_sz, int rawstr, ut64 baseaddr, ut64 loadaddr, int fd, const char *pluginname, ut64 offset) {
+-	r_return_val_if_fail (sz != UT64_MAX, NULL);
++	r_return_val_if_fail (file_sz != UT64_MAX, NULL);
+ 
+-	RBinPlugin *plugin = get_plugin (bin, pluginname, bytes, sz);
+-	RBinFile *bf = file_create_append (bin, file, bytes, sz, file_sz, rawstr, fd, NULL, true);
+-	if (!bf) {
+-		return NULL;
+-	}
+-
+-	RBinObject *o = r_bin_object_new (bf, plugin, baseaddr, loadaddr, 0, r_buf_size (bf->buf));
+-	if (!o) {
+-		r_list_delete_data (bin->binfiles, bf);
+-		return NULL;
+-	}
+-	// size is set here because the reported size of the object depends on
+-	// if loaded from xtr plugin or partially read
+-	if (!o->size) {
+-		o->size = file_sz;
++	RBinFile *bf = r_bin_file_new (bin, file, file_sz, rawstr, fd, pluginname, NULL, false);
++	if (bf) {
++		bf->buf = r_buf_ref (buf);
++		RBinPlugin *plugin = get_plugin_from_buffer (bin, pluginname, bf->buf);
++		RBinObject *o = r_bin_object_new (bf, plugin, baseaddr, loadaddr, 0, r_buf_size (bf->buf));
++		if (!o) {
++			r_bin_file_free (bf);
++			return NULL;
++		}
++		// size is set here because the reported size of the object depends on
++		// if loaded from xtr plugin or partially read
++		if (!o->size) {
++			o->size = file_sz;
++		}
++		r_list_append (bin->binfiles, bf);
+ 	}
+ 	return bf;
+ }
+@@ -669,94 +623,85 @@ R_API bool r_bin_file_deref(RBin *bin, RBinFile *a) {
+ 	return res;
+ }
+ 
+-R_API void r_bin_file_free(void /*RBinFile*/ *bf_) {
+-	RBinFile *a = bf_;
+-	RBinPlugin *plugin = r_bin_file_cur_plugin (a);
+-	if (!a) {
++R_API void r_bin_file_free(void /*RBinFile*/ *_bf) {
++	if (!_bf) {
+ 		return;
+ 	}
++	RBinFile *bf = _bf;
++	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
+ 	// Binary format objects are connected to the
+ 	// RBinObject, so the plugin must destroy the
+ 	// format data first
+ 	if (plugin && plugin->destroy) {
+-		plugin->destroy (a);
++		plugin->destroy (bf);
+ 	}
+-	r_buf_free (a->buf);
+-	if (a->curxtr && a->curxtr->destroy && a->xtr_obj) {
+-		a->curxtr->free_xtr ((void *)(a->xtr_obj));
++	r_buf_free (bf->buf);
++	if (bf->curxtr && bf->curxtr->destroy && bf->xtr_obj) {
++		bf->curxtr->free_xtr ((void *)(bf->xtr_obj));
+ 	}
+ 	// TODO: unset related sdb namespaces
+-	if (a && a->sdb_addrinfo) {
+-		sdb_free (a->sdb_addrinfo);
+-		a->sdb_addrinfo = NULL;
+-	}
+-	free (a->file);
+-	a->o = NULL;
+-	r_list_free (a->objs);
+-	r_list_free (a->xtr_data);
+-	if (a->id != -1) {
++	if (bf->sdb_addrinfo) {
++		sdb_free (bf->sdb_addrinfo);
++		bf->sdb_addrinfo = NULL;
++	}
++	free (bf->file);
++	bf->o = NULL;
++	r_list_free (bf->objs);
++	r_list_free (bf->xtr_data);
++	if (bf->id != -1) {
+ 		// TODO: use r_storage api
+-		r_id_pool_kick_id (a->rbin->ids->pool, a->id);
++		r_id_pool_kick_id (bf->rbin->ids->pool, bf->id);
+ 	}
+-	free (a);
++	free (bf);
+ }
+ 
+ R_IPI RBinFile *r_bin_file_xtr_load_buffer(RBin *bin, RBinXtrPlugin *xtr, const char *filename, RBuffer *buf, ut64 file_sz, ut64 baseaddr, ut64 loadaddr, int idx, int fd, int rawstr) {
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (buf, &sz);
+-	return r_bin_file_xtr_load_bytes (bin, xtr, filename, bytes, sz, file_sz, baseaddr, loadaddr, idx, fd, rawstr);
+-}
+-
+-// This function populate RBinFile->xtr_data, that information is enough to
+-// create RBinObject when needed using r_bin_file_object_new_from_xtr_data
+-R_IPI RBinFile *r_bin_file_xtr_load_bytes(RBin *bin, RBinXtrPlugin *xtr, const char *filename, const ut8 *bytes, ut64 sz, ut64 file_sz, ut64 baseaddr, ut64 loadaddr, int idx, int fd, int rawstr) {
+-	r_return_val_if_fail (bin && xtr && bytes, NULL);
++	r_return_val_if_fail (bin && xtr && buf, NULL);
+ 
+ 	RBinFile *bf = r_bin_file_find_by_name (bin, filename);
+ 	if (!bf) {
+-		bf = file_create_append (bin, filename, bytes, sz,
+-			file_sz, rawstr, fd, xtr->name, false);
++		bf = r_bin_file_new (bin, filename, file_sz, rawstr, fd, xtr->name, bin->sdb, false);
+ 		if (!bf) {
+ 			return NULL;
+ 		}
++		r_list_append (bin->binfiles, bf);
+ 		if (!bin->cur) {
+ 			bin->cur = bf;
+ 		}
+ 	}
+ 	r_list_free (bf->xtr_data);
+-	bf->xtr_data = xtr->extractall_from_bytes (bin, bytes, sz);
++	bf->xtr_data = NULL;
++	if (xtr->extractall_from_buffer) {
++		bf->xtr_data = xtr->extractall_from_buffer (bin, buf);
++	} else if (xtr->extractall_from_bytes) {
++		ut64 sz = 0;
++		const ut8 *bytes = r_buf_data (buf, &sz);
++		eprintf ("TODO: Implement extractall_from_buffer in '%s' xtr.bin plugin\n", xtr->name);
++		bf->xtr_data = xtr->extractall_from_bytes (bin, bytes, sz);
++	}
+ 	if (bf->xtr_data) {
+ 		RListIter *iter;
+-		RBinXtrData *xtr;
++		RBinXtrData *x;
+ 		//populate xtr_data with baddr and laddr that will be used later on
+ 		//r_bin_file_object_new_from_xtr_data
+-		r_list_foreach (bf->xtr_data, iter, xtr) {
+-			xtr->baddr = baseaddr? baseaddr : UT64_MAX;
+-			xtr->laddr = loadaddr? loadaddr : UT64_MAX;
++		r_list_foreach (bf->xtr_data, iter, x) {
++			x->baddr = baseaddr? baseaddr : UT64_MAX;
++			x->laddr = loadaddr? loadaddr : UT64_MAX;
+ 		}
+ 	}
+ 	bf->loadaddr = loadaddr;
+ 	return bf;
+ }
+ 
+-#define LIMIT_SIZE 0
++// XXX deprecate this function imho.. wee can just access bf->buf directly
+ R_IPI bool r_bin_file_set_bytes(RBinFile *bf, const ut8 *bytes, ut64 sz, bool steal_ptr) {
+ 	r_return_val_if_fail (bf && bytes, false);
+-
+ 	r_buf_free (bf->buf);
+-#if LIMIT_SIZE
+-	if (sz > 1024 * 1024) {
+-		eprintf ("Too big\n");
+-		// TODO: use r_buf_io instead of setbytes all the time to save memory
+-		return NULL;
+-	}
+-#else
+ 	if (steal_ptr) {
+ 		bf->buf = r_buf_new_with_pointers (bytes, sz, true);
+ 	} else {
+ 		bf->buf = r_buf_new_with_bytes (bytes, sz);
+ 	}
+-#endif
+ 	return bf->buf != NULL;
+ }
+ 
+@@ -768,17 +713,8 @@ R_IPI RList *r_bin_file_get_strings(RBinFile *a, int min, int dump, int raw) {
+ 	r_return_val_if_fail (a, NULL);
+ 	RListIter *iter;
+ 	RBinSection *section;
+-	RList *ret;
++	RList *ret = dump? NULL: r_list_newf (r_bin_string_free);
+ 
+-	if (dump) {
+-		/* dump to stdout, not stored in list */
+-		ret = NULL;
+-	} else {
+-		ret = r_list_newf (r_bin_string_free);
+-		if (!ret) {
+-			return NULL;
+-		}
+-	}
+ 	if (!raw && a->o && a->o && a->o->sections && !r_list_empty (a->o->sections)) {
+ 		RBinObject *o = a->o;
+ 		r_list_foreach (o->sections, iter, section) {
+@@ -794,7 +730,7 @@ R_IPI RList *r_bin_file_get_strings(RBinFile *a, int min, int dump, int raw) {
+ 			const int cfstr_offs = (bits == 64) ? 16 :  8;
+ 			if (strstr (section->name, "__cfstring")) {
+ 				int i;
+-// XXX do not walk if bin.strings == 0
++				// XXX do not walk if bin.strings == 0
+ 				ut8 *p;
+ 				if (section->size > a->size) {
+ 					continue;
+diff --git a/libr/bin/bin.c b/libr/bin/bin.c
+index 618f4bc840f8c..cf650b8adf10e 100644
+--- a/libr/bin/bin.c
++++ b/libr/bin/bin.c
+@@ -58,17 +58,15 @@ static ut64 binobj_a2b(RBinObject *o, ut64 addr) {
+ // TODO: move these two function do a different file
+ R_API RBinXtrData *r_bin_xtrdata_new(RBuffer *buf, ut64 offset, ut64 size, ut32 file_count, RBinXtrMetadata *metadata) {
+ 	RBinXtrData *data = R_NEW0 (RBinXtrData);
+-	if (!data) {
+-		return NULL;
++	if (data) {
++		data->offset = offset;
++		data->size = size;
++		data->file_count = file_count;
++		data->metadata = metadata;
++		data->loaded = 0;
++// dont slice twice TODO. review this
++		data->buf = r_buf_ref (buf); // r_buf_new_slice (buf, offset, size);
+ 	}
+-	data->offset = offset;
+-	data->size = size;
+-	data->file_count = file_count;
+-	data->metadata = metadata;
+-	data->loaded = 0;
+-	// TODO: USE RBuffer *buf inside RBinXtrData*
+-	data->buf = r_buf_ref (buf);
+-	// TODO. subbuffer?
+ 	return data;
+ }
+ 
+@@ -121,13 +119,11 @@ R_API void r_bin_arch_options_init(RBinArchOptions *opt, const char *arch, int b
+ }
+ 
+ R_API void r_bin_file_hash_free(RBinFileHash *fhash) {
+-	if (!fhash) {
+-		return;
++	if (fhash) {
++		R_FREE (fhash->type);
++		R_FREE (fhash->hex);
++		free (fhash);
+ 	}
+-
+-	R_FREE (fhash->type);
+-	R_FREE (fhash->hex);
+-	free (fhash);
+ }
+ 
+ R_API void r_bin_info_free(RBinInfo *rb) {
+@@ -322,7 +318,6 @@ R_API bool r_bin_open_io(RBin *bin, RBinOptions *opt) {
+ 	RIO *io = iob? iob->io: NULL;
+ 	RListIter *it;
+ 	RBinXtrPlugin *xtr;
+-	RBinFile *binfile = NULL;
+ 	int tfd = opt->fd;
+ 
+ 	bool is_debugger = iob->fd_is_dbg (io, opt->fd);
+@@ -364,6 +359,7 @@ R_API bool r_bin_open_io(RBin *bin, RBinOptions *opt) {
+ 		}
+ 	}
+ 
++	RBinFile *bf = NULL;
+ 	if (bin->use_xtr && !opt->pluginname && (st64)opt->sz > 0) {
+ 		// XXX - for the time being this is fine, but we may want to
+ 		// change the name to something like
+@@ -374,7 +370,8 @@ R_API bool r_bin_open_io(RBin *bin, RBinOptions *opt) {
+ 				continue;
+ 			}
+ 			if (xtr->check_buffer (buf)) {
+-				if (xtr->extract_from_bytes || xtr->extractall_from_bytes) {
++				if (xtr->extract_from_buffer || xtr->extractall_from_buffer ||
++				    xtr->extract_from_bytes || xtr->extractall_from_bytes) {
+ 					if (is_debugger && opt->sz != file_sz) {
+ 						if (tfd < 0) {
+ 							tfd = iob->fd_open (io, fname, R_PERM_R, 0);
+@@ -387,7 +384,7 @@ R_API bool r_bin_open_io(RBin *bin, RBinOptions *opt) {
+ 						// DOUBLECLOSE UAF : iob->fd_close (io, tfd);
+ 						tfd = -1; // marking it closed
+ 					}
+-					binfile = r_bin_file_xtr_load_buffer (bin, xtr,
++					bf = r_bin_file_xtr_load_buffer (bin, xtr,
+ 						fname, buf, file_sz,
+ 						opt->baseaddr, opt->loadaddr, opt->xtr_idx,
+ 						opt->fd, bin->rawstr);
+@@ -395,17 +392,18 @@ R_API bool r_bin_open_io(RBin *bin, RBinOptions *opt) {
+ 			}
+ 		}
+ 	}
+-	if (!binfile) {
+-		binfile = r_bin_file_new_from_buffer (
++	if (!bf) {
++		bf = r_bin_file_new_from_buffer (
+ 			bin, fname, buf, file_sz, bin->rawstr,
+ 			opt->baseaddr, opt->loadaddr, opt->fd, opt->pluginname, opt->offset);
++		if (!bf) {
++			return false;
++		}
+ 	}
+-
+-	if (!binfile || !r_bin_file_set_cur_binfile (bin, binfile)) {
++	if (!r_bin_file_set_cur_binfile (bin, bf)) {
+ 		return false;
+ 	}
+-
+-	r_id_storage_set (bin->ids, bin->cur, binfile->id);
++	r_id_storage_set (bin->ids, bin->cur, bf->id);
+ 	return true;
+ }
+ 
+@@ -428,6 +426,7 @@ R_API RBinPlugin *r_bin_get_binplugin_by_bytes(RBin *bin, const ut8 *bytes, ut64
+ 	RBinPlugin *plugin;
+ 	RListIter *it;
+ 
++eprintf ("r_bin_get_binplugin_by_bytes is deprecated. Use r_bin_get_binplugin_by_buffer instead\n");
+ 	r_return_val_if_fail (bin && bytes, NULL);
+ 
+ 	r_list_foreach (bin->plugins, it, plugin) {
+@@ -447,6 +446,29 @@ R_API RBinPlugin *r_bin_get_binplugin_by_bytes(RBin *bin, const ut8 *bytes, ut64
+ 	return NULL;
+ }
+ 
++R_API RBinPlugin *r_bin_get_binplugin_by_buffer(RBin *bin, RBuffer *buf) {
++	RBinPlugin *plugin;
++	RListIter *it;
++
++	r_return_val_if_fail (bin && buf, NULL);
++
++	r_list_foreach (bin->plugins, it, plugin) {
++		if (plugin->check_buffer) {
++			if (plugin->check_buffer (buf)) {
++				return plugin;
++			}
++		} else if (plugin->check_bytes) {
++			eprintf ("Deprecate plugin->check_bytes for '%s' please\n", plugin->name);
++			ut64 sz;
++			const ut8 *bytes = r_buf_data (buf, &sz);
++			if (plugin->check_bytes (bytes, sz)) {
++				return plugin;
++			}
++		}
++	}
++	return NULL;
++}
++
+ R_IPI RBinXtrPlugin *r_bin_get_xtrplugin_by_name(RBin *bin, const char *name) {
+ 	RBinXtrPlugin *xtr;
+ 	RListIter *it;
+@@ -1085,7 +1107,8 @@ R_API void r_bin_list_archs(RBin *bin, int mode) {
+ 	if (!binfile_sdb) {
+ 		eprintf ("Cannot find SDB!\n");
+ 		return;
+-	} else if (!binfile) {
++	}
++	if (!binfile) {
+ 		eprintf ("Binary format not currently loaded!\n");
+ 		return;
+ 	}
+diff --git a/libr/bin/bin_write.c b/libr/bin/bin_write.c
+index f0a5e05c47b71..3c0060b61884b 100644
+--- a/libr/bin/bin_write.c
++++ b/libr/bin/bin_write.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2015 - pancake, nibble */
++/* radare2 - LGPL - Copyright 2009-2019 - pancake, nibble */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -6,54 +6,55 @@
+ 
+ /* XXX Implement r__bin_wr_scn_{   set, del   } instead */
+ R_API ut64 r_bin_wr_scn_resize(RBin *bin, const char *name, ut64 size) {
+-	RBinFile *binfile = r_bin_cur (bin);
+-	RBinPlugin *plugin = r_bin_file_cur_plugin (binfile);
++	RBinFile *bf = r_bin_cur (bin);
++	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
+ 	if (plugin && plugin->write && plugin->write->scn_resize) {
+-		return plugin->write->scn_resize (bin->cur, name, size);
++		return plugin->write->scn_resize (bf, name, size);
+ 	}
+ 	return false;
+ }
+ 
+ R_API bool r_bin_wr_scn_perms(RBin *bin, const char *name, int perms) {
+-	RBinFile *binfile = r_bin_cur (bin);
+-	RBinPlugin *plugin = r_bin_file_cur_plugin (binfile);
++	RBinFile *bf = r_bin_cur (bin);
++	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
+ 	if (plugin && plugin->write && plugin->write->scn_perms) {
+-		return plugin->write->scn_perms (bin->cur, name, perms);
++		return plugin->write->scn_perms (bf, name, perms);
+ 	}
+ 	return false;
+ }
+ 
+ R_API bool r_bin_wr_rpath_del(RBin *bin) {
+-	RBinFile *binfile = r_bin_cur (bin);
+-	RBinPlugin *plugin = r_bin_file_cur_plugin (binfile);
++	RBinFile *bf = r_bin_cur (bin);
++	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
+ 	if (plugin && plugin->write && plugin->write->rpath_del) {
+-		return plugin->write->rpath_del (bin->cur);
++		return plugin->write->rpath_del (bf);
+ 	}
+ 	return false;
+ }
+ 
+ R_API bool r_bin_wr_output(RBin *bin, const char *filename) {
+-	RBinFile *binfile = r_bin_cur (bin);
+-	if (!filename || !binfile || !binfile->buf) {
++	r_return_val_if_fail (bin && filename, false);
++	RBinFile *bf = r_bin_cur (bin);
++	if (!bf || !bf->buf) {
+ 		return false;
+ 	}
+ 	ut64 tmpsz;
+-	const ut8 *tmp = r_buf_data (binfile->buf, &tmpsz);
++	const ut8 *tmp = r_buf_data (bf->buf, &tmpsz);
+ 	return r_file_dump (filename, tmp, tmpsz, 0);
+ }
+ 
+ R_API bool r_bin_wr_entry(RBin *bin, ut64 addr) {
+-	RBinFile *binfile = r_bin_cur (bin);
+-	RBinPlugin *plugin = r_bin_file_cur_plugin (binfile);
++	RBinFile *bf = r_bin_cur (bin);
++	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
+ 	if (plugin && plugin->write && plugin->write->entry) {
+-		return plugin->write->entry (bin->cur, addr);
++		return plugin->write->entry (bf, addr);
+ 	}
+ 	return false;
+ }
+ 
+ R_API bool r_bin_wr_addlib(RBin *bin, const char *lib) {
+-	RBinFile *binfile = r_bin_cur (bin);
+-	RBinPlugin *plugin = r_bin_file_cur_plugin (binfile);
++	RBinFile *bf = r_bin_cur (bin);
++	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
+ 	if (plugin && plugin->write && plugin->write->addlib) {
+ 		return plugin->write->addlib (bin->cur, lib);
+ 	}
+diff --git a/libr/bin/format/elf/elf.c b/libr/bin/format/elf/elf.c
+index 4bd0cb3ddccfb..e02f27adee86c 100644
+--- a/libr/bin/format/elf/elf.c
++++ b/libr/bin/format/elf/elf.c
+@@ -100,12 +100,12 @@ static bool is_bin_etrel(ELFOBJ *bin) {
+ 	return bin->ehdr.e_type == ET_REL;
+ }
+ 
+-static int handle_e_ident(ELFOBJ *bin) {
++static bool __is_valid_ident(ELFOBJ *bin) {
+ 	return !strncmp ((char *)bin->ehdr.e_ident, ELFMAG, SELFMAG) ||
+ 		!strncmp ((char *)bin->ehdr.e_ident, CGCMAG, SCGCMAG);
+ }
+ 
+-static int init_ehdr(ELFOBJ *bin) {
++static bool init_ehdr(ELFOBJ *bin) {
+ 	ut8 e_ident[EI_NIDENT];
+ 	ut8 ehdr[sizeof (Elf_(Ehdr))] = { 0 };
+ 	int i, len;
+@@ -172,14 +172,18 @@ static int init_ehdr(ELFOBJ *bin) {
+ #endif
+ 	bin->endian = (e_ident[EI_DATA] == ELFDATA2MSB)? 1: 0;
+ 	memset (&bin->ehdr, 0, sizeof (Elf_(Ehdr)));
+-
+-	len = r_buf_read_at (bin->b, 0, ehdr, sizeof (Elf_(Ehdr)));
+-	if (len < 1) {
++	len = r_buf_read_at (bin->b, 0, ehdr, sizeof (ehdr));
++	if (len < 32) { // tinyelf != sizeof (Elf_(Ehdr))) {
+ 		bprintf ("read (ehdr)\n");
+ 		return false;
+ 	}
++	// XXX no need to check twice
+ 	memcpy (&bin->ehdr.e_ident, ehdr, 16);
++	if (!__is_valid_ident (bin)) {
++		return false;
++	}
+ 	i = 16;
++	// TODO: use r_read or r_buf_read_ apis instead
+ 	bin->ehdr.e_type = READ16 (ehdr, i);
+ 	bin->ehdr.e_machine = READ16 (ehdr, i);
+ 	bin->ehdr.e_version = READ32 (ehdr, i);
+@@ -199,7 +203,7 @@ static int init_ehdr(ELFOBJ *bin) {
+ 	bin->ehdr.e_shentsize = READ16 (ehdr, i);
+ 	bin->ehdr.e_shnum = READ16 (ehdr, i);
+ 	bin->ehdr.e_shstrndx = READ16 (ehdr, i);
+-	return handle_e_ident (bin);
++	return true;
+ 	// [Outdated] Usage example:
+ 	// > td `k bin/cur/info/elf_type.cparse`; td `k bin/cur/info/elf_machine.cparse`
+ 	// > pf `k bin/cur/info/elf_header.format` @ `k bin/cur/info/elf_header.offset`
+@@ -1200,20 +1204,7 @@ static bool init_dynstr(ELFOBJ *bin) {
+ 	return false;
+ }
+ 
+-static int elf_init(ELFOBJ *bin) {
+-	bin->phdr = NULL;
+-	bin->shdr = NULL;
+-	bin->strtab = NULL;
+-	bin->shstrtab = NULL;
+-	bin->strtab_size = 0;
+-	bin->strtab_section = NULL;
+-	bin->dyn_buf = NULL;
+-	bin->dynstr = NULL;
+-	ZERO_FILL (bin->version_info);
+-
+-	bin->g_sections = NULL;
+-	bin->g_symbols = NULL;
+-	bin->g_imports = NULL;
++static bool elf_init(ELFOBJ *bin) {
+ 	/* bin is not an ELF */
+ 	if (!init_ehdr (bin)) {
+ 		return false;
+@@ -1244,7 +1235,6 @@ static int elf_init(ELFOBJ *bin) {
+ 	bin->g_sections = Elf_(r_bin_elf_get_sections) (bin);
+ 	bin->boffset = Elf_(r_bin_elf_get_boffset) (bin);
+ 	sdb_ns_set (bin->kv, "versioninfo", store_versioninfo (bin));
+-
+ 	return true;
+ }
+ 
+@@ -1876,13 +1866,14 @@ static ut64 getmainsymbol(ELFOBJ *bin) {
+ 
+ ut64 Elf_(r_bin_elf_get_main_offset)(ELFOBJ *bin) {
+ 	ut64 entry = Elf_(r_bin_elf_get_entry_offset) (bin);
+-	ut8 buf[512];
++	ut8 buf[256];
+ 	if (!bin || entry == UT64_MAX) {
+ 		return UT64_MAX;
+ 	}
+ 	if (entry > bin->size || (entry + sizeof (buf)) > bin->size) {
+ 		return UT64_MAX;
+ 	}
++	// unnecessary to read 512 bytes imho
+ 	if (r_buf_read_at (bin->b, entry, buf, sizeof (buf)) < 1) {
+ 		bprintf ("read (main)\n");
+ 		return UT64_MAX;
+@@ -3475,9 +3466,8 @@ static RBinElfSymbol* Elf_(_r_bin_elf_get_symbols_imports)(ELFOBJ *bin, int type
+ 	}
+ 	if (!ret) {
+ 		return Elf_(get_phdr_symbols) (bin, type);
+-	} else {
+-		ret[ret_ctr].last = 1; // ugly dirty hack :D
+ 	}
++	ret[ret_ctr].last = 1; // ugly dirty hack :D
+ 	int max = -1;
+ 	RBinElfSymbol *aux = NULL;
+ 	nsym = Elf_(fix_symbols) (bin, ret_ctr, type, &ret);
+@@ -3566,10 +3556,10 @@ RBinElfField* Elf_(r_bin_elf_get_fields)(ELFOBJ *bin) {
+ 	return ret;
+ }
+ 
+-void* Elf_(r_bin_elf_free)(ELFOBJ* bin) {
++void Elf_(r_bin_elf_free)(ELFOBJ* bin) {
+ 	int i;
+ 	if (!bin) {
+-		return NULL;
++		return;
+ 	}
+ 	free (bin->phdr);
+ 	free (bin->shdr);
+@@ -3603,44 +3593,19 @@ void* Elf_(r_bin_elf_free)(ELFOBJ* bin) {
+ 	ht_up_free (bin->rel_cache);
+ 	bin->rel_cache = NULL;
+ 	free (bin);
+-	return NULL;
+-}
+-
+-ELFOBJ* Elf_(r_bin_elf_new)(const char* file, bool verbose) {
+-	ut8 *buf;
+-	int size;
+-	ELFOBJ *bin = R_NEW0 (ELFOBJ);
+-	if (!bin) {
+-		return NULL;
+-	}
+-	memset (bin, 0, sizeof (ELFOBJ));
+-	bin->file = file;
+-	if (!(buf = (ut8*)r_file_slurp (file, &size))) {
+-		return Elf_(r_bin_elf_free) (bin);
+-	}
+-	bin->size = size;
+-	bin->verbose = verbose;
+-	bin->b = r_buf_new ();
+-	if (!r_buf_set_bytes (bin->b, buf, bin->size)) {
+-		free (buf);
+-		return Elf_(r_bin_elf_free) (bin);
+-	}
+-	if (!elf_init (bin)) {
+-		free (buf);
+-		return Elf_(r_bin_elf_free) (bin);
+-	}
+-	free (buf);
+-	return bin;
+ }
+ 
+ ELFOBJ* Elf_(r_bin_elf_new_buf)(RBuffer *buf, bool verbose) {
+ 	ELFOBJ *bin = R_NEW0 (ELFOBJ);
+-	bin->kv = sdb_new0 ();
+-	bin->size = (ut32)r_buf_size (buf);
+-	bin->verbose = verbose;
+-	bin->b = r_buf_ref (buf);
+-	if (!elf_init (bin)) {
+-		return Elf_(r_bin_elf_free) (bin);
++	if (bin) {
++		bin->kv = sdb_new0 ();
++		bin->size = (ut32)r_buf_size (buf);
++		bin->verbose = verbose;
++		bin->b = r_buf_ref (buf);
++		if (!elf_init (bin)) {
++			Elf_(r_bin_elf_free) (bin);
++			return NULL;
++		}
+ 	}
+ 	return bin;
+ }
+diff --git a/libr/bin/format/elf/elf.h b/libr/bin/format/elf/elf.h
+index 42832b3c70d1e..c6562400f8524 100644
+--- a/libr/bin/format/elf/elf.h
++++ b/libr/bin/format/elf/elf.h
+@@ -154,13 +154,16 @@ RBinElfSymbol* Elf_(r_bin_elf_get_symbols)(struct Elf_(r_bin_elf_obj_t) *bin);
+ RBinElfSymbol* Elf_(r_bin_elf_get_imports)(struct Elf_(r_bin_elf_obj_t) *bin);
+ struct r_bin_elf_field_t* Elf_(r_bin_elf_get_fields)(struct Elf_(r_bin_elf_obj_t) *bin);
+ char *Elf_(r_bin_elf_get_rpath)(struct Elf_(r_bin_elf_obj_t) *bin);
+-void* Elf_(r_bin_elf_free)(struct Elf_(r_bin_elf_obj_t)* bin);
++
+ struct Elf_(r_bin_elf_obj_t)* Elf_(r_bin_elf_new)(const char* file, bool verbose);
+ struct Elf_(r_bin_elf_obj_t)* Elf_(r_bin_elf_new_buf)(RBuffer *buf, bool verbose);
+-ut64 Elf_(r_bin_elf_resize_section)(struct Elf_(r_bin_elf_obj_t) *bin, const char *name, ut64 size);
+-bool Elf_(r_bin_elf_section_perms)(struct Elf_(r_bin_elf_obj_t) *bin, const char *name, int perms);
+-bool Elf_(r_bin_elf_entry_write)(struct Elf_(r_bin_elf_obj_t) *bin, ut64 addr);
+-bool Elf_(r_bin_elf_del_rpath)(struct Elf_(r_bin_elf_obj_t) *bin);
++void Elf_(r_bin_elf_free)(struct Elf_(r_bin_elf_obj_t)* bin);
++
++ut64 Elf_(r_bin_elf_resize_section)(RBinFile *bf, const char *name, ut64 size);
++bool Elf_(r_bin_elf_section_perms)(RBinFile *bf, const char *name, int perms);
++bool Elf_(r_bin_elf_entry_write)(RBinFile *bf, ut64 addr);
++bool Elf_(r_bin_elf_del_rpath)(RBinFile *bf);
++
+ int Elf_(r_bin_elf_has_relro)(struct Elf_(r_bin_elf_obj_t) *bin);
+ int Elf_(r_bin_elf_has_nx)(struct Elf_(r_bin_elf_obj_t) *bin);
+ ut8 *Elf_(r_bin_elf_grab_regstate)(struct Elf_(r_bin_elf_obj_t) *bin, int *len);
+@@ -168,5 +171,4 @@ RList *Elf_(r_bin_elf_get_maps)(ELFOBJ *bin);
+ RBinSymbol *Elf_(_r_bin_elf_convert_symbol)(struct Elf_(r_bin_elf_obj_t) *bin,
+ 					  struct r_bin_elf_symbol_t *symbol,
+ 					  const char *namefmt);
+-
+ #endif
+diff --git a/libr/bin/format/elf/elf_write.c b/libr/bin/format/elf/elf_write.c
+index 5b8ae3348493b..606b9c02ee7a7 100644
+--- a/libr/bin/format/elf/elf_write.c
++++ b/libr/bin/format/elf/elf_write.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2010-2018 pancake, nibble */
++/* radare - LGPL - Copyright 2010-2019 pancake, nibble */
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -11,7 +11,9 @@
+ /* TODO: Take care of endianess */
+ /* TODO: Real error handling */
+ /* TODO: Resize sections before .init */
+-ut64 Elf_(r_bin_elf_resize_section)(struct Elf_(r_bin_elf_obj_t) *bin, const char *name, ut64 size) {
++// ut64 Elf_(r_bin_elf_resize_section)(struct Elf_(r_bin_elf_obj_t) *bin, const char *name, ut64 size) {
++ut64 Elf_(r_bin_elf_resize_section)(RBinFile *bf, const char *name, ut64 size) {
++	struct Elf_(r_bin_elf_obj_t) *bin = bf->o->bin_obj; // , const char *name, ut64 size) {
+ 	Elf_(Ehdr) *ehdr = &bin->ehdr;
+ 	Elf_(Phdr) *phdr = bin->phdr, *phdrp;
+ 	Elf_(Shdr) *shdr = bin->shdr, *shdrp;
+@@ -185,7 +187,8 @@ ut64 Elf_(r_bin_elf_resize_section)(struct Elf_(r_bin_elf_obj_t) *bin, const cha
+ }
+ 
+ /* XXX Endianness? */
+-bool Elf_(r_bin_elf_del_rpath)(struct Elf_(r_bin_elf_obj_t) *bin) {
++bool Elf_(r_bin_elf_del_rpath)(RBinFile *bf) {
++	struct Elf_(r_bin_elf_obj_t) *bin = bf->o->bin_obj;
+ 	Elf_(Dyn) *dyn = NULL;
+ 	ut64 stroff = 0LL;
+ 	int ndyn, i, j;
+@@ -230,7 +233,8 @@ bool Elf_(r_bin_elf_del_rpath)(struct Elf_(r_bin_elf_obj_t) *bin) {
+ 	return true;
+ }
+ 
+-bool Elf_(r_bin_elf_section_perms)(struct Elf_(r_bin_elf_obj_t) *bin, const char *name, int perms) {
++bool Elf_(r_bin_elf_section_perms)(RBinFile *bf, const char *name, int perms) {
++	struct Elf_(r_bin_elf_obj_t) *bin = bf->o->bin_obj;
+ 	Elf_(Ehdr) *ehdr = &bin->ehdr;
+ 	Elf_(Shdr) *shdr = bin->shdr, *shdrp;
+ 	const char *strtab = bin->shstrtab;
+@@ -258,22 +262,22 @@ bool Elf_(r_bin_elf_section_perms)(struct Elf_(r_bin_elf_obj_t) *bin, const char
+ 			patchoff += ((const ut8*)shdrp - (const ut8*)bin->shdr);
+ 			patchoff += r_offsetof (Elf_(Shdr), sh_flags);
+ 			printf ("wx %02x @ 0x%x\n", newperms, patchoff);
+-			r_buf_write_at (bin->b, patchoff, (ut8*)&newperms, 1);
++			r_buf_write_at (bf->buf, patchoff, (ut8*)&newperms, 1);
+ 			return true;
+ 		}
+ 	}
+ 	return false;
+ }
+ 
+-bool Elf_(r_bin_elf_entry_write)(struct Elf_(r_bin_elf_obj_t) *bin, ut64 addr) {
+-	int patchoff = 0x18;
++bool Elf_(r_bin_elf_entry_write)(RBinFile *bf, ut64 addr) {
++	const int patchoff = 0x18;
+ #if R_BIN_ELF64
+ 	printf ("wv8 0x%"PFMT64x" @ 0x%x\n", addr, patchoff);
+-	eprintf ("%d\n", r_buf_write_at (bin->b, patchoff, (ut8*)&addr, sizeof (addr)));
++	eprintf ("%d\n", r_buf_write_at (bf->buf, patchoff, (ut8*)&addr, sizeof (addr)));
+ #else
+ 	ut32 addr32 = (ut32)addr;
+ 	printf ("wv4 0x%x @ 0x%x\n", addr32, patchoff);
+-	r_buf_write_at (bin->b, patchoff, (ut8*)&addr32, sizeof (addr32));
++	r_buf_write_at (bf->buf, patchoff, (ut8*)&addr32, sizeof (addr32));
+ #endif
+ 	return true;
+ }
+diff --git a/libr/bin/format/mach0/fatmach0.c b/libr/bin/format/mach0/fatmach0.c
+index 70706d97575ec..136da3baeb9e6 100644
+--- a/libr/bin/format/mach0/fatmach0.c
++++ b/libr/bin/format/mach0/fatmach0.c
+@@ -51,9 +51,6 @@ static int r_bin_fatmach0_init(struct r_bin_fatmach0_obj_t* bin) {
+ }
+ 
+ struct r_bin_fatmach0_arch_t *r_bin_fatmach0_extract(struct r_bin_fatmach0_obj_t* bin, int idx, int *narch) {
+-	struct r_bin_fatmach0_arch_t *ret;
+-	ut8 *buf = NULL;
+-
+ 	if (!bin || (idx < 0) || (idx > bin->nfat_arch)) {
+ 		return NULL;
+ 	}
+@@ -61,44 +58,20 @@ struct r_bin_fatmach0_arch_t *r_bin_fatmach0_extract(struct r_bin_fatmach0_obj_t
+ 		bin->archs[idx].offset + bin->archs[idx].size > bin->size) {
+ 		return NULL;
+ 	}
+-
+ 	if (narch) {
+ 		*narch = bin->nfat_arch;
+ 	}
+-	if (!(ret = R_NEW0 (struct r_bin_fatmach0_arch_t))) {
+-		perror ("malloc (ret)");
+-		return NULL;
+-	}
+-	if (!bin->archs[idx].size || bin->archs[idx].size > bin->size) {
+-		eprintf ("Skipping corrupted sub-bin %d arch %d\n", idx, bin->archs[idx].size);
+-		free (ret);
+-		return NULL;
+-	}
+-	if (!(buf = malloc (1 + bin->archs[idx].size))) {
+-		perror ("malloc (buf)");
+-		free (ret);
+-		return NULL;
+-	}
+-	if (r_buf_read_at (bin->b, bin->archs[idx].offset, buf, bin->archs[idx].size) != bin->archs[idx].size) {
+-		perror ("read (buf)");
+-		free (buf);
+-		free (ret);
+-		return NULL;
+-	}
+-	if (!(ret->b = r_buf_new ())) {
+-		free (buf);
+-		free (ret);
+-		return NULL;
+-	}
+-	if (!r_buf_set_bytes (ret->b, buf, bin->archs[idx].size)) {
+-		free (buf);
+-		r_buf_free (ret->b);
+-		free (ret);
+-		return NULL;
++	struct r_bin_fatmach0_arch_t *ret = R_NEW0 (struct r_bin_fatmach0_arch_t);
++	if (ret) {
++		ret->size = bin->archs[idx].size;
++		if (!ret->size || ret->size > bin->size) {
++			eprintf ("Skipping corrupted sub-bin %d arch %d\n", idx, bin->archs[idx].size);
++			free (ret);
++			return NULL;
++		}
++		ret->offset = bin->archs[idx].offset;
++		ret->b = r_buf_new_slice (bin->b, ret->offset, ret->size);
+ 	}
+-	free (buf);
+-	ret->offset = bin->archs[idx].offset;
+-	ret->size = bin->archs[idx].size;
+ 	return ret;
+ }
+ 
+@@ -134,6 +107,19 @@ struct r_bin_fatmach0_obj_t* r_bin_fatmach0_new(const char* file) {
+ 	return bin;
+ }
+ 
++struct r_bin_fatmach0_obj_t* r_bin_fatmach0_from_buffer_new(RBuffer *b) {
++	r_return_val_if_fail (b, NULL);
++	struct r_bin_fatmach0_obj_t *bo = R_NEW0 (struct r_bin_fatmach0_obj_t);
++	if (bo) {
++		bo->b = r_buf_ref (b);
++		bo->size = r_buf_size (bo->b); // XXX implicit in bo->b
++		if (!r_bin_fatmach0_init (bo)) {
++			return r_bin_fatmach0_free (bo);
++		}
++	}
++	return bo;
++}
++
+ struct r_bin_fatmach0_obj_t* r_bin_fatmach0_from_bytes_new(const ut8* buf, ut64 size) {
+ 	struct r_bin_fatmach0_obj_t *bin = R_NEW0 (struct r_bin_fatmach0_obj_t);
+ 	if (!bin) {
+diff --git a/libr/bin/format/mach0/fatmach0.h b/libr/bin/format/mach0/fatmach0.h
+index 829b1230a6b44..4fda39ec3e7af 100644
+--- a/libr/bin/format/mach0/fatmach0.h
++++ b/libr/bin/format/mach0/fatmach0.h
+@@ -1,5 +1,3 @@
+-/* radare - LGPL - Copyright 2009-2011 nibble<.ds@gmail.com> */
+-
+ #include <r_types.h>
+ #include "mach0_specs.h"
+ 
+@@ -26,4 +24,5 @@ struct r_bin_fatmach0_arch_t *r_bin_fatmach0_extract(struct r_bin_fatmach0_obj_t
+ void* r_bin_fatmach0_free(struct r_bin_fatmach0_obj_t* bin);
+ struct r_bin_fatmach0_obj_t* r_bin_fatmach0_new(const char* file);
+ struct r_bin_fatmach0_obj_t* r_bin_fatmach0_from_bytes_new(const ut8* buf, ut64 size);
++struct r_bin_fatmach0_obj_t* r_bin_fatmach0_from_buffer_new(RBuffer *b);
+ #endif
+diff --git a/libr/bin/format/mach0/mach0.c b/libr/bin/format/mach0/mach0.c
+index fc744b1da5110..bad519bb3f6ef 100644
+--- a/libr/bin/format/mach0/mach0.c
++++ b/libr/bin/format/mach0/mach0.c
+@@ -2694,14 +2694,15 @@ ut64 MACH0_(get_main)(struct MACH0_(obj_t) *bin) {
+ 	return addr;
+ }
+ 
+-void MACH0_(mach_headerfields)(RBinFile *file) {
+-	PrintfCallback cb_printf = file->rbin->cb_printf;
++void MACH0_(mach_headerfields)(RBinFile *bf) {
++	PrintfCallback cb_printf = bf->rbin->cb_printf;
+ 	if (!cb_printf) {
+ 		cb_printf = printf;
+ 	}
+-	RBuffer *buf = file->buf;
++	RBuffer *buf = bf->buf;
++	ut64 length = r_buf_size (buf);
+ 	int n = 0;
+-	struct MACH0_(mach_header) *mh = MACH0_(get_hdr_from_bytes)(buf);
++	struct MACH0_(mach_header) *mh = MACH0_(get_hdr_from_buffer)(buf);
+ 	if (!mh) {
+ 		return;
+ 	}
+@@ -2717,13 +2718,20 @@ void MACH0_(mach_headerfields)(RBinFile *file) {
+ 	ut64 addr = 0x20 - 4;
+ 	ut32 word = 0;
+ 	ut8 wordbuf[sizeof (word)];
++	bool isBe = false;
++	switch (mh->cputype) {
++	case CPU_TYPE_POWERPC:
++	case CPU_TYPE_POWERPC64:
++		isBe = true;
++		break;
++	}
+ #define READWORD() \
+-		if (!r_buf_read_at (buf, addr, (ut8*)wordbuf, 4)) { \
++		if (r_buf_read_at (buf, addr, (ut8*)wordbuf, 4) != 4) { \
+ 			eprintf ("Invalid address in buffer."); \
+ 			break; \
+ 		} \
+ 		addr += 4; \
+-		word = r_read_le32 (wordbuf);
++		word = isBe? r_read_be32 (wordbuf): r_read_le32 (wordbuf);
+ 	if (is64) {
+ 		addr += 4;
+ 	}
+@@ -2733,6 +2741,9 @@ void MACH0_(mach_headerfields)(RBinFile *file) {
+ 		cb_printf ("0x%08"PFMT64x"  cmd %7d 0x%x %s\n",
+ 			addr, n, lcType, cmd_to_string (lcType));
+ 		READWORD ();
++		if (addr > length) {
++			break;
++		}
+ 		int lcSize = word;
+ 		word &= 0xFFFFFF;
+ 		cb_printf ("0x%08"PFMT64x"  cmdsize     %d\n", addr, word);
+@@ -2829,7 +2840,7 @@ void MACH0_(mach_headerfields)(RBinFile *file) {
+ }
+ 
+ RList *MACH0_(mach_fields)(RBinFile *bf) {
+-	struct MACH0_(mach_header) *mh = MACH0_(get_hdr_from_bytes)(bf->buf);
++	struct MACH0_(mach_header) *mh = MACH0_(get_hdr_from_buffer)(bf->buf);
+ 	if (!mh) {
+ 		return NULL;
+ 	}
+@@ -2854,7 +2865,7 @@ RList *MACH0_(mach_fields)(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-struct MACH0_(mach_header) *MACH0_(get_hdr_from_bytes)(RBuffer *buf) {
++struct MACH0_(mach_header) *MACH0_(get_hdr_from_buffer)(RBuffer *buf) {
+ 	ut8 magicbytes[sizeof (ut32)] = {0};
+ 	ut8 machohdrbytes[sizeof (struct MACH0_(mach_header))] = {0};
+ 	int len;
+diff --git a/libr/bin/format/mach0/mach0.h b/libr/bin/format/mach0/mach0.h
+index 487234a0f0dcb..a08b4a32294d1 100644
+--- a/libr/bin/format/mach0/mach0.h
++++ b/libr/bin/format/mach0/mach0.h
+@@ -194,7 +194,7 @@ char *MACH0_(get_filetype_from_hdr)(struct MACH0_(mach_header) *hdr);
+ ut64 MACH0_(get_main)(struct MACH0_(obj_t) *bin);
+ const char *MACH0_(get_cputype_from_hdr)(struct MACH0_(mach_header) *hdr);
+ int MACH0_(get_bits_from_hdr)(struct MACH0_(mach_header) *hdr);
+-struct MACH0_(mach_header) *MACH0_(get_hdr_from_bytes)(RBuffer *buf);
++struct MACH0_(mach_header) *MACH0_(get_hdr_from_buffer)(RBuffer *buf);
+ void MACH0_(mach_headerfields)(RBinFile *bf);
+ RList *MACH0_(mach_fields)(RBinFile *bf);
+ #endif
+diff --git a/libr/bin/format/mach0/mach064_is_kernelcache.c b/libr/bin/format/mach0/mach064_is_kernelcache.c
+index 324dccb1e1f81..e74dfcb39b561 100644
+--- a/libr/bin/format/mach0/mach064_is_kernelcache.c
++++ b/libr/bin/format/mach0/mach064_is_kernelcache.c
+@@ -1,4 +1,5 @@
+ static bool is_kernelcache(const ut8 *buf, ut64 length) {
++	// XXX deprecate this method
+ 	if (length < sizeof (struct MACH0_(mach_header))) {
+ 		return false;
+ 	}
+@@ -47,3 +48,50 @@ static bool is_kernelcache(const ut8 *buf, ut64 length) {
+ 
+ 	return has_unixthread && has_negative_vaddr;
+ }
++
++static bool is_kernelcache_buffer(RBuffer *b) {
++	ut64 length = r_buf_size (b);
++	if (length < sizeof (struct MACH0_(mach_header))) {
++		return false;
++	}
++	ut32 cputype = r_buf_read_le32_at (b, 4);
++	if (cputype != CPU_TYPE_ARM64) {
++		return false;
++	}
++
++	int i, ncmds = r_buf_read_le32_at (b, 16);
++	bool has_unixthread = false;
++	bool has_negative_vaddr = false;
++
++	ut32 cursor = sizeof (struct MACH0_(mach_header));
++	for (i = 0; i < ncmds && cursor < length; i++) {
++
++		ut32 cmdtype = r_buf_read_le32_at (b, cursor);
++		ut32 cmdsize = r_buf_read_le32_at (b, cursor + 4);
++
++		switch (cmdtype) {
++		case LC_UNIXTHREAD:
++			has_unixthread = true;
++			break;
++		case LC_LOAD_DYLIB:
++		case LC_LOAD_WEAK_DYLIB:
++		case LC_LAZY_LOAD_DYLIB:
++			return false;
++		case LC_SEGMENT_64:
++			{
++				if (has_negative_vaddr) {
++					break;
++				}
++				st64 vmaddr = r_buf_read_le64_at (b, cursor + 24);
++				if (vmaddr < 0) {
++					has_negative_vaddr = true;
++				}
++			}
++			break;
++		}
++
++		cursor += cmdsize;
++	}
++
++	return has_unixthread && has_negative_vaddr;
++}
+diff --git a/libr/bin/format/mz/mz.c b/libr/bin/format/mz/mz.c
+index 134bb2b4b6f04..913e0249933d2 100644
+--- a/libr/bin/format/mz/mz.c
++++ b/libr/bin/format/mz/mz.c
+@@ -268,7 +268,7 @@ static int r_bin_mz_init_hdr(struct r_bin_mz_obj_t *bin) {
+ 	return true;
+ }
+ 
+-static int r_bin_mz_init(struct r_bin_mz_obj_t *bin) {
++static bool r_bin_mz_init(struct r_bin_mz_obj_t *bin) {
+ 	bin->dos_header = NULL;
+ 	bin->dos_extended_header = NULL;
+ 	bin->relocation_entries = NULL;
+diff --git a/libr/bin/format/pe/pe.h b/libr/bin/format/pe/pe.h
+index 6b9cbdaedb10b..3ee1589ff5ae5 100644
+--- a/libr/bin/format/pe/pe.h
++++ b/libr/bin/format/pe/pe.h
+@@ -159,5 +159,5 @@ void PE_(r_bin_pe_check_sections)(struct PE_(r_bin_pe_obj_t)* bin, struct r_bin_
+ struct r_bin_pe_addr_t *PE_(check_unknow) (struct PE_(r_bin_pe_obj_t) *bin);
+ struct r_bin_pe_addr_t *PE_(check_msvcseh) (struct PE_(r_bin_pe_obj_t) *bin);
+ struct r_bin_pe_addr_t *PE_(check_mingw) (struct PE_(r_bin_pe_obj_t) *bin);
+-bool PE_(r_bin_pe_section_perms)(struct PE_(r_bin_pe_obj_t) *bin, const char *name, int perms);
++bool PE_(r_bin_pe_section_perms)(RBinFile *bf, const char *name, int perms);
+ R_API void PE_(bin_pe_parse_resource) (struct PE_(r_bin_pe_obj_t) *bin);
+diff --git a/libr/bin/format/pe/pe_write.c b/libr/bin/format/pe/pe_write.c
+index b15c45eae0fa7..40d054f2a47ec 100644
+--- a/libr/bin/format/pe/pe_write.c
++++ b/libr/bin/format/pe/pe_write.c
+@@ -1,21 +1,22 @@
+-/* radare - LGPL - Copyright 2010-2018 pancake, nibble */
++/* radare - LGPL - Copyright 2010-2019 pancake, nibble */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+ #include "pe.h"
+ 
+-bool PE_(r_bin_pe_section_perms)(struct PE_(r_bin_pe_obj_t) *bin, const char *name, int perms) {
+-	PE_(image_section_header) *shdr = bin->section_header;
++// bool PE_(r_bin_pe_section_perms)(struct PE_(r_bin_pe_obj_t) *bin, const char *name, int perms) {
++bool PE_(r_bin_pe_section_perms)(RBinFile *bf, const char *name, int perms) {
++	struct PE_(r_bin_pe_obj_t) *pe = bf->o->bin_obj;
++	PE_(image_section_header) *shdr = pe->section_header;
+ 	int i;
+ 
+ 	if (!shdr) {
+ 		return false;
+ 	}
+ 
+-	for (i = 0; i < bin->num_sections; i++) {
++	for (i = 0; i < pe->num_sections; i++) {
+ 		const char *sname = (const char*) shdr[i].Name;
+ 		if (!strncmp (name, sname, PE_IMAGE_SIZEOF_SHORT_NAME)) {
+-			int patchoff;
+ 			ut32 newperms = shdr[i].Characteristics;
+ 			ut32 newperms_le;
+ 
+@@ -41,12 +42,15 @@ bool PE_(r_bin_pe_section_perms)(struct PE_(r_bin_pe_obj_t) *bin, const char *na
+ 				newperms &= ~PE_IMAGE_SCN_MEM_SHARED;
+ 			}
+ 
+-			patchoff = bin->section_header_offset;
++			int patchoff = pe->section_header_offset;
+ 			patchoff += i * sizeof (PE_(image_section_header));
+ 			patchoff += r_offsetof (PE_(image_section_header), Characteristics);
+ 			r_write_le32 (&newperms_le, newperms);
+ 			printf ("wx %02x @ 0x%x\n", newperms_le, patchoff);
+-			r_buf_write_at (bin->b, patchoff, (ut8*)&newperms_le, sizeof (newperms_le));
++			int res = r_buf_write_at (bf->buf, patchoff, (ut8*)&newperms_le, sizeof (newperms_le));
++			if (res != sizeof (newperms_le)) {
++				return false;
++			}
+ 			return true;
+ 		}
+ 	}
+diff --git a/libr/bin/i/private.h b/libr/bin/i/private.h
+index ac28c5c11d0c6..a49de8aa1c780 100644
+--- a/libr/bin/i/private.h
++++ b/libr/bin/i/private.h
+@@ -5,8 +5,7 @@
+ #include <r_util.h>
+ #include <r_types.h>
+ 
+-R_IPI RBinFile *r_bin_file_new(RBin *bin, const char *file, const ut8 *bytes, ut64 sz, ut64 file_sz, int rawstr, int fd, const char *xtrname, Sdb *sdb, bool steal_ptr);
+-R_IPI RBinFile *r_bin_file_new_from_bytes(RBin *bin, const char *file, const ut8 *bytes, ut64 sz, ut64 file_sz, int rawstr, ut64 baseaddr, ut64 loadaddr, int fd, const char *pluginname, ut64 offset);
++R_IPI RBinFile *r_bin_file_new(RBin *bin, const char *file, ut64 file_sz, int rawstr, int fd, const char *xtrname, Sdb *sdb, bool steal_ptr);
+ R_IPI RBinObject *r_bin_file_object_find_by_id(RBinFile *binfile, ut32 binobj_id);
+ R_IPI RList *r_bin_file_get_strings(RBinFile *a, int min, int dump, int raw);
+ R_IPI RBinFile *r_bin_file_find_by_object_id(RBin *bin, ut32 binobj_id);
+diff --git a/libr/bin/obj.c b/libr/bin/obj.c
+index 0a90b552b300e..bc91a7cc41ad0 100644
+--- a/libr/bin/obj.c
++++ b/libr/bin/obj.c
+@@ -1,13 +1,9 @@
+-/* radare2 - LGPL - Copyright 2009-2018 - pancake, nibble, dso */
++/* radare2 - LGPL - Copyright 2009-2019 - pancake, nibble, dso */
+ 
+ #include <r_bin.h>
+ #include <r_util.h>
+ #include "i/private.h"
+ 
+-#define bprintf                     \
+-	if (binfile->rbin->verbose) \
+-	eprintf
+-
+ static void mem_free(void *data) {
+ 	RBinMem *mem = (RBinMem *)data;
+ 	if (mem && mem->mirrors) {
+@@ -126,10 +122,8 @@ static RList *classes_from_symbols(RBinFile *bf) {
+ 				free (fn);
+ 			} else {
+ 				char *mn = strstr (dn, "..");
+-				if (mn) {
+-					// eprintf ("META %s  %s\n", sym->classname, mn);
+-				} else {
+-					char *mn = strstr (dn, cn);
++				if (!mn) {
++					mn = strstr (dn, cn);
+ 					if (mn && mn[strlen (cn)] == '.') {
+ 						mn += strlen (cn) + 1;
+ 						// eprintf ("METHOD %s  %s\n", sym->classname, mn);
+@@ -146,18 +140,11 @@ static RList *classes_from_symbols(RBinFile *bf) {
+ 	return classes;
+ }
+ 
+-static bool file_object_add(RBinFile *binfile, RBinObject *o) {
+-	r_return_val_if_fail (binfile && o, false);
+-	r_list_append (binfile->objs, o);
+-	r_bin_file_set_cur_binfile_obj (binfile->rbin, binfile, o);
+-	return true;
+-}
+-
+-R_IPI RBinObject *r_bin_object_new(RBinFile *binfile, RBinPlugin *plugin, ut64 baseaddr, ut64 loadaddr, ut64 offset, ut64 sz) {
+-	r_return_val_if_fail (binfile && plugin, NULL);
+-
+-	ut64 bytes_sz = r_buf_size (binfile->buf);
+-	Sdb *sdb = binfile->sdb;
++// TODO: kill offset and sz, because those should be infered from binfile->buf
++R_IPI RBinObject *r_bin_object_new(RBinFile *bf, RBinPlugin *plugin, ut64 baseaddr, ut64 loadaddr, ut64 offset, ut64 sz) {
++	r_return_val_if_fail (bf && plugin, NULL);
++	ut64 bytes_sz = r_buf_size (bf->buf);
++	Sdb *sdb = bf->sdb;
+ 	RBinObject *o = R_NEW0 (RBinObject);
+ 	if (!o) {
+ 		return NULL;
+@@ -166,7 +153,7 @@ R_IPI RBinObject *r_bin_object_new(RBinFile *binfile, RBinPlugin *plugin, ut64 b
+ 	o->boffset = offset;
+ 	o->strings_db = ht_up_new0 ();
+ 	o->regstate = NULL;
+-	if (!r_id_pool_grab_id (binfile->rbin->ids->pool, &o->id)) {
++	if (!r_id_pool_grab_id (bf->rbin->ids->pool, &o->id)) {
+ 		free (o);
+ 		eprintf ("Cannot grab an id\n");
+ 		return NULL;
+@@ -178,14 +165,16 @@ R_IPI RBinObject *r_bin_object_new(RBinFile *binfile, RBinPlugin *plugin, ut64 b
+ 	o->loadaddr = loadaddr != UT64_MAX ? loadaddr : 0;
+ 
+ 	if (plugin && plugin->load_buffer) {
+-		o->bin_obj = plugin->load_buffer (binfile, binfile->buf, loadaddr, sdb); // bytes + offset, sz, loadaddr, sdb);
+-		if (!o->bin_obj) {
+-			bprintf ("Error in r_bin_object_new: load_bytes failed for %s plugin\n", plugin->name);
++		if (!plugin->load_buffer (bf, &o->bin_obj, bf->buf, loadaddr, sdb)) {
++			if (bf->rbin->verbose) {
++				eprintf ("Error in r_bin_object_new: load_buffer failed for %s plugin\n", plugin->name);
++			}
+ 			sdb_free (o->kv);
+ 			free (o);
+ 			return NULL;
+ 		}
+ 	} else if (plugin && plugin->load_bytes && (bytes_sz >= sz + offset)) {
++		// DEPRECATE
+ 		R_LOG_WARN ("Plugin %s should implement load_buffer method instead of load_bytes.\n", plugin->name);
+ 		// XXX more checking will be needed here
+ 		// only use LoadBytes if buffer offset != 0
+@@ -201,10 +190,12 @@ R_IPI RBinObject *r_bin_object_new(RBinFile *binfile, RBinPlugin *plugin, ut64 b
+ 			free (o);
+ 			return NULL;
+ 		}
+-		r_buf_read_at (binfile->buf, offset, bytes, sz);
+-		if (!plugin->load_bytes (binfile, &o->bin_obj, bytes, sz,
+-					 loadaddr, sdb)) {
+-			bprintf ("Error in r_bin_object_new: load_bytes failed for %s plugin\n", plugin->name);
++		r_buf_read_at (bf->buf, offset, bytes, sz);
++		// TODO: use r_buf_data meanwhile.. meh just kill it with fire
++		if (!plugin->load_bytes (bf, &o->bin_obj, bytes, sz, loadaddr, sdb)) {
++			if (bf->rbin->verbose) {
++				eprintf ("Error in r_bin_object_new: load_bytes failed for %s plugin\n", plugin->name);
++			}
+ 			sdb_free (o->kv);
+ 			free (bytes);
+ 			free (o);
+@@ -212,18 +203,19 @@ R_IPI RBinObject *r_bin_object_new(RBinFile *binfile, RBinPlugin *plugin, ut64 b
+ 		}
+ 		free (bytes);
+ 	} else if (plugin->load) {
++		// DEPRECATE
+ 		R_LOG_WARN ("Plugin %s should implement load_buffer method instead of load.\n", plugin->name);
+ 		// XXX - haha, this is a hack.
+ 		// switching out the current object for the new
+ 		// one to be processed
+-		RBinObject *old_o = binfile->o;
+-		binfile->o = o;
+-		if (plugin->load (binfile)) {
+-			binfile->sdb_info = o->kv;
++		RBinObject *old_o = bf->o;
++		bf->o = o;
++		if (plugin->load (bf)) {
++			//bf->sdb_info = o->kv;
+ 			// mark as do not walk
+-			sdb_ns_set (binfile->sdb, "info", o->kv);
++			//sdb_ns_set (bf->sdb, "info", o->kv);
+ 		} else {
+-			binfile->o = old_o;
++			bf->o = old_o;
+ 		}
+ 		o->obj_size = sz;
+ 	} else {
+@@ -237,9 +229,36 @@ R_IPI RBinObject *r_bin_object_new(RBinFile *binfile, RBinPlugin *plugin, ut64 b
+ 	// the object is created from. The reason for this is to prevent
+ 	// mis-reporting when the file is loaded from impartial bytes or is
+ 	// extracted from a set of bytes in the file
+-	r_bin_object_set_items (binfile, o);
+-	file_object_add (binfile, o);
+-
++	r_bin_object_set_items (bf, o);
++	r_list_append (bf->objs, o);
++	r_bin_file_set_cur_binfile_obj (bf->rbin, bf, o);
++
++	bf->sdb_info = o->kv;
++	sdb = bf->rbin->sdb;
++	if (sdb) {
++		Sdb *okv = o->kv;
++		Sdb *bdb = bf->sdb; // sdb_new0 ();
++		sdb_ns_set (bdb, "info", o->kv);
++		sdb_ns_set (bdb, "addrinfo", bf->sdb_addrinfo);
++		o->kv = bdb;
++		// bf->sdb = o->kv;
++		// bf->sdb_info = o->kv;
++		// sdb_ns_set (bf->sdb, "info", o->kv);
++		//sdb_ns (sdb, sdb_fmt ("fd.%d", bf->fd), 1);
++		sdb_set (bf->sdb, "archs", "0:0:x86:32", 0); // x86??
++		/* NOTE */
++		/* Those refs++ are necessary because sdb_ns() doesnt rerefs all
++		 * sub-namespaces */
++		/* And if any namespace is referenced backwards it gets
++		 * double-freed */
++		// bf->sdb_info = sdb_ns (bf->sdb, "info", 1);
++	//	bf->sdb_addrinfo = sdb_ns (bf->sdb, "addrinfo", 1);
++	//	bf->sdb_addrinfo->refs++;
++		sdb_ns_set (sdb, "cur", bdb); // bf->sdb);
++		const char *fdns = sdb_fmt ("fd.%d", bf->fd);
++		sdb_ns_set (sdb, fdns, bdb); // bf->sdb);
++		bf->sdb->refs++;
++	}
+ 	return o;
+ }
+ 
+diff --git a/libr/bin/p/bin_any.c b/libr/bin/p/bin_any.c
+index 640563f778938..0b1d2ae8a338a 100644
+--- a/libr/bin/p/bin_any.c
++++ b/libr/bin/p/bin_any.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2017 - pancake, nibble */
++/* radare - LGPL - Copyright 2009-2019 - pancake, nibble */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -6,18 +6,17 @@
+ #include <r_bin.h>
+ #include <r_magic.h>
+ 
+-static char *get_filetype(RBuffer *obj) {
++static char *get_filetype(RBuffer *b) {
+ 	ut8 buf[4096] = { 0 };
+ 	char *res = NULL;
+ 	RMagic *ck = r_magic_new (0);
+ 	if (!ck) {
+ 		return NULL;
+ 	}
+-
+ 	const char *tmp = NULL;
+ 	// TODO: dir.magic not honored here
+ 	r_magic_load (ck, R2_SDB_MAGIC);
+-	r_buf_read_at (obj, 0, buf, sizeof (buf));
++	r_buf_read_at (b, 0, buf, sizeof (buf));
+ 	tmp = r_magic_buffer (ck, buf, sizeof (buf));
+ 	if (tmp) {
+ 		res = strdup (tmp);
+@@ -27,14 +26,13 @@ static char *get_filetype(RBuffer *obj) {
+ }
+ 
+ static RBinInfo *info(RBinFile *bf) {
+-	RBuffer *any_obj = bf->o->bin_obj;
+ 	RBinInfo *ret = R_NEW0 (RBinInfo);
+ 	if (!ret) {
+ 		return NULL;
+ 	}
+ 	ret->lang = "";
+ 	ret->file = bf->file? strdup (bf->file): NULL;
+-	ret->type = get_filetype (any_obj);
++	ret->type = get_filetype (bf->buf);
+ 	ret->has_pi = 0;
+ 	ret->has_canary = 0;
+ 	ret->has_retguard = -1;
+@@ -52,13 +50,12 @@ static RBinInfo *info(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	return r_buf_ref (buf);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	return true;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_buf_free (bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+diff --git a/libr/bin/p/bin_art.c b/libr/bin/p/bin_art.c
+index e6a17f363eefb..cf7462770e6be 100644
+--- a/libr/bin/p/bin_art.c
++++ b/libr/bin/p/bin_art.c
+@@ -65,27 +65,25 @@ static Sdb *get_sdb(RBinFile *bf) {
+ 	return ao? ao->kv: NULL;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	ArtObj *ao = R_NEW0 (ArtObj);
+-	if (!ao) {
+-		return NULL;
+-	}
+-	ao->kv = sdb_new0 ();
+-	if (!ao->kv) {
+-		free (ao);
+-		return NULL;
++	if (ao) {
++		ao->kv = sdb_new0 ();
++		if (ao->kv) {
++			ao->buf = r_buf_ref (buf);
++			art_header_load (ao, ao->kv);
++			sdb_ns_set (sdb, "info", ao->kv);
++			*bin_obj = ao;
++			return true;
++		}
+ 	}
+-	ao->buf = r_buf_ref (buf);
+-	art_header_load (ao, ao->kv);
+-	sdb_ns_set (sdb, "info", ao->kv);
+-	return ao;
++	return false;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	ArtObj *obj = bf->o->bin_obj;
+ 	r_buf_free (obj->buf);
+ 	free (obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -98,16 +96,12 @@ static RList *strings(RBinFile *bf) {
+ }
+ 
+ static RBinInfo *info(RBinFile *bf) {
+-	ArtObj *ao;
+-	RBinInfo *ret;
+-	if (!bf || !bf->o || !bf->o->bin_obj) {
+-		return NULL;
+-	}
+-	ret = R_NEW0 (RBinInfo);
++	r_return_val_if_fail (bf && bf->o && bf->o->bin_obj, NULL);
++	RBinInfo *ret = R_NEW0 (RBinInfo);
+ 	if (!ret) {
+ 		return NULL;
+ 	}
+-	ao = bf->o->bin_obj;
++	ArtObj *ao = bf->o->bin_obj;
+ 	ret->lang = NULL;
+ 	ret->file = bf->file? strdup (bf->file): NULL;
+ 	ret->type = strdup ("ART");
+diff --git a/libr/bin/p/bin_avr.c b/libr/bin/p/bin_avr.c
+index 3cb78d8cbaf9c..a77fa84b0d928 100644
+--- a/libr/bin/p/bin_avr.c
++++ b/libr/bin/p/bin_avr.c
+@@ -76,17 +76,12 @@ static bool check_bytes(const ut8 *b, ut64 length) {
+ 	return res;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	RBuffer *obj = r_buf_ref (buf);
+-	if (!check_buffer (obj)) {
+-		return NULL;
+-	}
+-	return obj;
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	return check_buffer (buf);
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_buf_free (bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static RBinInfo* info(RBinFile *bf) {
+diff --git a/libr/bin/p/bin_bf.c b/libr/bin/p/bin_bf.c
+index b109cdd29c3b6..b7567f1cdad0c 100644
+--- a/libr/bin/p/bin_bf.c
++++ b/libr/bin/p/bin_bf.c
+@@ -1,17 +1,16 @@
+-/* radare - LGPL - Copyright 2013-2018 - pancake */
++/* radare - LGPL - Copyright 2013-2019 - pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+ #include <r_lib.h>
+ #include <r_bin.h>
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	return r_buf_ref (buf);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	return true;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_buf_free (bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -93,13 +92,6 @@ static bool check_buffer(RBuffer *buf) {
+ 	return true;
+ }
+ 
+-static bool check_bytes(const ut8 *b, ut64 length) {
+-	RBuffer *buf = r_buf_new_with_bytes (b, length);
+-	bool res = check_buffer (buf);
+-	r_buf_free (buf);
+-	return res;
+-}
+-
+ static RList *entries(RBinFile *bf) {
+ 	RList *ret;
+ 	RBinAddr *ptr = NULL;
+@@ -121,7 +113,6 @@ RBinPlugin r_bin_plugin_bf = {
+ 	.license = "LGPL3",
+ 	.load_buffer = &load_buffer,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
+ 	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.entries = entries,
+diff --git a/libr/bin/p/bin_bflt.c b/libr/bin/p/bin_bflt.c
+index 69628d1f7684a..4831f1a3dcc8f 100644
+--- a/libr/bin/p/bin_bflt.c
++++ b/libr/bin/p/bin_bflt.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2016-2017 - Oscar Salvador */
++/* radare - LGPL - Copyright 2016-2019 - Oscar Salvador */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -7,8 +7,9 @@
+ #include <r_io.h>
+ #include "bflt/bflt.h"
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	return r_bin_bflt_new_buf (buf);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	*bin_obj = r_bin_bflt_new_buf (buf);
++	return *bin_obj;
+ }
+ 
+ static RList *entries(RBinFile *bf) {
+@@ -296,9 +297,8 @@ static bool check_bytes(const ut8 *buf, ut64 length) {
+ 	return res;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_bin_bflt_free (bf->o->bin_obj);
+-	return true;
+ }
+ 
+ RBinPlugin r_bin_plugin_bflt = {
+diff --git a/libr/bin/p/bin_bios.c b/libr/bin/p/bin_bios.c
+index 095bf1d013df4..ff94782bbedeb 100644
+--- a/libr/bin/p/bin_bios.c
++++ b/libr/bin/p/bin_bios.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2013-2018 - pancake */
++/* radare - LGPL - Copyright 2013-2019 - pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -33,25 +33,12 @@ static bool check_buffer(RBuffer *buf) {
+ 	return bep == 0xea || bep == 0xe9;
+ }
+ 
+-static bool check_bytes(const ut8 *b, ut64 length) {
+-	RBuffer *buf = r_buf_new_with_bytes (b, length);
+-	bool res = check_buffer (buf);
+-	r_buf_free (buf);
+-	return res;
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	return check_buffer (buf);
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	RBuffer *obj = r_buf_ref (buf);
+-	if (!check_buffer (obj)) {
+-		r_buf_free (obj);
+-		return NULL;
+-	}
+-	return obj;
+-}
+-
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_buf_free (bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -98,7 +85,7 @@ static RList *sections(RBinFile *bf) {
+ 	}
+ 	ptr->name = strdup ("bootblk"); // Maps to 0xF000:0000 segment
+ 	ptr->vsize = ptr->size = 0x10000;
+-	ptr->paddr = r_buf_size (obj) - ptr->size;
++	ptr->paddr = r_buf_size (bf->buf) - ptr->size;
+ 	ptr->vaddr = 0xf0000;
+ 	ptr->perm = R_PERM_RWX;
+ 	ptr->add = true;
+@@ -141,7 +128,6 @@ RBinPlugin r_bin_plugin_bios = {
+ 	.license = "LGPL",
+ 	.load_buffer = &load_buffer,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
+ 	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.entries = entries,
+diff --git a/libr/bin/p/bin_bootimg.c b/libr/bin/p/bin_bootimg.c
+index 10be1b3fbc91b..1c3e7e2b9e369 100644
+--- a/libr/bin/p/bin_bootimg.c
++++ b/libr/bin/p/bin_bootimg.c
+@@ -84,10 +84,10 @@ static Sdb *get_sdb(RBinFile *bf) {
+ 	return ao? ao->kv: NULL;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	BootImageObj *bio = R_NEW0 (BootImageObj);
+ 	if (!bio) {
+-		return NULL;
++		return false;
+ 	}
+ 	bio->kv = sdb_new0 ();
+ 	if (!bio->kv) {
+@@ -100,14 +100,14 @@ static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 		return false;
+ 	}
+ 	sdb_ns_set (sdb, "info", bio->kv);
+-	return bio;
++	*bin_obj = bio;
++	return true;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	BootImageObj *bio = bf->o->bin_obj;
+ 	r_buf_free (bio->buf);
+ 	R_FREE (bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+diff --git a/libr/bin/p/bin_coff.c b/libr/bin/p/bin_coff.c
+index 477d12819ae53..62d988ee31eeb 100644
+--- a/libr/bin/p/bin_coff.c
++++ b/libr/bin/p/bin_coff.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2014-2017 - Fedor Sakharov */
++/* radare - LGPL - Copyright 2014-2019 - Fedor Sakharov */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -24,13 +24,13 @@ static bool r_coff_is_stripped(struct r_bin_coff_obj *obj) {
+ 		COFF_FLAGS_TI_F_LNNO | COFF_FLAGS_TI_F_LSYMS));
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	return r_bin_coff_new_buf (buf, bf->rbin->verbose);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	*bin_obj = r_bin_coff_new_buf (buf, bf->rbin->verbose);
++	return *bin_obj != NULL;
+ }
+ 
+-static int destroy(RBinFile *bf) {
+-	r_bin_coff_free((struct r_bin_coff_obj*)bf->o->bin_obj);
+-	return true;
++static void destroy(RBinFile *bf) {
++	r_bin_coff_free ((struct r_bin_coff_obj*)bf->o->bin_obj);
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+diff --git a/libr/bin/p/bin_dex.c b/libr/bin/p/bin_dex.c
+index fb0d400bb39ec..7e6b16163e5c4 100644
+--- a/libr/bin/p/bin_dex.c
++++ b/libr/bin/p/bin_dex.c
+@@ -742,8 +742,9 @@ static Sdb *get_sdb (RBinFile *bf) {
+ 	return bin->kv;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	return r_bin_dex_new_buf (buf);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	*bin_obj = r_bin_dex_new_buf (buf);
++	return *bin_obj != NULL;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -2103,20 +2104,12 @@ static RList *dex_fields(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static bool check_bytes(const ut8 *bytes, ut64 length) {
+-	RBuffer *buf = r_buf_new_with_bytes (bytes, length);
+-	bool res = check_buffer (buf);
+-	r_buf_free (buf);
+-	return res;
+-}
+-
+ RBinPlugin r_bin_plugin_dex = {
+ 	.name = "dex",
+ 	.desc = "dex format bin plugin",
+ 	.license = "LGPL3",
+ 	.get_sdb = &get_sdb,
+ 	.load_buffer = &load_buffer,
+-	.check_bytes = check_bytes,
+ 	.check_buffer = check_buffer,
+ 	.baddr = baddr,
+ 	.entries = entries,
+diff --git a/libr/bin/p/bin_dol.c b/libr/bin/p/bin_dol.c
+index bbc0f9e767ddc..d587245c13afa 100644
+--- a/libr/bin/p/bin_dol.c
++++ b/libr/bin/p/bin_dol.c
+@@ -51,15 +51,15 @@ static bool check_bytes(const ut8 *b, ut64 length) {
+ 	return res;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	DolHeader *dol = NULL;
+ 	char *lowername = NULL, *ext;
+ 	if (r_buf_size (buf) < sizeof (DolHeader)) {
+-		return NULL;
++		return false;
+ 	}
+ 	dol = R_NEW0 (DolHeader);
+ 	if (!dol) {
+-		return NULL;
++		return false;
+ 	}
+ 	lowername = strdup (bf->file);
+ 	if (!lowername) {
+@@ -72,13 +72,14 @@ static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	}
+ 	free (lowername);
+ 	r_buf_fread_at (bf->buf, 0, (void *) dol, "67I", 1);
+-	return dol;
++	*bin_obj = dol;
++	return true;
+ 
+ lowername_err:
+ 	free (lowername);
+ dol_err:
+ 	free (dol);
+-	return NULL;
++	return false;
+ }
+ 
+ static RList *sections(RBinFile *bf) {
+diff --git a/libr/bin/p/bin_dyldcache.c b/libr/bin/p/bin_dyldcache.c
+index 145443f99de5c..7fb1c7a10bb13 100644
+--- a/libr/bin/p/bin_dyldcache.c
++++ b/libr/bin/p/bin_dyldcache.c
+@@ -1096,48 +1096,44 @@ static cache_accel_t *read_cache_accel(RBuffer *cache_buf, cache_hdr_t *hdr, cac
+ 	return accel;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	RDyldCache *cache = R_NEW0 (RDyldCache);
+ 	memcpy (cache->magic, "dyldcac", 7);
+ 	cache->buf = r_buf_new_with_io (&bf->rbin->iob, bf->fd);
+ 	if (!cache->buf) {
+ 		r_dyldcache_free (cache);
+-		return NULL;
++		return false;
+ 	}
+ 	cache->hdr = read_cache_header (cache->buf);
+ 	if (!cache->hdr) {
+ 		r_dyldcache_free (cache);
+-		return NULL;
++		return false;
+ 	}
+-
+ 	cache->maps = read_cache_maps (cache->buf, cache->hdr);
+ 	if (!cache->maps) {
+ 		r_dyldcache_free (cache);
+-		return NULL;
++		return false;
+ 	}
+-
+ 	cache->accel = read_cache_accel (cache->buf, cache->hdr, cache->maps);
+ 	if (!cache->accel) {
+ 		r_dyldcache_free (cache);
+-		return NULL;
++		return false;
+ 	}
+-
+ 	cache->bins = create_cache_bins (bf, cache->buf, cache->hdr, cache->maps, cache->accel);
+ 	if (!cache->bins) {
+ 		r_dyldcache_free (cache);
+-		return NULL;
++		return false;
+ 	}
+-
+ 	cache->rebase_info = get_rebase_info (bf, cache);
+ 	if (!cache->rebase_info) {
+ 		r_dyldcache_free (cache);
+-		return NULL;
++		return false;
+ 	}
+-
+ 	if (!cache->rebase_info->slide) {
+ 		swizzle_io_read (cache, bf->rbin->iob.io);
+ 	}
+-	return cache;
++	*bin_obj = cache;
++	return true;
+ }
+ 
+ static RList *entries(RBinFile *bf) {
+@@ -1387,11 +1383,10 @@ static RList *symbols(RBinFile *bf) {
+ 	cache->original_io_read = NULL;
+ } */
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	RDyldCache *cache = (RDyldCache*) bf->o->bin_obj;
+ 	// unswizzle_io_read (cache, bf->rbin->iob.io); // XXX io may be dead here
+ 	r_dyldcache_free (cache);
+-	return true;
+ }
+ 
+ static RList *classes(RBinFile *bf) {
+diff --git a/libr/bin/p/bin_elf.c b/libr/bin/p/bin_elf.c
+index 61c38a8731d03..4858f6dce6b65 100644
+--- a/libr/bin/p/bin_elf.c
++++ b/libr/bin/p/bin_elf.c
+@@ -1,3 +1,5 @@
++/* radare2 - LGPL - Copyright 2009-2019 - pancake, nibble, dso */
++
+ #include "bin_elf.inc"
+ 
+ static void headers32(RBinFile *bf) {
+@@ -11,26 +13,27 @@ static void headers32(RBinFile *bf) {
+ 	p ("0x00000020  ShOff       0x%08x\n", r_buf_read_le32_at (bf->buf, 0x20));
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	return buf && length > 4 && memcmp (buf, ELFMAG, SELFMAG) == 0
+-		&& buf[4] != 2;
++static bool check_buffer(RBuffer *buf) {
++	ut8 b[5] = {0};
++	r_buf_read_at (buf, 0, b, sizeof (b));
++	return !memcmp (b, ELFMAG, SELFMAG) && b[4] != 2;
+ }
+ 
+ extern struct r_bin_dbginfo_t r_bin_dbginfo_elf;
+ extern struct r_bin_write_t r_bin_write_elf;
+ 
+ static RBuffer* create(RBin* bin, const ut8 *code, int codelen, const ut8 *data, int datalen, RBinArchOptions *opt) {
++	r_return_val_if_fail (bin && opt && opt->arch, NULL);
++
+ 	ut32 filesize, code_va, code_pa, phoff;
+ 	ut32 p_start, p_phoff, p_phdr;
+ 	ut32 p_ehdrsz, p_phdrsz;
+ 	ut16 ehdrsz, phdrsz;
+ 	ut32 p_vaddr, p_paddr, p_fs, p_fs2;
+ 	ut32 baddr;
+-	int is_arm = 0;
+ 	RBuffer *buf = r_buf_new ();
+ 
+-	r_return_val_if_fail (bin && opt && opt->arch, NULL);
+-	is_arm = !strcmp (opt->arch, "arm");
++	bool is_arm = !strcmp (opt->arch, "arm");
+ 	// XXX: hardcoded
+ 	if (is_arm) {
+ 		baddr = 0x40000;
+@@ -121,7 +124,7 @@ RBinPlugin r_bin_plugin_elf = {
+ 	.get_sdb = &get_sdb,
+ 	.load_buffer = &load_buffer,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.boffset = &boffset,
+ 	.binsym = &binsym,
+diff --git a/libr/bin/p/bin_elf.inc b/libr/bin/p/bin_elf.inc
+index ee349ead54eeb..d38d9d6bea563 100644
+--- a/libr/bin/p/bin_elf.inc
++++ b/libr/bin/p/bin_elf.inc
+@@ -81,15 +81,17 @@ static Sdb* get_sdb(RBinFile *bf) {
+ 	return NULL;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	struct Elf_(r_bin_elf_obj_t) *res = Elf_(r_bin_elf_new_buf) (buf, bf->rbin->verbose);
+ 	if (res) {
+-		sdb_ns_set (sdb, "info", res->kv);
++	//	sdb_ns_set (sdb, "info", res->kv);
++		*bin_obj = res;
++		return true;
+ 	}
+-	return res;
++	return false;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	int i;
+ 	ELFOBJ* eobj = bf->o->bin_obj;
+ 	if (eobj && eobj->imports_by_ord) {
+@@ -104,7 +106,6 @@ static int destroy(RBinFile *bf) {
+ 		R_FREE (eobj->imports_by_ord);
+ 	}
+ 	Elf_(r_bin_elf_free) ((struct Elf_(r_bin_elf_obj_t)*)bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+diff --git a/libr/bin/p/bin_elf64.c b/libr/bin/p/bin_elf64.c
+index d174fe47e4d54..e2e1512a875d6 100644
+--- a/libr/bin/p/bin_elf64.c
++++ b/libr/bin/p/bin_elf64.c
+@@ -1,10 +1,13 @@
+-/* radare - LGPL - Copyright 2009-2017 - pancake, nibble */
++/* radare - LGPL - Copyright 2009-2019 - pancake, nibble */
+ 
+ #define R_BIN_ELF64 1
+ #include "bin_elf.inc"
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (buf && length >= 5) {
++
++static bool check_buffer(RBuffer *b) {
++	ut8 buf[5] = {0};
++	if (r_buf_size (b) > 4) {
++		r_buf_read_at (b, 0, buf, sizeof (buf));
+ 		if (!memcmp (buf, "\x7F\x45\x4c\x46\x02", 5)) {
+ 			return true;
+ 		}
+@@ -118,9 +121,9 @@ RBinPlugin r_bin_plugin_elf64 = {
+ 	.desc = "elf64 bin plugin",
+ 	.license = "LGPL3",
+ 	.get_sdb = &get_sdb,
++	.check_buffer = &check_buffer,
+ 	.load_buffer= &load_buffer,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
+ 	.baddr = &baddr,
+ 	.boffset = &boffset,
+ 	.binsym = &binsym,
+diff --git a/libr/bin/p/bin_fs.c b/libr/bin/p/bin_fs.c
+index c2451c5634956..e04cdb67a6734 100644
+--- a/libr/bin/p/bin_fs.c
++++ b/libr/bin/p/bin_fs.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2011-2017 - pancake */
++/* radare - LGPL - Copyright 2011-2019 - pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -6,31 +6,26 @@
+ #include <r_bin.h>
+ #include "../../fs/types.h"
+ 
+-static char *fsname(const ut8* buf, ut64 length) {
+-	ut8 fs_lbuf[1024];
+-	int i, j, len, ret = false;
++static char *fsname(RBuffer *b) {
++	ut8 buf[1024];
++	int i, j;
+ 
+ 	for (i = 0; fstypes[i].name; i++) {
+ 		RFSType *f = &fstypes[i];
+ 
+-		len = R_MIN (f->buflen, sizeof (fs_lbuf));
+-		memset (fs_lbuf, 0, sizeof (fs_lbuf));
+-		if (f->bufoff + len > length) {
++		if (r_buf_read_at (b, f->bufoff, buf, sizeof (buf)) != sizeof (buf)) {
+ 			break;
+ 		}
+-		memcpy (fs_lbuf, buf + f->bufoff, len);
+-		if ((f->buflen > 0) && len >= f->buflen) {
+-			int min = R_MIN (f->buflen, sizeof (fs_lbuf));
+-			if (!memcmp (fs_lbuf, f->buf, min)) {
+-				ret = true;
+-				len = R_MIN (f->bytelen, sizeof (fs_lbuf));
+-				if (f->byteoff + len > length) {
++		if (f->buflen > 0) {
++			size_t min = R_MIN (f->buflen, sizeof (buf));
++			if (!memcmp (buf, f->buf, min)) {
++				bool ret = true;
++				min = R_MIN (f->bytelen, sizeof (buf));
++				if (r_buf_read_at (b, f->byteoff, buf, min) != min) {
+ 					break;
+ 				}
+-				memcpy (fs_lbuf, buf + f->byteoff, len);
+-				// for (j = 0; j < f->bytelen; j++) {
+-				for (j = 0; j < len; j++) {
+-					if (fs_lbuf[j] != f->byte) {
++				for (j = 0; j < min; j++) {
++					if (buf[j] != f->byte) {
+ 						ret = false;
+ 						break;
+ 					}
+@@ -44,32 +39,26 @@ static char *fsname(const ut8* buf, ut64 length) {
+ 	return NULL;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (!buf || (st64)length < 1) {
+-		return false;
+-	}
+-	char *p = fsname (buf, length);
++static bool check_buffer(RBuffer *b) {
++	r_return_val_if_fail (b, false);
++	char *p = fsname (b);
++	bool hasFs = p != NULL;
+ 	free (p);
+-	return p != NULL;
++	return hasFs;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return check_bytes (buf, sz);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	return check_buffer (buf);
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
++	r_return_val_if_fail (bf && bf->o, false);
+ 	ut64 la = bf->o->loadaddr;
+-	return load_bytes (bf, &bf->o->bin_obj, bytes, sz, la, bf->sdb);
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, la, bf->sdb);
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	//r_bin_fs_free ((struct r_bin_fs_obj_t*)bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -83,22 +72,15 @@ static RList *strings(RBinFile *bf) {
+ 
+ static RBinInfo* info(RBinFile *bf) {
+ 	RBinInfo *ret = NULL;
+-	const ut8 *bytes;
+-	ut64 sz;
+-
+ 	if (!bf) {
+ 		return NULL;
+ 	}
+-	bytes = r_buf_data (bf->buf, &sz);
+-	if (!bytes) {
+-		return NULL;
+-	}
+ 	if (!(ret = R_NEW0 (RBinInfo))) {
+ 		return NULL;
+ 	}
+ 	ret->file = bf->file? strdup (bf->file): NULL;
+ 	ret->type = strdup ("fs");
+-	ret->bclass = fsname (bytes, sz);
++	ret->bclass = fsname (bf->buf);
+ 	ret->rclass = strdup ("fs");
+ 	ret->os = strdup ("any");
+ 	ret->subsystem = strdup ("unknown");
+@@ -118,9 +100,9 @@ RBinPlugin r_bin_plugin_fs = {
+ 	.version = "1.0",
+ 	.license = "LGPL3",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
++	.load_buffer = &load_buffer,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.strings = &strings,
+ 	.info = &info,
+diff --git a/libr/bin/p/bin_java.c b/libr/bin/p/bin_java.c
+index 6221a18691687..9b3d9a4bdcc45 100644
+--- a/libr/bin/p/bin_java.c
++++ b/libr/bin/p/bin_java.c
+@@ -135,11 +135,10 @@ static bool load(RBinFile *bf) {
+ 	return result;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_bin_java_free ((struct r_bin_java_obj_t *) bf->o->bin_obj);
+ 	sdb_free (DB);
+ 	DB = NULL;
+-	return true;
+ }
+ 
+ static RList *entries(RBinFile *bf) {
+@@ -185,6 +184,21 @@ static RBinInfo *info(RBinFile *bf) {
+ 	return ret;
+ }
+ 
++static bool check_buffer(RBuffer *b) {
++	if (r_buf_size (b) > 32) {
++		ut8 buf[4];
++		r_buf_read_at (b, 0, buf, sizeof (buf));
++		if (!memcmp (buf, "\xca\xfe\xba\xbe", 4)) {
++			int off = r_buf_read_be32_at (b, 4 * sizeof (int));
++			int version = r_buf_read_be16_at (b, 6);
++			if (off > 0 && version < 1024) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
+ static bool check_bytes(const ut8 *buf, ut64 length) {
+ 	bool ret = false;
+ 	int off, version = 0;
+@@ -256,6 +270,7 @@ RBinPlugin r_bin_plugin_java = {
+ 	.load_bytes = &load_bytes,
+ 	.destroy = &destroy,
+ 	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_mach0.c b/libr/bin/p/bin_mach0.c
+index 9db0169d218da..21911f051c448 100644
+--- a/libr/bin/p/bin_mach0.c
++++ b/libr/bin/p/bin_mach0.c
+@@ -28,31 +28,26 @@ static char *entitlements(RBinFile *bf, bool json) {
+ }
+ 
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb){
+-	struct MACH0_(obj_t) *res = NULL;
+-	if (!buf) {
+-		return NULL;
+-	}
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb){
++	r_return_val_if_fail (bf && bin_obj && buf, false);
+ 	struct MACH0_(opts_t) opts;
+ 	MACH0_(opts_set_default) (&opts, bf);
+-	res = MACH0_(new_buf) (buf, &opts);
++	struct MACH0_(obj_t) *res = MACH0_(new_buf) (buf, &opts);
+ 	if (res) {
+ 		sdb_ns_set (sdb, "info", res->kv);
++		*bin_obj = res;
++		return true;
+ 	}
+-	return res;
++	return false;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	MACH0_(mach0_free) (bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+-	struct MACH0_(obj_t) *bin;
+-	if (!bf || !bf->o || !bf->o->bin_obj) {
+-		return 0LL;
+-	}
+-	bin = bf->o->bin_obj;
++	r_return_val_if_fail (bf && bf->o && bf->o->bin_obj, UT64_MAX);
++	struct MACH0_(obj_t) *bin = bf->o->bin_obj;
+ 	return MACH0_(get_baddr)(bin);
+ }
+ 
+@@ -557,16 +552,19 @@ static RBinInfo *info(RBinFile *bf) {
+ }
+ 
+ #if !R_BIN_MACH064
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (buf && length >= 4) {
+-		if (!memcmp (buf, "\xce\xfa\xed\xfe", 4) ||
+-			!memcmp (buf, "\xfe\xed\xfa\xce", 4)) {
+-			return true;
++
++static bool check_buffer(RBuffer *b) {
++	if (r_buf_size (b) >= 4) {
++		ut8 buf[4] = {0};
++		if (r_buf_read_at (b, 0, buf, 4)) {
++			if (!memcmp (buf, "\xce\xfa\xed\xfe", 4) ||
++				!memcmp (buf, "\xfe\xed\xfa\xce", 4)) {
++				return true;
++			}
+ 		}
+ 	}
+ 	return false;
+ }
+-
+ static RBuffer *create(RBin *bin, const ut8 *code, int clen, const ut8 *data, int dlen, RBinArchOptions *opt) {
+ 	const bool use_pagezero = true;
+ 	const bool use_main = true;
+@@ -876,7 +874,7 @@ RBinPlugin r_bin_plugin_mach0 = {
+ 	.get_sdb = &get_sdb,
+ 	.load_buffer = &load_buffer,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_mach064.c b/libr/bin/p/bin_mach064.c
+index 735604af9f271..e66f7f88228d1 100644
+--- a/libr/bin/p/bin_mach064.c
++++ b/libr/bin/p/bin_mach064.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2015 - nibble, pancake, alvaro_fe */
++/* radare - LGPL - Copyright 2009-2019 - nibble, pancake, alvaro_fe */
+ 
+ #define R_BIN_MACH064 1
+ #include "bin_mach0.c"
+@@ -6,6 +6,20 @@
+ #include "objc/mach064_classes.h"
+ #include "../format/mach0/mach064_is_kernelcache.c"
+ 
++static bool check_buffer(RBuffer *b) {
++	ut8 buf[4] = {0};
++	if (r_buf_size (b) > 4) {
++		r_buf_read_at (b, 0, buf, sizeof (buf));
++		if (!memcmp (buf, "\xfe\xed\xfa\xcf", 4)) {
++			return true;
++		}
++		if (!memcmp (buf, "\xcf\xfa\xed\xfe", 4)) {
++			return !is_kernelcache_buffer (b);
++		}
++	}
++	return false;
++}
++
+ static bool check_bytes(const ut8 *buf, ut64 length) {
+ 	if (buf && length > 4) {
+ 		if (!memcmp (buf, "\xfe\xed\xfa\xcf", 4)) {
+@@ -285,6 +299,7 @@ RBinPlugin r_bin_plugin_mach064 = {
+ 	.load_buffer = &load_buffer,
+ 	.destroy = &destroy,
+ 	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_mbn.c b/libr/bin/p/bin_mbn.c
+index 7378d1906f270..eb6aba8193374 100644
+--- a/libr/bin/p/bin_mbn.c
++++ b/libr/bin/p/bin_mbn.c
+@@ -1,4 +1,7 @@
+-/* radare2 - LGPL - Copyright 2015-2017 - pancake */
++/* radare2 - LGPL - Copyright 2015-2019 - pancake */
++
++// XXX: this plugin have 0 tests and no binaries
++//
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -16,23 +19,35 @@ typedef struct sbl_header {
+ 	ut32 sign_sz;
+ 	ut32 cert_va;    // Max of 3 certs?
+ 	ut32 cert_sz;
+-} SBLHDR;
++} SblHeader;
+ 
+ // TODO avoid globals
+-static SBLHDR sb = {0};
++static SblHeader sb = {0};
+ 
+-static bool check_bytes(const ut8 *buf, ut64 bufsz) {
+-	if (buf && bufsz >= sizeof (SBLHDR)) {
+-		RBuffer *b = r_buf_new_with_pointers (buf, bufsz, false);
++static bool check_buffer(RBuffer *b) {
++	r_return_val_if_fail (b, false);
++	ut64 bufsz = r_buf_size (b);
++	if (sizeof (SblHeader) < bufsz) {
+ 		int ret = r_buf_fread_at (b, 0, (ut8*)&sb, "10i", 1);
+-		r_buf_free (b);
+ 		if (!ret) {
+ 			return false;
+ 		}
++#if 0
++		eprintf ("V=%d\n", sb.version);
++		eprintf ("PA=0x%08x sz=0x%x\n", sb.paddr, sb.psize);
++		eprintf ("VA=0x%08x sz=0x%x\n", sb.vaddr, sb.psize);
++		eprintf ("CODE=0x%08x\n", sb.code_pa + sb.vaddr + 40);
++		eprintf ("SIGN=0x%08x sz=0x%x\n", sb.sign_va, sb.sign_sz);
++		if (sb.cert_sz > 0) {
++			eprintf ("CERT=0x%08x sz=0x%x\n", sb.cert_va, sb.cert_sz);
++		} else {
++			eprintf ("No certificate found.\n");
++		}
++#endif
+ 		if (sb.version != 3) { // NAND
+ 			return false;
+ 		}
+-		if (sb.paddr + sizeof (SBLHDR) > bufsz) { // NAND
++		if (sb.paddr + sizeof (SblHeader) > bufsz) { // NAND
+ 			return false;
+ 		}
+ 		if (sb.vaddr < 0x100 || sb.psize > bufsz) { // NAND
+@@ -53,57 +68,36 @@ static bool check_bytes(const ut8 *buf, ut64 bufsz) {
+ 		if (sb.load_index < 1 || sb.load_index > 0x40) {
+ 			return false; // should be 0x19 ?
+ 		}
+-#if 0
+-		eprintf ("V=%d\n", sb.version);
+-		eprintf ("PA=0x%08x sz=0x%x\n", sb.paddr, sb.psize);
+-		eprintf ("VA=0x%08x sz=0x%x\n", sb.vaddr, sb.psize);
+-		eprintf ("CODE=0x%08x\n", sb.code_pa + sb.vaddr+40);
+-		eprintf ("SIGN=0x%08x sz=0x%x\n", sb.sign_va, sb.sign_sz);
+-		if (sb.cert_sz > 0) {
+-			eprintf ("CERT=0x%08x sz=0x%x\n", sb.cert_va, sb.cert_sz);
+-		} else {
+-			eprintf ("No certificate found.\n");
+-		}
+-#endif
+ // TODO: Add more checks here
+ 		return true;
+ 	}
+ 	return false;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return check_bytes (buf, sz);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb){
++	return check_buffer (b);
+ }
+ 
+ static bool load(RBinFile *bf) {
+ 	if (bf && bf->buf) {
+-		ut64 sz;
+-		const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-		return load_bytes (bf, &bf->o->bin_obj, bytes, sz, bf->o->loadaddr, bf->sdb);
++		return load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
+ 	}
+ 	return false;
+ }
+ 
+-static int destroy(RBinFile *bf) {
+-	return true;
+-}
+-
+ static ut64 baddr(RBinFile *bf) {
+ 	return sb.vaddr; // XXX
+ }
+ 
+ static RList* entries(RBinFile *bf) {
+-	RList* ret;
+-	RBinAddr *ptr = NULL;
+-
+-	if (!(ret = r_list_new ())) {
+-		return NULL;
+-	}
+-	ret->free = free;
+-	if ((ptr = R_NEW0 (RBinAddr))) {
+-		ptr->paddr = 40 + sb.code_pa;
+-		ptr->vaddr = 40 + sb.code_pa + sb.vaddr;
+-		r_list_append (ret, ptr);
++	RList* ret = r_list_newf (free);;
++	if (ret) {
++		RBinAddr *ptr = R_NEW0 (RBinAddr);
++		if (ptr) {
++			ptr->paddr = 40 + sb.code_pa;
++			ptr->vaddr = 40 + sb.code_pa + sb.vaddr;
++			r_list_append (ret, ptr);
++		}
+ 	}
+ 	return ret;
+ }
+@@ -192,7 +186,7 @@ static RBinInfo* info(RBinFile *bf) {
+ }
+ 
+ static ut64 size(RBinFile *bf) {
+-	return sizeof (SBLHDR) + sb.psize;
++	return sizeof (SblHeader) + sb.psize;
+ }
+ 
+ RBinPlugin r_bin_plugin_mbn = {
+@@ -201,10 +195,10 @@ RBinPlugin r_bin_plugin_mbn = {
+ 	.license = "LGPL3",
+ 	.minstrlen = 10,
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
++	// .load_bytes = &load_bytes,
++	.load_buffer = &load_buffer,
+ 	.size = &size,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.entries = &entries,
+ 	.sections = &sections,
+diff --git a/libr/bin/p/bin_mdmp.c b/libr/bin/p/bin_mdmp.c
+index b82a7e57fc3d8..71693c3478732 100644
+--- a/libr/bin/p/bin_mdmp.c
++++ b/libr/bin/p/bin_mdmp.c
+@@ -31,9 +31,8 @@ static Sdb *get_sdb(RBinFile *bf) {
+ 	return (obj && obj->kv) ? obj->kv: NULL;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_bin_mdmp_free ((struct r_bin_mdmp_obj*)bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static RList* entries(RBinFile *bf) {
+@@ -184,50 +183,20 @@ static RList* libs(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
+-	RBuffer *tbuf;
+-	struct r_bin_mdmp_obj *res;
+-
+-	if (!buf || !sz || sz == UT64_MAX) {
+-		return false;
+-	}
+-
+-	tbuf = r_buf_new_with_bytes (buf, sz);
+-	if (!tbuf) {
+-		return false;
+-	}
+-
+-	if ((res = r_bin_mdmp_new_buf (tbuf))) {
+-		sdb_ns_set (sdb, "info", res->kv);
+-	}
+-	r_buf_free (tbuf);
+-
+-	if (res) {
+-		*bin_obj = res;
+-		return true;
+-	} else {
+-		return false;
+-	}
+-}
+-
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	r_return_val_if_fail (buf, NULL);
+-
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	r_return_val_if_fail (buf, false);
+ 	struct r_bin_mdmp_obj *res = r_bin_mdmp_new_buf (buf);
+ 	if (res) {
+ 		sdb_ns_set (sdb, "info", res->kv);
++		*bin_obj = res;
++		return true;
+ 	}
+-	return res;
++	return false;
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	return load_bytes (bf, &bf->o->bin_obj, bytes, sz, bf->o->loadaddr, bf->sdb);
++	r_return_val_if_fail (bf && bf->o, false);
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
+ }
+ 
+ static RList *sections(RBinFile *bf) {
+@@ -505,9 +474,12 @@ static RList* symbols(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	return buf && (length > sizeof (struct minidump_header))
+-		&& (!memcmp (buf, MDMP_MAGIC, 6));
++static bool check_buffer(RBuffer *b) {
++	ut8 magic[6];
++	if (r_buf_read_at (b, 0, magic, sizeof (magic)) == 6) {
++		return !memcmp (magic, MDMP_MAGIC, 6);
++	}
++	return false;
+ }
+ 
+ RBinPlugin r_bin_plugin_mdmp = {
+@@ -515,7 +487,6 @@ RBinPlugin r_bin_plugin_mdmp = {
+ 	.desc = "Minidump format r_bin plugin",
+ 	.license = "LGPL3",
+ 	.baddr = &baddr,
+-	.check_bytes = &check_bytes,
+ 	.destroy = &destroy,
+ 	.entries = entries,
+ 	.get_sdb = &get_sdb,
+@@ -523,8 +494,8 @@ RBinPlugin r_bin_plugin_mdmp = {
+ 	.info = &info,
+ 	.libs = &libs,
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
+ 	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.mem = &mem,
+ 	.relocs = &relocs,
+ 	.sections = &sections,
+diff --git a/libr/bin/p/bin_menuet.c b/libr/bin/p/bin_menuet.c
+index 6dfa5f2f1f3bb..4dc99325d2b3a 100644
+--- a/libr/bin/p/bin_menuet.c
++++ b/libr/bin/p/bin_menuet.c
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2016-2018 - pancake */
++/* radare2 - LGPL - Copyright 2016-2019 - pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -49,8 +49,12 @@
+ 
+ #endif
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (buf && length >= 32 && !memcmp (buf, "MENUET0", 7)) {
++static bool check_buffer(RBuffer *b) {
++	ut8 buf[8];
++	if (r_buf_read_at (b, 0, buf, sizeof (buf)) != sizeof (buf)) {
++		return false;
++	}
++	if (r_buf_size (b) >= 32 && !memcmp (buf, "MENUET0", 7)) {
+ 		switch (buf[7]) {
+ 		case '0':
+ 		case '1':
+@@ -62,15 +66,13 @@ static bool check_bytes(const ut8 *buf, ut64 length) {
+ 	return false;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return check_bytes (buf, sz);
++static bool load_buffer (RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb){
++	return check_buffer (b);
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+ 	ut64 la = (bf && bf->o)? bf->o->loadaddr: 0;
+-	return load_bytes (bf, bf? &bf->o->bin_obj: NULL, bytes, sz, la, bf? bf->sdb: NULL);
++	return load_buffer (bf, bf->o->bin_obj, bf->buf, la, bf->sdb);
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -211,9 +213,9 @@ RBinPlugin r_bin_plugin_menuet = {
+ 	.desc = "Menuet/KolibriOS bin plugin",
+ 	.license = "LGPL3",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
++	.load_buffer = &load_buffer,
+ 	.size = &size,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.entries = &entries,
+ 	.sections = &sections,
+diff --git a/libr/bin/p/bin_mz.c b/libr/bin/p/bin_mz.c
+index 4ed9b7185c735..b372ad57cf7f6 100644
+--- a/libr/bin/p/bin_mz.c
++++ b/libr/bin/p/bin_mz.c
+@@ -1,10 +1,14 @@
+-/* radare - LGPL - Copyright 2015-2018 nodepad */
++/* radare - LGPL - Copyright 2015-2019 nodepad */
+ 
+ #include <r_types.h>
+ #include <r_bin.h>
+ #include <r_lib.h>
+ #include "mz/mz.h"
+ 
++
++/* half-magic */
++#define HM(x) (int)((int)(x[0]<<8)|(int)(x[1]))
++
+ static Sdb *get_sdb(RBinFile *bf) {
+ 	const struct r_bin_mz_obj_t *bin;
+ 	if (bf && bf->o && bf->o->bin_obj) {
+@@ -16,27 +20,35 @@ static Sdb *get_sdb(RBinFile *bf) {
+ 	return NULL;
+ }
+ 
+-static bool knownHeader(const ut8 *buf,ut16 offset,ut64 length){
+-	// check for PE
+-	if (!memcmp (buf + offset, "PE", 2) &&
+-		(length > offset + 0x20) &&
+-		!memcmp (buf + offset + 0x18, "\x0b\x01", 2)) {
++static bool knownHeaderBuffer(RBuffer *b, ut16 offset) {
++	ut8 h[2];
++	if (r_buf_read_at (b, 0, h, sizeof (h)) != sizeof (h)) {
+ 		return false;
+ 	}
+-	// Check for New Executable, LE/LX or Phar Lap executable
+-	if (!memcmp (buf + offset, "NE", 2) ||
+-		!memcmp (buf + offset, "LE", 2) ||
+-		!memcmp (buf + offset, "LX", 2) ||
+-		!memcmp (buf + offset, "PL", 2)) {
+-		return false;
++	if (!memcmp (h, "PE", 2)) {
++		if (offset + 0x20 < r_buf_size (b)) {
++			if (r_buf_read_at (b, offset + 0x18, h, sizeof (h)) != 2) {
++				return false;
++			}
++			if (!memcmp (h, "\x0b\x01", 2)) {
++				return true;
++			}
++		}
++	} else {
++		if (!memcmp (h, "NE", 2)
++		 || !memcmp (h, "LE", 2)
++		 || !memcmp (h, "LX", 2)
++		 || !memcmp (h, "PL", 2)) {
++			return true;
++		}
+ 	}
+-	return true;
++	return false;
+ }
+ 
+-static bool checkEntrypoint(const ut8 *buf, ut64 length) {
+-	st16 cs = r_read_ble16 (buf + 0x16, false);
+-	ut16 ip = r_read_ble16 (buf + 0x14, false);
+-	ut32 pa = ((r_read_ble16 (buf + 8, false) + cs) << 4) + ip;
++static bool checkEntrypointBuffer(RBuffer *b) {
++	st16 cs = r_buf_read_le16_at (b, 0x16);
++	ut16 ip = r_buf_read_le16_at (b, 0x14);
++	ut32 pa = ((r_buf_read_le16_at (b, 0x08) + cs) << 4) + ip;
+ 
+ 	/* A minimal MZ header is 0x1B bytes.  Header length is measured in
+ 	 * 16-byte paragraphs so the minimum header must occupy 2 paragraphs.
+@@ -44,56 +56,65 @@ static bool checkEntrypoint(const ut8 *buf, ut64 length) {
+ 	 * cleverly fit a few instructions inside the header.
+ 	 */
+ 	pa &= 0xffff;
++	ut64 length = r_buf_size (b);
+ 	if (pa >= 0x20 && pa + 1 < length) {
+-		ut16 pe = r_read_ble16 (buf + 0x3c, false);
+-		if (pe + 2 < length && length > 0x104 && !memcmp (buf + pe, "PE", 2)) {
+-			return false;
++		ut16 pe = r_buf_read_le16_at (b,  0x3c);
++		if (pe + 2 < length && length > 0x104) {
++			ut8 h[2];
++			if (r_buf_read_at (b, pe, h, 2) == 2) {
++				if (!memcmp (h, "PE", 2)) {
++					return false;
++				}
++			}
+ 		}
+ 		return true;
+ 	}
+ 	return false;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	ut16 new_exe_header_offset;
+-	if (!buf || length <= 0x3d) {
++static bool check_buffer(RBuffer *b) {
++	r_return_val_if_fail (b, false);
++	ut64 b_size = r_buf_size (b);
++	if (b_size <= 0x3d) {
+ 		return false;
+ 	}
+ 
+ 	// Check for MZ magic.
+-	if (memcmp (buf, "MZ", 2) && memcmp (buf, "ZM", 2)) {
++	ut8 h[2];
++	if (r_buf_read_at (b, 0, h, 2) != 2) {
++		return false;
++	}
++	if (memcmp (h, "MZ", 2)) {
+ 		return false;
+ 	}
+ 
+ 	// See if there is a new exe header.
+-	new_exe_header_offset = r_read_ble16 (buf + 0x3c, false);
+-	if (length > new_exe_header_offset + 2) {
+-		if (!knownHeader (buf,new_exe_header_offset, length)) {
++	ut16 new_exe_header_offset = r_buf_read_le16_at (b, 0x3c);
++	if (b_size > new_exe_header_offset + 2) {
++		if (knownHeaderBuffer (b, new_exe_header_offset)) {
+ 			return false;
+ 		}
+ 	}
+ 
+ 	// Raw plain MZ executable (watcom)
+-	if (!checkEntrypoint (buf, length)) {
++	if (!checkEntrypointBuffer (b)) {
+ 		return false;
+ 	}
+-
+ 	return true;
+ }
+ 
+-static void *load(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	struct r_bin_mz_obj_t *mz_obj;
+-
+-	mz_obj = r_bin_mz_new_buf (buf);
++static bool load(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	struct r_bin_mz_obj_t *mz_obj = r_bin_mz_new_buf (buf);
+ 	if (mz_obj) {
+ 		sdb_ns_set (sdb, "info", mz_obj->kv);
++		*bin_obj = mz_obj;
++		return true;
+ 	}
+-	return mz_obj;
++	return false;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_bin_mz_free ((struct r_bin_mz_obj_t *)bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static RBinAddr *binsym(RBinFile *bf, int type) {
+@@ -220,7 +241,7 @@ RBinPlugin r_bin_plugin_mz = {
+ 	.get_sdb = &get_sdb,
+ 	.load_buffer = &load,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+ 	.sections = &sections,
+diff --git a/libr/bin/p/bin_nes.c b/libr/bin/p/bin_nes.c
+index 86dbd377da850..09014b3f4ade2 100644
+--- a/libr/bin/p/bin_nes.c
++++ b/libr/bin/p/bin_nes.c
+@@ -1,27 +1,21 @@
+-/* radare - LGPL3 - 2015-2016 - maijin */
++/* radare - LGPL3 - 2015-2019 - maijin */
+ 
+ #include <r_bin.h>
+ #include <r_lib.h>
+ #include "nes/nes_specs.h"
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (!buf || length < 4) {
+-		return false;
+-	}
+-	return (!memcmp (buf, INES_MAGIC, 4));
+-}
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return check_bytes (buf, sz);
++static bool check_buffer(RBuffer *b) {
++	if (r_buf_size (b) > 4) {
++		ut8 buf[4];
++		r_buf_read_at (b, 0, buf, sizeof (buf));
++		return (!memcmp (buf, INES_MAGIC, sizeof (buf)));
++	}
++	return false;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	ut64 tmpsz;
+-	const ut8 *tmp = r_buf_data (buf, &tmpsz);
+-	if (!check_bytes (tmp, tmpsz)) {
+-		return NULL;
+-	}
+-	return r_buf_new ();
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	return check_buffer (buf);
+ }
+ 
+ static RBinInfo *info(RBinFile *bf) {
+@@ -217,11 +211,10 @@ static ut64 baddr(RBinFile *bf) {
+ RBinPlugin r_bin_plugin_nes = {
+ 	.name = "nes",
+ 	.desc = "NES",
+-	.license = "LGPL3",
+-	.load_bytes = &load_bytes,
++	.license = "MIT",
+ 	.load_buffer = &load_buffer,
+ 	.baddr = &baddr,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.entries = &entries,
+ 	.sections = sections,
+ 	.symbols = &symbols,
+diff --git a/libr/bin/p/bin_nin3ds.c b/libr/bin/p/bin_nin3ds.c
+index 414e630060fed..cccd4f0943419 100644
+--- a/libr/bin/p/bin_nin3ds.c
++++ b/libr/bin/p/bin_nin3ds.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - 2018 - a0rtega */
++/* radare - LGPL - 2018-2019 - a0rtega */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -10,31 +10,24 @@
+ 
+ static struct n3ds_firm_hdr loaded_header;
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (!buf || length < sizeof (struct n3ds_firm_hdr)) {
+-		return false;
+-	}
+-	return (!memcmp (buf, "FIRM", 4));
+-}
+-
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
+-	return memcpy (&loaded_header, buf, sizeof (struct n3ds_firm_hdr));
++static bool check_buffer(RBuffer *b) {
++	ut8 magic[4];
++	r_buf_read_at (b, 0, magic, sizeof (magic));
++	return (!memcmp (magic, "FIRM", 4));
+ }
+ 
+-static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb) {
++	if (r_buf_read_at (b, 0, (ut8*)&loaded_header, sizeof (loaded_header)) == sizeof (loaded_header)) {
++		*bin_obj = &loaded_header;
++		return true;
+ 	}
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	load_bytes (bf, &bf->o->bin_obj, bytes, sz, bf->o->loadaddr, bf->sdb);
+-	return check_bytes (bytes, sz);
++	return false;
+ }
+ 
+-static int destroy(RBinFile *bf) {
+-	r_buf_free (bf->buf);
+-	bf->buf = NULL;
+-	return true;
++static bool load(RBinFile *bf) {
++	r_return_val_if_fail (bf && bf->o, false);
++	load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
++	return check_buffer (bf->buf);
+ }
+ 
+ static RList *sections(RBinFile *bf) {
+@@ -145,9 +138,8 @@ RBinPlugin r_bin_plugin_nin3ds = {
+ 	.desc = "Nintendo 3DS FIRM format r_bin plugin",
+ 	.license = "LGPL3",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.entries = &entries,
+ 	.sections = &sections,
+ 	.info = &info,
+diff --git a/libr/bin/p/bin_ninds.c b/libr/bin/p/bin_ninds.c
+index 4ded93d907ef1..5a10c8e7e6f2c 100644
+--- a/libr/bin/p/bin_ninds.c
++++ b/libr/bin/p/bin_ninds.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - 2015-2018 - a0rtega */
++/* radare - LGPL - 2015-2019 - a0rtega */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -10,42 +10,30 @@
+ 
+ static struct nds_hdr loaded_header;
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
++static bool check_buffer(RBuffer *b) {
+ 	ut8 ninlogohead[6];
+-	if (!buf || length < sizeof(struct nds_hdr)) { /* header size */
+-		return false;
+-	}
+-	memcpy (ninlogohead, buf + 0xc0, 6);
+-	/* begin of nintendo logo =    \x24\xff\xae\x51\x69\x9a */
+-	if (!memcmp (ninlogohead, "\x24\xff\xae\x51\x69\x9a", 6)){
+-		return true;
+-	/* begin of Homebrew magic */
+-	} else if (!memcmp (ninlogohead, "\xC8\x60\x4F\xE2\x01\x70", 6)){
+-		return true;
+-	} else {
+-		return false;
++	if (r_buf_read_at (b, 0xc0, ninlogohead, sizeof (ninlogohead)) == 6) {
++		/* begin of nintendo logo =    \x24\xff\xae\x51\x69\x9a */
++		if (!memcmp (ninlogohead, "\x24\xff\xae\x51\x69\x9a", 6)) {
++			return true;
++		}
++		/* begin of Homebrew magic */
++		if (!memcmp (ninlogohead, "\xC8\x60\x4F\xE2\x01\x70", 6)){
++			return true;
++		}
+ 	}
++	return false;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
+-	*bin_obj = memcpy (&loaded_header, buf, sizeof(struct nds_hdr));
++static bool load_buffer (RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb) {
++	r_buf_read_at (b, 0, (ut8*)&loaded_header, sizeof (loaded_header));
++	*bin_obj = &loaded_header;
+ 	return (*bin_obj != NULL);
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	load_bytes (bf, &bf->o->bin_obj, bytes, sz, bf->o->loadaddr, bf->sdb);
+-	return check_bytes (bytes, sz);
+-}
+-
+-static int destroy(RBinFile *bf) {
+-	r_buf_free (bf->buf);
+-	bf->buf = NULL;
+-	return true;
++	r_return_val_if_fail (bf && bf->o, false);
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -127,24 +115,19 @@ static RList *entries(RBinFile *bf) {
+ }
+ 
+ static RBinInfo *info(RBinFile *bf) {
++	r_return_val_if_fail (bf && bf->buf, NULL);
+ 	RBinInfo *ret = R_NEW0 (RBinInfo);
+-	if (!ret) {
+-		return NULL;
+-	}
+-
+-	if (!bf || !bf->buf) {
+-		free (ret);
+-		return NULL;
++	if (ret) {
++		char *filepath = r_str_newf ("%.12s - %.4s",
++			loaded_header.title, loaded_header.gamecode);
++		ret->file = filepath;
++		ret->type = strdup ("ROM");
++		ret->machine = strdup ("Nintendo DS");
++		ret->os = strdup ("nds");
++		ret->arch = strdup ("arm");
++		ret->has_va = true;
++		ret->bits = 32;
+ 	}
+-	char *filepath = r_str_newf ("%.12s - %.4s",
+-		loaded_header.title, loaded_header.gamecode);
+-	ret->file = filepath;
+-	ret->type = strdup ("ROM");
+-	ret->machine = strdup ("Nintendo DS");
+-	ret->os = strdup ("nds");
+-	ret->arch = strdup ("arm");
+-	ret->has_va = true;
+-	ret->bits = 32;
+ 	return ret;
+ }
+ 
+@@ -153,9 +136,8 @@ RBinPlugin r_bin_plugin_ninds = {
+ 	.desc = "Nintendo DS format r_bin plugin",
+ 	.license = "LGPL3",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.boffset = &boffset,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_ningb.c b/libr/bin/p/bin_ningb.c
+index 876e008921e84..805609e46dc45 100644
+--- a/libr/bin/p/bin_ningb.c
++++ b/libr/bin/p/bin_ningb.c
+@@ -7,34 +7,17 @@
+ #include <string.h>
+ #include "../format/nin/nin.h"
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return true;
+-}
+-
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	ut8 lict[48];
+-	if (!buf || length < (0x104 + 48)) {
+-		return 0;
++static bool check_buffer(RBuffer *b) {
++	ut8 lict[sizeof (lic)];
++	if (r_buf_read_at (b, 0x104, lict, sizeof (lict)) == sizeof (lict)) {
++		return !memcmp (lict, lic, sizeof (lict));
+ 	}
+-	memcpy (lict, buf + 0x104, 48);
+-	return (!memcmp (lict, lic, 48))? 1: 0;
++	return false;
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	ut64 la = bf->o->loadaddr;
+-	load_bytes (bf, &bf->o->bin_obj, bytes, sz, la, bf->sdb);
+-	return check_bytes (bytes, sz);
+-}
+-
+-static int destroy(RBinFile *bf) {
+-	r_buf_free (bf->buf);
+-	bf->buf = NULL;
+-	return true;
++	r_return_val_if_fail (bf && bf->o, false);
++	return check_buffer (bf->buf);
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -306,9 +289,7 @@ RBinPlugin r_bin_plugin_ningb = {
+ 	.desc = "Gameboy format r_bin plugin",
+ 	.license = "LGPL3",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_ningba.c b/libr/bin/p/bin_ningba.c
+index f4f6200e0d87f..f721f0419ba6b 100644
+--- a/libr/bin/p/bin_ningba.c
++++ b/libr/bin/p/bin_ningba.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - 2014-2015 - condret@runas-racer.com */
++/* radare - LGPL - 2014-2019 - condret@runas-racer.com */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -7,29 +7,16 @@
+ #include <string.h>
+ #include "../format/nin/gba.h"
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
++static bool check_buffer(RBuffer *b) {
+ 	ut8 lict[156];
+-	if (!buf || length < 160) {
+-		return 0;
+-	}
+-	memcpy (lict, buf + 0x4, 156);
+-	return (!memcmp (lict, lic_gba, 156))? 1: 0;
++	r_return_val_if_fail (b, false);
++	r_buf_read_at (b, 4, (ut8*)lict, sizeof (lict));
++	return !memcmp (lict, lic_gba, 156);
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	bf->rbin->maxstrbuf = 0x20000000;
+-	return check_bytes (bytes, sz);
+-}
+-
+-static int destroy(RBinFile *bf) {
+-	r_buf_free (bf->buf);
+-	bf->buf = NULL;
+-	return true;
++	r_return_val_if_fail (bf && bf->o, false);
++	return check_buffer (bf->buf);
+ }
+ 
+ static RList *entries(RBinFile *bf) {
+@@ -101,8 +88,7 @@ RBinPlugin r_bin_plugin_ningba = {
+ 	.desc = "Game Boy Advance format r_bin plugin",
+ 	.license = "LGPL3",
+ 	.load = &load,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.entries = &entries,
+ 	.info = &info,
+ 	.sections = &sections,
+diff --git a/libr/bin/p/bin_nro.c b/libr/bin/p/bin_nro.c
+index e634821a7c4d8..2ccc70c229bc4 100644
+--- a/libr/bin/p/bin_nro.c
++++ b/libr/bin/p/bin_nro.c
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2017-2018 - pancake */
++/* radare2 - LGPL - Copyright 2017-2019 - pancake */
+ 
+ // TODO: Support NRR and MODF
+ #include <r_types.h>
+@@ -30,41 +30,33 @@ static ut64 baddr(RBinFile *bf) {
+ 	return bf? readLE32 (bf->buf, NRO_OFFSET_MODMEMOFF): 0;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (buf && length >= 0x20) {
+-		return fileType (buf + NRO_OFF (magic)) != NULL;
++static bool check_buffer(RBuffer *b) {
++	ut8 magic[4];
++	if (r_buf_read_at (b, NRO_OFF (magic), magic, sizeof (magic)) == 4) {
++		return fileType (magic) != NULL;
+ 	}
+ 	return false;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb) {
++	// XX bf->buf vs b :D this load_b
+ 	RBinNXOObj *bin = R_NEW0 (RBinNXOObj);
+-	if (!bin) {
+-		return false;
++	if (bin) {
++		ut64 ba = baddr (bf);
++		bin->methods_list = r_list_newf ((RListFree)free);
++		bin->imports_list = r_list_newf ((RListFree)free);
++		bin->classes_list = r_list_newf ((RListFree)free);
++		ut32 mod0 = readLE32 (b, NRO_OFFSET_MODMEMOFF);
++		parseMod (b, bin, mod0, ba);
++		*bin_obj = bin;
+ 	}
+-	ut64 ba = baddr (bf);
+-	bin->methods_list = r_list_newf ((RListFree)free);
+-	bin->imports_list = r_list_newf ((RListFree)free);
+-	bin->classes_list = r_list_newf ((RListFree)free);
+-	ut32 mod0 = readLE32 (bf->buf, NRO_OFFSET_MODMEMOFF);
+-	parseMod (bf->buf, bin, mod0, ba);
+-	*bin_obj = bin;
+ 	return true;
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->buf || !bf->o) {
+-		return false;
+-	}
+-	ut64 sz;
++	r_return_val_if_fail (bf && bf->buf && bf->o, false);
+ 	const ut64 la = bf->o->loadaddr;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	load_bytes (bf, &bf->o->bin_obj, bytes, sz, la, bf->sdb);
+-	return bf->o->bin_obj != NULL;
+-}
+-
+-static int destroy(RBinFile *bf) {
+-	return true;
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, la, bf->sdb);
+ }
+ 
+ static RBinAddr *binsym(RBinFile *bf, int type) {
+@@ -271,9 +263,8 @@ RBinPlugin r_bin_plugin_nro = {
+ 	.desc = "Nintendo Switch NRO0 binaries",
+ 	.license = "MIT",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_nso.c b/libr/bin/p/bin_nso.c
+index b8c0ae0a03b13..50780d934b19c 100644
+--- a/libr/bin/p/bin_nso.c
++++ b/libr/bin/p/bin_nso.c
+@@ -47,9 +47,13 @@ static ut64 baddr(RBinFile *bf) {
+ 	return 0x8000000;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (buf && length >= 0x20) {
+-		return fileType (buf + NSO_OFF (magic)) != NULL;
++static bool check_buffer(RBuffer *b) {
++	if (r_buf_size (b) >= 0x20) {
++		ut8 magic[4];
++		if (r_buf_read_at (b, 0, magic, sizeof (magic)) != 4) {
++			return false;
++		}
++		return fileType (magic) != NULL;
+ 	}
+ 	return false;
+ }
+@@ -63,6 +67,7 @@ static RBinNXOObj *nso_new () {
+ }
+ 
+ static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
++	eprintf ("load_bytes in bin.nso must die\n");
+ 	RBin *rbin = bf->rbin;
+ 	ut32 toff = readLE32 (bf->buf, NSO_OFF (text_memoffset));
+ 	ut32 tsize = readLE32 (bf->buf, NSO_OFF (text_size));
+@@ -130,23 +135,13 @@ static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut
+ 	return false;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	r_return_val_if_fail (bf && buf, NULL);
+-	const ut64 sz = r_buf_size (buf);
+-	ut8 *bytes = malloc (sz);
+-	if (!bytes) {
+-		return NULL;
+-	}
+-	r_buf_read_at (buf, 0, bytes, sz);
+-	void *ptr = NULL;
+ 	const ut64 la = bf->loadaddr;
+-	(void)load_bytes (bf, &ptr, bytes, sz, la, bf->sdb);
+-	free (bytes);
+-	return ptr;
+-}
+-
+-static int destroy(RBinFile *bf) {
+-	return true;
++	ut64 sz = 0;
++	const ut8 *bytes = r_buf_data (buf, &sz);
++	bool res = load_bytes (bf, bin_obj, bytes, sz, la, bf->sdb);
++	return res;
+ }
+ 
+ static RBinAddr *binsym(RBinFile *bf, int type) {
+@@ -288,8 +283,7 @@ RBinPlugin r_bin_plugin_nso = {
+ 	.desc = "Nintendo Switch NSO0 binaries",
+ 	.license = "MIT",
+ 	.load_buffer = &load_buffer,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_omf.c b/libr/bin/p/bin_omf.c
+index d4baa9918ed99..1c51c330fee76 100644
+--- a/libr/bin/p/bin_omf.c
++++ b/libr/bin/p/bin_omf.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2015-2018 - ampotos, pancake */
++/* radare - LGPL - Copyright 2015-2019 - ampotos, pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -6,29 +6,47 @@
+ #include <r_bin.h>
+ #include "omf/omf.h"
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 size, ut64 loadaddrn, Sdb *sdb) {
+-	if (!buf || !size || size == UT64_MAX) {
+-		return false;
+-	}
++static bool load_buffer (RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb) {
++	ut64 size;
++	const ut8 *buf = r_buf_data (b, &size);
+ 	*bin_obj = r_bin_internal_omf_load (buf, size);
+-	return true;
++	return *bin_obj != NULL;
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-	ut64 size;
+-	const ut8 *byte = r_buf_data (bf->buf, &size);
+-	return load_bytes (bf, &bf->o->bin_obj, byte, size, bf->o->loadaddr, bf->sdb);
++	r_return_val_if_fail (bf && bf->o, false);
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_bin_free_all_omf_obj (bf->o->bin_obj);
+ 	bf->o->bin_obj = NULL;
+-	return true;
+ }
+ 
++static bool check_buffer(RBuffer *b) {
++	int i;
++	ut8 ch;
++	if (r_buf_read_at (b, 0, &ch, 1) != 1) {
++		return false;
++	}
++	if (ch != 0x80 && ch != 0x82) {
++		return false;
++	}
++	ut64 length = 0;
++	const ut8 *buf = r_buf_data (b, &length);
++	ut16 rec_size = ut8p_bw (buf + 1);
++	ut8 str_size = *(buf + 3);
++	if (str_size + 2 != rec_size || length < rec_size + 3) {
++		return false;
++	}
++	// check that the string is ASCII
++	for (i = 4; i < str_size + 4; ++i) {
++		if (buf[i] > 0x7f) {
++			return false;
++		}
++	}
++	return r_bin_checksum_omf_ok (buf, length);
++}
+ static bool check_bytes(const ut8 *buf, ut64 length) {
+ 	int i;
+ 	if (!buf || length < 4) {
+@@ -158,9 +176,9 @@ RBinPlugin r_bin_plugin_omf = {
+ 	.desc = "omf bin plugin",
+ 	.license = "LGPL3",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
++	.load_buffer = &load_buffer,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.entries = &entries,
+ 	.sections = &sections,
+diff --git a/libr/bin/p/bin_p9.c b/libr/bin/p/bin_p9.c
+index 605136539054c..8f982a1583332 100644
+--- a/libr/bin/p/bin_p9.c
++++ b/libr/bin/p/bin_p9.c
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2009-2017 - nibble, pancake */
++/* radare2 - LGPL - Copyright 2009-2019 - nibble, pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -17,16 +17,12 @@ static bool check_bytes(const ut8 *b, ut64 length) {
+ 	return res;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb){
+-	if (!check_buffer (buf)) {
+-		return NULL;
+-	}
+-	return r_buf_new ();
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb){
++	return check_buffer (b);
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_buf_free (bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+diff --git a/libr/bin/p/bin_pe.c b/libr/bin/p/bin_pe.c
+index c348ad2c59cf4..3e1a24b31fd0a 100644
+--- a/libr/bin/p/bin_pe.c
++++ b/libr/bin/p/bin_pe.c
+@@ -2,25 +2,28 @@
+ 
+ #include "bin_pe.inc"
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	unsigned int idx;
+-	if (!buf || length <= 0x3d) {
++static bool check_buffer(RBuffer *b) {
++	ut64 length = r_buf_size (b);
++	if (length <= 0x3d) {
+ 		return false;
+ 	}
+-	idx = (buf[0x3c] | (buf[0x3d]<<8));
+-	if (length > idx + 0x18 + 2) {
++	ut16 idx = r_buf_read_le16_at (b, 0x3c);
++	if (idx + 26 < length) {
+ 		/* Here PE signature for usual PE files
+ 		 * and PL signature for Phar Lap TNT DOS extender 32bit executables
+ 		 */
++		ut8 buf[2];
++		r_buf_read_at (b, 0, buf, sizeof (buf));
+ 		if (!memcmp (buf, "MZ", 2)) {
+-			if (!memcmp (buf+idx, "PE", 2) &&
+-				!memcmp (buf + idx + 0x18, "\x0b\x01", 2)) {
+-				return true;
+-			}
++			r_buf_read_at (b, idx, buf, sizeof (buf));
+ 			// TODO: Add one more indicator, to prevent false positives
+-			if (!memcmp (buf+idx, "PL", 2)) {
++			if (!memcmp (buf, "PL", 2)) {
+ 				return true;
+ 			}
++			if (!memcmp (buf, "PE", 2)) {
++				r_buf_read_at (b, idx + 0x18, buf, sizeof (buf));
++				return !memcmp (buf, "\x0b\x01", 2);
++			}
+ 		}
+ 	}
+ 	return false;
+@@ -394,9 +397,8 @@ RBinPlugin r_bin_plugin_pe = {
+ 	.get_sdb = &get_sdb,
+ 	.load = &load,
+ 	.load_buffer = &load_buffer,
+-	.load_bytes = &load_bytes,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_pe.inc b/libr/bin/p/bin_pe.inc
+index 5fbf088c5f21d..4c2e8ef68756e 100644
+--- a/libr/bin/p/bin_pe.inc
++++ b/libr/bin/p/bin_pe.inc
+@@ -17,49 +17,24 @@ static Sdb* get_sdb (RBinFile *bf) {
+ 	return bin? bin->kv: NULL;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
+-	struct PE_(r_bin_pe_obj_t) *res = NULL;
+-	RBuffer *tbuf = NULL;
+-	if (!buf || !sz || sz == UT64_MAX) {
+-		return false;
+-	}
+-	tbuf = r_buf_new ();
+-	r_buf_set_bytes (tbuf, buf, sz);
+-	res = PE_(r_bin_pe_new_buf) (tbuf, bf->rbin->verbose);
+-	if (res) {
+-		sdb_ns_set (sdb, "info", res->kv);
+-	}
+-	r_buf_free (tbuf);
+-	*bin_obj = res;
+-	return true;
+-}
+-
+-static void * load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	struct PE_(r_bin_pe_obj_t) *res;
+-	if (!buf) {
+-		return NULL;
+-	}
+-	res = PE_(r_bin_pe_new_buf) (buf, bf->rbin->verbose);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++	r_return_val_if_fail (bf && bin_obj && buf, false);
++	struct PE_(r_bin_pe_obj_t) *res = PE_(r_bin_pe_new_buf) (buf, bf->rbin->verbose);
+ 	if (res) {
+ 		sdb_ns_set (sdb, "info", res->kv);
++		*bin_obj = res;
++		return true;
+ 	}
+-	return res;
++	return false;
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	const ut8 *bytes;
+-	ut64 sz;
+-
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-	bytes = r_buf_data (bf->buf, &sz);
+-	return load_bytes (bf, &bf->o->bin_obj, bytes, sz, bf->o->loadaddr, bf->sdb);
++	r_return_val_if_fail (bf && bf->o, false);
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	PE_(r_bin_pe_free) ((struct PE_(r_bin_pe_obj_t)*)bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -501,22 +476,22 @@ static RBinInfo* info(RBinFile *bf) {
+ 	ret->actual_checksum  = strdup (sdb_fmt ("0x%08x", actual_checksum));
+ 	ret->pe_overlay = pe_overlay > 0;
+ 	ret->signature = bin ? bin->is_signed : false;
+-
+-	sdb_bool_set (bf->sdb, "pe.canary", has_canary(bf), 0);
+-	sdb_bool_set (bf->sdb, "pe.highva", haschr(bf, IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA), 0);
+-	sdb_bool_set (bf->sdb, "pe.aslr", haschr(bf, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE), 0);
+-	sdb_bool_set (bf->sdb, "pe.forceintegrity", haschr(bf, IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY), 0);
+-	sdb_bool_set (bf->sdb, "pe.nx", haschr(bf, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT), 0);
+-	sdb_bool_set (bf->sdb, "pe.isolation", !haschr(bf, IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY), 0);
+-	sdb_bool_set (bf->sdb, "pe.seh", !haschr(bf, IMAGE_DLLCHARACTERISTICS_NO_SEH), 0);
+-	sdb_bool_set (bf->sdb, "pe.bind", !haschr(bf, IMAGE_DLLCHARACTERISTICS_NO_BIND), 0);
+-	sdb_bool_set (bf->sdb, "pe.appcontainer", haschr(bf, IMAGE_DLLCHARACTERISTICS_APPCONTAINER), 0);
+-	sdb_bool_set (bf->sdb, "pe.wdmdriver", haschr(bf, IMAGE_DLLCHARACTERISTICS_WDM_DRIVER), 0);
+-	sdb_bool_set (bf->sdb, "pe.guardcf", haschr(bf, IMAGE_DLLCHARACTERISTICS_GUARD_CF), 0);
+-	sdb_bool_set (bf->sdb, "pe.terminalserveraware", haschr(bf, IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE), 0);
+-	sdb_num_set (bf->sdb, "pe.bits", ret->bits, 0);
+-	sdb_set (bf->sdb, "pe.claimed_checksum", ret->claimed_checksum, 0);
+-	sdb_set (bf->sdb, "pe.actual_checksum", ret->actual_checksum, 0);
++	Sdb *db = sdb_ns (bf->sdb, "pe", true);
++	sdb_bool_set (db, "canary", has_canary (bf), 0);
++	sdb_bool_set (db, "highva", haschr (bf, IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA), 0);
++	sdb_bool_set (db, "aslr", haschr (bf, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE), 0);
++	sdb_bool_set (db, "forceintegrity", haschr (bf, IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY), 0);
++	sdb_bool_set (db, "nx", haschr (bf, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT), 0);
++	sdb_bool_set (db, "isolation", !haschr (bf, IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY), 0);
++	sdb_bool_set (db, "seh", !haschr (bf, IMAGE_DLLCHARACTERISTICS_NO_SEH), 0);
++	sdb_bool_set (db, "bind", !haschr (bf, IMAGE_DLLCHARACTERISTICS_NO_BIND), 0);
++	sdb_bool_set (db, "appcontainer", haschr (bf, IMAGE_DLLCHARACTERISTICS_APPCONTAINER), 0);
++	sdb_bool_set (db, "wdmdriver", haschr (bf, IMAGE_DLLCHARACTERISTICS_WDM_DRIVER), 0);
++	sdb_bool_set (db, "guardcf", haschr (bf, IMAGE_DLLCHARACTERISTICS_GUARD_CF), 0);
++	sdb_bool_set (db, "terminalserveraware", haschr (bf, IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE), 0);
++	sdb_num_set (db, "bits", ret->bits, 0);
++	sdb_set (db, "claimed_checksum", ret->claimed_checksum, 0);
++	sdb_set (db, "actual_checksum", ret->actual_checksum, 0);
+ 
+ 	ret->has_va = true;
+ 
+diff --git a/libr/bin/p/bin_pe64.c b/libr/bin/p/bin_pe64.c
+index 97699bf71026f..8f3002a02bf59 100644
+--- a/libr/bin/p/bin_pe64.c
++++ b/libr/bin/p/bin_pe64.c
+@@ -1,20 +1,30 @@
+-/* radare - LGPL - Copyright 2009-2015 - nibble, pancake */
++/* radare - LGPL - Copyright 2009-2019 - nibble, pancake */
+ #define R_BIN_PE64 1
+ #include "bin_pe.inc"
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	int idx, ret = false;
+-	if (!buf || length <= 0x3d) {
++static bool check_buffer(RBuffer *b) {
++	ut64 length = r_buf_size (b);
++	if (length <= 0x3d) {
+ 		return false;
+ 	}
+-	idx = buf[0x3c] | (buf[0x3d] << 8);
+-	if (length >= idx + 0x20) {
+-		if (!memcmp (buf, "MZ", 2) && !memcmp (buf + idx, "PE", 2) &&
+-			!memcmp (buf + idx + 0x18, "\x0b\x02", 2)) {
+-			ret = true;
++	ut16 idx = r_buf_read_le16_at (b, 0x3c);
++	if (idx + 26 < length) {
++		/* Here PE signature for usual PE files
++		 * and PL signature for Phar Lap TNT DOS extender 32bit executables
++		 */
++		ut8 buf[2];
++		r_buf_read_at (b, 0, buf, sizeof (buf));
++		if (!memcmp (buf, "MZ", 2)) {
++			r_buf_read_at (b, idx, buf, sizeof (buf));
++			// TODO: Add one more indicator, to prevent false positives
++			// if (!memcmp (buf, "PL", 2)) { return true; }
++			if (!memcmp (buf, "PE", 2)) {
++				r_buf_read_at (b, idx + 0x18, buf, sizeof (buf));
++				return !memcmp (buf, "\x0b\x02", 2);
++			}
+ 		}
+ 	}
+-	return ret;
++	return false;
+ }
+ 
+ static void header(RBinFile *bf) {
+@@ -127,9 +137,8 @@ RBinPlugin r_bin_plugin_pe64 = {
+ 	.get_sdb = &get_sdb,
+ 	.load = &load,
+ 	.load_buffer = &load_buffer,
+-	.load_bytes = &load_bytes,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_pebble.c b/libr/bin/p/bin_pebble.c
+index e1029e50bb535..d466a1915e61d 100644
+--- a/libr/bin/p/bin_pebble.c
++++ b/libr/bin/p/bin_pebble.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2014-2015 - pancake */
++/* radare - LGPL - Copyright 2014-2019 - pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -18,10 +18,10 @@ typedef struct  {
+ 
+ R_PACKED (
+ typedef struct  {
+-	char header[8];                   //!< Sentinal value, should always be 'PBLAPP\0\0'
+-	Version struct_version;           //!< version of this structure's format
+-	Version sdk_version;              //!< version of the SDK used to build this app
+-	Version app_version;              //!< version of the app
++	char header[8];               //!< Sentinal value, should always be 'PBLAPP\0\0'
++	Version struct_version;       //!< version of this structure's format
++	Version sdk_version;          //!< version of the SDK used to build this app
++	Version app_version;          //!< version of the app
+ 	ut16 size;                    //!< size of the app binary, including this metadata but not the reloc table
+ 	ut32 offset;                  //!< The entry point of this executable
+ 	ut32 crc;                     //!< CRC of the app data only, ie, not including this struct or the reloc table at the end
+@@ -35,23 +35,20 @@ typedef struct  {
+ 	ut8 uuid[16];
+ }) PebbleAppInfo;
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	return (length > 7 && !memcmp (buf, "PBLAPP\x00\x00", 8));
++static bool check_buffer(RBuffer *b) {
++	ut8 magic[8];
++	if (r_buf_read_at (b, 0, magic, sizeof (magic)) != sizeof (magic)) {
++		return false;
++	}
++	return !memcmp (magic, "PBLAPP\x00\x00", 8);
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return check_bytes (buf, sz);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb){
++	return check_buffer (b);
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	return check_bytes (bytes, sz);
+-}
+-
+-static int destroy(RBinFile *bf) {
+-	//r_bin_pebble_free ((struct r_bin_pebble_obj_t*)bf->o->bin_obj);
+-	return true;
++	return check_buffer (bf->buf);
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -195,9 +192,8 @@ RBinPlugin r_bin_plugin_pebble = {
+ 	.desc = "Pebble Watch App",
+ 	.license = "LGPL",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.entries = entries,
+ 	.sections = sections,
+diff --git a/libr/bin/p/bin_psxexe.c b/libr/bin/p/bin_psxexe.c
+index 82f724d3f99f0..20d9328b2ee60 100644
+--- a/libr/bin/p/bin_psxexe.c
++++ b/libr/bin/p/bin_psxexe.c
+@@ -7,15 +7,16 @@
+ #include "../i/private.h"
+ #include "psxexe/psxexe.h"
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (!buf || (length < PSXEXE_ID_LEN)) {
+-		return false;
++static bool check_buffer(RBuffer *b) {
++	ut8 magic[PSXEXE_ID_LEN];
++	if (r_buf_read_at (b, 0, magic, sizeof (magic)) == PSXEXE_ID_LEN) {
++		return !memcmp (magic, PSXEXE_ID, PSXEXE_ID_LEN);
+ 	}
+-	return !memcmp (buf, PSXEXE_ID, PSXEXE_ID_LEN);
++	return false;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
+-	return check_bytes (buf, sz);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb) {
++	return check_buffer (b);
+ }
+ 
+ static RBinInfo* info(RBinFile* bf) {
+@@ -115,8 +116,8 @@ RBinPlugin r_bin_plugin_psxexe = {
+ 	.name = "psxexe",
+ 	.desc = "Sony PlayStation 1 Executable",
+ 	.license = "LGPL3",
+-	.load_bytes = &load_bytes,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.info = &info,
+ 	.sections = &sections,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_qnx.c b/libr/bin/p/bin_qnx.c
+index b0a984a06413c..e540abebb6dad 100644
+--- a/libr/bin/p/bin_qnx.c
++++ b/libr/bin/p/bin_qnx.c
+@@ -31,25 +31,20 @@ static bool check_buffer(RBuffer *buf) {
+ 	return r == sizeof (tmp) && !memcmp (tmp, QNX_MAGIC, sizeof (tmp));
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	RBuffer *b = r_buf_new_with_bytes (buf, length);
+-	bool res = check_buffer (b);
+-	r_buf_free (b);
+-	return res;
+-}
+-
+ // Frees the bin_obj of the binary file
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	QnxObj *qo = bf->o->bin_obj;
+ 	r_list_free (qo->sections);
+ 	r_list_free (qo->fixups);
+ 	bf->o->bin_obj = NULL;
+ 	free (qo);
+-	return true;
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	QnxObj *qo = R_NEW0 (QnxObj);
++	if (!qo) {
++		return false;
++	}
+ 	lmf_record lrec;
+ 	lmf_resource lres;
+ 	lmf_data ldata;
+@@ -137,9 +132,10 @@ static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	sdb_ns_set (sdb, "info", qo->kv);
+ 	qo->sections = sections;
+ 	qo->fixups = fixups;
+-	return qo;
++	*bin_obj = qo;
++	return true;
+ beach:
+-	return NULL;
++	return false;
+ }
+ 
+ /*
+@@ -280,7 +276,6 @@ RBinPlugin r_bin_plugin_qnx = {
+ 	.baddr = &baddr,
+ 	.author = "deepakchethan",
+ 	.check_buffer = &check_buffer,
+-	.check_bytes  = &check_bytes,
+ 	.header = &header,
+ 	.get_sdb = &get_sdb,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_sfc.c b/libr/bin/p/bin_sfc.c
+index 77cd2d8e564f5..ded939eca7bb2 100644
+--- a/libr/bin/p/bin_sfc.c
++++ b/libr/bin/p/bin_sfc.c
+@@ -1,14 +1,13 @@
+-/* radare - LGPL3 - 2017 - usrshare */
++/* radare - LGPL3 - 2017-2019 - usrshare */
+ 
+ #include <r_bin.h>
+ #include <r_lib.h>
+ #include "sfc/sfc_specs.h"
+ #include <r_endian.h>
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	const ut8 *buf_hdr = buf;
++static bool check_buffer(RBuffer *b) {
+ 	ut16 cksum1, cksum2;
+-
++	ut64 length = r_buf_size (b);
+ 	// FIXME: this was commented out because it always evaluates to false.
+ 	//        Need to be fixed by someone with SFC knowledge
+ 	// if ((length & 0x8000) == 0x200) {
+@@ -18,23 +17,22 @@ static bool check_bytes(const ut8 *buf, ut64 length) {
+ 		return false;
+ 	}
+ 	//determine if ROM is headered, and add a 0x200 gap if so.
+-	cksum1 = r_read_le16 (buf_hdr + 0x7FDC);
+-	cksum2 = r_read_le16 (buf_hdr + 0x7FDE);
++	cksum1 = r_buf_read_le16_at (b, 0x7fdc);
++	cksum2 = r_buf_read_le16_at (b, 0x7fde);
+ 
+ 	if (cksum1 == (ut16)~cksum2) {
+ 		return true;
+ 	}
+-
+ 	if (length < 0xffee) {
+ 		return false;
+ 	}
+-	cksum1 = r_read_le16(buf_hdr + 0xFFDC);
+-	cksum2 = r_read_le16(buf_hdr + 0xFFDE);
++	cksum1 = r_buf_read_le16_at (b, 0xffdc);
++	cksum2 = r_buf_read_le16_at (b, 0xffde);
+ 	return (cksum1 == (ut16)~cksum2);
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return check_bytes (buf, sz);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb){
++	return check_buffer (b);
+ }
+ 
+ static RBinInfo* info(RBinFile *bf) {
+@@ -278,8 +276,8 @@ RBinPlugin r_bin_plugin_sfc = {
+ 	.name = "sfc",
+ 	.desc = "Super NES / Super Famicom ROM file",
+ 	.license = "LGPL3",
+-	.load_bytes = &load_bytes,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.entries = &entries,
+ 	.sections = sections,
+ 	.symbols = &symbols,
+diff --git a/libr/bin/p/bin_smd.c b/libr/bin/p/bin_smd.c
+index 5a4d10a0192dd..014ed3443a380 100644
+--- a/libr/bin/p/bin_smd.c
++++ b/libr/bin/p/bin_smd.c
+@@ -95,15 +95,17 @@ static ut64 baddr(RBinFile *bf) {
+ 	return 0;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (length > 0x190 && !memcmp (buf + 0x100, "SEGA", 4)) {
+-		return true;
++static bool check_buffer(RBuffer *b) {
++	if (r_buf_size (b) > 0x190) {
++		ut8 buf[4];
++		r_buf_read_at (b, 0x100, buf, sizeof (buf));
++		return !memcmp (buf, "SEGA", 4);
+ 	}
+ 	return false;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return check_bytes (buf, sz);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb){
++	return check_buffer (b);
+ }
+ 
+ static RBinInfo *info(RBinFile *bf) {
+@@ -319,8 +321,8 @@ RBinPlugin r_bin_plugin_smd = {
+ 	.name = "smd",
+ 	.desc = "SEGA Genesis/Megadrive",
+ 	.license = "LGPL3",
+-	.load_bytes = &load_bytes,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.entries = &entries,
+ 	.sections = &sections,
+diff --git a/libr/bin/p/bin_spc700.c b/libr/bin/p/bin_spc700.c
+index df19420206386..bb071a885ea14 100644
+--- a/libr/bin/p/bin_spc700.c
++++ b/libr/bin/p/bin_spc700.c
+@@ -1,19 +1,19 @@
+-/* radare - LGPL - 2015-2016 - maijin */
++/* radare - LGPL - 2015-2019 - maijin */
+ 
+ #include <r_bin.h>
+ #include <r_lib.h>
+ #include "../format/spc700/spc_specs.h"
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (!buf || length < 27) {
+-		return false;
++static bool check_buffer(RBuffer *b) {
++	ut8 buf[27];
++	if (r_buf_read_at (b, 0, buf, sizeof (buf)) == 27) {
++		return !memcmp (buf, SPC_MAGIC, 27);
+ 	}
+-	return !memcmp (buf, SPC_MAGIC, 27);
++	return false;
+ }
+ 
+-
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	return check_bytes (buf, sz);
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb){
++	return check_buffer (b);
+ }
+ 
+ static RBinInfo* info(RBinFile *bf) {
+@@ -67,17 +67,15 @@ static RList* sections(RBinFile *bf) {
+ }
+ 
+ static RList* entries(RBinFile *bf) {
+-	RList *ret;
+-	RBinAddr *ptr = NULL;
+-	if (!(ret = r_list_new ())) {
+-		return NULL;
++	RList *ret = r_list_newf (free);
++	if (ret) {
++		RBinAddr *ptr = R_NEW0 (RBinAddr);
++		if (ptr) {
++			ptr->paddr = RAM_START_ADDRESS;
++			ptr->vaddr = 0;
++			r_list_append (ret, ptr);
++		}
+ 	}
+-	if (!(ptr = R_NEW0 (RBinAddr))) {
+-		return ret;
+-	}
+-	ptr->paddr = RAM_START_ADDRESS;
+-	ptr->vaddr = 0;
+-	r_list_append (ret, ptr);
+ 	return ret;
+ }
+ 
+@@ -85,8 +83,8 @@ RBinPlugin r_bin_plugin_spc700 = {
+ 	.name = "spc700",
+ 	.desc = "SNES-SPC700 Sound File Data",
+ 	.license = "LGPL3",
+-	.load_bytes = &load_bytes,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.entries = &entries,
+ 	.sections = &sections,
+ 	.info = &info,
+diff --git a/libr/bin/p/bin_symbols.c b/libr/bin/p/bin_symbols.c
+index ee23d41446652..5e01bc8401511 100644
+--- a/libr/bin/p/bin_symbols.c
++++ b/libr/bin/p/bin_symbols.c
+@@ -476,7 +476,7 @@ static void parseTable3(RBuffer *buf, int x) {
+ 	free (b);
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ #if 0
+ 	SYMBOLS HEADER
+ 
+@@ -499,7 +499,7 @@ static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	SymbolsHeader sh = parseHeader (buf);
+ 	if (!sh.valid) {
+ 		eprintf ("Invalid headers\n");
+-		return NULL;
++		return false;
+ 	}
+ 	printSymbolsHeader (sh);
+ 
+@@ -550,9 +550,7 @@ static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 		r_list_free (symbolStrings);
+ 		globalSymbols = symbols;
+ 	}
+-
+-	// :D we must hold our priv obj to avoid multiple parsings. it leaks
+-	return malloc (32);
++	return true;
+ }
+ 
+ static RList *sections(RBinFile *bf) {
+@@ -594,13 +592,10 @@ static RBinInfo *info(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (buf && length >= 4) {
+-		if (!memcmp (buf, "\x02\xff\x01\xff", 4)) {
+-			return true;
+-		}
+-	}
+-	return false;
++static bool check_buffer(RBuffer *b) {
++	ut8 buf[4];
++	r_buf_read_at (b, 0, buf, sizeof (buf));
++	return !memcmp (buf, "\x02\xff\x01\xff", 4);
+ }
+ 
+ static RList *strings(RBinFile *bf) {
+@@ -630,7 +625,7 @@ RBinPlugin r_bin_plugin_symbols = {
+ 	.desc = "Apple Symbols file",
+ 	.license = "MIT",
+ 	.load_buffer = &load_buffer,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.symbols = &symbols,
+ 	.sections = &sections,
+ 	.strings = strings,
+diff --git a/libr/bin/p/bin_te.c b/libr/bin/p/bin_te.c
+index a78e99d846407..5f291e5c40700 100644
+--- a/libr/bin/p/bin_te.c
++++ b/libr/bin/p/bin_te.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2013-2015 - xvilka */
++/* radare - LGPL - Copyright 2013-2019 - xvilka */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -16,38 +16,27 @@ static Sdb *get_sdb(RBinFile *bf) {
+ 	return bin? bin->kv: NULL;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb){
+-	struct r_bin_te_obj_t *res = NULL;
+-	RBuffer *tbuf = NULL;
+-
+-	if (!buf || sz == 0 || sz == UT64_MAX) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb) {
++	r_return_val_if_fail (bf && bin_obj && b, false);
++	ut64 sz = r_buf_size (b);
++	if (sz == 0 || sz == UT64_MAX) {
+ 		return false;
+ 	}
+-	tbuf = r_buf_new ();
+-	r_buf_set_bytes (tbuf, buf, sz);
+-	res = r_bin_te_new_buf (tbuf);
++	struct r_bin_te_obj_t *res = r_bin_te_new_buf (b);
+ 	if (res) {
+ 		sdb_ns_set (sdb, "info", res->kv);
+ 	}
+-	r_buf_free (tbuf);
+ 	*bin_obj = res;
+ 	return true;
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	load_bytes (bf, &bf->o->bin_obj, bytes, sz, bf->o->loadaddr, bf->sdb);
+-	return bf->o->bin_obj? true: false;
++	r_return_val_if_fail (bf && bf->o, false);
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_bin_te_free ((struct r_bin_te_obj_t *) bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -68,23 +57,19 @@ static RBinAddr *binsym(RBinFile *bf, int type) {
+ }
+ 
+ static RList *entries(RBinFile *bf) {
+-	RList *ret;
+-	RBinAddr *ptr = NULL;
+-	RBinAddr *entry = NULL;
+-
+-	if (!(ret = r_list_new ())) {
+-		return NULL;
+-	}
+-	ret->free = free;
+-	if (!(entry = r_bin_te_get_entrypoint (bf->o->bin_obj))) {
+-		return ret;
+-	}
+-	if ((ptr = R_NEW (RBinAddr))) {
+-		ptr->paddr = entry->paddr;
+-		ptr->vaddr = entry->vaddr;
+-		r_list_append (ret, ptr);
++	RList *ret = r_list_newf (free);
++	if (ret) {
++		RBinAddr *entry = r_bin_te_get_entrypoint (bf->o->bin_obj);
++		if (entry) {
++			RBinAddr *ptr = R_NEW0 (RBinAddr);
++			if (ptr) {
++				ptr->paddr = entry->paddr;
++				ptr->vaddr = entry->vaddr;
++				r_list_append (ret, ptr);
++			}
++			free (entry);
++		}
+ 	}
+-	free (entry);
+ 	return ret;
+ }
+ 
+@@ -159,8 +144,12 @@ static RBinInfo *info(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	return (buf && length > 2 && !memcmp (buf, "\x56\x5a", 2));
++static bool check_buffer(RBuffer *b) {
++	ut8 buf[2];
++	if (r_buf_read_at (b, 0, buf, 2) == 2) {
++		return !memcmp (buf, "\x56\x5a", 2);
++	}
++	return false;
+ }
+ 
+ RBinPlugin r_bin_plugin_te = {
+@@ -169,9 +158,9 @@ RBinPlugin r_bin_plugin_te = {
+ 	.license = "LGPL3",
+ 	.get_sdb = &get_sdb,
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
++	.load_buffer = &load_buffer,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_vsf.c b/libr/bin/p/bin_vsf.c
+index 693b16010887f..3ebf37005477e 100644
+--- a/libr/bin/p/bin_vsf.c
++++ b/libr/bin/p/bin_vsf.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL3 - 2015 - riq */
++/* radare - LGPL3 - 2015-2019 - riq */
+ 
+ /* VICE Snapshot File loader: http://vice-emu.sourceforge.net/ */
+ 
+@@ -6,7 +6,7 @@
+ #include "vsf/vsf_specs.h"
+ 
+ static const char VICE_MAGIC[] = "VICE Snapshot File\032";
+-static const int VICE_MAGIC_LEN = sizeof(VICE_MAGIC)-1;
++static const int VICE_MAGIC_LEN = sizeof (VICE_MAGIC) - 1;
+ static const char VICE_MAINCPU[] = "MAINCPU";
+ static const char VICE_C64MEM[] = "C64MEM";
+ static const char VICE_C64ROM[] = "C64ROM";
+@@ -25,24 +25,24 @@ static const struct {
+ static const int MACHINES_MAX = sizeof(_machines) / sizeof(_machines[0]);
+ 
+ static Sdb* get_sdb (RBinFile *bf) {
+-	if (!bf || !bf->o || !bf->o->bin_obj) {
+-		return NULL;
+-	}
++	r_return_val_if_fail (bf && bf->o && bf->o->bin_obj, NULL);
+ 	struct r_bin_vsf_obj* bin = (struct r_bin_vsf_obj*) bf->o->bin_obj;
+ 	return bin->kv;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (!buf || length < VICE_MAGIC_LEN) {
+-		return false;
++static bool check_buffer(RBuffer *b) {
++	ut8 magic[VICE_MAGIC_LEN];
++	if (r_buf_read_at (b, 0, magic, VICE_MAGIC_LEN) == VICE_MAGIC_LEN) {
++		return !memcmp (magic, VICE_MAGIC, VICE_MAGIC_LEN);
+ 	}
+-	return (!memcmp (buf, VICE_MAGIC, VICE_MAGIC_LEN));
++	return false;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
++// XXX b vs bf->buf
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb) {
+ 	ut64 offset = 0;
+ 	struct r_bin_vsf_obj* res = NULL;
+-	if (check_bytes (buf, sz)) {
++	if (check_buffer (bf->buf)) {
+ 		int i = 0;
+ 		if (!(res = R_NEW0 (struct r_bin_vsf_obj))) {
+ 		    return false;
+@@ -75,6 +75,7 @@ static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut
+ 		}
+ 		// read all VSF modules
+ 		offset = sizeof (struct vsf_hdr);
++		ut64 sz = r_buf_size (bf->buf);
+ 		while (offset < sz) {
+ 			struct vsf_module module;
+ 			int read = r_buf_fread_at (bf->buf, offset, (ut8*)&module, "16ccci", 1);
+@@ -504,11 +505,10 @@ static RList* symbols(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	struct r_bin_vsf_obj *obj = (struct r_bin_vsf_obj *)bf->o->bin_obj;
+ 	free (obj->maincpu);
+ 	free (obj);
+-	return true;
+ }
+ 
+ static RList* entries(RBinFile *bf) {
+@@ -547,8 +547,8 @@ RBinPlugin r_bin_plugin_vsf = {
+ 	.desc = "VICE Snapshot File",
+ 	.license = "LGPL3",
+ 	.get_sdb = &get_sdb,
+-	.load_bytes = &load_bytes,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.entries = &entries,
+ 	.sections = sections,
+ 	.symbols = &symbols,
+diff --git a/libr/bin/p/bin_wasm.c b/libr/bin/p/bin_wasm.c
+index d307e5e862ddf..248ff3de3d870 100644
+--- a/libr/bin/p/bin_wasm.c
++++ b/libr/bin/p/bin_wasm.c
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2017 - pancake, cgvwzq */
++/* radare2 - LGPL - Copyright 2017-2019 - pancake, cgvwzq */
+ 
+ // http://webassembly.org/docs/binary-encoding/#module-structure
+ 
+@@ -9,13 +9,9 @@
+ 
+ #include "wasm/wasm.h"
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	return (buf && length >= 4 && !memcmp (buf, R_BIN_WASM_MAGIC_BYTES, 4));
+-}
+-
+-static bool check_bytes_buf(RBuffer* rbuf) {
++static bool check_buffer(RBuffer* rbuf) {
+ 	ut8 buf[4] = {0};
+-	return rbuf && r_buf_read (rbuf, buf, 4) == 4 && !memcmp (buf, R_BIN_WASM_MAGIC_BYTES, 4);
++	return rbuf && r_buf_read_at (rbuf, 0, buf, 4) == 4 && !memcmp (buf, R_BIN_WASM_MAGIC_BYTES, 4);
+ }
+ 
+ static bool find_symbol(const ut32 *p, const RBinWasmSymbol* q) {
+@@ -29,25 +25,23 @@ static bool find_export(const ut32 *p, const RBinWasmExportEntry* q) {
+ 	return q->index != (*p);
+ }
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	r_return_val_if_fail (bf && buf && r_buf_size (buf) != UT64_MAX, NULL);
+ 
+-	if (!check_bytes_buf (buf)) {
+-		return NULL;
++	if (check_buffer (buf)) {
++		*bin_obj = r_bin_wasm_init (bf, buf);
++		return true;
+ 	}
+-	return r_bin_wasm_init (bf, buf);
++	return false;
+ }
+ 
+ static bool load(RBinFile *bf) {
+ 	r_return_val_if_fail (bf && bf->o, false);
+-
+-	bf->o->bin_obj = load_buffer (bf, bf->buf, bf->o->loadaddr, bf->sdb);
+-	return bf->o->bin_obj != NULL;
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_bin_wasm_destroy (bf);
+-	return true;
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+@@ -333,7 +327,7 @@ RBinPlugin r_bin_plugin_wasm = {
+ 	.load_buffer = &load_buffer,
+ 	.size = &size,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_write_elf.c b/libr/bin/p/bin_write_elf.c
+index 2a657957c3121..92e8f90099e19 100644
+--- a/libr/bin/p/bin_write_elf.c
++++ b/libr/bin/p/bin_write_elf.c
+@@ -1,4 +1,5 @@
+-/* radare - LGPL - Copyright 2009-2018 - pancake, nibble */
++/* radare - LGPL - Copyright 2009-2019 - pancake, nibble */
++
+ #include "bin_write_elf.inc"
+ 
+ RBinWrite r_bin_write_elf = {
+diff --git a/libr/bin/p/bin_write_elf.inc b/libr/bin/p/bin_write_elf.inc
+index 2a40173e01aa2..a6f0027c0bcbe 100644
+--- a/libr/bin/p/bin_write_elf.inc
++++ b/libr/bin/p/bin_write_elf.inc
+@@ -1,41 +1,21 @@
+-/* radare - LGPL - Copyright 2009-2018 - pancake, nibble */
++/* radare - LGPL - Copyright 2009-2019 - pancake */
+ 
+ #include <r_types.h>
+ #include <r_bin.h>
+ #include "elf/elf.h"
+ 
+ static ut64 scn_resize(RBinFile *bf, const char *name, ut64 size) {
+-	struct Elf_(r_bin_elf_obj_t) *obj = bf->o->bin_obj;
+-	int ret = Elf_(r_bin_elf_resize_section) (bf->o->bin_obj, name, size);
+-	r_buf_free (bf->buf);
+-	bf->buf = obj->b;
+-	obj->b = NULL;
+-	return ret;
++	return Elf_(r_bin_elf_resize_section) (bf, name, size);
+ }
+ 
+ static bool scn_perms(RBinFile *bf, const char *name, int perms) {
+-	struct Elf_(r_bin_elf_obj_t) *obj = bf->o->bin_obj;
+-	int ret = Elf_(r_bin_elf_section_perms) (bf->o->bin_obj, name, perms);
+-	r_buf_free (bf->buf);
+-	bf->buf = obj->b;
+-	obj->b = NULL;
+-	return ret;
++	return Elf_(r_bin_elf_section_perms) (bf->o->bin_obj, name, perms);
+ }
+ 
+ static int rpath_del(RBinFile *bf) {
+-	struct Elf_(r_bin_elf_obj_t) *obj = bf->o->bin_obj;
+-	int ret = Elf_(r_bin_elf_del_rpath) (bf->o->bin_obj);
+-	r_buf_free (bf->buf);
+-	bf->buf = obj->b;
+-	obj->b = NULL;
+-	return ret;
++	return Elf_(r_bin_elf_del_rpath) (bf->o->bin_obj);
+ }
+ 
+ static bool chentry(RBinFile *bf, ut64 addr) {
+-	struct Elf_(r_bin_elf_obj_t) *obj = bf->o->bin_obj;
+-	int ret = Elf_(r_bin_elf_entry_write) (bf->o->bin_obj, addr);
+-	r_buf_free (bf->buf);
+-	bf->buf = obj->b;
+-	obj->b = NULL;
+-	return ret;
++	return Elf_(r_bin_elf_entry_write) (bf->o->bin_obj, addr);
+ }
+diff --git a/libr/bin/p/bin_write_pe.c b/libr/bin/p/bin_write_pe.c
+index e4f67b375accc..aab5fc35e0876 100644
+--- a/libr/bin/p/bin_write_pe.c
++++ b/libr/bin/p/bin_write_pe.c
+@@ -1,16 +1,11 @@
+-/* radare - LGPL - Copyright 2009-2017 - pancake, nibble */
++/* radare - LGPL - Copyright 2009-2019 - pancake, nibble */
+ 
+ #include <r_types.h>
+ #include <r_bin.h>
+ #include "pe/pe.h"
+ 
+ static bool scn_perms(RBinFile *bf, const char *name, int perms) {
+-	struct PE_(r_bin_pe_obj_t) *obj = bf->o->bin_obj;
+-	bool ret = PE_(r_bin_pe_section_perms) (bf->o->bin_obj, name, perms);
+-	r_buf_free (bf->buf);
+-	bf->buf = obj->b;
+-	obj->b = NULL;
+-	return ret;
++	return PE_(r_bin_pe_section_perms) (bf, name, perms);
+ }
+ 
+ #if !R_BIN_PE64
+diff --git a/libr/bin/p/bin_xbe.c b/libr/bin/p/bin_xbe.c
+index 15c16f7cc3fb0..5422967435757 100644
+--- a/libr/bin/p/bin_xbe.c
++++ b/libr/bin/p/bin_xbe.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - 2014-2017 - thatlemon@gmail.com, pancake */
++/* radare - LGPL - 2014-2019 - thatlemon@gmail.com, pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -11,15 +11,16 @@ static const char *kt_name[] = {
+ #include "../format/xbe/kernel.h"
+ };
+ 
+-static bool check_bytes(const ut8 *buf, ut64 size) {
+-	xbe_header *header = (xbe_header *) buf;
+-	return (size > sizeof (xbe_header) && header->magic == XBE_MAGIC);
++static bool check_buffer(RBuffer *b) {
++	ut8 magic[4];
++	if (r_buf_read_at (b, 0, magic, sizeof (magic)) == 4) {
++		return !memcmp (magic, "XBEH", 4);
++	}
++	return false;
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
++	r_return_val_if_fail (bf && bf->o, false);
+ 	r_bin_xbe_obj_t *obj = NULL;
+ 	const ut8 *bytes = r_buf_data (bf->buf, NULL);
+ 	bf->o->bin_obj = malloc (sizeof (r_bin_plugin_xbe));
+@@ -44,21 +45,18 @@ static bool load(RBinFile *bf) {
+ 	return false;
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	R_FREE (bf->o->bin_obj);
+ 	r_buf_free (bf->buf);
+ 	bf->buf = NULL;
+-	return true;
+ }
+ 
+ static RBinAddr *binsym(RBinFile *bf, int type) {
+-	RBinAddr *ret;
+-	r_bin_xbe_obj_t *obj;
+ 	if (!bf || !bf->buf || type != R_BIN_SYM_MAIN) {
+ 		return NULL;
+ 	}
+-	obj = bf->o->bin_obj;
+-	ret = R_NEW0 (RBinAddr);
++	r_bin_xbe_obj_t *obj = bf->o->bin_obj;
++	RBinAddr *ret = R_NEW0 (RBinAddr);
+ 	if (!ret) {
+ 		return NULL;
+ 	}
+@@ -362,7 +360,7 @@ RBinPlugin r_bin_plugin_xbe = {
+ 	.license = "LGPL3",
+ 	.load = &load,
+ 	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.binsym = &binsym,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_xnu_kernelcache.c b/libr/bin/p/bin_xnu_kernelcache.c
+index fac964edeb9a6..bc4b4732ef0cd 100644
+--- a/libr/bin/p/bin_xnu_kernelcache.c
++++ b/libr/bin/p/bin_xnu_kernelcache.c
+@@ -164,13 +164,13 @@ static RBinAddr *newEntry(ut64 haddr, ut64 vaddr, int type);
+ 
+ static void r_kernel_cache_free(RKernelCacheObj *obj);
+ 
+-static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	RBuffer *fbuf = r_buf_ref (buf);
+ 	struct MACH0_(opts_t) opts;
+ 	MACH0_(opts_set_default) (&opts, bf);
+ 	struct MACH0_(obj_t) *main_mach0 = MACH0_(new_buf) (fbuf, &opts);
+ 	if (!main_mach0) {
+-		return NULL;
++		return false;
+ 	}
+ 
+ 	RRebaseInfo *rebase_info = r_rebase_info_new_from_mach0 (fbuf, main_mach0);
+@@ -216,13 +216,13 @@ static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	}
+ 
+ 	obj->kexts = r_kext_index_new (kexts);
+-
+-	return obj;
++	*bin_obj = obj;
++	return true;
+ 
+ beach:
+ 	r_buf_free (fbuf);
+ 	MACH0_(mach0_free) (main_mach0);
+-	return NULL;
++	return false;
+ }
+ 
+ static RPrelinkRange *get_prelink_info_range_from_mach0(struct MACH0_(obj_t) *mach0) {
+@@ -860,20 +860,17 @@ static RBinAddr *newEntry(ut64 haddr, ut64 vaddr, int type) {
+ 	return ptr;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (buf && length > 4) {
+-		if (memcmp (buf, "\xcf\xfa\xed\xfe", 4)) {
+-			return false;
++static bool check_buffer(RBuffer *b) {
++	if (r_buf_size (b) > 4) {
++		ut8 buf[4];
++		r_buf_read_at (b, 0, buf, sizeof (buf));
++		if (!memcmp (buf, "\xcf\xfa\xed\xfe", 4)) {
++			return is_kernelcache_buffer (b);
+ 		}
+-		return is_kernelcache (buf, length);
+ 	}
+ 	return false;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
+-	return (bool) check_bytes (buf, sz);
+-}
+-
+ static RList *sections(RBinFile *bf) {
+ 	RList *ret = NULL;
+ 	RBinObject *obj = bf ? bf->o : NULL;
+@@ -1622,9 +1619,8 @@ static ut64 baddr(RBinFile *bf) {
+ 	return MACH0_(get_baddr)(obj->mach0);
+ }
+ 
+-static int destroy(RBinFile *bf) {
++static void destroy(RBinFile *bf) {
+ 	r_kernel_cache_free ((RKernelCacheObj*) bf->o->bin_obj);
+-	return true;
+ }
+ 
+ static void r_kernel_cache_free(RKernelCacheObj *obj) {
+@@ -1944,13 +1940,12 @@ RBinPlugin r_bin_plugin_xnu_kernelcache = {
+ 	.desc = "kernelcache bin plugin",
+ 	.license = "LGPL3",
+ 	.destroy = &destroy,
+-	.load_bytes = &load_bytes,
+ 	.load_buffer = &load_buffer,
+ 	.entries = &entries,
+ 	.baddr = &baddr,
+ 	.symbols = &symbols,
+ 	.sections = &sections,
+-	.check_bytes = &check_bytes,
++	.check_buffer = &check_buffer,
+ 	.info = &info
+ };
+ 
+diff --git a/libr/bin/p/bin_xtr_dyldcache.c b/libr/bin/p/bin_xtr_dyldcache.c
+index 74ee9acc833d6..eee035e1d2dc5 100644
+--- a/libr/bin/p/bin_xtr_dyldcache.c
++++ b/libr/bin/p/bin_xtr_dyldcache.c
+@@ -11,7 +11,6 @@ static RBinXtrData * extract(RBin *bin, int idx);
+ static RList * extractall(RBin *bin);
+ static RBinXtrData * oneshot(RBin *bin, const ut8 *buf, ut64 size, int idx);
+ static RList * oneshotall(RBin *bin, const ut8 *buf, ut64 size);
+-static int free_xtr (void *xtr_obj);
+ 
+ static bool check_buffer(RBuffer *buf) {
+ 	ut8 b[4] = {0};
+@@ -19,14 +18,12 @@ static bool check_buffer(RBuffer *buf) {
+ 	return !memcmp (buf, "dyld", 4);
+ }
+ 
+-// TODO: destroy must be void?
+-static int destroy(RBin *bin) {
+-	return free_xtr (bin->cur->xtr_obj);
++static void free_xtr(void *xtr_obj) {
++	r_bin_dyldcache_free ((struct r_bin_dyldcache_obj_t*)xtr_obj);
+ }
+ 
+-static int free_xtr(void *xtr_obj) {
+-	r_bin_dyldcache_free ((struct r_bin_dyldcache_obj_t*)xtr_obj);
+-	return true;
++static void destroy(RBin *bin) {
++	free_xtr (bin->cur->xtr_obj);
+ }
+ 
+ static bool load(RBin *bin) {
+@@ -85,7 +82,7 @@ static RBinXtrData *extract(RBin *bin, int idx) {
+ 			free (lib);
+ 			return NULL;
+ 		}
+-		hdr = MACH0_(get_hdr_from_bytes) (lib->b);
++		hdr = MACH0_(get_hdr_from_buffer) (lib->b);
+ 		if (!hdr) {
+ 			free (lib);
+ 			R_FREE (metadata);
+@@ -128,7 +125,7 @@ static RBinXtrData *oneshot(RBin *bin, const ut8* buf, ut64 size, int idx) {
+ 		free (lib);
+ 		return NULL;
+ 	}
+-	hdr = MACH0_(get_hdr_from_bytes) (lib->b);
++	hdr = MACH0_(get_hdr_from_buffer) (lib->b);
+ 	if (!hdr) {
+ 		free (lib);
+ 		free (metadata);
+diff --git a/libr/bin/p/bin_xtr_fatmach0.c b/libr/bin/p/bin_xtr_fatmach0.c
+index eda0ceaaf55f9..baa00c8e19b39 100644
+--- a/libr/bin/p/bin_xtr_fatmach0.c
++++ b/libr/bin/p/bin_xtr_fatmach0.c
+@@ -9,9 +9,6 @@
+ 
+ static RBinXtrData * extract(RBin *bin, int idx);
+ static RList * extractall(RBin *bin);
+-static RBinXtrData * oneshot(RBin *bin, const ut8 *buf, ut64 size, int idx);
+-static RList * oneshotall(RBin *bin, const ut8 *buf, ut64 size );
+-static int free_xtr (void *xtr_obj) ;
+ 
+ static bool checkHeader(RBuffer *b) {
+ 	ut8 buf[4];
+@@ -39,14 +36,12 @@ static bool check_buffer (RBuffer *buf) {
+ 	return checkHeader (buf);
+ }
+ 
+-// TODO: destroy must be void?
+-static int destroy(RBin *bin) {
+-	return free_xtr (bin->cur->xtr_obj);
++static void free_xtr (void *xtr_obj) {
++	r_bin_fatmach0_free ((struct r_bin_fatmach0_obj_t*)xtr_obj);
+ }
+ 
+-static int free_xtr (void *xtr_obj) {
+-	r_bin_fatmach0_free ((struct r_bin_fatmach0_obj_t*)xtr_obj);
+-	return true;
++static void destroy(RBin *bin) {
++	free_xtr (bin->cur->xtr_obj);
+ }
+ 
+ static bool load(RBin *bin) {
+@@ -67,16 +62,13 @@ static inline void fill_metadata_info_from_hdr(RBinXtrMetadata *meta, struct MAC
+ 	meta->xtr_type = "fat";
+ }
+ 
+-static RBinXtrData * extract(RBin* bin, int idx) {
++// XXX deprecate
++static RBinXtrData *extract(RBin* bin, int idx) {
+ 	int narch;
+-	RBinXtrData * res = NULL;
+ 	struct r_bin_fatmach0_obj_t *fb = bin->cur->xtr_obj;
+-	struct r_bin_fatmach0_arch_t *arch;
+-	struct MACH0_(mach_header) *hdr = NULL;
+-
+-	arch = r_bin_fatmach0_extract (fb, idx, &narch);
++	struct r_bin_fatmach0_arch_t *arch = r_bin_fatmach0_extract (fb, idx, &narch);
+ 	if (!arch) {
+-		return res;
++		return NULL;
+ 	}
+ 	RBinXtrMetadata *metadata = R_NEW0 (RBinXtrMetadata);
+ 	if (!metadata) {
+@@ -84,7 +76,7 @@ static RBinXtrData * extract(RBin* bin, int idx) {
+ 		free (arch);
+ 		return NULL;
+ 	}
+-	hdr = MACH0_(get_hdr_from_bytes) (arch->b);
++	struct MACH0_(mach_header) *hdr = MACH0_(get_hdr_from_buffer) (arch->b);
+ 	if (!hdr) {
+ 		free (metadata);
+ 		free (arch);
+@@ -92,99 +84,60 @@ static RBinXtrData * extract(RBin* bin, int idx) {
+ 		return NULL;
+ 	}
+ 	fill_metadata_info_from_hdr (metadata, hdr);
+-	res = r_bin_xtrdata_new (arch->b, arch->offset, arch->size,
+-		narch, metadata);
++	RBinXtrData * res = r_bin_xtrdata_new (arch->b, arch->offset, arch->size, narch, metadata);
+ 	r_buf_free (arch->b);
+ 	free (arch);
+ 	free (hdr);
+ 	return res;
+ }
+ 
+-static RBinXtrData * oneshot(RBin *bin, const ut8 *buf, ut64 size, int idx) {
+-	struct r_bin_fatmach0_obj_t *fb;
+-	struct r_bin_fatmach0_arch_t *arch;
+-	RBinXtrData *res = NULL;
+-	int narch;
+-	struct MACH0_(mach_header) *hdr;
+-
++static RBinXtrData *oneshot_buffer(RBin *bin, RBuffer *b, int idx) {
+ 	r_return_val_if_fail (bin && bin->cur, NULL);
+ 
+ 	if (!bin->cur->xtr_obj) {
+-		bin->cur->xtr_obj = r_bin_fatmach0_from_bytes_new (buf, size);
+-	}
+-
+-	fb = bin->cur->xtr_obj;
+-	arch = r_bin_fatmach0_extract (fb, idx, &narch);
+-	if (!arch) {
+-		return res;
+-	}
+-
+-	RBinXtrMetadata *metadata = R_NEW0 (RBinXtrMetadata);
+-	if (!metadata) {
+-		free (arch);
+-		return NULL;
++		bin->cur->xtr_obj = r_bin_fatmach0_from_buffer_new (b);
+ 	}
+-	hdr = MACH0_(get_hdr_from_bytes) (arch->b);
+-	if (!hdr) {
++	int narch;
++	struct r_bin_fatmach0_obj_t *fb = bin->cur->xtr_obj;
++	struct r_bin_fatmach0_arch_t *arch = r_bin_fatmach0_extract (fb, idx, &narch);
++	if (arch) {
++		RBinXtrMetadata *metadata = R_NEW0 (RBinXtrMetadata);
++		if (metadata) {
++			struct MACH0_(mach_header) *hdr = MACH0_(get_hdr_from_buffer) (arch->b);
++			if (hdr) {
++				fill_metadata_info_from_hdr (metadata, hdr);
++				RBinXtrData *res = r_bin_xtrdata_new (arch->b, arch->offset, arch->size, narch, metadata);
++				r_buf_free (arch->b);
++				free (arch);
++				free (hdr);
++				return res;
++			}
++			free (metadata);
++		}
+ 		free (arch);
+-		free (metadata);
+-		return NULL;
+ 	}
+-	fill_metadata_info_from_hdr (metadata, hdr);
+-	res = r_bin_xtrdata_new (arch->b, arch->offset, arch->size, narch, metadata);
+-	r_buf_free (arch->b);
+-	free (arch);
+-	free (hdr);
+-	return res;
++	return NULL;
+ }
+ 
+-static RList * extractall(RBin *bin) {
+-	RList *res = NULL;
+-	int narch, i = 0;
+-	RBinXtrData *data = NULL;
+-
+-	data = extract (bin, i);
+-	if (!data) {
+-		return res;
+-	}
+-
+-	// XXX - how do we validate a valid narch?
+-	narch = data->file_count;
+-	res = r_list_newf (r_bin_xtrdata_free);
+-	if (!res) {
+-		r_bin_xtrdata_free (data);
+-		return NULL;
+-	}
+-	r_list_append (res, data);
+-	for (i = 1; data && i < narch; i++) {
+-		data = extract (bin, i);
++static RList * oneshotall_buffer(RBin *bin, RBuffer *b) {
++	RBinXtrData *data = oneshot_buffer (bin, b, 0);
++	if (data) {
++		// XXX - how do we validate a valid narch?
++		int  narch = data->file_count;
++		RList *res = r_list_newf (r_bin_xtrdata_free);
++		if (!res) {
++			r_bin_xtrdata_free (data);
++			return NULL;
++		}
+ 		r_list_append (res, data);
+-	}
+-	return res;
+-}
+-
+-static RList * oneshotall(RBin *bin, const ut8 *buf, ut64 size) {
+-	RList *res = NULL;
+-	int narch, i = 0;
+-	RBinXtrData *data = oneshot (bin, buf, size, i);
+-
+-	if (!data) {
++		int i = 0;
++		for (i = 1; data && i < narch; i++) {
++			data = oneshot_buffer (bin, b, i);
++			r_list_append (res, data);
++		}
+ 		return res;
+ 	}
+-	// XXX - how do we validate a valid narch?
+-	narch = data->file_count;
+-	res = r_list_newf (r_bin_xtrdata_free);
+-	if (!res) {
+-		r_bin_xtrdata_free (data);
+-		return NULL;
+-	}
+-	r_list_append (res, data);
+-	for (i = 1; data && i < narch; i++) {
+-		data = oneshot (bin, buf, size, i);
+-		r_list_append (res, data);
+-	}
+-
+-	return res;
++	return NULL;
+ }
+ 
+ RBinXtrPlugin r_bin_xtr_plugin_xtr_fatmach0 = {
+@@ -194,10 +147,10 @@ RBinXtrPlugin r_bin_xtr_plugin_xtr_fatmach0 = {
+ 	.load = &load,
+ 	.size = &size,
+ 	.extract = &extract,
+-	.extractall = &extractall,
++	// DEPRECATE .extractall = &extractall,
+ 	.destroy = &destroy,
+-	.extract_from_bytes = &oneshot,
+-	.extractall_from_bytes = &oneshotall,
++	.extract_from_buffer = &oneshot_buffer,
++	.extractall_from_buffer = &oneshotall_buffer,
+ 	.free_xtr = &free_xtr,
+ 	.check_buffer = check_buffer,
+ };
+diff --git a/libr/bin/p/bin_xtr_pemixed.c b/libr/bin/p/bin_xtr_pemixed.c
+index c7d0128b449f0..8b341da1b0a56 100644
+--- a/libr/bin/p/bin_xtr_pemixed.c
++++ b/libr/bin/p/bin_xtr_pemixed.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2018 - JohnPeng47 */
++/* radare - LGPL - Copyright 2018-2019 - JohnPeng47 */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -7,21 +7,17 @@
+ #include "pe/pemixed.h"
+ 
+ static RList * oneshotall(RBin *bin, const ut8 *buf, ut64 size);
+-static bool check_bytes(const ut8 *bytes, ut64 sz);
+ static RBinXtrData * oneshot(RBin *bin, const ut8 *buf, ut64 size, int subbin_type);
+-static int destroy(RBin *bin);
+-static int free_xtr (void *xtr_obj);
+ 
+-static bool check_buffer(RBuffer *b) {
+-	return false;
++static void free_xtr (void *xtr_obj) {
++	r_bin_pemixed_free ((struct r_bin_pemixed_obj_t*) xtr_obj);
++}
++
++static void destroy(RBin *bin) {
++	free_xtr (bin->cur->xtr_obj);
+ }
+ 
+-//copied from bin_pe
+-//another check is used later to check for .NET only code
+-static bool check_bytes(const ut8 *bytes, ut64 sz) {
+-	// XXX pemixed is always loaded because it uses
+-	// XXX the same signature for fat and non-fat
+-	// XXX so we need to make that action implicit
++static bool check_buffer(RBuffer *b) {
+ 	return false;
+ #if 0
+ 	if (!bytes) {
+@@ -50,6 +46,7 @@ static bool check_bytes(const ut8 *bytes, ut64 sz) {
+ #endif
+ }
+ 
++// TODO RBufferify
+ static RList * oneshotall(RBin *bin, const ut8 *buf, ut64 size) {
+ 	//extract dos componenent first
+ 	RBinXtrData *data = oneshot (bin, buf, size, SUB_BIN_DOS);
+@@ -83,45 +80,28 @@ static void fill_metadata_info_from_hdr(RBinXtrMetadata *meta, void *foo) {// st
+ 	//strcpy (meta->xtr_type, "net");
+ }
+ 
++// XXX: ut8* should be RBuffer *
+ static RBinXtrData * oneshot(RBin *bin, const ut8 *buf, ut64 size, int sub_bin_type) {
+-	struct r_bin_pemixed_obj_t* fb;
+-	struct PE_(r_bin_pe_obj_t)* pe;
+-
+-	if (!bin || !bin->cur) {
+-		return NULL;
+-	}
++	r_return_val_if_fail (bin && bin->cur && buf, false);
+ 
+-	if (!bin->cur->xtr_obj){
+-		bin->cur->xtr_obj = r_bin_pemixed_from_bytes_new(buf, size);
++	if (!bin->cur->xtr_obj) {
++		bin->cur->xtr_obj = r_bin_pemixed_from_bytes_new (buf, size);
+ 	}
+ 
+-	fb = bin->cur->xtr_obj;
+-
+-	//this function is prolly not nessescary
+-	pe = r_bin_pemixed_extract (fb, sub_bin_type);
+-
+-	if (!pe){
++	struct r_bin_pemixed_obj_t* fb = bin->cur->xtr_obj;
++	// this function is prolly not nessescary
++	struct PE_(r_bin_pe_obj_t)* pe = r_bin_pemixed_extract (fb, sub_bin_type);
++	if (!pe) {
+ 		return NULL;
+ 	}
+-
+ 	RBinXtrMetadata *metadata = R_NEW0 (RBinXtrMetadata);
+ 	if (!metadata) {
+ 		return NULL;
+ 	}
+-
+ 	fill_metadata_info_from_hdr (metadata, pe);
+ 	return r_bin_xtrdata_new (pe->b, 0, pe->size, 3, metadata);
+ }
+ 
+-static int destroy(RBin *bin) {
+-	return free_xtr (bin->cur->xtr_obj);
+-}
+-
+-static int free_xtr (void *xtr_obj) {
+-	r_bin_pemixed_free ((struct r_bin_pemixed_obj_t*) xtr_obj);
+-	return true;
+-}
+-
+ RBinXtrPlugin r_bin_xtr_plugin_xtr_pemixed = {
+ 	.name = "xtr.pemixed",
+ 	.desc = "Extract sub-binaries in PE files",
+diff --git a/libr/bin/p/bin_z64.c b/libr/bin/p/bin_z64.c
+index cbca3c52db7f6..a8198e72653b9 100644
+--- a/libr/bin/p/bin_z64.c
++++ b/libr/bin/p/bin_z64.c
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL 3 - Copyright 2018 - lowlyw */
++/* radare2 - LGPL 3 - Copyright 2018-2019 - lowlyw */
+ 
+ /*
+  * info comes from here.
+@@ -69,16 +69,19 @@ static ut64 baddr(RBinFile *bf) {
+ 	return (ut64) r_read_be32(&n64_header.BootAddress);
+ }
+ 
+-static bool check_bytes (const ut8 *buf, ut64 length) {
+-	ut32 magic = 0x80371240;
+-	if (length < N64_ROM_START) {
++static bool check_buffer(RBuffer *b) {
++	ut8 magic[4];
++	if (r_buf_size (b) < N64_ROM_START) {
+ 		return false;
+ 	}
+-	return magic == r_read_be32 (buf);
++	(void)r_buf_read_at (b, 0, magic, sizeof (magic));
++	return !memcmp (magic, "\x80\x37\x12\x40", 4);
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb) {
+-	if (check_bytes (buf, sz)) {
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb) {
++	if (check_buffer (b)) {
++		ut8 buf[sizeof (N64Header)] = {0};
++		r_buf_read_at (b, 0, buf, sizeof (buf));
+ 		*bin_obj = memcpy (&n64_header, buf, sizeof (N64Header));
+ 		return true;
+ 	}
+@@ -86,17 +89,8 @@ static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-	ut64 sz;
+-	const ut8 *bytes = r_buf_data (bf->buf, &sz);
+-	load_bytes (bf, &bf->o->bin_obj, bytes, sz, bf->o->loadaddr, bf->sdb);
+-	return check_bytes (bytes, sz);
+-}
+-
+-static int destroy(RBinFile *bf) {
+-	return true;
++	r_return_val_if_fail (bf && bf->o, false);
++	return check_buffer (bf->buf);
+ }
+ 
+ static RList *entries(RBinFile *bf) {
+@@ -163,9 +157,8 @@ RBinPlugin r_bin_plugin_z64 = {
+ 	.desc = "Nintendo 64 binaries big endian r_bin plugin",
+ 	.license = "LGPL3",
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
+-	.destroy = &destroy,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.baddr = baddr,
+ 	.boffset = &boffset,
+ 	.entries = &entries,
+diff --git a/libr/bin/p/bin_zimg.c b/libr/bin/p/bin_zimg.c
+index bcb302eec3d7b..0e7711d93adb6 100644
+--- a/libr/bin/p/bin_zimg.c
++++ b/libr/bin/p/bin_zimg.c
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2011-2017 - ninjahacker */
++/* radare - LGPL - Copyright 2011-2019 - ninjahacker */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -7,50 +7,33 @@
+ #include "zimg/zimg.h"
+ 
+ static Sdb *get_sdb(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return NULL;
+-	}
++	r_return_val_if_fail (bf && bf->o, false);
+ 	struct r_bin_zimg_obj_t *bin = (struct r_bin_zimg_obj_t *) bf->o->bin_obj;
+ 	return bin? bin->kv: NULL;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 size, ut64 loadaddr, Sdb *sdb){
+-	void *res = NULL;
+-	RBuffer *tbuf = NULL;
+-	if (!buf || size == 0 || size == UT64_MAX) {
+-		return false;
+-	}
+-	tbuf = r_buf_new_with_bytes (buf, size);
+-	if (!tbuf) {
+-		return false;
+-	}
+-	res = r_bin_zimg_new_buf (tbuf);
+-	r_buf_free (tbuf);
+-	*bin_obj = res;
+-	return true;
++static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr, Sdb *sdb){
++	*bin_obj = r_bin_zimg_new_buf (b);
++	return *bin_obj != NULL;
+ }
+ 
+ static bool load(RBinFile *bf) {
+-	if (!bf || !bf->o) {
+-		return false;
+-	}
+-	ut64 size;
+-	const ut8 *bytes = r_buf_data (bf->buf, &size);
+-	return load_bytes (bf, &bf->o->bin_obj, bytes, size, bf->o->loadaddr, bf->sdb);
++	r_return_val_if_fail (bf && bf->o, false);
++	return load_buffer (bf, &bf->o->bin_obj, bf->buf, bf->o->loadaddr, bf->sdb);
+ }
+ 
+ static ut64 baddr(RBinFile *bf) {
+ 	return 0;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	if (buf && length >= 8) {
++static bool check_buffer(RBuffer *b) {
++	ut8 zimghdr[8];
++	if (r_buf_read_at (b, 0, zimghdr, sizeof (zimghdr))) {
+ 		// Checking ARM zImage kernel
+-		if (!memcmp (buf, "\x00\x00\xa0\xe1\x00\x00\xa0\xe1", 8)) {
++		if (!memcmp (zimghdr, "\x00\x00\xa0\xe1\x00\x00\xa0\xe1", 8)) {
+ 			return true;
+ 		}
+ 	}
+-	// TODO: Add other architectures
+ 	return false;
+ }
+ 
+@@ -81,8 +64,8 @@ RBinPlugin r_bin_plugin_zimg = {
+ 	.license = "LGPL3",
+ 	.get_sdb = &get_sdb,
+ 	.load = &load,
+-	.load_bytes = &load_bytes,
+-	.check_bytes = &check_bytes,
++	.load_buffer = &load_buffer,
++	.check_buffer = &check_buffer,
+ 	.baddr = &baddr,
+ 	.info = &info,
+ };
+diff --git a/libr/core/cbin.c b/libr/core/cbin.c
+index 66a69eb3c7bee..c7ca93cb67bfd 100644
+--- a/libr/core/cbin.c
++++ b/libr/core/cbin.c
+@@ -751,7 +751,8 @@ static int bin_info(RCore *r, int mode, ut64 laddr) {
+ 		}
+ 		pair_bool ("pic", info->has_pi, mode, false);
+ 		pair_bool ("relocs", R_BIN_DBG_RELOCS & info->dbg_info, mode, false);
+-		tmp_buf = sdb_get (obj->kv, "elf.relro", 0);
++		Sdb *sdb_info = sdb_ns (obj->kv, "info", false);
++		tmp_buf = sdb_get (sdb_info, "elf.relro", 0);
+ 		if (tmp_buf) {
+ 			pair_str ("relro", tmp_buf, mode, false);
+ 			free (tmp_buf);
+diff --git a/libr/core/cmd.c b/libr/core/cmd.c
+index e52577509cc88..cdf6943b5403b 100644
+--- a/libr/core/cmd.c
++++ b/libr/core/cmd.c
+@@ -1171,7 +1171,7 @@ static int cmd_kuery(void *data, const char *input) {
+ 		sdb_foreach (s, callback_foreach_kv, NULL);
+ 		break;
+ 	// TODO: add command to list all namespaces // sdb_ns_foreach ?
+-	case 's':
++	case 's': // "ks"
+ 		if (core->http_up) {
+ 			return false;
+ 		}
+@@ -1217,6 +1217,7 @@ static int cmd_kuery(void *data, const char *input) {
+ 			out = sdb_querys (s, NULL, 0, buf);
+ 			if (out) {
+ 				r_cons_println (out);
++				r_cons_flush ();
+ 			}
+ 		}
+ 		r_line_set_hist_callback (core->cons->line, &r_line_hist_cmd_up, &r_line_hist_cmd_down);
+diff --git a/libr/core/cmd_info.c b/libr/core/cmd_info.c
+index 7ead22d2c8aa6..98f100887e161 100644
+--- a/libr/core/cmd_info.c
++++ b/libr/core/cmd_info.c
+@@ -928,7 +928,6 @@ static int cmd_info(void *data, const char *input) {
+ 							if (radare2) {
+ 								r_cons_printf ("ac %s\n", cls->name);
+ 								r_list_foreach (cls->methods, iter2, sym) {
+-									const char *comma = iter2->p? " ": "";
+ 									r_cons_printf ("ac %s %s 0x%08"PFMT64x"\n", cls->name, sym->name, sym->vaddr);
+ 								}
+ 								continue;
+diff --git a/libr/debug/debug.c b/libr/debug/debug.c
+index 5045d4eec4a52..9de67abfbaad6 100644
+--- a/libr/debug/debug.c
++++ b/libr/debug/debug.c
+@@ -952,7 +952,7 @@ R_API int r_debug_step_over(RDebug *dbg, int steps) {
+ 		}
+ 		// Analyze the opcode
+ 		if (!r_anal_op (dbg->anal, &op, pc, buf + (pc - buf_pc), sizeof (buf) - (pc - buf_pc), R_ANAL_OP_MASK_BASIC)) {
+-			eprintf ("Decode error at %"PFMT64x"\n", pc);
++			eprintf ("debug-step-over: Decode error at %"PFMT64x"\n", pc);
+ 			return steps_taken;
+ 		}
+ 		if (op.fail == -1) {
+diff --git a/libr/include/r_bin.h b/libr/include/r_bin.h
+index 33efa3d9f53aa..d6852c2b64696 100644
+--- a/libr/include/r_bin.h
++++ b/libr/include/r_bin.h
+@@ -297,7 +297,7 @@ typedef struct r_bin_file_options_t {
+ 
+ typedef struct r_bin_t {
+ 	const char *file;
+-	RBinFile *cur;
++	RBinFile *cur; // TODO: deprecate
+ 	int narch;
+ 	void *user;
+ 	/* preconfigured values */
+@@ -369,14 +369,16 @@ typedef struct r_bin_xtr_plugin_t {
+ 	bool (*check_buffer)(RBuffer *b);
+ 
+ 	RBinXtrData * (*extract_from_bytes)(RBin *bin, const ut8 *buf, ut64 size, int idx);
++	RBinXtrData * (*extract_from_buffer)(RBin *bin, RBuffer *buf, int idx);
+ 	RList * (*extractall_from_bytes)(RBin *bin, const ut8 *buf, ut64 size);
++	RList * (*extractall_from_buffer)(RBin *bin, RBuffer *buf);
+ 	RBinXtrData * (*extract)(RBin *bin, int idx);
+ 	RList * (*extractall)(RBin *bin);
+ 
+ 	bool (*load)(RBin *bin);
+ 	int (*size)(RBin *bin);
+-	int (*destroy)(RBin *bin);
+-	int (*free_xtr)(void *xtr_obj);
++	void (*destroy)(RBin *bin);
++	void (*free_xtr)(void *xtr_obj);
+ } RBinXtrPlugin;
+ 
+ typedef struct r_bin_ldr_plugin_t {
+@@ -404,9 +406,9 @@ typedef struct r_bin_plugin_t {
+ 	Sdb * (*get_sdb)(RBinFile *obj);
+ 	bool (*load)(RBinFile *arch);
+ 	bool (*load_bytes)(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 loadaddr, Sdb *sdb);
+-	void *(*load_buffer)(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb);
++	bool (*load_buffer)(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb);
+ 	ut64 (*size)(RBinFile *bin); // return ut64 maybe? meh
+-	int (*destroy)(RBinFile *arch);
++	void (*destroy)(RBinFile *arch);
+ 	bool (*check_bytes)(const ut8 *buf, ut64 length);
+ 	bool (*check_buffer)(RBuffer *buf);
+ 	ut64 (*baddr)(RBinFile *arch);
+@@ -588,11 +590,11 @@ typedef struct r_bin_dbginfo_t {
+ } RBinDbgInfo;
+ 
+ typedef struct r_bin_write_t {
+-	ut64 (*scn_resize)(RBinFile *arch, const char *name, ut64 size);
+-	bool (*scn_perms)(RBinFile *arch, const char *name, int perms);
+-	int (*rpath_del)(RBinFile *arch);
+-	bool (*entry)(RBinFile *arch, ut64 addr);
+-	bool (*addlib)(RBinFile *arch, const char *lib);
++	ut64 (*scn_resize)(RBinFile *bf, const char *name, ut64 size);
++	bool (*scn_perms)(RBinFile *bf, const char *name, int perms);
++	int (*rpath_del)(RBinFile *bf);
++	bool (*entry)(RBinFile *bf, ut64 addr);
++	bool (*addlib)(RBinFile *bf, const char *lib);
+ } RBinWrite;
+ 
+ // TODO: deprecate r_bin_is_big_endian
+@@ -650,6 +652,7 @@ R_API int r_bin_list_plugin(RBin *bin, const char *name, int json);
+ R_API RBinPlugin *r_bin_file_cur_plugin(RBinFile *binfile);
+ R_API RBinFile *r_bin_file_find_by_object_id(RBin *bin, ut32 binobj_id);
+ R_API RBinPlugin *r_bin_get_binplugin_by_bytes(RBin *bin, const ut8 *bytes, ut64 sz);
++R_API RBinPlugin *r_bin_get_binplugin_by_buffer(RBin *bin, RBuffer *buf);
+ R_API void r_bin_force_plugin(RBin *bin, const char *pname);
+ 
+ // get/set various bin information
+diff --git a/libr/main/rabin2.c b/libr/main/rabin2.c
+index d34915068454b..f6fd9a7db0370 100644
+--- a/libr/main/rabin2.c
++++ b/libr/main/rabin2.c
+@@ -343,7 +343,6 @@ static int rabin_do_operation(const char *op) {
+ 	if (!(arg = strdup (op))) {
+ 		return false;
+ 	}
+-
+ 	if ((ptr = strchr (arg, '/'))) {
+ 		*ptr++ = 0;
+ 		if ((ptr2 = strchr (ptr, '/'))) {
+@@ -354,6 +353,12 @@ static int rabin_do_operation(const char *op) {
+ 	if (!output) {
+ 		output = file;
+ 	}
++	RBinFile *bf = r_bin_cur (bin);
++	if (bf) {
++		RBuffer *nb = r_buf_new_with_buf (bf->buf);
++		r_buf_free (bf->buf);
++		bf->buf = nb;
++	}
+ 
+ 	switch (arg[0]) {
+ 	case 'e':
+@@ -1133,8 +1138,7 @@ R_API int r_main_rabin2(int argc, char **argv) {
+ 		} else {
+ 			eprintf (
+ 				"Cannot extract bins from '%s'. No supported "
+-				"plugins found!\n",
+-				bin->file);
++				"plugins found!\n", bin->file);
+ 		}
+ 	}
+ 	if (op && action & R_BIN_REQ_OPERATION) {

@@ -1,0 +1,120 @@
+From a903932155a252f150da1d16552d1f2bbf67a9aa Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Fri, 1 Nov 2024 13:11:06 +0100
+Subject: [PATCH] HTTP: fix leak and out-of-bound error on credential
+ extraction (#2611)
+
+---
+ src/lib/ndpi_utils.c                    |   7 ++--
+ src/lib/protocols/http.c                |  46 ++++++++++++------------
+ tests/cfgs/default/pcap/http-pwd.pcapng | Bin 2688 -> 2053 bytes
+ 3 files changed, 28 insertions(+), 25 deletions(-)
+
+diff --git a/src/lib/ndpi_utils.c b/src/lib/ndpi_utils.c
+index 782f85f16b5..a51f6c059f8 100644
+--- a/src/lib/ndpi_utils.c
++++ b/src/lib/ndpi_utils.c
+@@ -929,11 +929,12 @@ static const unsigned char base64_table[65] =
+  * base64_decode - Base64 decode
+  * @src: Data to be decoded
+  * @len: Length of the data to be decoded
+- * @out_len: Pointer to output length variable
++ * @out_len: Pointer to output length variable (NULL character at the end is ignored)
+  * Returns: Allocated buffer of out_len bytes of decoded data,
+  * or %NULL on failure
+  *
+  * Caller is responsible for freeing the returned buffer.
++ * The returned buffer is always NULL terminated
+  */
+ u_char* ndpi_base64_decode(const u_char *src, size_t len, size_t *out_len) {
+   u_char dtable[256], *out, *pos, block[4], tmp;
+@@ -954,8 +955,8 @@ u_char* ndpi_base64_decode(const u_char *src, size_t len, size_t *out_len) {
+   if(count == 0 || count % 4)
+     return NULL;
+ 
+-  olen = count / 4 * 3;
+-  pos = out = ndpi_malloc(olen);
++  olen = count / 4 * 3 + 1; /* out is always NULL terminated */
++  pos = out = ndpi_calloc(1, olen);
+   if(out == NULL)
+     return NULL;
+ 
+diff --git a/src/lib/protocols/http.c b/src/lib/protocols/http.c
+index 1c468165c79..bdbd74f4016 100644
+--- a/src/lib/protocols/http.c
++++ b/src/lib/protocols/http.c
+@@ -1027,29 +1027,31 @@ static void check_content_type_and_change_protocol(struct ndpi_detection_module_
+     NDPI_LOG_DBG2(ndpi_struct, "Authorization line found %.*s\n",
+ 		  packet->authorization_line.len, packet->authorization_line.ptr);
+ 
+-    if((a = ndpi_strncasestr((const char*)packet->authorization_line.ptr,
+-			     "Basic", packet->authorization_line.len))
+-       || (b = ndpi_strncasestr((const char*)packet->authorization_line.ptr,
+-				"Digest", packet->authorization_line.len))) {
+-      size_t content_len;
+-      u_int len = b ? 7 : 6;
+-      u_char *content = ndpi_base64_decode((const u_char*)&packet->authorization_line.ptr[len],
+-					   packet->authorization_line.len - len, &content_len);
+-
+-      if(content != NULL) {
+-	char *double_dot = strchr((char*)content, ':');
+-
+-	if(double_dot) {
+-	  double_dot[0] = '\0';
+-	  flow->http.username = ndpi_strdup((char*)content);
+-	  flow->http.password = ndpi_strdup(&double_dot[1]);
+-	}
+-	
+-	ndpi_free(content);
+-      }
++    if(flow->http.username == NULL && flow->http.password == NULL) {
++      if((a = ndpi_strncasestr((const char*)packet->authorization_line.ptr,
++                               "Basic", packet->authorization_line.len))
++         || (b = ndpi_strncasestr((const char*)packet->authorization_line.ptr,
++                                  "Digest", packet->authorization_line.len))) {
++        size_t content_len;
++        u_int len = b ? 7 : 6;
++        u_char *content = ndpi_base64_decode((const u_char*)&packet->authorization_line.ptr[len],
++                                             packet->authorization_line.len - len, &content_len);
++
++        if(content != NULL) {
++          char *double_dot = strchr((char*)content, ':');
++
++          if(double_dot) {
++            double_dot[0] = '\0';
++            flow->http.username = ndpi_strdup((char*)content);
++            flow->http.password = ndpi_strdup(&double_dot[1]);
++          }
+ 
+-      ndpi_set_risk(flow, NDPI_CLEAR_TEXT_CREDENTIALS,
+-		    "Found credentials in HTTP Auth Line");
++          ndpi_free(content);
++        }
++
++        ndpi_set_risk(flow, NDPI_CLEAR_TEXT_CREDENTIALS,
++                      "Found credentials in HTTP Auth Line");
++      }
+     }
+   }
+ 
+diff --git a/tests/cfgs/default/pcap/http-pwd.pcapng b/tests/cfgs/default/pcap/http-pwd.pcapng
+index 7b926d994c7f84ef6cb49be6462eb107f9bb4a05..71981897102b2482c4b885d4dfe3f1b2eab1622a 100644
+GIT binary patch
+delta 240
+zcmZn=Z52?sa(L51CI%J;1c0!gFIP@i$Yo=gyoXU?vI7(Q<a$O`4v?S)M9>G!u>)}w
+zm>j?yXAtKCr`qIsOj2NhxI8w7%@>$HGl6-@Kpt3{i47v%0}?P{s{qSRfXTjs$~G4O
+zHOsJDF@mMLfxO8D91x2pf;bmA)hEB_kOa$40|_W_LS&CLf;qaAmvRb&Wv_z-E^s;k
+E02Uuhp8x;=
+
+delta 898
+zcmZn_Xb`RE;^pO<z`(%ZYojg22&Df*0TTlUgJVHKPO5^hAv1$ILvCWSf3Sj~sh**Z
+zLQ-jFPKtt&iIat~f`&_CQF&$_kf&#;XQ0Wz!eGSUQkq+koLHcs5uRC;TAYzsl&z^?
+zq6bu<piu^<bq#dWP0dY{jFRfpOw3KpQZ<1#0|Ce(AV(B{IAFlRz{J4Jkdto!Bsmy-
+z^79Ll5|gtzfvVVm^4ttuK*jk*B?`s{1_lfaJR~?2WPAZb6a&!33=A$n%*epUP!FVX
+z@{<#DGV+T{fMQGxQa};~pvZ${Kzc!rNda+y;J7Lq!-Fq}E=*MLkpPLI%l!b$DNHtC
+zWS=-&6|N)#tQn&HA5h6;0Y-(14(t=(OG<#GK&BuoVg3qM;sBTAVTKq0vR>}np$nTM
+z7(X*fGJu59^(q6UfyQf1u4NH}>j#BB2!QnafE3JTsgM8(qU#QT>2_sB=nerz8xVkW
+zJO2RMp3G{+2n;)rIJyDeKzWGo*e0K5lY+Yd*?WNyHENTE*|94KLoy^9hng17!*Gih
+z<4`jlqDF1<Yj&vukPBFWI0xhvAOQJBdZW}uMg|!M=ls&VlGLJNg@U5|vdom!6osTp
+ng%n6i2W1wJ+WwQ@&V$k^h`nor)I}B`8<dPdfECC_1|T~CLyfns
+

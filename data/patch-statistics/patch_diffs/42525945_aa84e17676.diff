@@ -1,0 +1,85 @@
+From 95881ce8241deb2ca70dd35399009bbdfc99cff5 Mon Sep 17 00:00:00 2001
+From: DRC <information@libjpeg-turbo.org>
+Date: Wed, 5 Jul 2023 15:35:21 -0400
+Subject: [PATCH] xform fuzz: Use src subsamp to calc dst buf size
+
+Referring to
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=60379
+there are some specially-crafted malformed JPEG images that, when
+transformed to grayscale, will exceed the worst-case transformed
+grayscale JPEG image size.  This is similar in nature to the issue fixed
+by 655450bbde5d8a5b63447b8e30256f221a0481c7, except that in this case,
+the issue occurs regardless of the amount of metadata in the source
+image.  Also, the tjTransform() function, the
+Java_org_libjpegturbo_turbojpeg_TJTransformer_transform() JNI function,
+and TJBench were behaving correctly in this case, because the TurboJPEG
+API documentation specifies that the source image's subsampling type
+should be used when computing the worst-case transformed JPEG image
+size.  (However, only the Java API documentation specified that.  Oops.
+The C API documentation now does as well.)  The documented usage
+mitigates the issue, and only the transform fuzzer did not adhere to
+that.  Thus, this was an issue with the fuzzer itself rather than an
+issue with the library.
+---
+ doc/html/group___turbo_j_p_e_g.html |  2 +-
+ fuzz/transform.cc                   |  4 ++--
+ turbojpeg.h                         | 15 ++++++++-------
+ 3 files changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/doc/html/group___turbo_j_p_e_g.html b/doc/html/group___turbo_j_p_e_g.html
+index 6e69c4444..f573591db 100644
+--- a/doc/html/group___turbo_j_p_e_g.html
++++ b/doc/html/group___turbo_j_p_e_g.html
+@@ -2664,7 +2664,7 @@ <h2 class="memtitle"><span class="permalink"><a href="#ga9cb8abf4cc91881e04a0329
+     <tr><td class="paramname">dstBufs</td><td>pointer to an array of n byte buffers. <code>dstBufs[i]</code> will receive a JPEG image that has been transformed using the parameters in <code>transforms[i]</code>. TurboJPEG has the ability to reallocate the JPEG destination buffer to accommodate the size of the transformed JPEG image. Thus, you can choose to:<ol type="1">
+ <li>pre-allocate the JPEG destination buffer with an arbitrary size using <a class="el" href="group___turbo_j_p_e_g.html#gaec627dd4c5f30b7a775a7aea3bec5d83" title="Allocate a byte buffer for use with TurboJPEG.">tjAlloc()</a> and let TurboJPEG grow the buffer as needed,</li>
+ <li>set <code>dstBufs[i]</code> to NULL to tell TurboJPEG to allocate the buffer for you, or</li>
+-<li>pre-allocate the buffer to a "worst case" size determined by calling <a class="el" href="group___turbo_j_p_e_g.html#ga67ac12fee79073242cb216e07c9f1f90" title="The maximum size of the buffer (in bytes) required to hold a JPEG image with the given parameters.">tjBufSize()</a> with the transformed or cropped width and height. Under normal circumstances, this should ensure that the buffer never has to be re-allocated. (Setting <a class="el" href="group___turbo_j_p_e_g.html#ga8808d403c68b62aaa58a4c1e58e98963" title="Disable JPEG buffer (re)allocation.">TJFLAG_NOREALLOC</a> guarantees that it won't be.) Note, however, that there are some rare cases (such as transforming images with a large amount of embedded EXIF or ICC profile data) in which the transformed JPEG image will be larger than the worst-case size, and <a class="el" href="group___turbo_j_p_e_g.html#ga8808d403c68b62aaa58a4c1e58e98963" title="Disable JPEG buffer (re)allocation.">TJFLAG_NOREALLOC</a> cannot be used in those cases.</li>
++<li>pre-allocate the buffer to a "worst case" size determined by calling <a class="el" href="group___turbo_j_p_e_g.html#ga67ac12fee79073242cb216e07c9f1f90" title="The maximum size of the buffer (in bytes) required to hold a JPEG image with the given parameters.">tjBufSize()</a> with the transformed or cropped width and height and the level of subsampling used in the source image. Under normal circumstances, this should ensure that the buffer never has to be re-allocated. (Setting <a class="el" href="group___turbo_j_p_e_g.html#ga8808d403c68b62aaa58a4c1e58e98963" title="Disable JPEG buffer (re)allocation.">TJFLAG_NOREALLOC</a> guarantees that it won't be.) Note, however, that there are some rare cases (such as transforming images with a large amount of embedded EXIF or ICC profile data) in which the transformed JPEG image will be larger than the worst-case size, and <a class="el" href="group___turbo_j_p_e_g.html#ga8808d403c68b62aaa58a4c1e58e98963" title="Disable JPEG buffer (re)allocation.">TJFLAG_NOREALLOC</a> cannot be used in those cases.</li>
+ </ol>
+ If you choose option 1, then <code>dstSizes[i]</code> should be set to the size of your pre-allocated buffer. In any case, unless you have set <a class="el" href="group___turbo_j_p_e_g.html#ga8808d403c68b62aaa58a4c1e58e98963" title="Disable JPEG buffer (re)allocation.">TJFLAG_NOREALLOC</a>, you should always check <code>dstBufs[i]</code> upon return from this function, as it may have changed.</td></tr>
+     <tr><td class="paramname">dstSizes</td><td>pointer to an array of n unsigned long variables that will receive the actual sizes (in bytes) of each transformed JPEG image. If <code>dstBufs[i]</code> points to a pre-allocated buffer, then <code>dstSizes[i]</code> should be set to the size of the buffer. Upon return, <code>dstSizes[i]</code> will contain the size of the transformed JPEG image (in bytes.)</td></tr>
+diff --git a/fuzz/transform.cc b/fuzz/transform.cc
+index 2eefd6703..99d1584c2 100644
+--- a/fuzz/transform.cc
++++ b/fuzz/transform.cc
+@@ -98,11 +98,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+   transforms[0].options = TJXOPT_GRAY | TJXOPT_CROP | TJXOPT_COPYNONE;
+   dstBufs[0] =
+     (unsigned char *)malloc(tjBufSize((height + 1) / 2, (width + 1) / 2,
+-                                      TJSAMP_GRAY));
++                                      jpegSubsamp));
+   if (!dstBufs[0])
+     goto bailout;
+ 
+-  maxBufSize = tjBufSize((height + 1) / 2, (width + 1) / 2, TJSAMP_GRAY);
++  maxBufSize = tjBufSize((height + 1) / 2, (width + 1) / 2, jpegSubsamp);
+ 
+   if (tjTransform(handle, data, size, 1, dstBufs, dstSizes, transforms,
+                   TJFLAG_LIMITSCANS | TJFLAG_NOREALLOC) == 0) {
+diff --git a/turbojpeg.h b/turbojpeg.h
+index db8b79c3e..b4b2373a4 100644
+--- a/turbojpeg.h
++++ b/turbojpeg.h
+@@ -1506,13 +1506,14 @@ DLLEXPORT tjhandle tjInitTransform(void);
+  * -# set `dstBufs[i]` to NULL to tell TurboJPEG to allocate the buffer for
+  * you, or
+  * -# pre-allocate the buffer to a "worst case" size determined by calling
+- * #tjBufSize() with the transformed or cropped width and height.  Under normal
+- * circumstances, this should ensure that the buffer never has to be
+- * re-allocated.  (Setting #TJFLAG_NOREALLOC guarantees that it won't be.)
+- * Note, however, that there are some rare cases (such as transforming images
+- * with a large amount of embedded EXIF or ICC profile data) in which the
+- * transformed JPEG image will be larger than the worst-case size, and
+- * #TJFLAG_NOREALLOC cannot be used in those cases.
++ * #tjBufSize() with the transformed or cropped width and height and the level
++ * of subsampling used in the source image.  Under normal circumstances, this
++ * should ensure that the buffer never has to be re-allocated.  (Setting
++ * #TJFLAG_NOREALLOC guarantees that it won't be.)  Note, however, that there
++ * are some rare cases (such as transforming images with a large amount of
++ * embedded EXIF or ICC profile data) in which the transformed JPEG image will
++ * be larger than the worst-case size, and #TJFLAG_NOREALLOC cannot be used in
++ * those cases.
+  * .
+  * If you choose option 1, then `dstSizes[i]` should be set to the size of your
+  * pre-allocated buffer.  In any case, unless you have set #TJFLAG_NOREALLOC,

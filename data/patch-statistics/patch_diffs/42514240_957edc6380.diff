@@ -1,0 +1,281 @@
+From 98ce79a52ca67e0d0b6b2c867c1aa327c6c58240 Mon Sep 17 00:00:00 2001
+From: Julien Voisin <jvoisin@google.com>
+Date: Thu, 13 Oct 2022 14:13:19 +0200
+Subject: [PATCH] Extend the usage of the DONT_FAIL_ON_CRC_ERROR macro
+
+DONT_FAIL_ON_CRC_ERROR is already used in the rar5 support code, so let's make
+use of it in another places as well. This should tremendously help with
+fuzzing.
+---
+ libarchive/archive_read_support_filter_lz4.c  |  6 ++++++
+ libarchive/archive_read_support_filter_lzop.c |  2 ++
+ libarchive/archive_read_support_filter_xz.c   |  2 ++
+ libarchive/archive_read_support_format_7zip.c |  6 ++++++
+ libarchive/archive_read_support_format_cab.c  |  2 ++
+ libarchive/archive_read_support_format_lha.c  |  4 ++++
+ libarchive/archive_read_support_format_rar.c  | 10 ++++++++++
+ libarchive/archive_read_support_format_rar5.c |  2 ++
+ libarchive/archive_read_support_format_xar.c  |  4 ++++
+ 9 files changed, 38 insertions(+)
+
+diff --git a/libarchive/archive_read_support_filter_lz4.c b/libarchive/archive_read_support_filter_lz4.c
+index ae0b08003..1e99542d7 100644
+--- a/libarchive/archive_read_support_filter_lz4.c
++++ b/libarchive/archive_read_support_filter_lz4.c
+@@ -450,7 +450,9 @@ lz4_filter_read_descriptor(struct archive_read_filter *self)
+ 	chsum = (chsum >> 8) & 0xff;
+ 	chsum_verifier = read_buf[descriptor_bytes-1] & 0xff;
+ 	if (chsum != chsum_verifier)
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		goto malformed_error;
++#endif
+ 
+ 	__archive_read_filter_consume(self->upstream, descriptor_bytes);
+ 
+@@ -521,7 +523,9 @@ lz4_filter_read_data_block(struct archive_read_filter *self, const void **p)
+ 		unsigned int chsum_block =
+ 		    archive_le32dec(read_buf + 4 + compressed_size);
+ 		if (chsum != chsum_block)
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			goto malformed_error;
++#endif
+ 	}
+ 
+ 
+@@ -652,10 +656,12 @@ lz4_filter_read_default_stream(struct archive_read_filter *self, const void **p)
+ 			    state->xxh32_state);
+ 			state->xxh32_state = NULL;
+ 			if (checksum != checksum_stream) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 				archive_set_error(&self->archive->archive,
+ 				    ARCHIVE_ERRNO_MISC,
+ 				    "lz4 stream checksum error");
+ 				return (ARCHIVE_FATAL);
++#endif
+ 			}
+ 		} else if (ret > 0)
+ 			__archive_xxhash.XXH32_update(state->xxh32_state,
+diff --git a/libarchive/archive_read_support_filter_lzop.c b/libarchive/archive_read_support_filter_lzop.c
+index afd2d4d0c..4ebdd3bf3 100644
+--- a/libarchive/archive_read_support_filter_lzop.c
++++ b/libarchive/archive_read_support_filter_lzop.c
+@@ -283,7 +283,9 @@ consume_header(struct archive_read_filter *self)
+ 	else
+ 		checksum = adler32(adler32(0, NULL, 0), p, len);
+ 	if (archive_be32dec(p + len) != checksum)
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		goto corrupted;
++#endif
+ 	__archive_read_filter_consume(self->upstream, len + 4);
+ 	if (flags & EXTRA_FIELD) {
+ 		/* Skip extra field */
+diff --git a/libarchive/archive_read_support_filter_xz.c b/libarchive/archive_read_support_filter_xz.c
+index 32ae0be92..e313d39c0 100644
+--- a/libarchive/archive_read_support_filter_xz.c
++++ b/libarchive/archive_read_support_filter_xz.c
+@@ -612,9 +612,11 @@ lzip_tail(struct archive_read_filter *self)
+ 	/* Check the crc32 value of the uncompressed data of the current
+ 	 * member */
+ 	if (state->crc32 != archive_le32dec(f)) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&self->archive->archive, ARCHIVE_ERRNO_MISC,
+ 		    "Lzip: CRC32 error");
+ 		return (ARCHIVE_FAILED);
++#endif
+ 	}
+ 
+ 	/* Check the uncompressed size of the current member */
+diff --git a/libarchive/archive_read_support_format_7zip.c b/libarchive/archive_read_support_format_7zip.c
+index 9142051e3..0ba4bee35 100644
+--- a/libarchive/archive_read_support_format_7zip.c
++++ b/libarchive/archive_read_support_format_7zip.c
+@@ -2857,8 +2857,10 @@ slurp_central_directory(struct archive_read *a, struct _7zip *zip,
+ 	/* CRC check. */
+ 	if (crc32(0, (const unsigned char *)p + 12, 20)
+ 	    != archive_le32dec(p + 8)) {
++#ifdef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, -1, "Header CRC error");
+ 		return (ARCHIVE_FATAL);
++#endif
+ 	}
+ 
+ 	next_header_offset = archive_le64dec(p + 12);
+@@ -2908,8 +2910,10 @@ slurp_central_directory(struct archive_read *a, struct _7zip *zip,
+ 		/* Check the EncodedHeader CRC.*/
+ 		if (r == 0 && zip->header_crc32 != next_header_crc) {
+ 			archive_set_error(&a->archive, -1,
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			    "Damaged 7-Zip archive");
+ 			r = -1;
++#endif
+ 		}
+ 		if (r == 0) {
+ 			if (zip->si.ci.folders[0].digest_defined)
+@@ -2960,9 +2964,11 @@ slurp_central_directory(struct archive_read *a, struct _7zip *zip,
+ 
+ 		/* Check the Header CRC.*/
+ 		if (check_header_crc && zip->header_crc32 != next_header_crc) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			archive_set_error(&a->archive, -1,
+ 			    "Malformed 7-Zip archive");
+ 			return (ARCHIVE_FATAL);
++#endif
+ 		}
+ 		break;
+ 	default:
+diff --git a/libarchive/archive_read_support_format_cab.c b/libarchive/archive_read_support_format_cab.c
+index 433b5600d..ea256cda8 100644
+--- a/libarchive/archive_read_support_format_cab.c
++++ b/libarchive/archive_read_support_format_cab.c
+@@ -1171,12 +1171,14 @@ cab_checksum_finish(struct archive_read *a)
+ 	cfdata->sum_calculated = cab_checksum_cfdata(
+ 	    cfdata->memimage + CFDATA_cbData, l, cfdata->sum_calculated);
+ 	if (cfdata->sum_calculated != cfdata->sum) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Checksum error CFDATA[%d] %" PRIx32 ":%" PRIx32 " in %d bytes",
+ 		    cab->entry_cffolder->cfdata_index -1,
+ 		    cfdata->sum, cfdata->sum_calculated,
+ 		    cfdata->compressed_size);
+ 		return (ARCHIVE_FAILED);
++#endif
+ 	}
+ 	return (ARCHIVE_OK);
+ }
+diff --git a/libarchive/archive_read_support_format_lha.c b/libarchive/archive_read_support_format_lha.c
+index 6d0b6d2e0..bcfd42e1d 100644
+--- a/libarchive/archive_read_support_format_lha.c
++++ b/libarchive/archive_read_support_format_lha.c
+@@ -1039,9 +1039,11 @@ lha_read_file_header_2(struct archive_read *a, struct lha *lha)
+ 	}
+ 
+ 	if (header_crc != lha->header_crc) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "LHa header CRC error");
+ 		return (ARCHIVE_FATAL);
++#endif
+ 	}
+ 	return (err);
+ }
+@@ -1107,9 +1109,11 @@ lha_read_file_header_3(struct archive_read *a, struct lha *lha)
+ 		return (err);
+ 
+ 	if (header_crc != lha->header_crc) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "LHa header CRC error");
+ 		return (ARCHIVE_FATAL);
++#endif
+ 	}
+ 	return (err);
+ invalid:
+diff --git a/libarchive/archive_read_support_format_rar.c b/libarchive/archive_read_support_format_rar.c
+index f9cbe2a88..793e8e985 100644
+--- a/libarchive/archive_read_support_format_rar.c
++++ b/libarchive/archive_read_support_format_rar.c
+@@ -1007,9 +1007,11 @@ archive_read_format_rar_read_header(struct archive_read *a,
+ 
+       crc32_val = crc32(0, (const unsigned char *)p + 2, (unsigned)skip - 2);
+       if ((crc32_val & 0xffff) != archive_le16dec(p)) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+           "Header CRC error");
+         return (ARCHIVE_FATAL);
++#endif
+       }
+       __archive_read_consume(a, skip);
+       break;
+@@ -1065,9 +1067,11 @@ archive_read_format_rar_read_header(struct archive_read *a,
+ 	      skip -= to_read;
+       }
+       if ((crc32_val & 0xffff) != crc32_expected) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 	      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		  "Header CRC error");
+ 	      return (ARCHIVE_FATAL);
++#endif
+       }
+       if (head_type == ENDARC_HEAD)
+ 	      return (ARCHIVE_EOF);
+@@ -1432,9 +1436,11 @@ read_header(struct archive_read *a, struct archive_entry *entry,
+   /* File Header CRC check. */
+   crc32_val = crc32(crc32_val, h, (unsigned)(header_size - 7));
+   if ((crc32_val & 0xffff) != archive_le16dec(rar_header.crc)) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+       "Header CRC error");
+     return (ARCHIVE_FATAL);
++#endif
+   }
+   /* If no CRC error, Go on parsing File Header. */
+   p = h;
+@@ -1952,9 +1958,11 @@ read_data_stored(struct archive_read *a, const void **buff, size_t *size,
+     *size = 0;
+     *offset = rar->offset;
+     if (rar->file_crc != rar->crc_calculated) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                         "File CRC error");
+       return (ARCHIVE_FATAL);
++#endif
+     }
+     rar->entry_eof = 1;
+     return (ARCHIVE_EOF);
+@@ -2045,9 +2053,11 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
+       *size = 0;
+       *offset = rar->offset;
+       if (rar->file_crc != rar->crc_calculated) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                           "File CRC error");
+         return (ARCHIVE_FATAL);
++#endif
+       }
+       rar->entry_eof = 1;
+       return (ARCHIVE_EOF);
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index cc966a51e..38979cbe9 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -2821,11 +2821,13 @@ static int parse_block_header(struct archive_read* a, const uint8_t* p,
+ 	    ^ (uint8_t) (*block_size >> 16);
+ 
+ 	if(calculated_cksum != hdr->block_cksum) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Block checksum error: got 0x%x, expected 0x%x",
+ 		    hdr->block_cksum, calculated_cksum);
+ 
+ 		return ARCHIVE_FATAL;
++#endif
+ 	}
+ 
+ 	return ARCHIVE_OK;
+diff --git a/libarchive/archive_read_support_format_xar.c b/libarchive/archive_read_support_format_xar.c
+index 503ff58b9..ec5b06eda 100644
+--- a/libarchive/archive_read_support_format_xar.c
++++ b/libarchive/archive_read_support_format_xar.c
+@@ -624,7 +624,9 @@ read_toc(struct archive_read *a)
+ 		__archive_read_consume(a, xar->toc_chksum_size);
+ 		xar->offset += xar->toc_chksum_size;
+ 		if (r != ARCHIVE_OK)
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			return (ARCHIVE_FATAL);
++#endif
+ 	}
+ 
+ 	/*
+@@ -827,10 +829,12 @@ xar_read_header(struct archive_read *a, struct archive_entry *entry)
+ 		    xattr->a_sum.val, xattr->a_sum.len,
+ 		    xattr->e_sum.val, xattr->e_sum.len);
+ 		if (r != ARCHIVE_OK) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			archive_set_error(&(a->archive), ARCHIVE_ERRNO_MISC,
+ 			    "Xattr checksum error");
+ 			r = ARCHIVE_WARN;
+ 			break;
++#endif
+ 		}
+ 		if (xattr->name.s == NULL) {
+ 			archive_set_error(&(a->archive), ARCHIVE_ERRNO_MISC,

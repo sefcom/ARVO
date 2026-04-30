@@ -1,0 +1,400 @@
+From 1f8b6ac3c3ffcdc2f3878486602a7336baaf187e Mon Sep 17 00:00:00 2001
+From: Andreas Kling <kling@serenityos.org>
+Date: Tue, 22 Jun 2021 17:16:08 +0200
+Subject: [PATCH] LibJS: Begin implementing GlobalEnvironmentRecord
+
+These represent the outermost scope in the environment record
+hierarchy. The spec says they should be a "composite" of two things:
+
+- An ObjectEnvironmentRecord wrapping the global object
+- A DeclarativeEnvironmentRecord for other declarations
+
+It's not yet clear to me how this should work, so this patch only
+implements the first part, an object record wrapping the global object.
+---
+ .../Libraries/LibJS/Bytecode/Interpreter.cpp  |  4 +-
+ Userland/Libraries/LibJS/CMakeLists.txt       |  1 +
+ Userland/Libraries/LibJS/Forward.h            |  1 +
+ Userland/Libraries/LibJS/Interpreter.cpp      |  5 +-
+ .../LibJS/Runtime/EnvironmentRecord.cpp       |  5 --
+ .../LibJS/Runtime/EnvironmentRecord.h         |  1 -
+ .../LibJS/Runtime/GlobalEnvironmentRecord.cpp | 58 +++++++++++++++++++
+ .../LibJS/Runtime/GlobalEnvironmentRecord.h   | 46 +++++++++++++++
+ .../Libraries/LibJS/Runtime/GlobalObject.cpp  | 24 ++------
+ .../Libraries/LibJS/Runtime/GlobalObject.h    | 12 ++--
+ Userland/Libraries/LibJS/Runtime/Object.h     |  1 +
+ .../LibJS/Runtime/ObjectEnvironmentRecord.h   |  2 +
+ Userland/Libraries/LibJS/Runtime/VM.cpp       | 13 ++---
+ 13 files changed, 130 insertions(+), 43 deletions(-)
+ create mode 100644 Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.cpp
+ create mode 100644 Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.h
+
+diff --git a/Userland/Libraries/LibJS/Bytecode/Interpreter.cpp b/Userland/Libraries/LibJS/Bytecode/Interpreter.cpp
+index 0a9d77240c3780..988a9c16b78538 100644
+--- a/Userland/Libraries/LibJS/Bytecode/Interpreter.cpp
++++ b/Userland/Libraries/LibJS/Bytecode/Interpreter.cpp
+@@ -10,6 +10,7 @@
+ #include <LibJS/Bytecode/Instruction.h>
+ #include <LibJS/Bytecode/Interpreter.h>
+ #include <LibJS/Bytecode/Op.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ 
+ namespace JS::Bytecode {
+@@ -48,7 +49,8 @@ Value Interpreter::run(Executable const& executable, BasicBlock const* entry_poi
+         global_call_frame.this_value = &global_object();
+         static FlyString global_execution_context_name = "(*BC* global execution context)";
+         global_call_frame.function_name = global_execution_context_name;
+-        global_call_frame.lexical_environment = &global_object();
++        global_call_frame.lexical_environment = &global_object().environment_record();
++        global_call_frame.variable_environment = &global_object().environment_record();
+         VERIFY(!vm().exception());
+         // FIXME: How do we know if we're in strict mode? Maybe the Bytecode::Block should know this?
+         // global_call_frame.is_strict_mode = ???;
+diff --git a/Userland/Libraries/LibJS/CMakeLists.txt b/Userland/Libraries/LibJS/CMakeLists.txt
+index ff30f057044d88..8aeb7bbf6343ea 100644
+--- a/Userland/Libraries/LibJS/CMakeLists.txt
++++ b/Userland/Libraries/LibJS/CMakeLists.txt
+@@ -67,6 +67,7 @@ set(SOURCES
+     Runtime/GeneratorFunctionPrototype.cpp
+     Runtime/GeneratorObject.cpp
+     Runtime/GeneratorObjectPrototype.cpp
++    Runtime/GlobalEnvironmentRecord.cpp
+     Runtime/GlobalObject.cpp
+     Runtime/IndexedProperties.cpp
+     Runtime/IteratorOperations.cpp
+diff --git a/Userland/Libraries/LibJS/Forward.h b/Userland/Libraries/LibJS/Forward.h
+index 3af5edad7edfc3..5e1ba35db27b7f 100644
+--- a/Userland/Libraries/LibJS/Forward.h
++++ b/Userland/Libraries/LibJS/Forward.h
+@@ -129,6 +129,7 @@ class Exception;
+ class Expression;
+ class FunctionEnvironmentRecord;
+ class FunctionNode;
++class GlobalEnvironmentRecord;
+ class GlobalObject;
+ class HandleImpl;
+ class Heap;
+diff --git a/Userland/Libraries/LibJS/Interpreter.cpp b/Userland/Libraries/LibJS/Interpreter.cpp
+index df7f4ec42c55a8..b70671b788fbe0 100644
+--- a/Userland/Libraries/LibJS/Interpreter.cpp
++++ b/Userland/Libraries/LibJS/Interpreter.cpp
+@@ -10,6 +10,7 @@
+ #include <LibJS/AST.h>
+ #include <LibJS/Interpreter.h>
+ #include <LibJS/Runtime/FunctionEnvironmentRecord.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ #include <LibJS/Runtime/Object.h>
+ #include <LibJS/Runtime/Reference.h>
+@@ -50,8 +51,8 @@ void Interpreter::run(GlobalObject& global_object, const Program& program)
+     global_call_frame.this_value = &global_object;
+     static FlyString global_execution_context_name = "(global execution context)";
+     global_call_frame.function_name = global_execution_context_name;
+-    global_call_frame.lexical_environment = &global_object;
+-    global_call_frame.variable_environment = &global_object;
++    global_call_frame.lexical_environment = &global_object.environment_record();
++    global_call_frame.variable_environment = &global_object.environment_record();
+     VERIFY(!vm.exception());
+     global_call_frame.is_strict_mode = program.is_strict_mode();
+     vm.push_call_frame(global_call_frame, global_object);
+diff --git a/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.cpp b/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.cpp
+index 5349d84687f7be..165b47792e61fa 100644
+--- a/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.cpp
++++ b/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.cpp
+@@ -15,11 +15,6 @@ EnvironmentRecord::EnvironmentRecord(EnvironmentRecord* outer_environment)
+ {
+ }
+ 
+-EnvironmentRecord::EnvironmentRecord(GlobalObjectTag tag)
+-    : Object(tag)
+-{
+-}
+-
+ void EnvironmentRecord::visit_edges(Visitor& visitor)
+ {
+     Base::visit_edges(visitor);
+diff --git a/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.h b/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.h
+index c0eecf6dca6f99..cb954ec651e06b 100644
+--- a/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.h
++++ b/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.h
+@@ -32,7 +32,6 @@ class EnvironmentRecord : public Object {
+ 
+ protected:
+     explicit EnvironmentRecord(EnvironmentRecord* parent);
+-    explicit EnvironmentRecord(GlobalObjectTag);
+ 
+     virtual void visit_edges(Visitor&) override;
+ 
+diff --git a/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.cpp b/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.cpp
+new file mode 100644
+index 00000000000000..cca3f175fa9a5e
+--- /dev/null
++++ b/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.cpp
+@@ -0,0 +1,58 @@
++/*
++ * Copyright (c) 2020-2021, Andreas Kling <kling@serenityos.org>
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#include <LibJS/AST.h>
++#include <LibJS/Runtime/DeclarativeEnvironmentRecord.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
++#include <LibJS/Runtime/GlobalObject.h>
++#include <LibJS/Runtime/ObjectEnvironmentRecord.h>
++
++namespace JS {
++
++GlobalEnvironmentRecord::GlobalEnvironmentRecord(GlobalObject& global_object)
++    : EnvironmentRecord(nullptr)
++    , m_global_object(global_object)
++{
++    m_object_record = global_object.heap().allocate<ObjectEnvironmentRecord>(global_object, global_object, nullptr);
++    m_declarative_record = global_object.heap().allocate<DeclarativeEnvironmentRecord>(global_object);
++}
++
++void GlobalEnvironmentRecord::visit_edges(Cell::Visitor& visitor)
++{
++    Base::visit_edges(visitor);
++    visitor.visit(m_object_record);
++    visitor.visit(m_declarative_record);
++}
++
++Optional<Variable> GlobalEnvironmentRecord::get_from_environment_record(FlyString const& name) const
++{
++    // FIXME: This should be a "composite" of the object record and the declarative record.
++    return m_object_record->get_from_environment_record(name);
++}
++
++void GlobalEnvironmentRecord::put_into_environment_record(FlyString const& name, Variable variable)
++{
++    // FIXME: This should be a "composite" of the object record and the declarative record.
++    m_object_record->put_into_environment_record(name, variable);
++}
++
++bool GlobalEnvironmentRecord::delete_from_environment_record(FlyString const& name)
++{
++    // FIXME: This should be a "composite" of the object record and the declarative record.
++    return object_record().delete_property(name);
++}
++
++Value GlobalEnvironmentRecord::get_this_binding(GlobalObject&) const
++{
++    return &m_global_object;
++}
++
++Value GlobalEnvironmentRecord::global_this_value() const
++{
++    return &m_global_object;
++}
++
++}
+diff --git a/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.h b/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.h
+new file mode 100644
+index 00000000000000..1b76340e2292a3
+--- /dev/null
++++ b/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.h
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (c) 2021, Andreas Kling <kling@serenityos.org>
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#pragma once
++
++#include <LibJS/Runtime/EnvironmentRecord.h>
++
++namespace JS {
++
++class GlobalEnvironmentRecord final : public EnvironmentRecord {
++    JS_OBJECT(GlobalEnvironmentRecord, EnvironmentRecord);
++
++public:
++    explicit GlobalEnvironmentRecord(GlobalObject&);
++
++    virtual Optional<Variable> get_from_environment_record(FlyString const&) const override;
++    virtual void put_into_environment_record(FlyString const&, Variable) override;
++    virtual bool delete_from_environment_record(FlyString const&) override;
++    virtual bool has_this_binding() const final { return true; }
++    virtual Value get_this_binding(GlobalObject&) const final;
++
++    Value global_this_value() const;
++
++    // [[ObjectRecord]]
++    ObjectEnvironmentRecord& object_record() { return *m_object_record; }
++
++    // [[DeclarativeReco rd]]
++    DeclarativeEnvironmentRecord& declarative_record() { return *m_declarative_record; }
++
++private:
++    virtual bool is_global_environment_record() const override { return true; }
++    virtual void visit_edges(Visitor&) override;
++
++    GlobalObject& m_global_object;
++
++    ObjectEnvironmentRecord* m_object_record { nullptr };
++    DeclarativeEnvironmentRecord* m_declarative_record { nullptr };
++};
++
++template<>
++inline bool Object::fast_is<GlobalEnvironmentRecord>() const { return is_global_environment_record(); }
++
++}
+diff --git a/Userland/Libraries/LibJS/Runtime/GlobalObject.cpp b/Userland/Libraries/LibJS/Runtime/GlobalObject.cpp
+index e05a861c8fe3e3..cdd4dddff38047 100644
+--- a/Userland/Libraries/LibJS/Runtime/GlobalObject.cpp
++++ b/Userland/Libraries/LibJS/Runtime/GlobalObject.cpp
+@@ -40,6 +40,7 @@
+ #include <LibJS/Runtime/GeneratorFunctionConstructor.h>
+ #include <LibJS/Runtime/GeneratorFunctionPrototype.h>
+ #include <LibJS/Runtime/GeneratorObjectPrototype.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ #include <LibJS/Runtime/IteratorPrototype.h>
+ #include <LibJS/Runtime/JSONObject.h>
+@@ -82,7 +83,7 @@
+ namespace JS {
+ 
+ GlobalObject::GlobalObject()
+-    : EnvironmentRecord(GlobalObjectTag::Tag)
++    : Object(GlobalObjectTag::Tag)
+     , m_console(make<Console>(*this))
+ {
+ }
+@@ -98,6 +99,8 @@ void GlobalObject::initialize_global_object()
+     m_object_prototype = heap().allocate_without_global_object<ObjectPrototype>(*this);
+     m_function_prototype = heap().allocate_without_global_object<FunctionPrototype>(*this);
+ 
++    m_environment_record = heap().allocate_without_global_object<GlobalEnvironmentRecord>(*this);
++
+     m_new_object_shape = vm.heap().allocate_without_global_object<Shape>(*this);
+     m_new_object_shape->set_prototype_without_transition(m_object_prototype);
+ 
+@@ -207,6 +210,7 @@ void GlobalObject::visit_edges(Visitor& visitor)
+     visitor.visit(m_new_script_function_prototype_object_shape);
+     visitor.visit(m_proxy_constructor);
+     visitor.visit(m_generator_object_prototype);
++    visitor.visit(m_environment_record);
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
+     visitor.visit(m_##snake_name##_constructor);                                         \
+@@ -328,24 +332,6 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_int)
+     return Value(sign * number);
+ }
+ 
+-Optional<Variable> GlobalObject::get_from_environment_record(FlyString const& name) const
+-{
+-    auto value = get(name);
+-    if (value.is_empty())
+-        return {};
+-    return Variable { value, DeclarationKind::Var };
+-}
+-
+-void GlobalObject::put_into_environment_record(FlyString const& name, Variable variable)
+-{
+-    put(name, variable.value);
+-}
+-
+-bool GlobalObject::delete_from_environment_record(FlyString const& name)
+-{
+-    return delete_property(name);
+-}
+-
+ // 19.2.1 eval ( x ), https://tc39.es/ecma262/#sec-eval-x
+ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::eval)
+ {
+diff --git a/Userland/Libraries/LibJS/Runtime/GlobalObject.h b/Userland/Libraries/LibJS/Runtime/GlobalObject.h
+index b59254dac19b2f..8451169460e8d1 100644
+--- a/Userland/Libraries/LibJS/Runtime/GlobalObject.h
++++ b/Userland/Libraries/LibJS/Runtime/GlobalObject.h
+@@ -12,8 +12,8 @@
+ 
+ namespace JS {
+ 
+-class GlobalObject : public EnvironmentRecord {
+-    JS_OBJECT(GlobalObject, EnvironmentRecord);
++class GlobalObject : public Object {
++    JS_OBJECT(GlobalObject, Object);
+ 
+ public:
+     explicit GlobalObject();
+@@ -21,11 +21,7 @@ class GlobalObject : public EnvironmentRecord {
+ 
+     virtual ~GlobalObject() override;
+ 
+-    virtual Optional<Variable> get_from_environment_record(FlyString const&) const override;
+-    virtual void put_into_environment_record(FlyString const&, Variable) override;
+-    virtual bool delete_from_environment_record(FlyString const&) override;
+-    virtual bool has_this_binding() const final { return true; }
+-    virtual Value get_this_binding(GlobalObject&) const final { return this; }
++    GlobalEnvironmentRecord& environment_record() { return *m_environment_record; }
+ 
+     Console& console() { return *m_console; }
+ 
+@@ -87,6 +83,8 @@ class GlobalObject : public EnvironmentRecord {
+     // Not included in JS_ENUMERATE_NATIVE_OBJECTS due to missing distinct constructor
+     GeneratorObjectPrototype* m_generator_object_prototype { nullptr };
+ 
++    GlobalEnvironmentRecord* m_environment_record { nullptr };
++
+ #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
+     ConstructorName* m_##snake_name##_constructor { nullptr };                           \
+     Object* m_##snake_name##_prototype { nullptr };
+diff --git a/Userland/Libraries/LibJS/Runtime/Object.h b/Userland/Libraries/LibJS/Runtime/Object.h
+index 4fbc23de43b98d..9ff166729f7cae 100644
+--- a/Userland/Libraries/LibJS/Runtime/Object.h
++++ b/Userland/Libraries/LibJS/Runtime/Object.h
+@@ -108,6 +108,7 @@ class Object : public Cell {
+     virtual bool is_global_object() const { return false; }
+     virtual bool is_proxy_object() const { return false; }
+     virtual bool is_native_function() const { return false; }
++    virtual bool is_global_environment_record() const { return false; }
+     virtual bool is_declarative_environment_record() const { return false; }
+     virtual bool is_function_environment_record() const { return false; }
+ 
+diff --git a/Userland/Libraries/LibJS/Runtime/ObjectEnvironmentRecord.h b/Userland/Libraries/LibJS/Runtime/ObjectEnvironmentRecord.h
+index c6c2bf1f329c0c..4c55b813ba379b 100644
+--- a/Userland/Libraries/LibJS/Runtime/ObjectEnvironmentRecord.h
++++ b/Userland/Libraries/LibJS/Runtime/ObjectEnvironmentRecord.h
+@@ -20,6 +20,8 @@ class ObjectEnvironmentRecord : public EnvironmentRecord {
+     virtual void put_into_environment_record(FlyString const&, Variable) override;
+     virtual bool delete_from_environment_record(FlyString const&) override;
+ 
++    Object& object() { return m_object; }
++
+ private:
+     virtual void visit_edges(Visitor&) override;
+ 
+diff --git a/Userland/Libraries/LibJS/Runtime/VM.cpp b/Userland/Libraries/LibJS/Runtime/VM.cpp
+index 238db115f9beed..ff1d41eedfd78b 100644
+--- a/Userland/Libraries/LibJS/Runtime/VM.cpp
++++ b/Userland/Libraries/LibJS/Runtime/VM.cpp
+@@ -14,6 +14,7 @@
+ #include <LibJS/Runtime/Error.h>
+ #include <LibJS/Runtime/FinalizationRegistry.h>
+ #include <LibJS/Runtime/FunctionEnvironmentRecord.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ #include <LibJS/Runtime/IteratorOperations.h>
+ #include <LibJS/Runtime/NativeFunction.h>
+@@ -394,14 +395,10 @@ Value VM::get_variable(const FlyString& name, GlobalObject& global_object)
+ 
+ Reference VM::get_reference(const FlyString& name)
+ {
+-    if (m_call_stack.size()) {
+-        for (auto* environment_record = lexical_environment(); environment_record; environment_record = environment_record->outer_environment()) {
+-            if (is<GlobalObject>(environment_record))
+-                break;
+-            auto possible_match = environment_record->get_from_environment_record(name);
+-            if (possible_match.has_value())
+-                return { Reference::LocalVariable, name };
+-        }
++    for (auto* environment_record = lexical_environment(); environment_record && environment_record->outer_environment(); environment_record = environment_record->outer_environment()) {
++        auto possible_match = environment_record->get_from_environment_record(name);
++        if (possible_match.has_value())
++            return { Reference::LocalVariable, name };
+     }
+     return { Reference::GlobalVariable, name };
+ }

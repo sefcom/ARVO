@@ -1,0 +1,66 @@
+From aac6caaa22c2c6f017d3926856c54646155ff898 Mon Sep 17 00:00:00 2001
+From: Michael Zillgith <michael.zillgith@mz-automation.de>
+Date: Wed, 24 Feb 2021 16:07:01 +0100
+Subject: [PATCH] - fixed oss-fuzz issues 31399, 31340, 31341, 31344, 31346
+
+---
+ src/mms/asn1/ber_decode.c                  | 5 ++++-
+ src/mms/iso_mms/server/mms_access_result.c | 8 ++++++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/mms/asn1/ber_decode.c b/src/mms/asn1/ber_decode.c
+index bcc4352cd..42141a5a6 100644
+--- a/src/mms/asn1/ber_decode.c
++++ b/src/mms/asn1/ber_decode.c
+@@ -30,7 +30,7 @@ getIndefiniteLength(uint8_t* buffer, int bufPos, int maxBufPos)
+     int length = 0;
+ 
+     while (bufPos < maxBufPos) {
+-        if ((buffer[bufPos] == 0) && (buffer[bufPos+1] == 0)) {
++        if ((buffer[bufPos] == 0) && ((bufPos + 1) < maxBufPos) && (buffer[bufPos+1] == 0)) {
+             return length + 2;
+         }
+         else {
+@@ -80,6 +80,9 @@ BerDecoder_decodeLength(uint8_t* buffer, int* length, int bufPos, int maxBufPos)
+                 if (bufPos >= maxBufPos)
+                     return -1;
+ 
++                if (bufPos + (*length) > maxBufPos)
++                    return -1;
++
+                 *length <<= 8;
+                 *length += buffer[bufPos++];
+             }
+diff --git a/src/mms/iso_mms/server/mms_access_result.c b/src/mms/iso_mms/server/mms_access_result.c
+index 4671211fa..d4d8fdae6 100644
+--- a/src/mms/iso_mms/server/mms_access_result.c
++++ b/src/mms/iso_mms/server/mms_access_result.c
+@@ -159,6 +159,9 @@ MmsValue_decodeMmsData(uint8_t* buffer, int bufPos, int bufferLength, int* endBu
+ 
+     int dataEndBufPos = bufferLength;
+ 
++    if (bufferLength < 1)
++        goto exit_with_error;
++
+     uint8_t tag = buffer[bufPos++];
+ 
+     int dataLength;
+@@ -168,6 +171,10 @@ MmsValue_decodeMmsData(uint8_t* buffer, int bufPos, int bufferLength, int* endBu
+     if (bufPos < 0)
+         goto exit_with_error;
+ 
++    /* if not indefinite length end tag, data length must be > 0 */
++    if ((tag != 0) && (dataLength == 0))
++        goto exit_with_error;
++
+     switch (tag) {
+ 
+     case 0xa1: /* MMS_ARRAY */
+@@ -253,6 +260,7 @@ MmsValue_decodeMmsData(uint8_t* buffer, int bufPos, int bufferLength, int* endBu
+         value = MmsValue_newUnsigned(dataLength * 8);
+         memcpy(value->value.integer->octets, buffer + bufPos, dataLength);
+         value->value.integer->size = dataLength;
++
+         bufPos += dataLength;
+         break;
+ 

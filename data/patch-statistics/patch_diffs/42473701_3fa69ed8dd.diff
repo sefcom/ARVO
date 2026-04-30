@@ -1,0 +1,119 @@
+From e7acaa887997f529182c6cbcd29f144af8b453ba Mon Sep 17 00:00:00 2001
+From: Jonathan Hui <jonhui@google.com>
+Date: Mon, 25 Feb 2019 18:57:36 -0800
+Subject: [PATCH] [mesh-forwarder] do not allow eviction of message being
+ processed (#3629)
+
+Processing a message may trigger an Address Solicit message to be sent.
+Because Thread control messages have higher priority, it is possible for the
+Address Solicit message to evict the data message that caused the generation
+of the Address Solicit message.
+
+This commit present a message that's being processed from being evicted.
+
+Credit to OSS-Fuzz.
+---
+ src/core/common/message.hpp            | 22 ++++++++++++++++++++--
+ src/core/thread/mesh_forwarder.cpp     | 10 ++++++++--
+ src/core/thread/mesh_forwarder_ftd.cpp |  1 +
+ 3 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/common/message.hpp b/src/core/common/message.hpp
+index 1649411e7d3..a4712fc3eeb 100644
+--- a/src/core/common/message.hpp
++++ b/src/core/common/message.hpp
+@@ -114,6 +114,7 @@ struct MessageInfo
+     uint8_t mPriority : 2;     ///< Identifies the message priority level (lower value is higher priority).
+     bool    mInPriorityQ : 1;  ///< Indicates whether the message is queued in normal or priority queue.
+     bool    mTxSuccess : 1;    ///< Indicates whether the direct tx of the message was successful.
++    bool    mDoNotEvict : 1;   ///< Indicates whether or not this message may be evicted.
+ #if OPENTHREAD_CONFIG_ENABLE_TIME_SYNC
+     bool    mTimeSync : 1;      ///< Indicates whether the message is also used for time sync purpose.
+     uint8_t mTimeSyncSeq;       ///< The time sync sequence.
+@@ -619,7 +620,7 @@ class Message : public Buffer
+     void SetDirectTransmission(void) { mBuffer.mHead.mInfo.mDirectTx = true; }
+ 
+     /**
+-     * This methods indicates whether the direct transmission of message was successful.
++     * This method indicates whether the direct transmission of message was successful.
+      *
+      * @retval TRUE   If direct transmission of message was successful (all fragments were delivered and acked).
+      * @retval FALSE  If direct transmission of message failed (at least one fragment failed).
+@@ -628,7 +629,7 @@ class Message : public Buffer
+     bool GetTxSuccess(void) const { return mBuffer.mHead.mInfo.mTxSuccess; }
+ 
+     /**
+-     * This methods sets whether the direct transmission of message was successful.
++     * This method sets whether the direct transmission of message was successful.
+      *
+      * @param[in] aTxSuccess   TRUE if the direct transmission is successful, FALSE otherwise (i.e., at least one
+      *                         fragment transmission failed).
+@@ -636,6 +637,23 @@ class Message : public Buffer
+      */
+     void SetTxSuccess(bool aTxSuccess) { mBuffer.mHead.mInfo.mTxSuccess = aTxSuccess; }
+ 
++    /**
++     * This method indicates whether the message may be evicted.
++     *
++     * @retval TRUE   If the message must not be evicted.
++     * @retval FALSE  If the message may be evicted.
++     *
++     */
++    bool GetDoNotEvict(void) const { return mBuffer.mHead.mInfo.mDoNotEvict; }
++
++    /**
++     * This method sets whether the message may be evicted.
++     *
++     * @param[in]  aDoNotEvict  TRUE if the message may not be evicted, FALSE otherwise.
++     *
++     */
++    void SetDoNotEvict(bool aDoNotEvict) { mBuffer.mHead.mInfo.mDoNotEvict = aDoNotEvict; }
++
+     /**
+      * This method indicates whether or not link security is enabled for the message.
+      *
+diff --git a/src/core/thread/mesh_forwarder.cpp b/src/core/thread/mesh_forwarder.cpp
+index f4d12bf857e..c20f9cc3c62 100644
+--- a/src/core/thread/mesh_forwarder.cpp
++++ b/src/core/thread/mesh_forwarder.cpp
+@@ -230,13 +230,14 @@ Message *MeshForwarder::GetDirectTransmission(void)
+ 
+     for (curMessage = mSendQueue.GetHead(); curMessage; curMessage = nextMessage)
+     {
+-        nextMessage = curMessage->GetNext();
+-
+         if (curMessage->GetDirectTransmission() == false)
+         {
++            nextMessage = curMessage->GetNext();
+             continue;
+         }
+ 
++        curMessage->SetDoNotEvict(true);
++
+         switch (curMessage->GetType())
+         {
+         case Message::kTypeIp6:
+@@ -266,6 +267,11 @@ Message *MeshForwarder::GetDirectTransmission(void)
+             break;
+         }
+ 
++        curMessage->SetDoNotEvict(false);
++
++        // the next message may have been evicted during processing (e.g. due to Address Solicit)
++        nextMessage = curMessage->GetNext();
++
+         switch (error)
+         {
+         case OT_ERROR_NONE:
+diff --git a/src/core/thread/mesh_forwarder_ftd.cpp b/src/core/thread/mesh_forwarder_ftd.cpp
+index 95d9ba679f1..3a0b50a623c 100644
+--- a/src/core/thread/mesh_forwarder_ftd.cpp
++++ b/src/core/thread/mesh_forwarder_ftd.cpp
+@@ -244,6 +244,7 @@ otError MeshForwarder::EvictMessage(uint8_t aPriority)
+ 
+     if (message->GetPriority() < aPriority)
+     {
++        VerifyOrExit(!message->GetDoNotEvict());
+         RemoveMessage(*message);
+         ExitNow(error = OT_ERROR_NONE);
+     }

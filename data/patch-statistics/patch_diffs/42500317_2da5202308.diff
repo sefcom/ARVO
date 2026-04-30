@@ -1,0 +1,74 @@
+From e37d86c260d95eae53326b14d496ffa85e9e5934 Mon Sep 17 00:00:00 2001
+From: Michael Hanselmann <public@hansmi.ch>
+Date: Sun, 22 Aug 2021 21:07:36 +0200
+Subject: [PATCH] Skip empty write buffers when unserializing parser
+
+At commit 8490a7ac101d the following `fuzzing/usbredirparserfuzz` input causes
+the instantiation of empty write buffers:
+
+$ base64 -d <<'EOF' > testcase6474540506021888
+QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAG
+AAAAAN7/AAAACAA=
+EOF
+
+Empty write buffers trigger all kinds of issues, in part because they cause
+calls to write(2) with a zero length.
+
+Signed-off-by: Michael Hanselmann <public@hansmi.ch>
+---
+ usbredirparser/usbredirparser.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/usbredirparser/usbredirparser.c b/usbredirparser/usbredirparser.c
+index 383b77f..054a3d8 100644
+--- a/usbredirparser/usbredirparser.c
++++ b/usbredirparser/usbredirparser.c
+@@ -1748,6 +1748,12 @@ int usbredirparser_unserialize(struct usbredirparser *parser_pub,
+         return -1;
+     }
+ 
++    if (parser->write_buf_count != 0 || parser->write_buf != NULL ||
++        parser->data != NULL) {
++        ERROR("unserialization must use a pristine parser");
++        return -1;
++    }
++
+     if (unserialize_int(parser, &state, &remain, &i, "length"))
+         return -1;
+     if (i != len) {
+@@ -1838,16 +1844,28 @@ int usbredirparser_unserialize(struct usbredirparser *parser_pub,
+         return -1;
+     next = &parser->write_buf;
+     while (i) {
++        uint8_t *buf = NULL;
++
++        l = 0;
++        if (unserialize_data(parser, &state, &remain, &buf, &l, "wbuf")) {
++            return -1;
++        }
++
++        if (l == 0) {
++            free(buf);
++            ERROR("write buffer %d is empty", i);
++            return -1;
++        }
++
+         wbuf = calloc(1, sizeof(*wbuf));
+         if (!wbuf) {
++            free(buf);
+             ERROR("Out of memory allocating unserialize buffer");
+             return -1;
+         }
+-        *next = wbuf;
+-        l = 0;
+-        if (unserialize_data(parser, &state, &remain, &wbuf->buf, &l, "wbuf"))
+-            return -1;
++        wbuf->buf = buf;
+         wbuf->len = l;
++        *next = wbuf;
+         next = &wbuf->next;
+         i--;
+     }
+-- 
+GitLab
+

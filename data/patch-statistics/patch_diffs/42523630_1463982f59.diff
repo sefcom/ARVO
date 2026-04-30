@@ -1,0 +1,97 @@
+From 5078eedc5b18f0d208af6e30f60b33419132d1b6 Mon Sep 17 00:00:00 2001
+From: jx124 <64946984+jx124@users.noreply.github.com>
+Date: Tue, 2 May 2023 03:15:47 +0800
+Subject: [PATCH] gh-104016: Fixed off by 1 error in f string tokenizer
+ (#104047)
+
+Co-authored-by: sunmy2019 <59365878+sunmy2019@users.noreply.github.com>
+Co-authored-by: Ken Jin <kenjin@python.org>
+Co-authored-by: Pablo Galindo <pablogsal@gmail.com>
+---
+ Lib/test/test_fstring.py | 16 ++++++++++++++++
+ Parser/tokenizer.c       |  7 +++++--
+ Parser/tokenizer.h       |  7 ++++---
+ 3 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/Lib/test/test_fstring.py b/Lib/test/test_fstring.py
+index 5e94c99ae65af1..5c5176dc54a6d9 100644
+--- a/Lib/test/test_fstring.py
++++ b/Lib/test/test_fstring.py
+@@ -565,7 +565,23 @@ def test_fstring_nested_too_deeply(self):
+         self.assertAllRaise(SyntaxError,
+                             "f-string: expressions nested too deeply",
+                             ['f"{1+2:{1+2:{1+1:{1}}}}"'])
++        
++        def create_nested_fstring(n):
++            if n == 0:
++                return "1+1"
++            prev = create_nested_fstring(n-1)
++            return f'f"{{{prev}}}"'
+ 
++        self.assertAllRaise(SyntaxError,
++                            "too many nested f-strings",
++                            [create_nested_fstring(160)])
++    
++    def test_syntax_error_in_nested_fstring(self):
++        # See gh-104016 for more information on this crash
++        self.assertAllRaise(SyntaxError,
++                            "invalid syntax",
++                            ['f"{1 1:' + ('{f"1:' * 199)])
++    
+     def test_double_braces(self):
+         self.assertEqual(f'{{', '{')
+         self.assertEqual(f'a{{', 'a{')
+diff --git a/Parser/tokenizer.c b/Parser/tokenizer.c
+index 8fb9be7bfd0182..d2f9fee110ebf5 100644
+--- a/Parser/tokenizer.c
++++ b/Parser/tokenizer.c
+@@ -43,12 +43,12 @@
+ #ifdef Py_DEBUG
+ static inline tokenizer_mode* TOK_GET_MODE(struct tok_state* tok) {
+     assert(tok->tok_mode_stack_index >= 0);
+-    assert(tok->tok_mode_stack_index < MAXLEVEL);
++    assert(tok->tok_mode_stack_index < MAXFSTRINGLEVEL);
+     return &(tok->tok_mode_stack[tok->tok_mode_stack_index]);
+ }
+ static inline tokenizer_mode* TOK_NEXT_MODE(struct tok_state* tok) {
+     assert(tok->tok_mode_stack_index >= 0);
+-    assert(tok->tok_mode_stack_index < MAXLEVEL);
++    assert(tok->tok_mode_stack_index + 1 < MAXFSTRINGLEVEL); 
+     return &(tok->tok_mode_stack[++tok->tok_mode_stack_index]);
+ }
+ #else
+@@ -2235,6 +2235,9 @@ tok_get_normal_mode(struct tok_state *tok, tokenizer_mode* current_tok, struct t
+ 
+         p_start = tok->start;
+         p_end = tok->cur;
++        if (tok->tok_mode_stack_index + 1 >= MAXFSTRINGLEVEL) {
++            return MAKE_TOKEN(syntaxerror(tok, "too many nested f-strings"));
++        }
+         tokenizer_mode *the_current_tok = TOK_NEXT_MODE(tok);
+         the_current_tok->kind = TOK_FSTRING_MODE;
+         the_current_tok->f_string_quote = quote;
+diff --git a/Parser/tokenizer.h b/Parser/tokenizer.h
+index 8b4213c4ce3b5a..5e2171885ac75b 100644
+--- a/Parser/tokenizer.h
++++ b/Parser/tokenizer.h
+@@ -10,8 +10,9 @@ extern "C" {
+ 
+ #include "pycore_token.h" /* For token types */
+ 
+-#define MAXINDENT 100   /* Max indentation level */
+-#define MAXLEVEL 200    /* Max parentheses level */
++#define MAXINDENT 100       /* Max indentation level */
++#define MAXLEVEL 200        /* Max parentheses level */
++#define MAXFSTRINGLEVEL 150 /* Max f-string nesting level */
+ 
+ enum decoding_state {
+     STATE_INIT,
+@@ -123,7 +124,7 @@ struct tok_state {
+     enum interactive_underflow_t interactive_underflow;
+     int report_warnings;
+     // TODO: Factor this into its own thing
+-    tokenizer_mode tok_mode_stack[MAXLEVEL];
++    tokenizer_mode tok_mode_stack[MAXFSTRINGLEVEL];
+     int tok_mode_stack_index;
+     int tok_report_warnings;
+ #ifdef Py_DEBUG

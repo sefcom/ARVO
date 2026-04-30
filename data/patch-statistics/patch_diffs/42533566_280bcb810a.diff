@@ -1,0 +1,66 @@
+From f45a7cc4cf8fabf643c8796d8191eb418ce18143 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Sun, 4 Mar 2018 11:37:10 +0000
+Subject: [PATCH] EHdr: fix read heap buffer overflow with nbits < 8. Fixes
+ https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=6724. Credit to OSS
+ Fuzz
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@41627 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/frmts/raw/ehdrdataset.cpp | 28 ++++++++++++++++------------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/gdal/frmts/raw/ehdrdataset.cpp b/gdal/frmts/raw/ehdrdataset.cpp
+index f278ce7b5e0a..b53813479e14 100644
+--- a/gdal/frmts/raw/ehdrdataset.cpp
++++ b/gdal/frmts/raw/ehdrdataset.cpp
+@@ -167,16 +167,18 @@ CPLErr EHdrRasterBand::IReadBlock( int nBlockXOff, int nBlockYOff,
+         return RawRasterBand::IReadBlock(nBlockXOff, nBlockYOff, pImage);
+ 
+     // Establish desired position.
+-    const vsi_l_offset nLineBytesBig =
+-        (static_cast<vsi_l_offset>(nPixelOffsetBits) * nBlockXSize + 7) / 8;
+-    if( nLineBytesBig >
+-        static_cast<vsi_l_offset>(std::numeric_limits<int>::max()) )
+-        return CE_Failure;
+-    const unsigned int nLineBytes = static_cast<unsigned int>(nLineBytesBig);
+     const vsi_l_offset nLineStart =
+         (nStartBit + nLineOffsetBits * nBlockYOff) / 8;
+     int iBitOffset =
+         static_cast<int>((nStartBit + nLineOffsetBits * nBlockYOff) % 8);
++    const vsi_l_offset nLineEnd =
++        (nStartBit + nLineOffsetBits * nBlockYOff +
++            static_cast<vsi_l_offset>(nPixelOffsetBits) * nBlockXSize - 1) / 8;
++    const vsi_l_offset nLineBytesBig = nLineEnd - nLineStart + 1;
++    if( nLineBytesBig >
++        static_cast<vsi_l_offset>(std::numeric_limits<int>::max()) )
++        return CE_Failure;
++    const unsigned int nLineBytes = static_cast<unsigned int>(nLineBytesBig);
+ 
+     // Read data into buffer.
+     GByte *pabyBuffer = static_cast<GByte *>(VSI_MALLOC_VERBOSE(nLineBytes));
+@@ -229,16 +231,18 @@ CPLErr EHdrRasterBand::IWriteBlock( int nBlockXOff, int nBlockYOff,
+         return RawRasterBand::IWriteBlock(nBlockXOff, nBlockYOff, pImage);
+ 
+     // Establish desired position.
+-    const vsi_l_offset nLineBytesBig =
+-        (static_cast<vsi_l_offset>(nPixelOffsetBits) * nBlockXSize + 7) / 8;
+-    if( nLineBytesBig >
+-        static_cast<vsi_l_offset>(std::numeric_limits<int>::max()) )
+-        return CE_Failure;
+-    const unsigned int nLineBytes = static_cast<unsigned int>(nLineBytesBig);
+     const vsi_l_offset nLineStart =
+         (nStartBit + nLineOffsetBits * nBlockYOff) / 8;
+     int iBitOffset =
+         static_cast<int>((nStartBit + nLineOffsetBits * nBlockYOff) % 8);
++    const vsi_l_offset nLineEnd =
++        (nStartBit + nLineOffsetBits * nBlockYOff +
++            static_cast<vsi_l_offset>(nPixelOffsetBits) * nBlockXSize - 1) / 8;
++    const vsi_l_offset nLineBytesBig = nLineEnd - nLineStart + 1;
++    if( nLineBytesBig >
++        static_cast<vsi_l_offset>(std::numeric_limits<int>::max()) )
++        return CE_Failure;
++    const unsigned int nLineBytes = static_cast<unsigned int>(nLineBytesBig);
+ 
+     // Read data into buffer.
+     GByte *pabyBuffer =

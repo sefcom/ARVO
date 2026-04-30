@@ -1,0 +1,520 @@
+From 6d6ad2a8172966e9a0b1f4c3831db41f640c6296 Mon Sep 17 00:00:00 2001
+From: Even Rouault <even.rouault@mines-paris.org>
+Date: Sat, 17 Mar 2018 15:20:21 +0000
+Subject: [PATCH] Shapelib: simplify/factor code relative to filename extension
+ stripping
+
+git-svn-id: https://svn.osgeo.org/gdal/trunk@41851 f0d54148-0727-0410-94bb-9a71ac55c965
+---
+ gdal/ogr/ogrsf_frmts/shape/dbfopen.c |  84 +++++++-------
+ gdal/ogr/ogrsf_frmts/shape/shpopen.c | 160 +++++++++++----------------
+ 2 files changed, 104 insertions(+), 140 deletions(-)
+
+diff --git a/gdal/ogr/ogrsf_frmts/shape/dbfopen.c b/gdal/ogr/ogrsf_frmts/shape/dbfopen.c
+index 3300abaffbeb..fba0331dd85e 100644
+--- a/gdal/ogr/ogrsf_frmts/shape/dbfopen.c
++++ b/gdal/ogr/ogrsf_frmts/shape/dbfopen.c
+@@ -465,6 +465,26 @@ DBFOpen( const char * pszFilename, const char * pszAccess )
+     return DBFOpenLL( pszFilename, pszAccess, &sHooks );
+ }
+ 
++/************************************************************************/
++/*                      DBFGetLenWithoutExtension()                     */
++/************************************************************************/
++
++static int DBFGetLenWithoutExtension(const char* pszBasename)
++{
++    int i;
++    int nLen = (int)strlen(pszBasename);
++    for( i = nLen-1;
++         i > 0 && pszBasename[i] != '/' && pszBasename[i] != '\\';
++         i-- )
++    {
++        if( pszBasename[i] == '.' )
++        {
++            return i;
++        }
++    }
++    return nLen;
++}
++
+ /************************************************************************/
+ /*                              DBFOpen()                               */
+ /*                                                                      */
+@@ -478,10 +498,10 @@ DBFOpenLL( const char * pszFilename, const char * pszAccess, SAHooks *psHooks )
+     DBFHandle		psDBF;
+     SAFile		pfCPG;
+     unsigned char	*pabyBuf;
+-    int			nFields, nHeadLen, iField, i;
+-    char		*pszBasename, *pszFullname;
++    int			nFields, nHeadLen, iField;
++    char		*pszFullname;
+     int                 nBufSize = 500;
+-    size_t              nFullnameLen;
++    int                 nLenWithoutExtension;
+ 
+ /* -------------------------------------------------------------------- */
+ /*      We only allow the access strings "rb" and "r+".                  */
+@@ -501,22 +521,10 @@ DBFOpenLL( const char * pszFilename, const char * pszAccess, SAHooks *psHooks )
+ /*	Compute the base (layer) name.  If there is any extension	*/
+ /*	on the passed in filename we will strip it off.			*/
+ /* -------------------------------------------------------------------- */
+-    pszBasename = (char *) malloc(strlen(pszFilename)+5);
+-    strcpy( pszBasename, pszFilename );
+-    for( i = (int)strlen(pszBasename)-1;
+-         i > 0 && pszBasename[i] != '/' && pszBasename[i] != '\\';
+-         i-- )
+-    {
+-        if( pszBasename[i] == '.' )
+-        {
+-            pszBasename[i] = '\0';
+-            break;
+-        }
+-    }
+-
+-    nFullnameLen = strlen(pszBasename) + 5;
+-    pszFullname = (char *) malloc(nFullnameLen);
+-    snprintf( pszFullname, nFullnameLen, "%s.dbf", pszBasename );
++    nLenWithoutExtension = DBFGetLenWithoutExtension(pszFilename);
++    pszFullname = (char *) malloc(nLenWithoutExtension + 5);
++    memcpy(pszFullname, pszFilename, nLenWithoutExtension);
++    memcpy(pszFullname + nLenWithoutExtension, ".dbf", 5);
+ 
+     psDBF = (DBFHandle) calloc( 1, sizeof(DBFInfo) );
+     psDBF->fp = psHooks->FOpen( pszFullname, pszAccess );
+@@ -524,19 +532,18 @@ DBFOpenLL( const char * pszFilename, const char * pszAccess, SAHooks *psHooks )
+ 
+     if( psDBF->fp == NULL )
+     {
+-        snprintf( pszFullname, nFullnameLen, "%s.DBF", pszBasename );
++        memcpy(pszFullname + nLenWithoutExtension, ".DBF", 5);
+         psDBF->fp = psDBF->sHooks.FOpen(pszFullname, pszAccess );
+     }
+ 
+-    snprintf( pszFullname, nFullnameLen, "%s.cpg", pszBasename );
++    memcpy(pszFullname + nLenWithoutExtension, ".cpg", 5);
+     pfCPG = psHooks->FOpen( pszFullname, "r" );
+     if( pfCPG == NULL )
+     {
+-        snprintf( pszFullname, nFullnameLen, "%s.CPG", pszBasename );
++        memcpy(pszFullname + nLenWithoutExtension, ".CPG", 5);
+         pfCPG = psHooks->FOpen( pszFullname, "r" );
+     }
+ 
+-    free( pszBasename );
+     free( pszFullname );
+ 
+     if( psDBF->fp == NULL )
+@@ -779,31 +786,19 @@ DBFCreateLL( const char * pszFilename, const char * pszCodePage, SAHooks *psHook
+ {
+     DBFHandle	psDBF;
+     SAFile	fp;
+-    char	*pszFullname, *pszBasename;
+-    int		i, ldid = -1;
++    char	*pszFullname;
++    int		ldid = -1;
+     char chZero = '\0';
+-    size_t      nFullnameLen;
++    int         nLenWithoutExtension;
+ 
+ /* -------------------------------------------------------------------- */
+ /*	Compute the base (layer) name.  If there is any extension	*/
+ /*	on the passed in filename we will strip it off.			*/
+ /* -------------------------------------------------------------------- */
+-    pszBasename = (char *) malloc(strlen(pszFilename)+5);
+-    strcpy( pszBasename, pszFilename );
+-    for( i = (int)strlen(pszBasename)-1;
+-         i > 0 && pszBasename[i] != '/' && pszBasename[i] != '\\';
+-         i-- )
+-    {
+-        if( pszBasename[i] == '.' )
+-        {
+-            pszBasename[i] = '\0';
+-            break;
+-        }
+-    }
+-
+-    nFullnameLen = strlen(pszBasename) + 5;
+-    pszFullname = (char *) malloc(nFullnameLen);
+-    snprintf( pszFullname, nFullnameLen, "%s.dbf", pszBasename );
++    nLenWithoutExtension = DBFGetLenWithoutExtension(pszFilename);
++    pszFullname = (char *) malloc(nLenWithoutExtension + 5);
++    memcpy(pszFullname, pszFilename, nLenWithoutExtension);
++    memcpy(pszFullname + nLenWithoutExtension, ".dbf", 5);
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Create the file.                                                */
+@@ -811,7 +806,6 @@ DBFCreateLL( const char * pszFilename, const char * pszCodePage, SAHooks *psHook
+     fp = psHooks->FOpen( pszFullname, "wb" );
+     if( fp == NULL )
+     {
+-        free( pszBasename );
+         free( pszFullname );
+         return( NULL );
+     }
+@@ -822,12 +816,11 @@ DBFCreateLL( const char * pszFilename, const char * pszCodePage, SAHooks *psHook
+     fp = psHooks->FOpen( pszFullname, "rb+" );
+     if( fp == NULL )
+     {
+-        free( pszBasename );
+         free( pszFullname );
+         return( NULL );
+     }
+ 
+-    snprintf( pszFullname, nFullnameLen, "%s.cpg", pszBasename );
++    memcpy(pszFullname + nLenWithoutExtension, ".cpg", 5);
+     if( pszCodePage != NULL )
+     {
+         if( strncmp( pszCodePage, "LDID/", 5 ) == 0 )
+@@ -848,7 +841,6 @@ DBFCreateLL( const char * pszFilename, const char * pszCodePage, SAHooks *psHook
+         psHooks->Remove( pszFullname );
+     }
+ 
+-    free( pszBasename );
+     free( pszFullname );
+ 
+ /* -------------------------------------------------------------------- */
+diff --git a/gdal/ogr/ogrsf_frmts/shape/shpopen.c b/gdal/ogr/ogrsf_frmts/shape/shpopen.c
+index 3b936dc5dde7..1ed70c71d619 100644
+--- a/gdal/ogr/ogrsf_frmts/shape/shpopen.c
++++ b/gdal/ogr/ogrsf_frmts/shape/shpopen.c
+@@ -543,6 +543,26 @@ SHPOpen( const char * pszLayer, const char * pszAccess )
+     return SHPOpenLL( pszLayer, pszAccess, &sHooks );
+ }
+ 
++/************************************************************************/
++/*                      SHPGetLenWithoutExtension()                     */
++/************************************************************************/
++
++static int SHPGetLenWithoutExtension(const char* pszBasename)
++{
++    int i;
++    int nLen = (int)strlen(pszBasename);
++    for( i = nLen-1;
++         i > 0 && pszBasename[i] != '/' && pszBasename[i] != '\\';
++         i-- )
++    {
++        if( pszBasename[i] == '.' )
++        {
++            return i;
++        }
++    }
++    return nLen;
++}
++
+ /************************************************************************/
+ /*                              SHPOpen()                               */
+ /*                                                                      */
+@@ -554,14 +574,14 @@ SHPHandle SHPAPI_CALL
+ SHPOpenLL( const char * pszLayer, const char * pszAccess, SAHooks *psHooks )
+ 
+ {
+-    char        *pszFullname, *pszBasename;
++    char        *pszFullname;
+     SHPHandle       psSHP;
+ 
+     uchar       *pabyBuf;
+     int         i;
+     double      dValue;
+     int         bLazySHXLoading = FALSE;
+-    size_t nFullnameLen;
++    int         nLenWithoutExtension;
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Ensure the access string is one of the legal ones.  We          */
+@@ -596,80 +616,63 @@ SHPOpenLL( const char * pszLayer, const char * pszAccess, SAHooks *psHooks )
+     psSHP->bUpdated = FALSE;
+     memcpy( &(psSHP->sHooks), psHooks, sizeof(SAHooks) );
+ 
+-/* -------------------------------------------------------------------- */
+-/*  Compute the base (layer) name.  If there is any extension   */
+-/*  on the passed in filename we will strip it off.         */
+-/* -------------------------------------------------------------------- */
+-    pszBasename = (char *) malloc(strlen(pszLayer)+5);
+-    strcpy( pszBasename, pszLayer );
+-    for( i = (int)strlen(pszBasename)-1;
+-         i > 0 && pszBasename[i] != '/' && pszBasename[i] != '\\';
+-         i-- )
+-    {
+-        if( pszBasename[i] == '.' )
+-        {
+-            pszBasename[i] = '\0';
+-            break;
+-        }
+-    }
+-
+ /* -------------------------------------------------------------------- */
+ /*  Open the .shp and .shx files.  Note that files pulled from  */
+ /*  a PC to Unix with upper case filenames won't work!      */
+ /* -------------------------------------------------------------------- */
+-    nFullnameLen = strlen(pszBasename) + 5;
+-    pszFullname = (char *) malloc(nFullnameLen);
+-    snprintf( pszFullname, nFullnameLen, "%s.shp", pszBasename ) ;
++    nLenWithoutExtension = SHPGetLenWithoutExtension(pszLayer);
++    pszFullname = (char *) malloc(nLenWithoutExtension + 5);
++    memcpy(pszFullname, pszLayer, nLenWithoutExtension);
++    memcpy(pszFullname + nLenWithoutExtension, ".shp", 5);
+     psSHP->fpSHP = psSHP->sHooks.FOpen(pszFullname, pszAccess );
+     if( psSHP->fpSHP == NULL )
+     {
+-        snprintf( pszFullname, nFullnameLen, "%s.SHP", pszBasename );
++        memcpy(pszFullname + nLenWithoutExtension, ".SHP", 5);
+         psSHP->fpSHP = psSHP->sHooks.FOpen(pszFullname, pszAccess );
+     }
+ 
+     if( psSHP->fpSHP == NULL )
+     {
+-        size_t nMessageLen = strlen(pszBasename)*2+256;
++        size_t nMessageLen = strlen(pszFullname)*2+256;
+         char *pszMessage = (char *) malloc(nMessageLen);
++        pszFullname[nLenWithoutExtension] = 0;
+         snprintf( pszMessage, nMessageLen, "Unable to open %s.shp or %s.SHP.",
+-                  pszBasename, pszBasename );
++                  pszFullname, pszFullname );
+         psHooks->Error( pszMessage );
+         free( pszMessage );
+ 
+         free( psSHP );
+-        free( pszBasename );
+         free( pszFullname );
+ 
+         return NULL;
+     }
+ 
+-    snprintf( pszFullname, nFullnameLen, "%s.shx", pszBasename );
++    memcpy(pszFullname + nLenWithoutExtension, ".shx", 5);
+     psSHP->fpSHX =  psSHP->sHooks.FOpen(pszFullname, pszAccess );
+     if( psSHP->fpSHX == NULL )
+     {
+-        snprintf( pszFullname, nFullnameLen, "%s.SHX", pszBasename );
++        memcpy(pszFullname + nLenWithoutExtension, ".SHX", 5);
+         psSHP->fpSHX = psSHP->sHooks.FOpen(pszFullname, pszAccess );
+     }
+ 
+     if( psSHP->fpSHX == NULL )
+     {
+-        size_t nMessageLen = strlen(pszBasename)*2+256;
++        size_t nMessageLen = strlen(pszFullname)*2+256;
+         char *pszMessage = (char *) malloc(nMessageLen);
++        pszFullname[nLenWithoutExtension] = 0;
+         snprintf( pszMessage, nMessageLen, "Unable to open %s.shx or %s.SHX. "
+                   "Set SHAPE_RESTORE_SHX config option to YES to restore or "
+-                  "create it.", pszBasename, pszBasename );
++                  "create it.", pszFullname, pszFullname );
+         psHooks->Error( pszMessage );
+         free( pszMessage );
+ 
+         psSHP->sHooks.FClose( psSHP->fpSHP );
+         free( psSHP );
+-        free( pszBasename );
+         free( pszFullname );
+         return( NULL );
+     }
+ 
+     free( pszFullname );
+-    free( pszBasename );
+ 
+ /* -------------------------------------------------------------------- */
+ /*  Read the file size from the SHP file.               */
+@@ -937,18 +940,14 @@ int       SHPAPI_CALL
+ SHPRestoreSHX ( const char * pszLayer, const char * pszAccess, SAHooks *psHooks )
+ 
+ {
+-    char            *pszFullname, *pszBasename;
++    char            *pszFullname;
+     SAFile          fpSHP, fpSHX;
+ 
+ 
+     uchar           *pabyBuf;
+-    int             i;
+-    size_t          nFullnameLen;
++    int             nLenWithoutExtension;
+     unsigned int    nSHPFilesize;
+ 
+-    size_t          nMessageLen;
+-    char            *pszMessage;
+-
+     unsigned int    nCurrentRecordOffset = 0;
+     unsigned int    nCurrentSHPOffset = 100;
+     size_t          nRealSHXContentSize = 100;
+@@ -984,47 +983,32 @@ SHPRestoreSHX ( const char * pszLayer, const char * pszAccess, SAHooks *psHooks
+         bBigEndian = TRUE;
+ #endif
+ 
+-/* -------------------------------------------------------------------- */
+-/*  Compute the base (layer) name.  If there is any extension           */
+-/*  on the passed in filename we will strip it off.                     */
+-/* -------------------------------------------------------------------- */
+-    pszBasename = (char *) malloc(strlen(pszLayer)+5);
+-    strcpy( pszBasename, pszLayer );
+-    for( i = (int)strlen(pszBasename)-1;
+-         i > 0 && pszBasename[i] != '/' && pszBasename[i] != '\\';
+-         i-- )
+-    {
+-        if( pszBasename[i] == '.' )
+-        {
+-            pszBasename[i] = '\0';
+-            break;
+-        }
+-    }
+-
+ /* -------------------------------------------------------------------- */
+ /*  Open the .shp file.  Note that files pulled from                    */
+ /*  a PC to Unix with upper case filenames won't work!                  */
+ /* -------------------------------------------------------------------- */
+-    nFullnameLen = strlen(pszBasename) + 5;
+-    pszFullname = (char *) malloc(nFullnameLen);
+-    snprintf( pszFullname, nFullnameLen, "%s.shp", pszBasename ) ;
++    nLenWithoutExtension = SHPGetLenWithoutExtension(pszLayer);
++    pszFullname = (char *) malloc(nLenWithoutExtension + 5);
++    memcpy(pszFullname, pszLayer, nLenWithoutExtension);
++    memcpy(pszFullname + nLenWithoutExtension, ".shp", 5);
+     fpSHP = psHooks->FOpen(pszFullname, pszAccess );
+     if( fpSHP == NULL )
+     {
+-        snprintf( pszFullname, nFullnameLen, "%s.SHP", pszBasename );
++        memcpy(pszFullname + nLenWithoutExtension, ".SHP", 5);
+         fpSHP = psHooks->FOpen(pszFullname, pszAccess );
+     }
+ 
+     if( fpSHP == NULL )
+     {
+-        nMessageLen = strlen(pszBasename)*2+256;
+-        pszMessage = (char *) malloc(nMessageLen);
++        size_t nMessageLen = strlen( pszFullname ) * 2 + 256;
++        char* pszMessage = (char *) malloc( nMessageLen );
++
++        pszFullname[nLenWithoutExtension] = 0;
+         snprintf( pszMessage, nMessageLen, "Unable to open %s.shp or %s.SHP.",
+-                  pszBasename, pszBasename );
++                  pszFullname, pszFullname );
+         psHooks->Error( pszMessage );
+         free( pszMessage );
+ 
+-        free( pszBasename );
+         free( pszFullname );
+ 
+         return( 0 );
+@@ -1043,22 +1027,28 @@ SHPRestoreSHX ( const char * pszLayer, const char * pszAccess, SAHooks *psHooks
+     else
+         nSHPFilesize = (UINT_MAX / 2) * 2;
+ 
+-    snprintf( pszFullname, nFullnameLen, "%s.shx", pszBasename );
++    memcpy(pszFullname + nLenWithoutExtension, ".shx", 5);
+     fpSHX = psHooks->FOpen( pszFullname, pszSHXAccess );
++    if( fpSHX == NULL )
++    {
++        memcpy(pszFullname + nLenWithoutExtension, ".SHX", 5);
++        fpSHP = psHooks->FOpen(pszFullname, pszAccess );
++    }
+ 
+     if( fpSHX == NULL )
+     {
+-        nMessageLen = strlen( pszBasename ) * 2 + 256;
+-        pszMessage = (char *) malloc( nMessageLen );
+-        snprintf( pszMessage, nMessageLen, "Error opening file %s.shx for writing",
+-                 pszBasename );
++        size_t nMessageLen = strlen( pszFullname ) * 2 + 256;
++        char* pszMessage = (char *) malloc( nMessageLen );
++        pszFullname[nLenWithoutExtension] = 0;
++        snprintf( pszMessage, nMessageLen,
++                  "Error opening file %s.shx or %s.SHX for writing",
++                  pszFullname, pszFullname );
+         psHooks->Error( pszMessage );
+         free( pszMessage );
+ 
+         psHooks->FClose( fpSHX );
+ 
+         free( pabyBuf );
+-        free( pszBasename );
+         free( pszFullname );
+ 
+         return( 0 );
+@@ -1100,7 +1090,6 @@ SHPRestoreSHX ( const char * pszLayer, const char * pszAccess, SAHooks *psHooks
+             psHooks->FClose( fpSHP );
+ 
+             free( pabySHXHeader );
+-            free( pszBasename );
+             free( pszFullname );
+ 
+             return( 0 );
+@@ -1117,7 +1106,6 @@ SHPRestoreSHX ( const char * pszLayer, const char * pszAccess, SAHooks *psHooks
+ 
+     free ( pabyBuf );
+     free ( pszFullname );
+-    free ( pszBasename );
+     free ( pabySHXHeader );
+ 
+     return( 1 );
+@@ -1251,13 +1239,12 @@ SHPHandle SHPAPI_CALL
+ SHPCreateLL( const char * pszLayer, int nShapeType, SAHooks *psHooks )
+ 
+ {
+-    char	*pszBasename = NULL, *pszFullname = NULL;
+-    int		i;
++    char	*pszFullname = NULL;
+     SAFile	fpSHP = NULL, fpSHX = NULL;
+     uchar     	abyHeader[100];
+     int32	i32;
+     double	dValue;
+-    size_t      nFullnameLen;
++    int         nLenWithoutExtension;
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Establish the byte order on this system.                        */
+@@ -1270,26 +1257,13 @@ SHPCreateLL( const char * pszLayer, int nShapeType, SAHooks *psHooks )
+         bBigEndian = TRUE;
+ #endif
+ 
+-/* -------------------------------------------------------------------- */
+-/*	Compute the base (layer) name.  If there is any extension	*/
+-/*	on the passed in filename we will strip it off.			*/
+-/* -------------------------------------------------------------------- */
+-    pszBasename = (char *) malloc(strlen(pszLayer)+5);
+-    strcpy( pszBasename, pszLayer );
+-    for( i = (int)strlen(pszBasename)-1;
+-         i > 0 && pszBasename[i] != '.' && pszBasename[i] != '/'
+-             && pszBasename[i] != '\\';
+-         i-- ) {}
+-
+-    if( pszBasename[i] == '.' )
+-        pszBasename[i] = '\0';
+-
+ /* -------------------------------------------------------------------- */
+ /*      Open the two files so we can write their headers.               */
+ /* -------------------------------------------------------------------- */
+-    nFullnameLen = strlen(pszBasename) + 5;
+-    pszFullname = (char *) malloc(nFullnameLen);
+-    snprintf( pszFullname, nFullnameLen, "%s.shp", pszBasename );
++    nLenWithoutExtension = SHPGetLenWithoutExtension(pszLayer);
++    pszFullname = (char *) malloc(nLenWithoutExtension + 5);
++    memcpy(pszFullname, pszLayer, nLenWithoutExtension);
++    memcpy(pszFullname + nLenWithoutExtension, ".shp", 5);
+     fpSHP = psHooks->FOpen(pszFullname, "wb" );
+     if( fpSHP == NULL )
+     {
+@@ -1302,7 +1276,7 @@ SHPCreateLL( const char * pszLayer, int nShapeType, SAHooks *psHooks )
+         goto error;
+     }
+ 
+-    snprintf( pszFullname, nFullnameLen, "%s.shx", pszBasename );
++    memcpy(pszFullname + nLenWithoutExtension, ".shx", 5);
+     fpSHX = psHooks->FOpen(pszFullname, "wb" );
+     if( fpSHX == NULL )
+     {
+@@ -1315,7 +1289,6 @@ SHPCreateLL( const char * pszLayer, int nShapeType, SAHooks *psHooks )
+     }
+ 
+     free( pszFullname ); pszFullname = NULL;
+-    free( pszBasename ); pszBasename = NULL;
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Prepare header block for .shp file.                             */
+@@ -1387,7 +1360,6 @@ SHPCreateLL( const char * pszLayer, int nShapeType, SAHooks *psHooks )
+ 
+ error:
+     if (pszFullname) free(pszFullname);
+-    if (pszBasename) free(pszBasename);
+     if (fpSHP) psHooks->FClose( fpSHP );
+     if (fpSHX) psHooks->FClose( fpSHX );
+     return NULL;

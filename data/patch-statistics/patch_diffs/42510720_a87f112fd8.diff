@@ -1,0 +1,206 @@
+From 4fae247b37ae8c1115b6d13ff4e447c54aea9d8b Mon Sep 17 00:00:00 2001
+From: Chris Liddell <chris.liddell@artifex.com>
+Date: Thu, 14 Apr 2022 11:01:11 +0100
+Subject: oss-fuzz 46672: Avoid PS stack extensions from pdfi error
+
+pdfi was using the standard gs_error_stackoverflow error code when the pdfi
+operand stack overflowed. Returning that to the Postscript interpreter caused
+the interpreter to attempt to extend the Postscript op stack with a new block
+with zero requested new elements.
+
+This, in turn, caused the garbage collector to traverse the previous op stack
+block, and find no longer valid objects. Leading to trying to mark objects
+freed by a restore.
+
+The solution is to add a specific gs_error_pdf_stackoverflow, so we can still
+signal the appropriate error, but avoid confusing the Postscript interpreter.
+---
+ base/gserrors.h  | 10 ++++++++--
+ pdf/ghostpdf.c   |  3 ++-
+ pdf/pdf_check.c  |  2 +-
+ pdf/pdf_fontps.c |  2 +-
+ pdf/pdf_fontps.h |  4 ++--
+ pdf/pdf_page.c   |  2 +-
+ pdf/pdf_stack.c  |  4 ++--
+ psi/ierrors.h    |  7 +++++--
+ psi/iinit.c      |  4 ++--
+ 9 files changed, 24 insertions(+), 14 deletions(-)
+
+diff --git a/base/gserrors.h b/base/gserrors.h
+index 0e4982d79..6a7c5fea0 100644
+--- a/base/gserrors.h
++++ b/base/gserrors.h
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2021 Artifex Software, Inc.
++/* Copyright (C) 2001-2022 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -62,6 +62,12 @@ enum gs_error_type {
+ /* invalidid is for the NeXT DPS extension. */
+     gs_error_invalidid = -30,
+ 
++/* We need a specific stackoverflow error for the PDF interpreter to avoid dropping into
++ * the Postscript interpreter's stack extending code, when the PDF interpreter is called from
++ * Postscript
++ */
++    gs_error_pdf_stackoverflow = -31,
++
+         /* ------ Pseudo-errors used internally ------ */
+ 
+     gs_error_hit_detected = -99,
+@@ -122,7 +128,7 @@ enum gs_error_type {
+     gs_error_handled = -111,
+ 
+ /* Internal error for the C-based PDF interpreter, to indicate a circular PDF reference */
+-  gs_error_circular_reference = -112,
++    gs_error_circular_reference = -112,
+ };
+ 
+ /* We do provide a typedef type for external API use */
+diff --git a/pdf/ghostpdf.c b/pdf/ghostpdf.c
+index 6077d1cc1..439170290 100644
+--- a/pdf/ghostpdf.c
++++ b/pdf/ghostpdf.c
+@@ -347,6 +347,7 @@ const char *gs_error_strings[] = {
+     "unregistered",
+     "invalidcontext",
+     "invalidid",
++    "pdf_stackoverflow"
+ };
+ 
+ const char *gs_internal_error_strings[] = {
+@@ -365,7 +366,7 @@ const char *gs_internal_error_strings[] = {
+     "handled",
+     "circular reference"
+ };
+-#define LASTNORMALGSERROR gs_error_invalidid * -1
++#define LASTNORMALGSERROR gs_error_pdf_stackoverflow * -1
+ #define FIRSTINTERNALERROR gs_error_hit_detected * -1
+ #define LASTGSERROR gs_error_circular_reference * -1
+ 
+diff --git a/pdf/pdf_check.c b/pdf/pdf_check.c
+index 00933bdf9..91bd2bdf1 100644
+--- a/pdf/pdf_check.c
++++ b/pdf/pdf_check.c
+@@ -1104,7 +1104,7 @@ static int pdfi_check_page_inner(pdf_context *ctx, pdf_dict *page_dict,
+     code = pdfi_dict_knownget_type(ctx, page_dict, "Resources", PDF_DICT, (pdf_obj **)&Resources);
+     if (code > 0)
+         code = pdfi_check_Resources(ctx, Resources, page_dict, tracker);
+-    if ((code < 0 && ctx->args.pdfstoponerror) || (code == gs_error_stackoverflow))
++    if ((code < 0 && ctx->args.pdfstoponerror) || (code == gs_error_pdf_stackoverflow))
+         goto exit;
+ 
+     /* If we are drawing Annotations, check to see if the page uses any Annots */
+diff --git a/pdf/pdf_fontps.c b/pdf/pdf_fontps.c
+index 3ab399b96..ab993750d 100644
+--- a/pdf/pdf_fontps.c
++++ b/pdf/pdf_fontps.c
+@@ -1282,7 +1282,7 @@ pdfi_read_ps_font(pdf_context *ctx, pdf_dict *font_dict, byte *fbuf, int fbuflen
+        and that can end up in a stackoverflow error, even though we have a complete font. Override it
+        and let the Type 1 specific code decide for itself if it can use the font.
+      */
+-    if (code == gs_error_stackoverflow)
++    if (code == gs_error_pdf_stackoverflow)
+         code = 0;
+ 
+     return code;
+diff --git a/pdf/pdf_fontps.h b/pdf/pdf_fontps.h
+index 835f00669..79ba2aeff 100644
+--- a/pdf/pdf_fontps.h
++++ b/pdf/pdf_fontps.h
+@@ -208,7 +208,7 @@ static inline int pdf_ps_stack_push(pdf_ps_ctx_t *s)
+     }
+     s->cur++;
+     if (pdf_ps_obj_has_type(s->cur, PDF_PS_OBJ_STACK_TOP))
+-        return_error(gs_error_stackoverflow);
++        return_error(gs_error_pdf_stackoverflow);
+     if (pdf_ps_obj_has_type(s->cur, PDF_PS_OBJ_STACK_BOTTOM))
+         return_error(gs_error_stackunderflow);
+     return 0;
+@@ -239,7 +239,7 @@ static inline int pdf_ps_stack_pop(pdf_ps_ctx_t *s, unsigned int n)
+         pdf_ps_make_null(s->cur);
+         s->cur--;
+         if (pdf_ps_obj_has_type(s->cur, PDF_PS_OBJ_STACK_TOP))
+-            return_error(gs_error_stackoverflow);
++            return_error(gs_error_pdf_stackoverflow);
+         if (pdf_ps_obj_has_type(s->cur, PDF_PS_OBJ_STACK_BOTTOM))
+             return_error(gs_error_stackunderflow);
+     }
+diff --git a/pdf/pdf_page.c b/pdf/pdf_page.c
+index 911789890..4386ea894 100644
+--- a/pdf/pdf_page.c
++++ b/pdf/pdf_page.c
+@@ -879,7 +879,7 @@ exit3:
+      */
+     gx_pattern_cache_winnow(gstate_pattern_cache(ctx->pgs), pdfi_pattern_purge_all_proc, NULL);
+ 
+-    if (code == 0 || (!ctx->args.pdfstoponerror && code != gs_error_stackoverflow))
++    if (code == 0 || (!ctx->args.pdfstoponerror && code != gs_error_pdf_stackoverflow))
+         if (!page_dict_error && ctx->finish_page != NULL)
+             code = ctx->finish_page(ctx);
+     return code;
+diff --git a/pdf/pdf_stack.c b/pdf/pdf_stack.c
+index d2644fbbc..330ad804e 100644
+--- a/pdf/pdf_stack.c
++++ b/pdf/pdf_stack.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2018-2021 Artifex Software, Inc.
++/* Copyright (C) 2018-2022 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -49,7 +49,7 @@ int pdfi_push(pdf_context *ctx, pdf_obj *o)
+ 
+     if (ctx->stack_top >= ctx->stack_limit) {
+         if (ctx->stack_size >= MAX_STACK_SIZE)
+-            return_error(gs_error_stackoverflow);
++            return_error(gs_error_pdf_stackoverflow);
+ 
+         new_stack = (pdf_obj **)gs_alloc_bytes(ctx->memory, (ctx->stack_size + INITIAL_STACK_SIZE) * sizeof (pdf_obj *), "pdfi_push_increase_interp_stack");
+         if (new_stack == NULL)
+diff --git a/psi/ierrors.h b/psi/ierrors.h
+index 50f321288..fa0c789db 100644
+--- a/psi/ierrors.h
++++ b/psi/ierrors.h
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2021 Artifex Software, Inc.
++/* Copyright (C) 2001-2022 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -57,8 +57,11 @@ extern const char *const gs_error_names[];
+ #define DPS_ERROR_NAMES\
+  "invalidcontext", "invalidid"
+ 
++#define PDF_ERROR_NAMES\
++ "pdf_stackoverflow"
++
+ #define ERROR_NAMES\
+- LEVEL1_ERROR_NAMES, LEVEL2_ERROR_NAMES, DPS_ERROR_NAMES
++ LEVEL1_ERROR_NAMES, LEVEL2_ERROR_NAMES, DPS_ERROR_NAMES, PDF_ERROR_NAMES
+ 
+ /*
+  * Define which error codes require re-executing the current object.
+diff --git a/psi/iinit.c b/psi/iinit.c
+index e34712927..2d8bfe99e 100644
+--- a/psi/iinit.c
++++ b/psi/iinit.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2001-2021 Artifex Software, Inc.
++/* Copyright (C) 2001-2022 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+@@ -363,7 +363,7 @@ obj_init(i_ctx_t **pi_ctx_p, gs_dual_memory_t *idmem)
+ 
+     /* Create the error name table */
+     {
+-        int n = countof(gs_error_names) - 1;
++        int n = countof(gs_error_names);
+         int i;
+         ref era;
+ 
+-- 
+cgit v1.2.3
+

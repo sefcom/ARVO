@@ -1,0 +1,60 @@
+From 08dafda1232ffb70d878cb9b334982163aa32357 Mon Sep 17 00:00:00 2001
+From: Dmitry Stogov <dmitry@zend.com>
+Date: Mon, 19 Apr 2021 18:16:14 +0300
+Subject: [PATCH] Fixed use-after-free introduced by
+ ca49e53670631ed9754810d7ec6d56ede0d06cca
+
+---
+ Zend/tests/exception_026.phpt | 26 ++++++++++++++++++++++++++
+ Zend/zend_objects.c           |  5 +++++
+ 2 files changed, 31 insertions(+)
+ create mode 100644 Zend/tests/exception_026.phpt
+
+diff --git a/Zend/tests/exception_026.phpt b/Zend/tests/exception_026.phpt
+new file mode 100644
+index 0000000000000..0c47a449a4bf3
+--- /dev/null
++++ b/Zend/tests/exception_026.phpt
+@@ -0,0 +1,26 @@
++--TEST--
++Nested exceptions in destructors
++--FILE--
++<?php
++class A {
++    static $max=0;
++    function __destruct() {
++        if (self::$max--<0)
++            X;  
++        $a = new A;
++        Y;      
++    }
++}
++new A;
++?>
++--EXPECTF--
++Fatal error: Uncaught Error: Undefined constant "Y" in %s:8
++Stack trace:
++#0 %s(11): A->__destruct()
++#1 {main}
++
++Next Error: Undefined constant "X" in %s:6
++Stack trace:
++#0 %s(11): A->__destruct()
++#1 {main}
++  thrown in %s on line 6
+diff --git a/Zend/zend_objects.c b/Zend/zend_objects.c
+index c0eb532ada606..7e3fa03912a87 100644
+--- a/Zend/zend_objects.c
++++ b/Zend/zend_objects.c
+@@ -156,6 +156,11 @@ ZEND_API void zend_objects_destroy_object(zend_object *object)
+ 			if (EG(exception) == object) {
+ 				zend_error_noreturn(E_CORE_ERROR, "Attempt to destruct pending exception");
+ 			} else {
++				if (EG(current_execute_data)
++				 && EG(current_execute_data)->func
++				 && ZEND_USER_CODE(EG(current_execute_data)->func->common.type)) {
++					zend_rethrow_exception(EG(current_execute_data));
++				}
+ 				old_exception = EG(exception);
+ 				old_opline_before_exception = EG(opline_before_exception);
+ 				EG(exception) = NULL;

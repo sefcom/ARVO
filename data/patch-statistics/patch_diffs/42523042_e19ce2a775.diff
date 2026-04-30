@@ -1,0 +1,360 @@
+From 761da806fc950c6b26c1763e8989a814e9b16a59 Mon Sep 17 00:00:00 2001
+From: David Anderson <davea42@linuxmail.org>
+Date: Sun, 9 Apr 2023 11:17:05 -0700
+Subject: [PATCH] Fixing DW202304-002 oss fuzz  57766 A  read off the end of
+ the relevant (.debug_str_offsets) section.
+
+Using renamed fields related to str_offsets
+	modified:   src/lib/libdwarf/dwarf_die_deliv.c
+	modified:   src/lib/libdwarf/dwarf_fission_to_cu.c
+
+Add a new check for sanity in reading indexes
+to be used on str_offsets.
+Simplify and correct
+_dwarf_extract_string_offset_via_str_offsets()
+	modified:   src/lib/libdwarf/dwarf_form.c
+
+Revise the list of values used in str_offsets
+data for cu contexts. Document the fields better.
+Put the boolean markers next to what they relate
+to.  Delete a useless boolean.
+	modified:   src/lib/libdwarf/dwarf_opaque.h
+
+Using renamed fields related to str_offsets
+	modified:   src/lib/libdwarf/dwarf_query.c
+	modified:   src/lib/libdwarf/dwarf_str_offsets.c
+---
+ src/lib/libdwarf/dwarf_die_deliv.c     |  6 +-
+ src/lib/libdwarf/dwarf_fission_to_cu.c |  8 +--
+ src/lib/libdwarf/dwarf_form.c          | 78 ++++++++++++++++++--------
+ src/lib/libdwarf/dwarf_opaque.h        | 38 ++++++++-----
+ src/lib/libdwarf/dwarf_query.c         |  4 --
+ src/lib/libdwarf/dwarf_str_offsets.c   |  5 +-
+ 6 files changed, 90 insertions(+), 49 deletions(-)
+
+diff --git a/src/lib/libdwarf/dwarf_die_deliv.c b/src/lib/libdwarf/dwarf_die_deliv.c
+index eca972170..cba0ae660 100644
+--- a/src/lib/libdwarf/dwarf_die_deliv.c
++++ b/src/lib/libdwarf/dwarf_die_deliv.c
+@@ -1216,18 +1216,18 @@ find_cu_die_base_fields(Dwarf_Debug dbg,
+ 
+             /*  The offset is of the first offset in
+                 .debug_str_offsets that is the string table
+-                for this CU. */
++                offset array for this CU. */
+             case DW_AT_str_offsets_base:{
+                 int udres = 0;
+                 Dwarf_Bool is_info = cucon->cc_is_info;
+ 
+                 udres = _dwarf_internal_global_formref_b(attr,
+                     /* avoid recurse creating context */ 1,
+-                    &cucon->cc_str_offsets_header_offset,
++                    &cucon->cc_str_offsets_array_offset,
+                     &is_info,
+                     error);
+                 if (udres == DW_DLV_OK) {
+-                    cucon->cc_str_offsets_tab_present = TRUE;
++                    cucon->cc_str_offsets_array_offset_present = TRUE;
+                 } else {
+                     local_attrlist_dealloc(dbg,atcount,alist);
+                     /* Something is badly wrong. */
+diff --git a/src/lib/libdwarf/dwarf_fission_to_cu.c b/src/lib/libdwarf/dwarf_fission_to_cu.c
+index f6d96817f..782e27207 100644
+--- a/src/lib/libdwarf/dwarf_fission_to_cu.c
++++ b/src/lib/libdwarf/dwarf_fission_to_cu.c
+@@ -99,8 +99,8 @@ load_xu_loclists_into_cucontext(Dwarf_Debug dbg,
+     return DW_DLV_OK;
+ }
+ 
+-/*  ASSERT: cc_str_offsets_base_present FALSE
+-    ASSERT: cc_str_offsets_header_length_present  FALSE
++/*  
++   
+     ASSERT: dbg,cu_context, and fsd are non-NULL
+     as the caller ensured that.
+     If .debug_cu_index or
+@@ -166,11 +166,11 @@ load_xu_str_offsets_into_cucontext(Dwarf_Debug dbg,
+         /*  See dwarf_opaque.h for comments. */
+         cu_context->cc_str_offsets_tab_present = TRUE;
+         cu_context->cc_str_offsets_header_offset = soff_hdroffset;
+-        cu_context->cc_str_offsets_tab_to_array_present = TRUE;
+         cu_context->cc_str_offsets_tab_to_array =
+             local_offset_to_array;
+-        cu_context->cc_str_offsets_offset_size = offset_size;
++        cu_context->cc_str_offsets_table_size = total_table_length;
+         cu_context->cc_str_offsets_version = version;
++        cu_context->cc_str_offsets_offset_size = offset_size;
+     }
+     return DW_DLV_OK;
+ }
+diff --git a/src/lib/libdwarf/dwarf_form.c b/src/lib/libdwarf/dwarf_form.c
+index de8c98f69..e99a6fb22 100644
+--- a/src/lib/libdwarf/dwarf_form.c
++++ b/src/lib/libdwarf/dwarf_form.c
+@@ -1055,6 +1055,9 @@ dwarf_get_debug_addr_index(Dwarf_Attribute attr,
+     return DW_DLV_ERROR;
+ }
+ 
++/*  The index value here is the value of the
++    attribute with this form.
++    FORMs passed in are always strx forms. */
+ static int
+ dw_read_str_index_val_itself(Dwarf_Debug dbg,
+     unsigned theform,
+@@ -1116,7 +1119,10 @@ dwarf_get_debug_str_index(Dwarf_Attribute attr,
+     Dwarf_Unsigned index = 0;
+     Dwarf_Small *info_ptr = 0;
+     int indxres = 0;
++    Dwarf_Unsigned length_size = 0;
++    Dwarf_Unsigned sectionlen = 0;
+ 
++    
+     res = get_attr_dbg(&dbg,&cu_context,attr,error);
+     if (res != DW_DLV_OK) {
+         return res;
+@@ -1131,6 +1137,18 @@ dwarf_get_debug_str_index(Dwarf_Attribute attr,
+         *return_index = index;
+         return indxres;
+     }
++    length_size = cu_context->cc_length_size;
++    sectionlen = dbg->de_debug_str_offsets.dss_size;
++    if (index > sectionlen ||
++        (index *length_size) > sectionlen) {
++        _dwarf_error_string(dbg, error,
++            DW_DLE_ATTR_FORM_SIZE_BAD,
++            "DW_DLE_ATTR_FORM_SIZE_BAD: "
++            "An Attribute Value (index  into "
++            ".debug_str_offsets) is Impossibly "            
++            "large. Corrupt Dwarf.");
++        return DW_DLV_ERROR;
++    }
+     return indxres;
+ }
+ 
+@@ -1693,6 +1711,10 @@ dwarf_formblock(Dwarf_Attribute attr,
+     return DW_DLV_OK;
+ }
+ 
++/*  This is called for attribute with strx form
++    or macro5 with strx form. 
++    No relation to the Name Table or
++    to  FIXME */
+ int
+ _dwarf_extract_string_offset_via_str_offsets(Dwarf_Debug dbg,
+     Dwarf_Small *data_ptr,
+@@ -1703,8 +1725,8 @@ _dwarf_extract_string_offset_via_str_offsets(Dwarf_Debug dbg,
+     Dwarf_Error *error)
+ {
+     Dwarf_Unsigned index_to_offset_entry = 0;
+-    Dwarf_Unsigned offsetintable = 0;
+-    Dwarf_Unsigned end_offsetintable = 0;
++    Dwarf_Unsigned offsettotable = 0;
++    Dwarf_Unsigned end_offsettotable = 0;
+     Dwarf_Unsigned indexoffset = 0;
+     Dwarf_Unsigned baseoffset = 0;
+     Dwarf_Unsigned table_offset_to_array = 0;
+@@ -1716,6 +1738,7 @@ _dwarf_extract_string_offset_via_str_offsets(Dwarf_Debug dbg,
+     Dwarf_Small   *sof_end = 0;
+     Dwarf_Unsigned str_sect_offset = 0;
+     Dwarf_Unsigned length_size  = 0;
++    Dwarf_Bool have_array_offset = FALSE;
+ 
+     res = _dwarf_load_section(dbg, &dbg->de_debug_str_offsets,error);
+     if (res != DW_DLV_OK) {
+@@ -1732,22 +1755,34 @@ _dwarf_extract_string_offset_via_str_offsets(Dwarf_Debug dbg,
+     if ( idxres != DW_DLV_OK) {
+         return idxres;
+     }
+-
+-    if (cu_context->cc_str_offsets_tab_present) {
++    if (cu_context->cc_str_offsets_array_offset_present) {
++        baseoffset = cu_context->cc_str_offsets_array_offset;
++        have_array_offset = TRUE;
++    } else if (cu_context->cc_str_offsets_tab_present) {
+         baseoffset = cu_context->cc_str_offsets_header_offset;
++        baseoffset += cu_context->cc_str_offsets_tab_to_array;
++        have_array_offset = TRUE;
++    } else { /* do nothing */}
++    if (baseoffset > sectionlen ||
++        (baseoffset+length_size) > sectionlen ||
++        (baseoffset+(index_to_offset_entry *length_size)) >
++            sectionlen) {
++        _dwarf_error_string(dbg, error,
++            DW_DLE_ATTR_FORM_SIZE_BAD,
++            "DW_DLE_ATTR_FORM_SIZE_BAD: "
++            "An Attribute value (offset  into "
++            ".debug_str_offsets) is impossibly "            
++            "large. Corrupt Dwarf.");
++        return DW_DLV_ERROR;
+     }
+-    if (cu_context->cc_str_offsets_tab_to_array_present) {
+-        table_offset_to_array =
+-            cu_context->cc_str_offsets_tab_to_array;
+-    }
+-
+-    if (!cu_context->cc_str_offsets_tab_present ||
+-        !cu_context->cc_str_offsets_tab_to_array_present) {
++    indexoffset = index_to_offset_entry* length_size;
++    if (!have_array_offset) {
+         /*  missing any connection to a specific
+             str_offsets table this guesses at table zero.
+             When the compiler/linker have
+             combined str offsets into a
+             single table this works. */
++        Dwarf_Unsigned headeroffset = 0;
+         if (cu_context->cc_version_stamp ==  DW_CU_VERSION5 ) {
+             /*  A base offset of 0 is ok for either
+                 DWARF5. but some early GNU compilers emitted
+@@ -1763,7 +1798,7 @@ _dwarf_extract_string_offset_via_str_offsets(Dwarf_Debug dbg,
+             Dwarf_Half padding              = 0;
+ 
+             res = _dwarf_trial_read_dwarf_five_hdr(dbg,
+-                baseoffset,stsize,
++                headeroffset,stsize,
+                 &table_offset_to_array,
+                 &table_length,
+                 &length, &local_offset_size,
+@@ -1772,7 +1807,8 @@ _dwarf_extract_string_offset_via_str_offsets(Dwarf_Debug dbg,
+                 &padding,
+                 error);
+             if (res == DW_DLV_OK) {
+-                /* baseoffset unchanged */
++                baseoffset = table_offset_to_array+
++                    headeroffset;
+             } else {
+                 if (res == DW_DLV_ERROR && error) {
+                     dwarf_dealloc_error(dbg,*error);
+@@ -1781,22 +1817,21 @@ _dwarf_extract_string_offset_via_str_offsets(Dwarf_Debug dbg,
+             }
+         }
+     }
+-    indexoffset = index_to_offset_entry* length_size;
+-    offsetintable = indexoffset+ baseoffset
+-        + table_offset_to_array;
+-    end_offsetintable = offsetintable + length_size;
++    offsettotable = indexoffset+ baseoffset;
++    end_offsettotable = offsettotable + length_size;
+     /*  The offsets table is a series of offset-size entries.
+         The == case in the test applies when we are at the last table
+         entry, so == is not an error, hence only test >
+     */
+-    if (end_offsetintable  > sectionlen) {
++    if (offsettotable  > sectionlen ||
++        end_offsettotable  > sectionlen) {
+         dwarfstring m;
+ 
+         dwarfstring_constructor(&m);
+         dwarfstring_append_printf_u(&m,
+             "DW_DLE_ATTR_FORM_SIZE_BAD: The end offset of "
+             "a .debug_str_offsets table is 0x%x ",
+-            end_offsetintable);
++            end_offsettotable);
+         dwarfstring_append_printf_u(&m,
+             "but the object section is just 0x%x "
+             "bytes long",
+@@ -1807,9 +1842,8 @@ _dwarf_extract_string_offset_via_str_offsets(Dwarf_Debug dbg,
+         dwarfstring_destructor(&m);
+         return DW_DLV_ERROR;
+     }
+-
+-    sof_start = sectionptr+ offsetintable;
+-    sof_end = sectionptr + end_offsetintable;
++    sof_start = sectionptr+ offsettotable;
++    sof_end = sectionptr + end_offsettotable;
+     /* Now read the string offset from the offset table. */
+     READ_UNALIGNED_CK(dbg,str_sect_offset,Dwarf_Unsigned,
+         sof_start,
+diff --git a/src/lib/libdwarf/dwarf_opaque.h b/src/lib/libdwarf/dwarf_opaque.h
+index 481a52839..c80325c1f 100644
+--- a/src/lib/libdwarf/dwarf_opaque.h
++++ b/src/lib/libdwarf/dwarf_opaque.h
+@@ -264,24 +264,36 @@ struct Dwarf_CU_Context_s {
+     Dwarf_Bool     cc_loclists_base_present;
+     Dwarf_Bool     cc_loclists_header_length_present;
+ 
+-    /*  .debug_str_offsets DW_SECT_STR_OFFSETS DW4 DW5 vs
+-        DW_AT_str_offsets_base (table array offset) .
+-        Here cc_str_offsets_tab_present
+-        paired with cc_str_offsets_header_offset
+-        which is what the offset means */
++    /* ======= str_offsets table data  =======*/
++    /*  header_offset is global offset in str_offsets section
++        of an array of string offsets. Not a header offset
++        at all.
++        from DW_AT_str_offsets_base DW5 page 66 item 13.
++        Not related to the Name Table */
++    /*  Set from DW_AT_str_offsets_base. Global offset. */
++    Dwarf_Bool     cc_str_offsets_array_offset_present;
++    Dwarf_Unsigned cc_str_offsets_array_offset;
++
++    /*  Set from str_offsets header, means all the relevant
++        data from the header is present. Does not mean
++        the data from DW_AT_str_offsets_base is present */
+     Dwarf_Bool     cc_str_offsets_tab_present;
+-    /*  Without tab_to_array present we cannot do much. */
+-    Dwarf_Bool     cc_str_offsets_tab_to_array_present;
++    /*  Set from str_offsets header. */
++    Dwarf_Unsigned cc_str_offsets_header_offset;
+ 
+-    /*  header_offset is global offset in str_offsets section. */
+-    Dwarf_Unsigned cc_str_offsets_header_offset; /* cu/tu etc*/
+-    Dwarf_Unsigned cc_str_offsets_table_size;
+-
+-    /*  to get from the start of a str_offsets table to the
+-        offsets array entries. */
++    /*  Set by reading str_offsets header. Local offset
++        from header to its array. */
+     Dwarf_Unsigned cc_str_offsets_tab_to_array;
++
++    /*  The following three set but not used. Might
++        be useful for error checking. */
+     Dwarf_Unsigned cc_str_offsets_offset_size;
++    /*  The size of the table from table header
++        to end of this table. Not the size of array
++        in the table */
++    Dwarf_Unsigned cc_str_offsets_table_size;
+     Dwarf_Half     cc_str_offsets_version;
++    /* ======= end str_offsets table data  =======*/
+ 
+     /*  DW_SECT_MACRO */
+     Dwarf_Unsigned cc_macro_base;    /*DW5 */
+diff --git a/src/lib/libdwarf/dwarf_query.c b/src/lib/libdwarf/dwarf_query.c
+index 1078d2a7f..557bbeca4 100644
+--- a/src/lib/libdwarf/dwarf_query.c
++++ b/src/lib/libdwarf/dwarf_query.c
+@@ -1247,10 +1247,6 @@ _dwarf_merge_all_base_attrs_of_cu_die(Dwarf_Debug dbg,
+             tiedcontext->cc_str_offsets_tab_present;
+         context->        cc_str_offsets_header_offset=
+             tiedcontext->cc_str_offsets_header_offset;
+-    }
+-    if (!context->cc_str_offsets_tab_to_array_present) {
+-        context->        cc_str_offsets_tab_to_array_present =
+-            tiedcontext->cc_str_offsets_tab_to_array_present;
+         context->        cc_str_offsets_tab_to_array=
+             tiedcontext->cc_str_offsets_tab_to_array;
+         context->        cc_str_offsets_table_size=
+diff --git a/src/lib/libdwarf/dwarf_str_offsets.c b/src/lib/libdwarf/dwarf_str_offsets.c
+index e0b97ef40..fafb14ff8 100644
+--- a/src/lib/libdwarf/dwarf_str_offsets.c
++++ b/src/lib/libdwarf/dwarf_str_offsets.c
+@@ -413,7 +413,7 @@ _dwarf_read_str_offsets_header(Dwarf_Str_Offsets_Table sot,
+ 
+     globaltaboff = sot->so_next_table_offset;
+     if (cucontext) {
+-        if (cucontext->cc_str_offsets_tab_to_array_present) {
++        if (cucontext->cc_str_offsets_tab_present) {
+             /*  cu_context has what it needs already and we do
+                 not need the rest of what the interface
+                 provides */
+@@ -481,10 +481,9 @@ _dwarf_read_str_offsets_header(Dwarf_Str_Offsets_Table sot,
+         cucontext->cc_str_offsets_tab_present = TRUE;
+         cucontext->cc_str_offsets_tab_to_array =
+             table_local_offset_of_array;
+-        cucontext->cc_str_offsets_tab_to_array_present = TRUE;
++        cucontext->cc_str_offsets_version   = version;
+         cucontext->cc_str_offsets_offset_size  = local_offset_size;
+         cucontext->cc_str_offsets_table_size   = total_table_length;
+-        cucontext->cc_str_offsets_version   = version;
+     }
+     if (local_offset_to_array_out) {
+         *local_offset_to_array_out = table_local_offset_of_array;

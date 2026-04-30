@@ -1,0 +1,207 @@
+From cb335699aafc84952d1a6a94eb9d2ee201ad416f Mon Sep 17 00:00:00 2001
+From: Thomas Knudsen <busstoptaktik@users.noreply.github.com>
+Date: Sun, 8 Oct 2017 16:29:16 +0200
+Subject: [PATCH] Resolve #594 and OSS-Fuzz-3569 (#595)
+
+* Resolve #594 and OSS-Fuzz-3569
+
+* Restructure PJ_geos opaque object: sweep_axis showed unneeded, and freeing it was wrong. Eliminate instead
+
+Resolves #594
+Resolves OSS-Fuzz Issue 3569
+
+Credit to OSS-Fuzz
+---
+ src/PJ_geos.c   | 16 ++++++++--------
+ src/pj_ctx.c    | 28 +++++++++++++++++++++-------
+ src/pj_malloc.c |  9 +++++++--
+ 3 files changed, 36 insertions(+), 17 deletions(-)
+
+diff --git a/src/PJ_geos.c b/src/PJ_geos.c
+index 5679455f17..5fd3e56b84 100644
+--- a/src/PJ_geos.c
++++ b/src/PJ_geos.c
+@@ -40,7 +40,6 @@ struct pj_opaque {
+     double radius_g;
+     double radius_g_1;
+     double C;
+-    char *sweep_axis;
+     int flip_axis;
+ };
+ 
+@@ -191,25 +190,26 @@ static LP e_inverse (XY xy, PJ *P) {          /* Ellipsoidal, inverse */
+ 
+ 
+ PJ *PROJECTION(geos) {
++    char *sweep_axis;
+     struct pj_opaque *Q = pj_calloc (1, sizeof (struct pj_opaque));
+     if (0==Q)
+         return pj_default_destructor (P, ENOMEM);
+     P->opaque = Q;
+ 
+     if ((Q->h = pj_param(P->ctx, P->params, "dh").f) <= 0.)
+-        pj_default_destructor (P, PJD_ERR_H_LESS_THAN_ZERO);
++        return pj_default_destructor (P, PJD_ERR_H_LESS_THAN_ZERO);
+ 
+     if (P->phi0 != 0.0)
+-        pj_default_destructor (P, PJD_ERR_UNKNOWN_PRIME_MERIDIAN);
++        return pj_default_destructor (P, PJD_ERR_UNKNOWN_PRIME_MERIDIAN);
+ 
+-    Q->sweep_axis = pj_param(P->ctx, P->params, "ssweep").s;
+-    if (Q->sweep_axis == NULL)
++    sweep_axis = pj_param(P->ctx, P->params, "ssweep").s;
++    if (sweep_axis == NULL)
+       Q->flip_axis = 0;
+     else {
+-        if (Q->sweep_axis[1] != '\0' || (Q->sweep_axis[0] != 'x' && Q->sweep_axis[0] != 'y'))
+-            pj_default_destructor (P, PJD_ERR_INVALID_SWEEP_AXIS);
++        if (sweep_axis[1] != '\0' || (sweep_axis[0] != 'x' && sweep_axis[0] != 'y'))
++            return pj_default_destructor (P, PJD_ERR_INVALID_SWEEP_AXIS);
+ 
+-        if (Q->sweep_axis[0] == 'x')
++        if (sweep_axis[0] == 'x')
+           Q->flip_axis = 1;
+         else
+           Q->flip_axis = 0;
+diff --git a/src/pj_ctx.c b/src/pj_ctx.c
+index 7ba85e7882..a8edaf43bd 100644
+--- a/src/pj_ctx.c
++++ b/src/pj_ctx.c
+@@ -55,6 +55,8 @@ projCtx pj_get_ctx( projPJ pj )
+ void pj_set_ctx( projPJ pj, projCtx ctx )
+ 
+ {
++    if (pj==0)
++        return;
+     pj->ctx = ctx;
+ }
+ 
+@@ -103,6 +105,8 @@ projCtx pj_ctx_alloc()
+ 
+ {
+     projCtx ctx = (projCtx_t *) malloc(sizeof(projCtx_t));
++    if (0==ctx)
++        return 0;
+     memcpy( ctx, pj_get_default_ctx(), sizeof(projCtx_t) );
+     ctx->last_errno = 0;
+ 
+@@ -116,7 +120,7 @@ projCtx pj_ctx_alloc()
+ void pj_ctx_free( projCtx ctx )
+ 
+ {
+-    free( ctx );
++    pj_dealloc( ctx );
+ }
+ 
+ /************************************************************************/
+@@ -126,27 +130,25 @@ void pj_ctx_free( projCtx ctx )
+ int pj_ctx_get_errno( projCtx ctx )
+ 
+ {
++    if (0==ctx)
++        return pj_get_default_ctx ()->last_errno;
+     return ctx->last_errno;
+ }
+ 
+ /************************************************************************/
+ /*                          pj_ctx_set_errno()                          */
+ /*                                                                      */
+-/*      Also sets the global errno.                                     */
+-/*      Since pj_errno makes sense in single threaded cases only,       */
+-/*      we set it only when called on the default context.              */
++/*                      Also sets the global errno                      */
+ /************************************************************************/
+ 
+ void pj_ctx_set_errno( projCtx ctx, int new_errno )
+ 
+ {
+     ctx->last_errno = new_errno;
+-    if (ctx!=pj_get_default_ctx())
+-        return;
+     if( new_errno == 0 )
+         return;
+-    pj_errno = new_errno;
+     errno = new_errno;
++    pj_errno = new_errno;
+ }
+ 
+ /************************************************************************/
+@@ -156,6 +158,8 @@ void pj_ctx_set_errno( projCtx ctx, int new_errno )
+ void pj_ctx_set_debug( projCtx ctx, int new_debug )
+ 
+ {
++    if (0==ctx)
++        pj_get_default_ctx ()->debug_level = new_debug;
+     ctx->debug_level = new_debug;
+ }
+ 
+@@ -166,6 +170,8 @@ void pj_ctx_set_debug( projCtx ctx, int new_debug )
+ void pj_ctx_set_logger( projCtx ctx, void (*new_logger)(void*,int,const char*) )
+ 
+ {
++    if (0==ctx)
++        return;
+     ctx->logger = new_logger;
+ }
+ 
+@@ -176,6 +182,8 @@ void pj_ctx_set_logger( projCtx ctx, void (*new_logger)(void*,int,const char*) )
+ void pj_ctx_set_app_data( projCtx ctx, void *new_app_data )
+ 
+ {
++    if (0==ctx)
++        return;
+     ctx->app_data = new_app_data;
+ }
+ 
+@@ -186,6 +194,8 @@ void pj_ctx_set_app_data( projCtx ctx, void *new_app_data )
+ void *pj_ctx_get_app_data( projCtx ctx )
+ 
+ {
++    if (0==ctx)
++        return 0;
+     return ctx->app_data;
+ }
+ 
+@@ -196,6 +206,8 @@ void *pj_ctx_get_app_data( projCtx ctx )
+ void pj_ctx_set_fileapi( projCtx ctx, projFileAPI *fileapi )
+ 
+ {
++    if (0==ctx)
++        return;
+     ctx->fileapi = fileapi;
+ }
+ 
+@@ -206,5 +218,7 @@ void pj_ctx_set_fileapi( projCtx ctx, projFileAPI *fileapi )
+ projFileAPI *pj_ctx_get_fileapi( projCtx ctx )
+ 
+ {
++    if (0==ctx)
++        return 0;
+     return ctx->fileapi;
+ }
+diff --git a/src/pj_malloc.c b/src/pj_malloc.c
+index 75d0537825..4e465c46c4 100644
+--- a/src/pj_malloc.c
++++ b/src/pj_malloc.c
+@@ -158,6 +158,13 @@ void *pj_default_destructor (PJ *P, int errlev) {   /* Destructor */
+     of PJs where the opaque object does not contain any additionally
+     allocated memory below the P->opaque level.
+ ******************************************************************************/
++
++    /* Even if P==0, we set the errlev on pj_error and the default context   */
++    /* Note that both, in the multithreaded case, may then contain undefined */
++    /* values. This is expected behaviour. For MT have one ctx per thread    */
++    if (0!=errlev)
++        pj_ctx_set_errno (pj_get_ctx(P), errlev);
++
+     if (0==P)
+         return 0;
+     
+@@ -179,7 +186,5 @@ void *pj_default_destructor (PJ *P, int errlev) {   /* Destructor */
+     pj_dealloc_params (pj_get_ctx(P), P->params, errlev);
+ 
+     pj_dealloc (P->opaque);
+-    if (0!=errlev)
+-        pj_ctx_set_errno (pj_get_ctx(P), errlev);
+     return pj_dealloc(P);
+ }

@@ -1,0 +1,294 @@
+From ab0905f46d43b71228fa501d4981f419e710c7f1 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dbaryshkov@gmail.com>
+Date: Wed, 29 Jan 2020 20:00:53 +0300
+Subject: [PATCH] nettle/gost: support use GOST DSA support from master branch
+
+Use GOST DSA and GOST curves provided by Nettle's master branch.
+
+Signed-off-by: Dmitry Baryshkov <dbaryshkov@gmail.com>
+---
+ configure.ac                     |  9 +++++
+ lib/nettle/Makefile.am           |  7 +++-
+ lib/nettle/gost/ecc-gost-curve.h |  8 ++---
+ lib/nettle/gost/ecc-gost256cpa.c |  6 ++--
+ lib/nettle/gost/ecc-gost512a.c   |  6 ++--
+ lib/nettle/gost/gostdsa-mask.c   |  2 +-
+ lib/nettle/gost/gostdsa-vko.c    |  2 +-
+ lib/nettle/gost/gostdsa.h        | 12 -------
+ lib/nettle/gost/gostdsa2.h       | 62 ++++++++++++++++++++++++++++++++
+ lib/nettle/pk.c                  | 13 ++++---
+ 10 files changed, 97 insertions(+), 30 deletions(-)
+ create mode 100644 lib/nettle/gost/gostdsa2.h
+
+diff --git a/configure.ac b/configure.ac
+index 2e73a904d6..09acf8b22f 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -660,6 +660,15 @@ AC_CHECK_FUNCS([nettle_curve448_mul nettle_ed448_shake256_sign],
+ LIBS=$save_LIBS
+ AM_CONDITIONAL(NEED_CURVE448, test "$have_curve448" != "yes")
+ 
++have_gostdsa=yes
++save_LIBS=$LIBS
++LIBS="$LIBS $HOGWEED_LIBS $NETTLE_LIBS"
++AC_CHECK_FUNCS([nettle_get_gost_gc256b nettle_get_gost_gc512a nettle_gostdsa_sign], [],
++	       have_gostdsa=no)
++LIBS=$save_LIBS
++AS_IF([test "$have_gostdsa" != "yes"], AC_DEFINE([NEED_GOSTDSA], 1, [Use backported GOST R 34.10 DSA support]))
++AM_CONDITIONAL(NEED_GOSTDSA, [test "$have_gostdsa" != "yes"])
++
+ AC_MSG_CHECKING([whether to build libdane])
+ AC_ARG_ENABLE(libdane,
+     AS_HELP_STRING([--disable-libdane],
+diff --git a/lib/nettle/Makefile.am b/lib/nettle/Makefile.am
+index 8c1a2d17ee..e4d9ad64ef 100644
+--- a/lib/nettle/Makefile.am
++++ b/lib/nettle/Makefile.am
+@@ -86,14 +86,19 @@ libcrypto_la_SOURCES += \
+ 	gost/pbkdf2-hmac-gosthash94.c gost/pbkdf2-hmac-streebog.c \
+ 	gost/pbkdf2-gost.h
+ 
++if NEED_GOSTDSA
+ libcrypto_la_SOURCES += \
+ 	gost/nettle-internal.h \
+ 	gost/ecc-gost256cpa.c gost/ecc-gost256cpa-32.h  gost/ecc-gost256cpa-64.h\
+ 	gost/ecc-gost512a.c gost/ecc-gost512a-32.h gost/ecc-gost512a-64.h \
+ 	gost/ecc-internal.h gost/gmp-glue.h \
+ 	gost/ecc-gostdsa-sign.c gost/ecc-gostdsa-verify.c \
+-	gost/gostdsa-mask.c gost/gostdsa-sign.c gost/gostdsa-verify.c gost/gostdsa-vko.c \
++	gost/gostdsa-sign.c gost/gostdsa-verify.c \
+ 	gost/gostdsa.h gost/ecc-gost-curve.h gost/ecc-gost-hash.c
++endif
++
++libcrypto_la_SOURCES += \
++	gost/gostdsa-mask.c gost/gostdsa-vko.c gost/gostdsa2.h
+ 
+ libcrypto_la_SOURCES += gost_keywrap.c
+ endif
+diff --git a/lib/nettle/gost/ecc-gost-curve.h b/lib/nettle/gost/ecc-gost-curve.h
+index 9e972c7689..a7979275d0 100644
+--- a/lib/nettle/gost/ecc-gost-curve.h
++++ b/lib/nettle/gost/ecc-gost-curve.h
+@@ -49,10 +49,10 @@ struct ecc_curve;
+ #endif
+ #endif
+ 
+-#define nettle_get_gost_256cpa _gnutls_get_gost_256cpa
+-#define nettle_get_gost_512a _gnutls_get_gost_512a
+-const struct ecc_curve * NETTLE_PURE nettle_get_gost_256cpa(void);
+-const struct ecc_curve * NETTLE_PURE nettle_get_gost_512a(void);
++#define nettle_get_gost_gc256b _gnutls_get_gost_gc256b
++#define nettle_get_gost_gc512a _gnutls_get_gost_gc512a
++const struct ecc_curve * NETTLE_PURE nettle_get_gost_gc256b(void);
++const struct ecc_curve * NETTLE_PURE nettle_get_gost_gc512a(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/lib/nettle/gost/ecc-gost256cpa.c b/lib/nettle/gost/ecc-gost256cpa.c
+index 6d7fa51b3e..74ea4d2685 100644
+--- a/lib/nettle/gost/ecc-gost256cpa.c
++++ b/lib/nettle/gost/ecc-gost256cpa.c
+@@ -64,7 +64,7 @@
+ #define ecc_256_modp ecc_mod
+ #define ecc_256_modq ecc_mod
+ 
+-static const struct ecc_curve _gnutls_gost_256cpa =
++static const struct ecc_curve _gnutls_gost_gc256b =
+ {
+   {
+     256,
+@@ -140,7 +140,7 @@ static const struct ecc_curve _gnutls_gost_256cpa =
+   ecc_table
+ };
+ 
+-const struct ecc_curve *nettle_get_gost_256cpa(void)
++const struct ecc_curve *nettle_get_gost_gc256b(void)
+ {
+-  return &_gnutls_gost_256cpa;
++  return &_gnutls_gost_gc256b;
+ }
+diff --git a/lib/nettle/gost/ecc-gost512a.c b/lib/nettle/gost/ecc-gost512a.c
+index 1bd4d1b7af..d77a41f4c0 100644
+--- a/lib/nettle/gost/ecc-gost512a.c
++++ b/lib/nettle/gost/ecc-gost512a.c
+@@ -64,7 +64,7 @@
+ #define ecc_512_modp ecc_mod
+ #define ecc_512_modq ecc_mod
+ 
+-static const struct ecc_curve _gnutls_gost_512a =
++static const struct ecc_curve _gnutls_gost_gc512a =
+ {
+   {
+     512,
+@@ -140,7 +140,7 @@ static const struct ecc_curve _gnutls_gost_512a =
+   ecc_table
+ };
+ 
+-const struct ecc_curve *nettle_get_gost_512a(void)
++const struct ecc_curve *nettle_get_gost_gc512a(void)
+ {
+-  return &_gnutls_gost_512a;
++  return &_gnutls_gost_gc512a;
+ }
+diff --git a/lib/nettle/gost/gostdsa-mask.c b/lib/nettle/gost/gostdsa-mask.c
+index 49dc2f4569..6654d386b2 100644
+--- a/lib/nettle/gost/gostdsa-mask.c
++++ b/lib/nettle/gost/gostdsa-mask.c
+@@ -37,7 +37,7 @@
+ 
+ #include <stdlib.h>
+ 
+-#include "gostdsa.h"
++#include "gostdsa2.h"
+ #include "ecc-internal.h"
+ 
+ #include "gmp-glue.h"
+diff --git a/lib/nettle/gost/gostdsa-vko.c b/lib/nettle/gost/gostdsa-vko.c
+index 89dff1cc45..4251930a80 100644
+--- a/lib/nettle/gost/gostdsa-vko.c
++++ b/lib/nettle/gost/gostdsa-vko.c
+@@ -38,7 +38,7 @@
+ #include <stdlib.h>
+ 
+ #include "ecc-internal.h"
+-#include "gostdsa.h"
++#include "gostdsa2.h"
+ 
+ int
+ gostdsa_vko(const struct ecc_scalar *key,
+diff --git a/lib/nettle/gost/gostdsa.h b/lib/nettle/gost/gostdsa.h
+index 9e0375f2ce..d9b79ff3ce 100644
+--- a/lib/nettle/gost/gostdsa.h
++++ b/lib/nettle/gost/gostdsa.h
+@@ -46,8 +46,6 @@ extern "C" {
+ /* Name mangling */
+ #define gostdsa_sign _gnutls_gostdsa_sign
+ #define gostdsa_verify _gnutls_gostdsa_verify
+-#define gostdsa_unmask_key _gnutls_gostdsa_unmask_key
+-#define gostdsa_vko _gnutls_gostdsa_vko
+ #define ecc_gostdsa_sign _gnutls_ecc_gostdsa_sign
+ #define ecc_gostdsa_sign_itch _gnutls_ecc_gostdsa_sign_itch
+ #define ecc_gostdsa_verify _gnutls_ecc_gostdsa_verify
+@@ -72,16 +70,6 @@ gostdsa_verify (const struct ecc_point *pub,
+ 	        size_t length, const uint8_t *digest,
+ 	        const struct dsa_signature *signature);
+ 
+-int
+-gostdsa_unmask_key (const struct ecc_curve *ecc,
+-		    mpz_t key);
+-
+-int
+-gostdsa_vko(const struct ecc_scalar *key,
+-	    const struct ecc_point *pub,
+-	    size_t ukm_length, const uint8_t *ukm,
+-	    size_t out_length, uint8_t *out);
+-
+ /* Low-level GOSTDSA functions. */
+ mp_size_t
+ ecc_gostdsa_sign_itch (const struct ecc_curve *ecc);
+diff --git a/lib/nettle/gost/gostdsa2.h b/lib/nettle/gost/gostdsa2.h
+new file mode 100644
+index 0000000000..a4b26ab497
+--- /dev/null
++++ b/lib/nettle/gost/gostdsa2.h
+@@ -0,0 +1,62 @@
++/* gostdsa.h
++
++   Copyright (C) 2015 Dmity Eremin-Solenikov
++   Copyright (C) 2013 Niels Möller
++
++   This file is part of GNU Nettle.
++
++   GNU Nettle is free software: you can redistribute it and/or
++   modify it under the terms of either:
++
++     * the GNU Lesser General Public License as published by the Free
++       Software Foundation; either version 3 of the License, or (at your
++       option) any later version.
++
++   or
++
++     * the GNU General Public License as published by the Free
++       Software Foundation; either version 2 of the License, or (at your
++       option) any later version.
++
++   or both in parallel, as here.
++
++   GNU Nettle is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   General Public License for more details.
++
++   You should have received copies of the GNU General Public License and
++   the GNU Lesser General Public License along with this program.  If
++   not, see https://www.gnu.org/licenses/.
++*/
++
++/* Development of Nettle's ECC support was funded by the .SE Internet Fund. */
++
++#ifndef GNUTLS_LIB_NETTLE_GOST_GOSTDSA2_H
++#define GNUTLS_LIB_NETTLE_GOST_GOSTDSA2_H
++
++#include <nettle/ecc.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Name mangling */
++#define gostdsa_unmask_key _gnutls_gostdsa_unmask_key
++#define gostdsa_vko _gnutls_gostdsa_vko
++
++int
++gostdsa_unmask_key (const struct ecc_curve *ecc,
++		    mpz_t key);
++
++int
++gostdsa_vko(const struct ecc_scalar *key,
++	    const struct ecc_point *pub,
++	    size_t ukm_length, const uint8_t *ukm,
++	    size_t out_length, uint8_t *out);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* GNUTLS_LIB_NETTLE_GOST_GOSTDSA2_H */
+diff --git a/lib/nettle/pk.c b/lib/nettle/pk.c
+index 4be8dc7eda..f236cef3db 100644
+--- a/lib/nettle/pk.c
++++ b/lib/nettle/pk.c
+@@ -57,8 +57,13 @@
+ #include <nettle/eddsa.h>
+ #include <nettle/version.h>
+ #if ENABLE_GOST
++#if NEED_GOSTDSA
+ #include "gost/gostdsa.h"
+ #include "gost/ecc-gost-curve.h"
++#else
++#include <nettle/gostdsa.h>
++#endif
++#include "gost/gostdsa2.h"
+ #endif
+ #include "int/ecdsa-compute-k.h"
+ #include "int/dsa-compute-k.h"
+@@ -1499,13 +1504,11 @@ static inline const struct ecc_curve *get_supported_gost_curve(int curve)
+ 	switch (curve) {
+ #if ENABLE_GOST
+ 	case GNUTLS_ECC_CURVE_GOST256CPA:
+-		return nettle_get_gost_256cpa();
+ 	case GNUTLS_ECC_CURVE_GOST256CPXA:
+-		return nettle_get_gost_256cpa();
+-	case GNUTLS_ECC_CURVE_GOST512A:
+-		return nettle_get_gost_512a();
+ 	case GNUTLS_ECC_CURVE_GOST256B:
+-		return nettle_get_gost_256cpa();
++		return nettle_get_gost_gc256b();
++	case GNUTLS_ECC_CURVE_GOST512A:
++		return nettle_get_gost_gc512a();
+ #endif
+ 	default:
+ 		return NULL;
+-- 
+GitLab
+

@@ -1,0 +1,157 @@
+From b5e004379647bd1ebb75eb2eac8826fb6abdd3d8 Mon Sep 17 00:00:00 2001
+From: Xinchen Hui <laruence@gmail.com>
+Date: Wed, 25 Dec 2019 12:43:44 +0800
+Subject: [PATCH 1/2] Partial fix for bug #79029
+
+---
+ ext/xmlwriter/php_xmlwriter.c       | 16 +++++++++-------
+ ext/xmlwriter/tests/bug79029_1.phpt | 13 +++++++++++++
+ 2 files changed, 22 insertions(+), 7 deletions(-)
+ create mode 100644 ext/xmlwriter/tests/bug79029_1.phpt
+
+diff --git a/ext/xmlwriter/php_xmlwriter.c b/ext/xmlwriter/php_xmlwriter.c
+index 2fa4e328544f2..a4f1df3917330 100644
+--- a/ext/xmlwriter/php_xmlwriter.c
++++ b/ext/xmlwriter/php_xmlwriter.c
+@@ -83,13 +83,15 @@ typedef int (*xmlwriter_read_int_t)(xmlTextWriterPtr writer);
+ static void xmlwriter_free_resource_ptr(xmlwriter_object *intern)
+ {
+ 	if (intern) {
+-		if (intern->ptr) {
+-			xmlFreeTextWriter(intern->ptr);
+-			intern->ptr = NULL;
+-		}
+-		if (intern->output) {
+-			xmlBufferFree(intern->output);
+-			intern->output = NULL;
++		if (EG(active)) {
++			if (intern->ptr) {
++				xmlFreeTextWriter(intern->ptr);
++				intern->ptr = NULL;
++			}
++			if (intern->output) {
++				xmlBufferFree(intern->output);
++				intern->output = NULL;
++			}
+ 		}
+ 		efree(intern);
+ 	}
+diff --git a/ext/xmlwriter/tests/bug79029_1.phpt b/ext/xmlwriter/tests/bug79029_1.phpt
+new file mode 100644
+index 0000000000000..c91295c1675f3
+--- /dev/null
++++ b/ext/xmlwriter/tests/bug79029_1.phpt
+@@ -0,0 +1,13 @@
++--TEST--
++#79029 (Use After Free's in XMLReader / XMLWriter)
++--SKIPIF--
++<?php if (!extension_loaded("xmlwriter")) print "skip"; ?>
++--FILE--
++<?php
++$x = array( new XMLWriter() );
++$x[0]->openUri("a");
++$x[0]->startComment();
++?>
++okey
++--EXPECT--
++okey
+
+From d8ad2f4695ebd6dc2d4e668d9baeac1c071791a6 Mon Sep 17 00:00:00 2001
+From: Xinchen Hui <laruence@gmail.com>
+Date: Wed, 25 Dec 2019 13:14:08 +0800
+Subject: [PATCH 2/2] Fixed bug #79029 (Use After Free's in XMLReader /
+ XMLWriter)
+
+---
+ NEWS                                |  3 +++
+ ext/libxml/libxml.c                 |  2 ++
+ ext/xmlwriter/tests/bug79029.phpt   | 32 +++++++++++++++++++++++++++++
+ ext/xmlwriter/tests/bug79029_1.phpt | 13 ------------
+ 4 files changed, 37 insertions(+), 13 deletions(-)
+ create mode 100644 ext/xmlwriter/tests/bug79029.phpt
+ delete mode 100644 ext/xmlwriter/tests/bug79029_1.phpt
+
+diff --git a/NEWS b/NEWS
+index 881d0c8697bc7..0c8a9af73d90b 100644
+--- a/NEWS
++++ b/NEWS
+@@ -48,6 +48,9 @@ PHP                                                                        NEWS
+   . Fixed bug #79000 (Non-blocking socket stream reports EAGAIN as error).
+     (Nikita)
+ 
++- Libxml:
++  . Fixed bug #79029 (Use After Free's in XMLReader / XMLWriter). (Laruence)
++
+ 18 Dec 2019, PHP 7.4.1
+ 
+ - Core:
+diff --git a/ext/libxml/libxml.c b/ext/libxml/libxml.c
+index efccf0a4078e9..837cc7ad98c4c 100644
+--- a/ext/libxml/libxml.c
++++ b/ext/libxml/libxml.c
+@@ -355,6 +355,8 @@ static void *php_libxml_streams_IO_open_wrapper(const char *filename, const char
+ 	context = php_stream_context_from_zval(Z_ISUNDEF(LIBXML(stream_context))? NULL : &LIBXML(stream_context), 0);
+ 
+ 	ret_val = php_stream_open_wrapper_ex(path_to_open, (char *)mode, REPORT_ERRORS, NULL, context);
++	/* Prevent from closing this by fclose() */
++	((php_stream*)ret_val)->flags |= PHP_STREAM_FLAG_NO_FCLOSE;
+ 	if (isescaped) {
+ 		xmlFree(resolved_path);
+ 	}
+diff --git a/ext/xmlwriter/tests/bug79029.phpt b/ext/xmlwriter/tests/bug79029.phpt
+new file mode 100644
+index 0000000000000..f329b627567d9
+--- /dev/null
++++ b/ext/xmlwriter/tests/bug79029.phpt
+@@ -0,0 +1,32 @@
++--TEST--
++#79029 (Use After Free's in XMLReader / XMLWriter)
++--SKIPIF--
++<?php if (!extension_loaded("xmlwriter")) print "skip"; ?>
++--FILE--
++<?php
++$x = array( new XMLWriter() );
++$x[0]->openUri("bug79029.txt");
++$x[0]->startComment();
++@unlink("bug79029.txt");
++
++$x = new XMLWriter();
++$x->openUri("bug79029.txt");
++fclose(@end(get_resources()));
++@unlink("bug79029.txt");
++
++file_put_contents("bug79029.txt", "a");
++$x = new XMLReader();
++$x->open("bug79029.txt");
++fclose(@end(get_resources()));
++@unlink("bug79029.txt");
++?>
++okey
++--CLEAN--
++<?php
++@unlink("bug79029.txt");
++?>
++--EXPECTF--
++Warning: fclose(): %d is not a valid stream resource in %sbug79029.php on line %d
++
++Warning: fclose(): %d is not a valid stream resource in %sbug79029.php on line %d
++okey
+diff --git a/ext/xmlwriter/tests/bug79029_1.phpt b/ext/xmlwriter/tests/bug79029_1.phpt
+deleted file mode 100644
+index c91295c1675f3..0000000000000
+--- a/ext/xmlwriter/tests/bug79029_1.phpt
++++ /dev/null
+@@ -1,13 +0,0 @@
+---TEST--
+-#79029 (Use After Free's in XMLReader / XMLWriter)
+---SKIPIF--
+-<?php if (!extension_loaded("xmlwriter")) print "skip"; ?>
+---FILE--
+-<?php
+-$x = array( new XMLWriter() );
+-$x[0]->openUri("a");
+-$x[0]->startComment();
+-?>
+-okey
+---EXPECT--
+-okey

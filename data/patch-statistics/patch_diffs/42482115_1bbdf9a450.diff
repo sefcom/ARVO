@@ -1,0 +1,160 @@
+From 61208401f41f5d41f32d436cee500c630706f6be Mon Sep 17 00:00:00 2001
+From: Ebrahim Byagowi <ebrahim@gnu.org>
+Date: Fri, 28 Feb 2020 21:09:07 +0330
+Subject: [PATCH] [gvar] Use hb_bytes_t.check_range instead having in house one
+
+And use TupleVarHeader calculated size for validity check.
+
+Fixes https://crbug.com/oss-fuzz/20919 and possibly other gvar related issues
+---
+ src/hb-ot-var-gvar-table.hh                   |  36 +++++++-----------
+ ...-minimized-hb-draw-fuzzer-5686960406659072 | Bin 0 -> 4004 bytes
+ 2 files changed, 13 insertions(+), 23 deletions(-)
+ create mode 100644 test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-draw-fuzzer-5686960406659072
+
+diff --git a/src/hb-ot-var-gvar-table.hh b/src/hb-ot-var-gvar-table.hh
+index 35dbc5faff4..e8f24a135d2 100644
+--- a/src/hb-ot-var-gvar-table.hh
++++ b/src/hb-ot-var-gvar-table.hh
+@@ -203,10 +203,10 @@ struct GlyphVarData
+ 
+   struct tuple_iterator_t
+   {
+-    void init (const GlyphVarData *var_data_, unsigned int length_, unsigned int axis_count_)
++    void init (hb_bytes_t var_data_bytes_, unsigned int axis_count_)
+     {
+-      var_data = var_data_;
+-      length = length_;
++      var_data_bytes = var_data_bytes_;
++      var_data = var_data_bytes_.as<GlyphVarData> ();
+       index = 0;
+       axis_count = axis_count_;
+       current_tuple = &var_data->get_tuple_var_header ();
+@@ -217,10 +217,9 @@ struct GlyphVarData
+     {
+       if (var_data->has_shared_point_numbers ())
+       {
+-	hb_bytes_t bytes ((const char *) var_data, length);
+ 	const HBUINT8 *base = &(var_data+var_data->data);
+ 	const HBUINT8 *p = base;
+-	if (!unpack_points (p, shared_indices, bytes)) return false;
++	if (!unpack_points (p, shared_indices, var_data_bytes)) return false;
+ 	data_offset = p - base;
+       }
+       return true;
+@@ -229,7 +228,8 @@ struct GlyphVarData
+     bool is_valid () const
+     {
+       return (index < var_data->tupleVarCount.get_count ()) &&
+-	     in_range (current_tuple) &&
++	     var_data_bytes.check_range (current_tuple, TupleVarHeader::min_size) &&
++	     var_data_bytes.check_range (current_tuple, current_tuple->get_data_size ()) &&
+ 	     current_tuple->get_size (axis_count);
+     }
+ 
+@@ -241,32 +241,25 @@ struct GlyphVarData
+       return is_valid ();
+     }
+ 
+-    bool in_range (const void *p, unsigned int l) const
+-    { return (const char*) p >= (const char*) var_data && (const char*) p+l <= (const char*) var_data + length; }
+-
+-    template <typename T> bool in_range (const T *p) const { return in_range (p, sizeof (*p)); }
+-
+     const HBUINT8 *get_serialized_data () const
+     { return &(var_data+var_data->data) + data_offset; }
+ 
+     private:
+     const GlyphVarData *var_data;
+-    unsigned int length;
+     unsigned int index;
+     unsigned int axis_count;
+     unsigned int data_offset;
+ 
+     public:
++    hb_bytes_t var_data_bytes;
+     const TupleVarHeader *current_tuple;
+   };
+ 
+-  static bool get_tuple_iterator (const GlyphVarData *var_data,
+-				  unsigned int length,
+-				  unsigned int axis_count,
++  static bool get_tuple_iterator (hb_bytes_t var_data_bytes, unsigned axis_count,
+ 				  hb_vector_t<unsigned int> &shared_indices /* OUT */,
+ 				  tuple_iterator_t *iterator /* OUT */)
+   {
+-    iterator->init (var_data, length, axis_count);
++    iterator->init (var_data_bytes, axis_count);
+     if (!iterator->get_shared_indices (shared_indices))
+       return false;
+     return iterator->is_valid ();
+@@ -574,14 +567,11 @@ struct gvar
+       if (!coord_count || coord_count != gvar_table->axisCount) return true;
+ 
+       hb_bytes_t var_data_bytes = gvar_table->get_glyph_var_data_bytes (gvar_table.get_blob (), glyph);
+-      const GlyphVarData *var_data = var_data_bytes.as<GlyphVarData> ();
+-      if (!var_data->has_data ()) return true;
++      if (!var_data_bytes.as<GlyphVarData> ()->has_data ()) return true;
+       hb_vector_t<unsigned int> shared_indices;
+       GlyphVarData::tuple_iterator_t iterator;
+-      if (!GlyphVarData::get_tuple_iterator (var_data, var_data_bytes.length,
+-					     gvar_table->axisCount,
+-					     shared_indices,
+-					     &iterator))
++      if (!GlyphVarData::get_tuple_iterator (var_data_bytes, gvar_table->axisCount,
++					     shared_indices, &iterator))
+ 	return true; /* so isn't applied at all */
+ 
+       /* Save original points for inferred delta calculation */
+@@ -599,7 +589,7 @@ struct gvar
+ 	if (scalar == 0.f) continue;
+ 	const HBUINT8 *p = iterator.get_serialized_data ();
+ 	unsigned int length = iterator.current_tuple->get_data_size ();
+-	if (unlikely (!iterator.in_range (p, length)))
++	if (unlikely (!iterator.var_data_bytes.check_range (p, length)))
+ 	  return false;
+ 
+ 	hb_bytes_t bytes ((const char *) p, length);
+diff --git a/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-draw-fuzzer-5686960406659072 b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-draw-fuzzer-5686960406659072
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6e1461cb890cd43dfaeb98fd2fb7e4b28c6e8d6
+GIT binary patch
+literal 4004
+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
+L@TO!2Q&WEdsxWKa
+
+literal 0
+HcmV?d00001
+

@@ -1,0 +1,51 @@
+From 4d1ca7035df8d1688b7d85e6495722f57870726f Mon Sep 17 00:00:00 2001
+From: Yifeng Sun <pkusunyifeng@gmail.com>
+Date: Tue, 27 Nov 2018 16:10:11 -0800
+Subject: [PATCH] ofctl_parse_target: Fix memory leaks if there is no usable
+ protocol
+
+When there is no usable protocol, ofctl_parse_flows__ returns without
+properly freeing memory. A previous patch failed to fix this issue.
+This patch fixes it.
+
+Reported-at: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=11406
+Reported-at: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=11408
+Signed-off-by: Yifeng Sun <pkusunyifeng@gmail.com>
+Signed-off-by: Ben Pfaff <blp@ovn.org>
+---
+ tests/oss-fuzz/ofctl_parse_target.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/tests/oss-fuzz/ofctl_parse_target.c b/tests/oss-fuzz/ofctl_parse_target.c
+index d4712a44247..b4db52f7ed4 100644
+--- a/tests/oss-fuzz/ofctl_parse_target.c
++++ b/tests/oss-fuzz/ofctl_parse_target.c
+@@ -22,7 +22,7 @@ ofctl_parse_flows__(struct ofputil_flow_mod *fms, size_t n_fms,
+ 
+     if (!(usable_protocols & OFPUTIL_P_ANY)) {
+         printf("no usable protocol\n");
+-        return;
++        goto free;
+     }
+     for (i = 0; i < sizeof(enum ofputil_protocol) * CHAR_BIT; i++) {
+         protocol = 1u << i;
+@@ -40,7 +40,11 @@ ofctl_parse_flows__(struct ofputil_flow_mod *fms, size_t n_fms,
+ 
+         msg = ofputil_encode_flow_mod(fm, protocol);
+         ofpbuf_delete(msg);
++    }
+ 
++free:
++    for (i = 0; i < n_fms; i++) {
++        struct ofputil_flow_mod *fm = &fms[i];
+         free(CONST_CAST(struct ofpact *, fm->ofpacts));
+         minimatch_destroy(&fm->match);
+     }
+@@ -62,7 +66,6 @@ ofctl_parse_flow(const char *input, int command)
+         free(error);
+     } else {
+         ofctl_parse_flows__(&fm, 1, usable_protocols);
+-        minimatch_destroy(&fm.match);
+     }
+ }
+ 

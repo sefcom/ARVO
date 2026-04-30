@@ -1,0 +1,187 @@
+From 7b7b6d741bda9f9f92c3632153e7a7a5b39cb06b Mon Sep 17 00:00:00 2001
+From: Huijing Hei <hhei@redhat.com>
+Date: Fri, 8 Jul 2022 19:37:37 +0800
+Subject: [PATCH 1/3] Fix `ostree admin kargs edit-in-place` fails issue
+
+Add func to set kernel arguments in place, instead of create new
+deployment
+Fix https://github.com/ostreedev/ostree/issues/2664
+---
+ apidoc/ostree-sections.txt                    |  1 +
+ src/libostree/libostree-devel.sym             |  1 +
+ src/libostree/ostree-sysroot-deploy.c         | 43 +++++++++++++++++++
+ src/libostree/ostree-sysroot.h                |  7 +++
+ .../ot-admin-kargs-builtin-edit-in-place.c    |  7 ++-
+ 5 files changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/apidoc/ostree-sections.txt b/apidoc/ostree-sections.txt
+index 5af8e68773..900e170430 100644
+--- a/apidoc/ostree-sections.txt
++++ b/apidoc/ostree-sections.txt
+@@ -577,6 +577,7 @@ ostree_sysroot_get_repo
+ ostree_sysroot_get_staged_deployment
+ ostree_sysroot_init_osname
+ ostree_sysroot_deployment_set_kargs
++ostree_sysroot_deployment_set_kargs_in_place
+ ostree_sysroot_deployment_set_mutable
+ ostree_sysroot_deployment_unlock
+ ostree_sysroot_deployment_set_pinned
+diff --git a/src/libostree/libostree-devel.sym b/src/libostree/libostree-devel.sym
+index 54945ecaf6..145ec1ec5f 100644
+--- a/src/libostree/libostree-devel.sym
++++ b/src/libostree/libostree-devel.sym
+@@ -23,6 +23,7 @@
+ LIBOSTREE_2022.5 {
+ global:
+   ostree_kernel_args_append_if_missing;
++  ostree_sysroot_deployment_set_kargs_in_place;
+ } LIBOSTREE_2022.4;
+ 
+ /* Stub section for the stable release *after* this development one; don't
+diff --git a/src/libostree/ostree-sysroot-deploy.c b/src/libostree/ostree-sysroot-deploy.c
+index 456b0c041d..a9d41258f8 100644
+--- a/src/libostree/ostree-sysroot-deploy.c
++++ b/src/libostree/ostree-sysroot-deploy.c
+@@ -3589,6 +3589,49 @@ ostree_sysroot_deployment_set_kargs (OstreeSysroot     *self,
+   return TRUE;
+ }
+ 
++/**
++ * ostree_sysroot_deployment_set_kargs_in_place:
++ * @self: Sysroot
++ * @deployment: A deployment
++ * @kargs_str: (allow none): Replace @deployment's kernel arguments
++ * @cancellable: Cancellable
++ * @error: Error
++ *
++ * Replace the kernel arguments of @deployment with the values in @kargs_str.
++ */
++gboolean
++ostree_sysroot_deployment_set_kargs_in_place (OstreeSysroot     *self,
++                                              OstreeDeployment  *deployment,
++                                              char              *kargs_str,
++                                              GCancellable      *cancellable,
++                                              GError           **error)
++{
++  if (!_ostree_sysroot_ensure_writable (self, error))
++    return FALSE;
++
++  g_assert (!ostree_deployment_is_staged (deployment));
++
++  OstreeBootconfigParser *new_bootconfig = ostree_deployment_get_bootconfig (deployment);
++  ostree_bootconfig_parser_set (new_bootconfig, "options", kargs_str);
++
++  g_autofree char *bootconf_name =
++    g_strdup_printf ("ostree-%d-%s.conf",
++                     self->deployments->len - ostree_deployment_get_index (deployment),
++                     ostree_deployment_get_osname (deployment));
++
++  g_autofree char *bootconfdir = g_strdup_printf ("loader.%d/entries", self->bootversion);
++  glnx_autofd int bootconf_dfd = -1;
++  if (!glnx_opendirat (self->boot_fd, bootconfdir, TRUE, &bootconf_dfd, error))
++    return FALSE;
++
++  if (!ostree_bootconfig_parser_write_at (new_bootconfig,
++                                          bootconf_dfd, bootconf_name,
++                                          cancellable, error))
++    return FALSE;
++
++  return TRUE;
++}
++
+ /**
+  * ostree_sysroot_deployment_set_mutable:
+  * @self: Sysroot
+diff --git a/src/libostree/ostree-sysroot.h b/src/libostree/ostree-sysroot.h
+index c240aaa06b..0cde9e4423 100644
+--- a/src/libostree/ostree-sysroot.h
++++ b/src/libostree/ostree-sysroot.h
+@@ -175,6 +175,13 @@ gboolean ostree_sysroot_deployment_set_kargs (OstreeSysroot     *self,
+                                               GCancellable      *cancellable,
+                                               GError           **error);
+ 
++_OSTREE_PUBLIC
++gboolean ostree_sysroot_deployment_set_kargs_in_place (OstreeSysroot     *self,
++                                                       OstreeDeployment  *deployment,
++                                                       char              *kargs_str,
++                                                       GCancellable      *cancellable,
++                                                       GError           **error);
++
+ _OSTREE_PUBLIC
+ gboolean ostree_sysroot_write_deployments (OstreeSysroot     *self,
+                                            GPtrArray         *new_deployments,
+diff --git a/src/ostree/ot-admin-kargs-builtin-edit-in-place.c b/src/ostree/ot-admin-kargs-builtin-edit-in-place.c
+index 40ada02fc6..2a16da9c96 100644
+--- a/src/ostree/ot-admin-kargs-builtin-edit-in-place.c
++++ b/src/ostree/ot-admin-kargs-builtin-edit-in-place.c
+@@ -67,11 +67,10 @@ ot_admin_kargs_builtin_edit_in_place (int argc, char **argv, OstreeCommandInvoca
+             }
+         }
+       
+-      g_auto(GStrv) kargs_strv = ostree_kernel_args_to_strv (kargs);
++      g_autofree char *new_options = ostree_kernel_args_to_string (kargs);
+       
+-      if (!ostree_sysroot_deployment_set_kargs (sysroot, deployment,
+-                                              kargs_strv,
+-                                              cancellable, error))
++      if (!ostree_sysroot_deployment_set_kargs_in_place (sysroot, deployment, new_options, 
++                                                         cancellable, error))
+         return FALSE;
+       
+     }
+
+From 8f24e0826ac30fe7538bd60a000d9e43500749eb Mon Sep 17 00:00:00 2001
+From: Huijing Hei <hhei@redhat.com>
+Date: Tue, 12 Jul 2022 16:27:56 +0800
+Subject: [PATCH 2/3] Add test to verify `ostree admin kargs edit-in-place`
+ working
+
+---
+ tests/kolainst/destructive/kargs-edit-in-place.sh | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+ create mode 100755 tests/kolainst/destructive/kargs-edit-in-place.sh
+
+diff --git a/tests/kolainst/destructive/kargs-edit-in-place.sh b/tests/kolainst/destructive/kargs-edit-in-place.sh
+new file mode 100755
+index 0000000000..6380ff3340
+--- /dev/null
++++ b/tests/kolainst/destructive/kargs-edit-in-place.sh
+@@ -0,0 +1,12 @@
++#!/bin/bash
++
++# Verify "ostree admin kargs edit-in-place" works
++
++set -xeuo pipefail
++
++. ${KOLA_EXT_DATA}/libinsttest.sh
++
++sudo ostree admin kargs edit-in-place --append-if-missing=testarg
++assert_file_has_content /boot/loader/entries/ostree-* testarg
++
++echo "ok test `kargs edit-in-place --append-if-missing`"
+
+From 2c716552052cd3d03cef5f2968d5945d799f8d90 Mon Sep 17 00:00:00 2001
+From: Colin Walters <walters@verbum.org>
+Date: Wed, 13 Jul 2022 15:32:05 -0400
+Subject: [PATCH 3/3] deploy: Ensure sysroot is initialized for kargs in place
+
+Even without a mount namespace set up.
+---
+ src/libostree/ostree-sysroot-deploy.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/libostree/ostree-sysroot-deploy.c b/src/libostree/ostree-sysroot-deploy.c
+index a9d41258f8..47c70c4366 100644
+--- a/src/libostree/ostree-sysroot-deploy.c
++++ b/src/libostree/ostree-sysroot-deploy.c
+@@ -3606,6 +3606,10 @@ ostree_sysroot_deployment_set_kargs_in_place (OstreeSysroot     *self,
+                                               GCancellable      *cancellable,
+                                               GError           **error)
+ {
++  if (!ostree_sysroot_initialize (self, error))
++    return FALSE;
++  if (!_ostree_sysroot_ensure_boot_fd (self, error))
++    return FALSE;
+   if (!_ostree_sysroot_ensure_writable (self, error))
+     return FALSE;
+ 

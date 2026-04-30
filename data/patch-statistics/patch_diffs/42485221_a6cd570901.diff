@@ -1,0 +1,57 @@
+From 07d47060e0d99d0884440c3fa55ef2a338987769 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Thu, 25 Jun 2020 07:41:22 +0200
+Subject: [PATCH] BUG/MINOR: cfgparse: report extraneous args *after* the
+ string is allocated
+
+The config parser change in commit 9e1758efb ("BUG/MEDIUM: cfgparse: use
+parse_line() to expand/unquote/unescape config lines") is wrong when
+displaying the last parsed word, because it doesn't verify that the output
+string was properly allocated. This may fail in two cases:
+  - very first line (outline is NULL, as in oss-fuzz issue 23657)
+  - much longer line than previous ones, requiring a realloc(), in which
+    case the final 0 is out of the allocated space.
+
+This patch moves the reporting after the allocation check to fix this.
+
+No backport is needed, this is 2.2 only.
+---
+ src/cfgparse.c | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 9f65d838941e..6525806e0392 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1976,14 +1976,6 @@ int readcfgfile(const char *file)
+ 				goto next_line;
+ 			}
+ 
+-			if (err & PARSE_ERR_TOOMANY) {
+-				ha_alert("parsing [%s:%d]: too many words, truncating after word %d, position %ld: <%s>.\n",
+-					 file, linenum, MAX_LINE_ARGS, (long)(args[MAX_LINE_ARGS-1] - outline + 1), args[MAX_LINE_ARGS-1]);
+-				err_code |= ERR_ALERT | ERR_FATAL;
+-				fatal++;
+-				goto next_line;
+-			}
+-
+ 			if (err & (PARSE_ERR_TOOLARGE|PARSE_ERR_OVERLAP)) {
+ 				outlinesize = (outlen + 1023) & -1024;
+ 				outline = realloc(outline, outlinesize);
+@@ -1997,6 +1989,16 @@ int readcfgfile(const char *file)
+ 				/* try again */
+ 				continue;
+ 			}
++
++			if (err & PARSE_ERR_TOOMANY) {
++				/* only check this *after* being sure the output is allocated */
++				ha_alert("parsing [%s:%d]: too many words, truncating after word %d, position %ld: <%s>.\n",
++					 file, linenum, MAX_LINE_ARGS, (long)(args[MAX_LINE_ARGS-1] - outline + 1), args[MAX_LINE_ARGS-1]);
++				err_code |= ERR_ALERT | ERR_FATAL;
++				fatal++;
++				goto next_line;
++			}
++
+ 			/* everything's OK */
+ 			break;
+ 		}

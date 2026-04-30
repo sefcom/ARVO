@@ -1,0 +1,56 @@
+From 41133638dc303be1717462876814a6102669757c Mon Sep 17 00:00:00 2001
+From: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date: Fri, 31 Jan 2025 10:14:20 +0100
+Subject: [PATCH] DNS: fix extraction of transactionID field (#2703)
+
+We can't write to `flow->protos.dns` until we are sure this is a valid
+DNS packet
+
+```
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==14729==ERROR: AddressSanitizer: SEGV on unknown address (pc 0x60e876372a86 bp 0x000000000000 sp 0x79392fdf90e0 T1)
+==14729==The signal is caused by a READ memory access.
+==14729==Hint: this fault was caused by a dereference of a high value address (see register values below).  Disassemble the provided pc to learn which register was used.
+    #0 0x60e876372a86 in __asan::Allocator::Deallocate(void*, unsigned long, unsigned long, __sanitizer::BufferedStackTrace*, __asan::AllocType) (/home/ivan/svnrepos/nDPI/example/ndpiReader+0x8b0a86) (BuildId: a9c4718bcd5c3947812b6fd704e203b8bb6f633c)
+    #1 0x60e87640b29f in free (/home/ivan/svnrepos/nDPI/example/ndpiReader+0x94929f) (BuildId: a9c4718bcd5c3947812b6fd704e203b8bb6f633c)
+    #2 0x60e87647b0ec in free_wrapper /home/ivan/svnrepos/nDPI/example/ndpiReader.c:348:3
+    #3 0x60e876865454 in ndpi_free /home/ivan/svnrepos/nDPI/src/lib/ndpi_memory.c:82:7
+    #4 0x60e8767f0d4f in ndpi_free_flow_data /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:6752:2
+    #5 0x60e8767abd67 in ndpi_free_flow /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:10449:5
+
+```
+Found by oss-fuzz
+---
+ src/lib/protocols/dns.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/lib/protocols/dns.c b/src/lib/protocols/dns.c
+index d78a8e80888..5471b61771c 100644
+--- a/src/lib/protocols/dns.c
++++ b/src/lib/protocols/dns.c
+@@ -283,7 +283,7 @@ static int search_valid_dns(struct ndpi_detection_module_struct *ndpi_struct,
+   memcpy(dns_header, (struct ndpi_dns_packet_header*)&packet->payload[x],
+ 	 sizeof(struct ndpi_dns_packet_header));
+ 
+-  flow->protos.dns.transaction_id = dns_header->tr_id = ntohs(dns_header->tr_id);
++  dns_header->tr_id = ntohs(dns_header->tr_id);
+   dns_header->flags = ntohs(dns_header->flags);
+   dns_header->num_queries = ntohs(dns_header->num_queries);
+   dns_header->num_answers = ntohs(dns_header->num_answers);
+@@ -320,6 +320,7 @@ static int search_valid_dns(struct ndpi_detection_module_struct *ndpi_struct,
+ 	} else
+ 	  x++;
+       }
++      flow->protos.dns.transaction_id = dns_header->tr_id;
+     } else {
+       if(flow->detected_protocol_stack[0] != NDPI_PROTOCOL_UNKNOWN)
+         ndpi_set_risk(ndpi_struct, flow, NDPI_MALFORMED_PACKET, "Invalid DNS Header");
+@@ -345,6 +346,7 @@ static int search_valid_dns(struct ndpi_detection_module_struct *ndpi_struct,
+       }
+     }
+ 
++    flow->protos.dns.transaction_id = dns_header->tr_id;
+     flow->protos.dns.reply_code = dns_header->flags & 0x0F;
+ 
+     if(flow->protos.dns.reply_code != 0) {

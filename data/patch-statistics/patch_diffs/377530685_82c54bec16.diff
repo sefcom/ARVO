@@ -1,0 +1,71 @@
+From ead2a8b253c7db8d17a0765044947c5fbd564bc4 Mon Sep 17 00:00:00 2001
+From: Greg Hudson <ghudson@mit.edu>
+Date: Wed, 30 Oct 2024 17:08:00 -0400
+Subject: [PATCH] Use getentropy() when available
+
+When available, use getentropy() in preference to SYS_getrandom or
+/dev/urandom.  This binding is present in glibc 2.25 and the BSDs.
+
+ticket: 9149 (new)
+---
+ src/configure.ac          |  2 +-
+ src/lib/crypto/krb/prng.c | 26 ++++++++++++++++++++++----
+ 2 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/src/configure.ac b/src/configure.ac
+index 464648079ea..10a5d1a7418 100644
+--- a/src/configure.ac
++++ b/src/configure.ac
+@@ -466,7 +466,7 @@ AC_CONFIG_HEADERS(include/autoconf.h, [echo timestamp > include/autoconf.stamp])
+ AC_C_CONST
+ AC_HEADER_DIRENT
+ AC_FUNC_STRERROR_R
+-AC_CHECK_FUNCS(strdup setvbuf seteuid setresuid setreuid setegid setresgid setregid setsid flock fchmod chmod strptime geteuid setenv unsetenv getenv gmtime_r localtime_r bswap16 bswap64 mkstemp getusershell access getcwd srand48 srand srandom stat strchr strerror timegm explicit_bzero explicit_memset getresuid getresgid)
++AC_CHECK_FUNCS(strdup setvbuf seteuid setresuid setreuid setegid setresgid setregid setsid flock fchmod chmod strptime geteuid setenv unsetenv getenv gmtime_r localtime_r bswap16 bswap64 mkstemp getusershell access getcwd srand48 srand srandom stat strchr strerror timegm explicit_bzero explicit_memset getresuid getresgid getentropy)
+ 
+ AC_CHECK_FUNC(mkstemp,
+ [MKSTEMP_ST_OBJ=
+diff --git a/src/lib/crypto/krb/prng.c b/src/lib/crypto/krb/prng.c
+index d6b79e2deac..a9c16681575 100644
+--- a/src/lib/crypto/krb/prng.c
++++ b/src/lib/crypto/krb/prng.c
+@@ -96,7 +96,28 @@ read_entropy_from_device(const char *device, unsigned char *buf, size_t len)
+ static krb5_boolean
+ get_os_entropy(unsigned char *buf, size_t len)
+ {
+-#if defined(__linux__) && defined(SYS_getrandom)
++#if defined(HAVE_GETENTROPY)
++    int r;
++    size_t seg;
++
++    /* getentropy() has a maximum length of 256. */
++    while (len > 0) {
++        seg = (len > 256) ? 256 : len;
++        r = getentropy(buf, seg);
++        if (r != 0)
++            break;
++        len -= seg;
++        buf += seg;
++    }
++    if (len == 0)
++        return TRUE;
++#elif defined(__linux__) && defined(SYS_getrandom)
++    /*
++     * Linux added SYS_getrandom in 3.17 (2014), but glibc did not have a
++     * wrapper until 2.25 (2017).  This block can be deleted when that interval
++     * is far in the past, along with the conditional include of
++     * <sys/syscall.h> above.
++     */
+     int r;
+ 
+     while (len > 0) {
+@@ -104,9 +125,6 @@ get_os_entropy(unsigned char *buf, size_t len)
+          * Pull from the /dev/urandom pool, but require it to have been seeded.
+          * This ensures strong randomness while only blocking during first
+          * system boot.
+-         *
+-         * glibc does not currently provide a binding for getrandom:
+-         * https://sourceware.org/bugzilla/show_bug.cgi?id=17252
+          */
+         errno = 0;
+         r = syscall(SYS_getrandom, buf, len, 0);

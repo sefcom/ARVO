@@ -1,0 +1,95 @@
+From e507e24ffb6ed326e48d9cf287cabc90260c2a8b Mon Sep 17 00:00:00 2001
+From: Abtin Keshavarzian <abtink@google.com>
+Date: Wed, 26 Aug 2020 13:45:42 -0700
+Subject: [PATCH] [message] update 'Write()' to use 'memmove()' instead of
+ 'memcpy()' (#5462)
+
+This change allows `CopyTo()` method to be used to copy bytes backwards
+within the same message (i.e., src and dest messages are the same and
+the dest offset is before src offset). Unit test `test_message` is
+updated in this commit to cover such a use.
+
+However, the `CopyTo()` implementing can still potentially overwrite
+the data when bytes are being copied forward within the same message.
+This commit adds an assert not allowing such a use and updates the
+method documentation mentioning this restriction.
+---
+ src/core/common/message.cpp |  9 ++++++++-
+ src/core/common/message.hpp |  4 ++++
+ tests/unit/test_message.cpp | 20 ++++++++++++++++++++
+ 3 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/common/message.cpp b/src/core/common/message.cpp
+index d4341b805b0..6dbf8066db7 100644
+--- a/src/core/common/message.cpp
++++ b/src/core/common/message.cpp
+@@ -537,7 +537,7 @@ void Message::Write(uint16_t aOffset, uint16_t aLength, const void *aBuf)
+ 
+     while (chunk.GetLength() > 0)
+     {
+-        memcpy(chunk.GetData(), bufPtr, chunk.GetLength());
++        memmove(chunk.GetData(), bufPtr, chunk.GetLength());
+         bufPtr += chunk.GetLength();
+         GetNextChunk(aLength, chunk);
+     }
+@@ -548,6 +548,13 @@ uint16_t Message::CopyTo(uint16_t aSourceOffset, uint16_t aDestinationOffset, ui
+     uint16_t bytesCopied = 0;
+     Chunk    chunk;
+ 
++    // This implementing can potentially overwrite the data when bytes are
++    // being copied forward within the same message, i.e., source and
++    // destination messages are the same, and source offset is smaller than
++    // the destination offset. We assert not allowing such a use.
++
++    OT_ASSERT((&aMessage != this) || (aSourceOffset >= aDestinationOffset));
++
+     GetFirstChunk(aSourceOffset, aLength, chunk);
+ 
+     while (chunk.GetLength() > 0)
+diff --git a/src/core/common/message.hpp b/src/core/common/message.hpp
+index 3492e91fed7..f9b33495d37 100644
+--- a/src/core/common/message.hpp
++++ b/src/core/common/message.hpp
+@@ -532,6 +532,10 @@ class Message : public Buffer
+     /**
+      * This method copies bytes from one message to another.
+      *
++     * If source and destination messages are the same, `CopyTo()` can be used to perform a backward copy, but
++     * it MUST not be used to forward copy within the same message (i.e., when source and destination messages are the
++     * same and source offset is smaller than the destination offset).
++     *
+      * @param[in] aSourceOffset       Byte offset within the source message to begin reading.
+      * @param[in] aDestinationOffset  Byte offset within the destination message to begin writing.
+      * @param[in] aLength             Number of bytes to copy.
+diff --git a/tests/unit/test_message.cpp b/tests/unit/test_message.cpp
+index f97494bca98..86ffcd14a5d 100644
+--- a/tests/unit/test_message.cpp
++++ b/tests/unit/test_message.cpp
+@@ -144,7 +144,27 @@ void TestMessage(void)
+         }
+     }
+ 
++    // Verify `CopyTo()` with same source and destination message and a backward copy.
++
++    for (uint16_t srcOffset = 0; srcOffset < kMaxSize; srcOffset++)
++    {
++        uint16_t bytesCopied;
++
++        message->Write(0, kMaxSize, writeBuffer);
++
++        bytesCopied = message->CopyTo(srcOffset, 0, kMaxSize, *message);
++        VerifyOrQuit(bytesCopied == kMaxSize - srcOffset, "CopyTo() failed");
++
++        VerifyOrQuit(message->Read(0, kMaxSize, readBuffer) == kMaxSize, "Message::Read failed");
++
++        VerifyOrQuit(memcmp(&readBuffer[0], &writeBuffer[srcOffset], bytesCopied) == 0,
++                     "CopyTo() changed before srcOffset");
++        VerifyOrQuit(memcmp(&readBuffer[bytesCopied], &writeBuffer[bytesCopied], kMaxSize - bytesCopied) == 0,
++                     "CopyTo() write error");
++    }
++
+     message->Free();
++    message2->Free();
+ 
+     testFreeInstance(instance);
+ }
