@@ -14,6 +14,10 @@ In this work, we propose a method to produce a new security dataset which ensure
 
 ## Paper
 
+Accepted at IEEE European Symposium on Security and Privacy (EuroS&P) 2026 
+
+[ARVO paper (PDF)](./2026155803.pdf)
+
 > To appear. Wait for IEEE Xplore to be ready.
 
 ```bibtex
