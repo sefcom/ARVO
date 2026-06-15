@@ -15,4 +15,13 @@ To validate these solutions, we introduce full reproducibility to the largest op
 
 ## Paper
 
-> **TODO**: add citation link / BibTeX entry once Euro S&P 2026 proceedings are published.
+> To appear. Wait for IEEE Xplore to be ready.
+
+```bibtex
+@inproceedings{mei2026arvo,
+  title     = {{ARVO}: Atlas of Reproducible Vulnerabilities for Open-Source Software},
+  author    = {Mei, Xiang and Del Castillo, Jordi and Singh Singaria, Pulkit and Xi, Haoran and Benchikh, Abdelouahab and Bao, Tiffany and Wang, Ruoyu and Shoshitaishvili, Yan and Doup\'{e}, Adam and Pearce, Hammond and Dolan-Gavitt, Brendan},
+  booktitle = {IEEE European Symposium on Security and Privacy (EuroS\&P)},
+  year      = {2026}
+}
+```
