@@ -10,7 +10,6 @@ In this work, we propose a method to produce a new security dataset which ensure
 
 - Source code: https://github.com/n132/arvo
 - Dataset: https://github.com/n132/ARVO-Meta
-- Paper: `data/paper.pdf` (TODO: add once camera-ready is finalized)
 - Paper data: `./data/` contains the raw evaluation logs, metadata, and analysis scripts backing the paper's results.
 
 ## Paper
